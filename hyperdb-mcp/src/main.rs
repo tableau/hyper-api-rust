@@ -25,9 +25,15 @@ use hyperdb_mcp::server::HyperMcpServer;
 use rmcp::ServiceExt;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+// Both MCP_VERSION and HYPERDB_GIT_HASH are env! string literals, so this
+// concat! resolves at compile time into a single &'static str — exactly
+// what clap wants for the `version = ...` attribute.
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), ".r", env!("HYPERDB_GIT_HASH"));
+
 #[derive(Parser)]
 #[command(
     name = "hyperdb-mcp",
+    version = VERSION,
     about = "MCP server for Hyper database analytics"
 )]
 struct Cli {

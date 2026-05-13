@@ -20,8 +20,13 @@ use hyperdb_bootstrap::{
     VersionSource, DEFAULT_DEST_ROOT,
 };
 
+// CARGO_PKG_VERSION + git short hash captured by build.rs. Both are
+// env! literals so concat! collapses them into a &'static str at compile
+// time — exactly what clap wants for `version = ...`.
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), ".r", env!("HYPERDB_GIT_HASH"));
+
 #[derive(Parser)]
-#[command(name = "hyperd-bootstrap", version, about)]
+#[command(name = "hyperdb-bootstrap", version = VERSION, about)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

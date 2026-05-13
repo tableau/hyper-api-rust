@@ -1723,7 +1723,7 @@ dependencies = [
 
 [[package]]
 name = "hyperdb-api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "bytes",
@@ -1744,7 +1744,7 @@ dependencies = [
 
 [[package]]
 name = "hyperdb-api-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "base64",
@@ -1785,7 +1785,7 @@ dependencies = [
 
 [[package]]
 name = "hyperdb-api-node"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hyperdb-api",
  "napi",
@@ -1797,7 +1797,7 @@ dependencies = [
 
 [[package]]
 name = "hyperdb-api-salesforce"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "base64",
@@ -1818,7 +1818,7 @@ dependencies = [
 
 [[package]]
 name = "hyperdb-bootstrap"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1836,7 +1836,7 @@ dependencies = [
 
 [[package]]
 name = "hyperdb-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "base64",
@@ -3660,7 +3660,7 @@ dependencies = [
 
 [[package]]
 name = "sea-query-hyperdb"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "sea-query",
 ]

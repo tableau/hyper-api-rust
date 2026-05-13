@@ -1,6 +1,6 @@
 {
   "name": "hyperdb-api-node",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Node.js bindings for the Hyper database API, powered by napi-rs",
   "main": "index.js",
   "types": "index.d.ts",
@@ -31,12 +31,12 @@
     "tsx": "^4.21.0"
   },
   "optionalDependencies": {
-    "hyperdb-api-node-darwin-arm64": "0.1.0",
-    "hyperdb-api-node-darwin-x64": "0.1.0",
-    "hyperdb-api-node-linux-arm64-gnu": "0.1.0",
-    "hyperdb-api-node-linux-x64-gnu": "0.1.0",
-    "hyperdb-api-node-linux-x64-musl": "0.1.0",
-    "hyperdb-api-node-win32-x64-msvc": "0.1.0"
+    "hyperdb-api-node-darwin-arm64": "0.1.1",
+    "hyperdb-api-node-darwin-x64": "0.1.1",
+    "hyperdb-api-node-linux-arm64-gnu": "0.1.1",
+    "hyperdb-api-node-linux-x64-gnu": "0.1.1",
+    "hyperdb-api-node-linux-x64-musl": "0.1.1",
+    "hyperdb-api-node-win32-x64-msvc": "0.1.1"
   },
   "keywords": [
     "hyper",
@@ -52,7 +52,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/tableau/hyper-api-rust.git",
+    "url": "git+https://github.com/tableau/hyper-api-rust.git",
     "directory": "hyperdb-api-node"
   },
   "engines": {

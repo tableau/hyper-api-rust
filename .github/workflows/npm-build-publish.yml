@@ -250,6 +250,19 @@ jobs:
           pattern: npm-*
           merge-multiple: true
 
+      - name: Restore executable bits on platform binaries
+        # actions/upload-artifact preserves perms via tarball but
+        # actions/download-artifact extracts without them. Re-apply
+        # +x so the binaries are runnable after `npm install`.
+        run: |
+          set -euo pipefail
+          for d in hyperdb-mcp/npm/* hyperdb-api-node/npm/*; do
+            [[ -d "$d" ]] || continue
+            for f in "$d"/hyperdb-mcp "$d"/hyperd; do
+              [[ -f "$f" ]] && chmod +x "$f"
+            done
+          done
+
       - name: Determine npm dist-tag
         id: dist-tag
         run: |
@@ -306,6 +319,9 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_TAG: ${{ steps.dist-tag.outputs.tag }}
+        # --ignore-scripts skips the prepublishOnly hook (`napi prepublish`),
+        # which would try to re-orchestrate the platform packages our CI
+        # has already built and published independently.
         run: |
           cd hyperdb-api-node
-          npm publish --access public --tag "$NPM_TAG"
+          npm publish --access public --tag "$NPM_TAG" --ignore-scripts

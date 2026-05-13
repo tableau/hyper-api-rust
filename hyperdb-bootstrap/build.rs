@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::Command;
 
 fn main() {
     let manifest_dir =
@@ -22,6 +23,32 @@ fn main() {
     // Rebuild whenever the pin or this script changes.
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", pin_path.display());
+
+    // Capture the git short hash for `--version` output. Falls back to
+    // "unknown" when source was obtained as a tarball or git is missing.
+    println!("cargo:rerun-if-changed=../.git/HEAD");
+    println!("cargo:rerun-if-changed=../.git/refs/heads");
+    println!("cargo:rerun-if-changed=../.git/index");
+    let hash = Command::new("git")
+        .args(["rev-parse", "--short=8", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    let dirty = Command::new("git")
+        .args(["status", "--porcelain", "-uno"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .is_some_and(|o| !o.stdout.is_empty());
+    let git_hash = if dirty && hash != "unknown" {
+        format!("{hash}-dirty")
+    } else {
+        hash
+    };
+    println!("cargo:rustc-env=HYPERDB_GIT_HASH={git_hash}");
 
     let text = std::fs::read_to_string(&pin_path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", pin_path.display()));
