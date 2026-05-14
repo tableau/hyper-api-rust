@@ -5,9 +5,29 @@ name: ci
 # HEADs the pinned release's URLs.
 
 on:
+  # Pure-prose changes don't affect Rust compilation, lint output,
+  # advisory checks, or the publish dry-run. The paths-ignore lists
+  # below skip CI on docs-only PRs to avoid burning CI minutes. Note:
+  # `deny.toml` and `.cargo/audit.toml` are deliberately NOT in the
+  # ignore list — those files configure the security checks themselves
+  # and a typo would silently disable them. Keep the two lists in sync.
   push:
     branches: [main]
-  pull_request: {}
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE-*"
+      - "NOTICE"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/pull_request_template.md"
+  pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE-*"
+      - "NOTICE"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/pull_request_template.md"
   workflow_dispatch: {}
 
 # Cancel a PR's in-progress CI runs when a new push lands on the PR.
