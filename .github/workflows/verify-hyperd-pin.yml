@@ -26,12 +26,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install mold linker
         run: sudo apt-get update -q && sudo apt-get install -y mold
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          workspaces: . -> target
+          toolchain: stable
+          cache-key: verify-hyperd-pin
+          rustflags: ""
       - name: Verify pinned release URLs are reachable
         run: cargo run --release -p hyperdb-bootstrap --bin hyperdb-bootstrap -- verify

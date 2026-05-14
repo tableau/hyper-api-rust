@@ -27,9 +27,16 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
+          toolchain: stable
           components: rustfmt
+          cache: false
+          # Disable the action's default RUSTFLAGS=-D warnings; workspace
+          # lint policy lives in [workspace.lints] in Cargo.toml, and
+          # promoting warn-level lints to errors at the env level would
+          # break local-friendly behaviors elsewhere.
+          rustflags: ""
       - run: cargo fmt --all --check
 
   clippy:
@@ -42,12 +49,14 @@ jobs:
       - uses: actions/checkout@v6
       - name: Install system libraries (fontconfig for plotters, mold for fast linking, protobuf)
         run: sudo apt-get update -q && sudo apt-get install -y libfontconfig1-dev mold protobuf-compiler
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: clippy
+          cache-key: clippy
+          # See fmt job for rationale; clippy enforces -D warnings via
+          # the explicit `-- -D warnings` arg below, not via env.
+          rustflags: ""
       - name: Clippy (workspace, all targets)
         # Every crate in the workspace is linted under the Microsoft Rust
         # Guidelines config in `[workspace.lints]` (see Cargo.toml and
@@ -83,10 +92,10 @@ jobs:
       - name: Remove pre-installed Homebrew rust (macOS)
         # Recent macos-14 runner images ship Homebrew's `rust` package,
         # which symlinks `cargo` to `rustup-init`. With no toolchain
-        # installed, running `cargo test` then invokes rustup-init's
-        # CLI parser and fails with "unexpected argument 'test' found".
-        # Removing brew's rust before installing the real toolchain
-        # below avoids the symlink shadowing.
+        # installed, `cargo test` then invokes rustup-init's CLI parser
+        # and fails with "unexpected argument 'test' found". Removing
+        # brew's rust before installing the real toolchain avoids the
+        # symlink shadowing.
         if: runner.os == 'macOS'
         shell: bash
         run: |
@@ -94,20 +103,15 @@ jobs:
           rm -f /usr/local/bin/cargo /usr/local/bin/rustc /usr/local/bin/rustup-init || true
           rm -f /opt/homebrew/bin/cargo /opt/homebrew/bin/rustc /opt/homebrew/bin/rustup-init || true
 
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Ensure cargo is on PATH
-        shell: bash
-        run: |
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.cargo/bin:$PATH"
-          which cargo
-          cargo --version
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
+          toolchain: stable
           # Keep this cache separate from the clippy job's; the test
           # profile has different artifacts and mixing them causes
           # unnecessary rebuilds.
-          key: test-${{ matrix.os }}
+          cache-key: test-${{ matrix.os }}
+          # See fmt job for rationale.
+          rustflags: ""
 
       - name: Cache hyperd binary
         # Keyed on the pinned release file, so bumping the pin
@@ -161,10 +165,11 @@ jobs:
       - uses: actions/checkout@v6
       - name: Install mold linker
         run: sudo apt-get update -q && sudo apt-get install -y mold
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          key: publish-dry-run
+          toolchain: stable
+          cache-key: publish-dry-run
+          rustflags: ""
       - run: |
           cargo publish -p hyperdb-bootstrap   --dry-run
           cargo publish -p sea-query-hyperdb   --dry-run
@@ -191,9 +196,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          key: audit
+          toolchain: stable
+          cache-key: audit
+          rustflags: ""
       - run: cargo install cargo-audit --locked
       - run: cargo audit --deny warnings
