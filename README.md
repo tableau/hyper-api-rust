@@ -89,38 +89,32 @@ Add to your `Cargo.toml`:
 hyperdb-api = { path = "hyperdb-api" }
 ```
 
-#### Pre-built binaries
+#### Installing the CLIs
 
-Release archives for the `hyperdb-mcp` and `hyperdb-bootstrap` CLIs are
-attached to every tagged release on the
-[Releases page](https://github.com/tableau/hyper-api-rust/releases).
-Supported targets: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`,
-`x86_64-apple-darwin`, `x86_64-pc-windows-msvc`.
+`hyperdb-mcp` and `hyperdb-bootstrap` ship two ways:
 
-Linux / macOS:
+**Via npm** (recommended for `hyperdb-mcp`; bundles a matching `hyperd`):
 
 ```bash
-TAG=v0.1.0
-TARGET=x86_64-unknown-linux-gnu   # or aarch64-apple-darwin, x86_64-apple-darwin
-BIN=hyperdb-mcp                   # or hyperdb-bootstrap
-curl -fsSL "https://github.com/tableau/hyper-api-rust/releases/download/${TAG}/${BIN}-${TAG}-${TARGET}.tar.gz" \
-  | tar -xz -C /tmp
-sudo install "/tmp/${BIN}-${TAG}-${TARGET}/${BIN}" /usr/local/bin/
+npm install -g hyperdb-mcp
 ```
 
-Windows: download the `.zip` from the Releases page and extract the
-`.exe` to somewhere on `%PATH%`.
+Supported platforms: macOS ARM64 (Apple Silicon), Linux x64 (glibc),
+Windows x64. Intel macOS is built-from-source only at the moment — see
+the platform table in [`hyperdb-mcp/README.md`](hyperdb-mcp/README.md#installation).
 
-Verify downloads against the `SHA256SUMS.txt` attached to the release:
+**Via crates.io** (compiles from source; no bundled `hyperd`):
 
 ```bash
-sha256sum -c SHA256SUMS.txt
+cargo install hyperdb-mcp
+cargo install hyperdb-bootstrap
 ```
 
-**macOS Gatekeeper:** these binaries are unsigned. `curl | tar` extraction
-does not set the quarantine xattr, so the one-liner above works cleanly.
-If a `.tar.gz` downloaded via browser gets quarantined, clear it once with
-`xattr -d com.apple.quarantine <binary>`.
+`hyperdb-bootstrap` will then download a compatible `hyperd` for you:
+
+```bash
+hyperdb-bootstrap download
+```
 
 ### Environment Setup
 

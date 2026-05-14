@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-05-13
+
 ### Added
 
 `types` module — SQL type system, binary encoding, OIDs:

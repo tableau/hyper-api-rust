@@ -8,7 +8,6 @@
     "binaryName": "hyperdb-api-node",
     "targets": [
       "aarch64-apple-darwin",
-      "x86_64-apple-darwin",
       "x86_64-unknown-linux-gnu",
       "x86_64-unknown-linux-musl",
       "aarch64-unknown-linux-gnu",
@@ -32,7 +31,6 @@
   },
   "optionalDependencies": {
     "hyperdb-api-node-darwin-arm64": "0.1.1",
-    "hyperdb-api-node-darwin-x64": "0.1.1",
     "hyperdb-api-node-linux-arm64-gnu": "0.1.1",
     "hyperdb-api-node-linux-x64-gnu": "0.1.1",
     "hyperdb-api-node-linux-x64-musl": "0.1.1",
@@ -56,7 +54,7 @@
     "directory": "hyperdb-api-node"
   },
   "engines": {
-    "node": ">= 18"
+    "node": ">= 21"
   },
   "files": [
     "index.js",

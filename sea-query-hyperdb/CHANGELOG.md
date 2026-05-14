@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-05-13
+
 ### Added
 
 - `HyperQueryBuilder` implementing `sea_query::QueryBuilder` for HyperDB SQL dialect

@@ -33,7 +33,7 @@ For a detailed class diagram with all methods and properties, see
 
 ## Requirements
 
-- **Node.js** >= 18
+- **Node.js** >= 21
 - **Hyper server binary** (`hyperd`) — set `HYPERD_PATH` env var or place in standard location
 
 ## Installation
@@ -49,17 +49,20 @@ npm will automatically install the correct prebuilt binary for your platform via
 | Platform | Architecture | Package |
 |---|---|---|
 | macOS | ARM64 (Apple Silicon) | `hyperdb-api-node-darwin-arm64` |
-| macOS | x64 (Intel) | `hyperdb-api-node-darwin-x64` |
 | Linux | x64 (glibc) | `hyperdb-api-node-linux-x64-gnu` |
 | Linux | x64 (musl/Alpine) | `hyperdb-api-node-linux-x64-musl` |
 | Linux | ARM64 (glibc) | `hyperdb-api-node-linux-arm64-gnu` |
 | Windows | x64 (MSVC) | `hyperdb-api-node-win32-x64-msvc` |
 
+> **macOS x64 (Intel) is not currently published** while we wait for `macos-13`
+> GitHub Actions runners to become reliably available. Build from source for
+> Intel Macs in the meantime.
+
 ### Build from source
 
 To build from the workspace source instead, you'll need:
 
-- Node.js >= 18
+- Node.js >= 21
 - Rust stable (install via [rustup](https://rustup.rs/))
 - `protoc` — `brew install protobuf` (macOS), `apt-get install protobuf-compiler` (Debian/Ubuntu), or `choco install protoc` (Windows)
 - The `hyperd` binary (`make download-hyperd` from the repo root, or set `HYPERD_PATH` to an existing copy)

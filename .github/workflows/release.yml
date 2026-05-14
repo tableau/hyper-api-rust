@@ -1,8 +1,16 @@
 name: release
 
-# Tag-triggered publish to crates.io. Stable tags (v0.1.0) mark the
-# GitHub release as latest; pre-release tags (v0.1.0-rc.1) mark it as
-# prerelease so it doesn't show as "Latest release" on the repo home.
+# Publish to crates.io.
+#
+# Triggered by:
+#   - a GitHub Release published event (release-please drives this on
+#     merge of the release PR), or
+#   - a direct `git push origin v0.X.Y` tag push (emergency releases),
+#   - or a manual workflow_dispatch with an explicit existing tag.
+#
+# Stable tags (v0.1.0) mark the GitHub release as latest; pre-release
+# tags (v0.1.0-rc.1) mark it as prerelease so it doesn't show as
+# "Latest release" on the repo home.
 #
 # Publishing is destructive — version numbers on crates.io are
 # permanent. This workflow re-runs the full test matrix before
@@ -11,6 +19,12 @@ name: release
 # consistent for downstream crates.
 
 on:
+  # release-please drives most releases by merging the release PR and
+  # publishing a GitHub Release; that fires the `release: published`
+  # event below. Direct `git push origin v0.X.Y` tag pushes also work
+  # (e.g. for emergency releases that bypass release-please).
+  release:
+    types: [published]
   push:
     tags:
       - "v*.*.*-rc.*"
@@ -37,7 +51,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ github.event.inputs.tag || github.event.release.tag_name || github.ref }}
 
       - name: Install system libraries
         run: sudo apt-get update -q && sudo apt-get install -y libfontconfig1-dev mold protobuf-compiler
@@ -80,7 +94,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ github.event.inputs.tag || github.event.release.tag_name || github.ref }}
 
       - name: Install system libraries
         run: sudo apt-get update -q && sudo apt-get install -y libfontconfig1-dev mold protobuf-compiler
@@ -95,9 +109,10 @@ jobs:
         env:
           REF_NAME: ${{ github.ref_name }}
           INPUT_TAG: ${{ github.event.inputs.tag }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          TAG="${INPUT_TAG:-$REF_NAME}"
+          TAG="${INPUT_TAG:-${RELEASE_TAG:-$REF_NAME}}"
           # Defense in depth: tags coming from workflow_dispatch are
           # user-supplied. Enforce a strict `vX.Y.Z` / `vX.Y.Z-rc.N`
           # shape before letting the name flow into cargo/git commands.

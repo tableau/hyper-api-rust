@@ -50,7 +50,7 @@ For documentation conventions specific to JavaScript/TypeScript, see the [Docume
 
 ## Build and Test Commands
 
-**Prerequisites:** Rust toolchain, Node.js >= 18, `HYPERD_PATH` set.
+**Prerequisites:** Rust toolchain, Node.js >= 21, `HYPERD_PATH` set.
 
 ```bash
 cd hyperdb-api-node
@@ -124,13 +124,14 @@ Uses napi-rs platform packages for cross-platform prebuilt binaries:
 | Platform | Package |
 |----------|---------|
 | macOS ARM64 | `hyperdb-api-node-darwin-arm64` |
-| macOS x64 | `hyperdb-api-node-darwin-x64` |
 | Linux x64 (glibc) | `hyperdb-api-node-linux-x64-gnu` |
 | Linux x64 (musl) | `hyperdb-api-node-linux-x64-musl` |
 | Linux ARM64 | `hyperdb-api-node-linux-arm64-gnu` |
 | Windows x64 | `hyperdb-api-node-win32-x64-msvc` |
 
-CI builds all platforms on push. Publishing is triggered by a `release:` commit on `main`.
+macOS x64 (Intel) is currently disabled — `macos-13` GHA runners are unreliable.
+
+CI builds all enabled platforms on push. Publishing is driven by release-please.
 
 ## Common Development Scenarios
 

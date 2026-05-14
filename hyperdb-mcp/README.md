@@ -8,16 +8,16 @@ Built on the pure-Rust [`hyperdb-api`](../hyperdb-api/) crate for maximum perfor
 
 ## Why
 
-LLMs are powerful at reasoning but cannot natively crunch millions of rows. This plugin bridges that gap: another MCP tool produces data, the LLM passes it to `hyperdb-mcp`, Hyper ingests it and makes it SQL-queryable, the LLM runs analytical SQL, and results come back as JSON. Optionally export to CSV, Parquet, Arrow IPC, or `.hyper` (opens directly in **Tableau Desktop**).
+LLMs are powerful at reasoning but cannot natively crunch millions of rows. This plugin bridges that gap: another MCP tool produces data, the LLM passes it to `hyperdb-mcp`, Hyper ingests it and makes it SQL-queryable, the LLM runs analytical SQL, and results come back as JSON. Optionally export to CSV, Parquet, Apache Iceberg, Arrow IPC, or `.hyper` (opens directly in **Tableau Desktop**).
 
 ---
 
 ## Features
 
 - **Zero setup** — `HyperProcess` auto-starts the Hyper server
-- **Any data in** — JSON, CSV, Parquet, Arrow IPC; schema inferred or exact
+- **Any data in** — JSON, CSV, Parquet, Arrow IPC, Apache Iceberg; schema inferred or exact
 - **SQL at scale** — thousands to billions of rows
-- **Data out** — export to CSV, Parquet, Arrow IPC, or `.hyper` (Tableau Desktop-ready)
+- **Data out** — export to CSV, Parquet, Apache Iceberg, Arrow IPC, or `.hyper` (Tableau Desktop-ready)
 - **One-shot queries** — `query_file("/tmp/sales.csv", "SELECT ...")` — single call, zero management
 - **Persistent workspace** — load multiple tables, JOIN across them, persist across sessions
 - **Read-only safe mode** — `--read-only` flag for safe deployment
@@ -39,11 +39,41 @@ LLMs are powerful at reasoning but cannot natively crunch millions of rows. This
 
 ### From npm
 
+> **Requirement:** Node.js **v21 or later**. Earlier versions ship an
+> older `npx` whose argument parsing is incompatible with the
+> `npx -y hyperdb-mcp` invocation in the MCP config below. If you're
+> on an older Node, see [Upgrading Node.js with nvm](#upgrading-nodejs-with-nvm)
+> below.
+
 ```bash
 npm install -g hyperdb-mcp
 ```
 
 The npm package bundles both the `hyperdb-mcp` binary and the `hyperd` database server — no additional setup required.
+
+### Upgrading Node.js with nvm
+
+`nvm` (Node Version Manager) makes it easy to install and switch between Node.js versions.
+
+**macOS / Linux** ([nvm-sh/nvm](https://github.com/nvm-sh/nvm)):
+```bash
+# install nvm if you don't have it
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+
+# install and use the latest LTS (>= 21)
+nvm install --lts
+nvm use --lts
+node --version    # should report v22.x.x or newer
+```
+
+**Windows** ([coreybutler/nvm-windows](https://github.com/coreybutler/nvm-windows)): download the installer, then in a new shell:
+```powershell
+nvm install lts
+nvm use lts
+node --version
+```
+
+After upgrading, restart your MCP client so it picks up the new Node binary on `PATH`.
 
 ### Building from Source
 
@@ -88,6 +118,7 @@ For a **persistent workspace** (tables survive across sessions), add `"args"`:
 ```json
 "args": ["--workspace", "/path/to/my-project.hyper"]
 ```
+This is still **experimental** and will only work with only one session at a time since the Hyper database is locked by Hyper. Each session is isolated and has its own Hyper instance running. Future work will allow multiple sessions to share the same database but requires work to spin up a shared Hyper instance.
 
 #### Claude Code / AI Suite
 
@@ -183,6 +214,28 @@ When you're unsure of the right types — or recovering from a previous
 `SCHEMA_MISMATCH` — call [`inspect_file`](#inspect-file) first. It reports the
 exact schema `load_file` would use plus per-column `min` / `max` / `null_count`
 so you can build a minimal, correct override in one shot.
+
+#### `load_iceberg`
+
+Load an [Apache Iceberg](https://iceberg.apache.org/) table into a named
+workspace table. Pass the absolute path to the Iceberg table root (the
+directory containing `metadata/` and `data/`); hyperd's native Iceberg
+reader derives the schema and resolves the snapshot.
+
+```
+load_iceberg(table: 'sales', path: '/lake/warehouse/db/sales')
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `table` | string | yes | Target Hyper table name |
+| `path` | string | yes | Absolute path to the Iceberg table root directory |
+| `mode` | string | no | `"replace"` (default) or `"append"` |
+| `metadata_filename` | string | no | Pin a specific snapshot, e.g. `"v2.metadata.json"`. Omit for latest. |
+| `version_as_of` | integer | no | Pin a snapshot by version number |
+
+Schema overrides are not accepted — hyperd derives the schema from the
+Iceberg table metadata.
 
 #### `query`
 
@@ -323,7 +376,7 @@ export(sql: 'SELECT ...', path: '~/Desktop/analysis.hyper', format: 'hyper')
 | `sql` | string | no | Query to export (if omitted, exports whole table) |
 | `table` | string | no | Table name (used if `sql` omitted) |
 | `path` | string | yes | Output file path |
-| `format` | string | yes | `"csv"`, `"parquet"`, `"arrow_ipc"`, or `"hyper"` |
+| `format` | string | yes | `"csv"`, `"parquet"`, `"iceberg"`, `"arrow_ipc"`, or `"hyper"` |
 
 The `"hyper"` format produces a `.hyper` file that opens directly in **Tableau Desktop**.
 
@@ -365,7 +418,7 @@ unwatch_directory(path: '/tmp/inbox')
 
 **Producer protocol (`.ready` sentinel):**
 
-1. Write data file atomically (e.g. `foo.csv.tmp` then rename to `foo.csv`).
+1. Write data file (e.g. `foo.csv`) and close it.
 2. Create a zero-byte companion `foo.csv.ready` — this is the atomic signal.
 3. Poll for the absence of `foo.csv.ready` to confirm the watcher is done.
 

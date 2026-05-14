@@ -6,7 +6,7 @@ The UI is a React SPA (Vite + Tailwind). The API is Express + TypeScript, backed
 
 ## Prerequisites
 
-- **Node.js** >= 18  
+- **Node.js** >= 21  
 - **Rust toolchain** (stable) — required to build `hyperdb-api-node` from the workspace when using `file:../../`  
 - **`hyperdb-api-node` built** — from the `hyperdb-api-node/` directory:
   - Release: `npm run build` (faster runtime)

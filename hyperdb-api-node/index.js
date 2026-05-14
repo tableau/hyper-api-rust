@@ -31,7 +31,9 @@ function isMusl() {
 function getPlatformPackage() {
   switch (platform) {
     case 'darwin':
-      return arch === 'arm64' ? 'hyperdb-api-node-darwin-arm64' : 'hyperdb-api-node-darwin-x64'
+      // darwin-x64 builds are disabled until macos-13 GHA runners are
+      // reliable again — see npm-build-publish.yml matrix.
+      return arch === 'arm64' ? 'hyperdb-api-node-darwin-arm64' : null
     case 'linux':
       if (arch === 'arm64') return isMusl() ? 'hyperdb-api-node-linux-arm64-musl' : 'hyperdb-api-node-linux-arm64-gnu'
       return isMusl() ? 'hyperdb-api-node-linux-x64-musl' : 'hyperdb-api-node-linux-x64-gnu'

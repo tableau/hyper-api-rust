@@ -1,0 +1,37 @@
+name: release-please
+
+# Maintains a single open "release PR" on main that bumps all workspace
+# versions, updates per-crate CHANGELOG.md files, and updates the
+# .release-please-manifest.json based on Conventional Commits since the
+# last release. Merging that PR creates a GitHub Release and a v{X.Y.Z}
+# tag.
+#
+# The downstream workflows trigger off the GitHub Release publish event
+# (release.yml → crates.io, npm-build-publish.yml → npm) rather than the
+# tag push. This avoids the GitHub Actions limitation where tags pushed
+# by GITHUB_TOKEN don't fire `on: push: tags:` workflows — which would
+# otherwise require a custom PAT.
+#
+# Maintainers don't run anything by hand:
+#   1. Land conventional-commit PRs into main.
+#   2. Merge the release-please PR when ready to ship.
+#
+# See docs/GITHUB_OPERATIONS.md → "Cutting a release" for details.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

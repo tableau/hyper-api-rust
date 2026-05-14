@@ -254,7 +254,7 @@ classDiagram
 ### Prerequisites
 
 1. **Rust toolchain** — install via [rustup](https://rustup.rs/)
-2. **Node.js** >= 18
+2. **Node.js** >= 21
 3. **npm** >= 9
 4. **`hyperd` binary** — set `HYPERD_PATH` environment variable
 
@@ -326,49 +326,33 @@ columnar query, Arrow query, filtered queries, and aggregation.
 ## Publishing to npm
 
 The package uses [napi-rs](https://napi.rs/) to publish prebuilt native
-binaries for each platform. A GitHub Actions workflow
-(`.github/workflows/hyperdb-api-node.yml`) automates the build, test, and
-publish pipeline.
+binaries for each platform. Releases are driven by **release-please** —
+contributors don't bump versions or push tags by hand. See
+[CONTRIBUTING.md → Release Process](../CONTRIBUTING.md#release-process)
+and [docs/GITHUB_OPERATIONS.md → Cutting a release](../docs/GITHUB_OPERATIONS.md#cutting-a-release)
+for the end-to-end flow.
 
 ### Platform packages
 
 | Platform | Package |
 |----------|---------|
 | macOS ARM64 | `hyperdb-api-node-darwin-arm64` |
-| macOS x64 | `hyperdb-api-node-darwin-x64` |
 | Linux x64 (glibc) | `hyperdb-api-node-linux-x64-gnu` |
 | Linux x64 (musl) | `hyperdb-api-node-linux-x64-musl` |
 | Linux ARM64 | `hyperdb-api-node-linux-arm64-gnu` |
 | Windows x64 | `hyperdb-api-node-win32-x64-msvc` |
 
-### Setup (one-time)
+macOS x64 (Intel) builds are currently disabled — see [`npm-build-publish.yml`](../.github/workflows/npm-build-publish.yml)
+matrix; we'll re-enable once `macos-13` runner availability is reliable.
 
-1. Create an npm access token: `npm token create`
-2. Add it as a GitHub repo secret named `NPM_TOKEN` (Settings > Secrets > Actions)
-
-### How it works
-
-- On every push to `main` or `ssteiner/**` branches, CI builds native binaries
-  for all 6 platforms
-- Tests run on macOS (ARM64 + x64), Linux, and Windows
-- Publishing is triggered when a commit on `main` starts with `release:`
-
-```bash
-# Bump version in package.json and all npm/*/package.json
-npm version patch   # or minor / major
-git push origin main
-
-# Then merge a commit with this message format:
-git commit --allow-empty -m "release: v0.1.1"
-git push origin main
-```
-
-CI publishes:
-1. Platform packages (`hyperdb-api-node-darwin-arm64`, etc.)
-2. Main package (`hyperdb-api-node`) — users install this, npm auto-downloads the
-   right binary
+The build/publish pipeline lives in
+[`.github/workflows/npm-build-publish.yml`](../.github/workflows/npm-build-publish.yml);
+it triggers off the GitHub Release event that release-please publishes.
 
 ### Manual publish (without CI)
+
+For local one-off testing only — production releases always go through
+release-please + CI.
 
 ```bash
 # Build for your current platform

@@ -91,7 +91,7 @@ graph LR
 
 The `hyperdb-api` crate has **zero feature flags** — all capabilities (TLS, pooling, geography,
 transactions, chrono) are always enabled. This simplifies dependency management and matches
-the C++/Python/Java APIs. Domain-specific functionality lives in companion crates instead.
+the C++/Python/Java APIs. Domain-specific functionality lives in companion crates instead. This may change before 1.0.0 if it's found that certain feature flags can greatly reduce the number of dependencies for users who don't need them, reduce the overall binary size and build time.
 
 ---
 

@@ -16,7 +16,7 @@
   "description": "hyperdb-api-node native binding for Linux x64 (glibc)",
   "license": "MIT OR Apache-2.0",
   "engines": {
-    "node": ">= 18"
+    "node": ">= 21"
   },
   "libc": [
     "glibc"

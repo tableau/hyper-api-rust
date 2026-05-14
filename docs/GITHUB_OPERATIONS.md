@@ -23,7 +23,8 @@ Four GitHub Actions workflows live under [`.github/workflows/`](../.github/workf
 | Workflow | File | Triggers | Purpose |
 |---|---|---|---|
 | `ci` | [ci.yml](../.github/workflows/ci.yml) | `push` to `main`, all PRs, manual | fmt, clippy, full test matrix, `cargo deny`, `cargo audit`, `cargo publish --dry-run` |
-| `release` | [release.yml](../.github/workflows/release.yml) | tag push matching `v*.*.*` / `v*.*.*-rc.*`, manual | re-run tests, build per-platform binaries, publish 6 Rust crates to crates.io (`hyperdb-api-node` is published separately to npm), attach archives to the GitHub Release |
+| `release-please` | [release-please.yml](../.github/workflows/release-please.yml) | `push` to `main`, manual | open/update the release PR; on merge, create the `vX.Y.Z` tag + GitHub Release |
+| `release` | [release.yml](../.github/workflows/release.yml) | tag push matching `v*.*.*` / `v*.*.*-rc.*`, manual | re-run tests, publish the 6 Rust crates to crates.io (`hyperdb-api-node` is published separately to npm) |
 | `npm-build-publish` | [npm-build-publish.yml](../.github/workflows/npm-build-publish.yml) | GitHub Release published, manual | build npm platform packages with bundled hyperd, publish to npm registry |
 | `verify-hyperd-pin` | [verify-hyperd-pin.yml](../.github/workflows/verify-hyperd-pin.yml) | changes to `hyperdb-bootstrap/hyperd-version.toml` or its source, weekly cron, manual | `HEAD` every pinned hyperd release URL to catch Tableau yanks / typos |
 
@@ -44,45 +45,30 @@ the PR. Main-branch runs always complete. This is set via the
 
 ### Release (`release.yml`)
 
-Runs on **tag push** (e.g. `git push origin v0.2.0`) or via manual
-`workflow_dispatch` with an explicit tag input. Structure:
+Runs on the **`release: published`** event (release-please publishes
+the GitHub Release after merging the release PR), on direct **tag push**
+matching `v*.*.*` (emergency releases that bypass release-please), or
+via manual `workflow_dispatch` with an explicit tag input. Structure:
 
 ```
 verify          ← full test suite + hyperd URL check, single-platform
    │
-   ├─► build-binaries (matrix × 4 targets)
-   │      build release binaries for hyperdb-mcp + hyperdb-bootstrap
-   │      package as .tar.gz / .zip, compute per-archive .sha256
-   │      upload as per-target GitHub Actions artifacts
-   │
-   └─► (gate) ──┐
-                ▼
-              publish          ← crates.io publish in dependency order,
-                                 then combine sha256 sidecars, then
-                                 create/update GitHub Release with
-                                 archives + SHA256SUMS.txt attached
+   └─► publish          ← crates.io publish in dependency order
 ```
 
-**Targets built** (binary archives only — the crates themselves are
-architecture-independent source on crates.io):
-
-| Target | Runner | Archive format |
-|---|---|---|
-| `x86_64-unknown-linux-gnu` | `ubuntu-latest` | `.tar.gz` |
-| `aarch64-apple-darwin` | `macos-14` | `.tar.gz` |
-| `x86_64-apple-darwin` | `macos-14` (cross) | `.tar.gz` |
-| `x86_64-pc-windows-msvc` | `windows-latest` | `.zip` |
-
-Other `hyperdb-api-node` triples (aarch64 Linux, musl Linux) are intentionally
-**not** built — `hyperd` itself is not supported on those platforms today,
-so a `hyperdb-bootstrap` binary for them would be a trap.
+There is no per-platform binary-archive build today. Users on supported
+platforms install via crates.io (`cargo install hyperdb-mcp`) or via npm
+(`npm install -g hyperdb-mcp`, which delivers prebuilt binaries through
+`npm-build-publish.yml`). The crates themselves are
+architecture-independent source on crates.io.
 
 **Dependency-ordered crates.io publish** (per-crate `sleep 45` between
 each so the crates.io index has time to settle before the next crate's
 verification step resolves the just-published dep):
 
-1. `hyperdb-api-core`
-2. `hyperdb-api-salesforce`
+1. `hyperdb-api-salesforce` (no workspace runtime deps; published first to
+   break the optional cycle with `hyperdb-api-core`)
+2. `hyperdb-api-core`
 3. `hyperdb-api`
 4. `hyperdb-mcp`
 5. `hyperdb-bootstrap`
@@ -135,9 +121,14 @@ verify-ci       ← checks that CI passed for this commit (gh api commit status)
 | Platform | Runner | Rust target | hyperd source |
 |---|---|---|---|
 | `darwin-arm64` | `macos-14` | `aarch64-apple-darwin` | `macos-arm64` |
-| `darwin-x64` | `macos-13` | `x86_64-apple-darwin` | `macos-x86_64` |
 | `linux-x64-gnu` | `ubuntu-latest` | `x86_64-unknown-linux-gnu` | `linux-x86_64` |
 | `win32-x64-msvc` | `windows-latest` | `x86_64-pc-windows-msvc` | `windows-x86_64` |
+
+`darwin-x64` (Intel macOS) is currently disabled — `macos-13` GHA
+runners have been unreliable. The matrix entry is commented out in
+[`npm-build-publish.yml`](../.github/workflows/npm-build-publish.yml)
+and will be re-enabled when runner availability stabilizes. Until then,
+Intel-Mac users must build from source.
 
 **npm packages published:**
 
@@ -145,7 +136,6 @@ verify-ci       ← checks that CI passed for this commit (gh api commit status)
 |---|---|---|
 | `hyperdb-mcp` | Main (bin shim) | `bin.js` — detects platform, sets `HYPERD_PATH`, spawns native binary |
 | `hyperdb-mcp-darwin-arm64` | Platform | `hyperdb-mcp` + `hyperd` + `LICENSE-HYPERD` |
-| `hyperdb-mcp-darwin-x64` | Platform | same, Intel macOS |
 | `hyperdb-mcp-linux-x64-gnu` | Platform | same, Linux x64 |
 | `hyperdb-mcp-win32-x64-msvc` | Platform | same, Windows x64 |
 | `hyperdb-api-node` | Main (napi-rs) | JS bindings + `getHyperdPath()` helper |
@@ -198,83 +188,143 @@ still resolve (via `hyperdb-bootstrap verify`). Runs:
 
 ## Cutting a release
 
-End-to-end recipe for a maintainer:
+Releases are driven by [release-please](https://github.com/googleapis/release-please).
+Maintainers don't bump versions, edit changelogs, or push tags by hand — those
+steps are automated based on [Conventional Commits](https://www.conventionalcommits.org/).
 
-1. **Bump workspace versions to match the tag.** All 7 publishable crates
-   (6 Rust + `hyperdb-api-node` on npm) are kept in lockstep via their
-   `Cargo.toml` `version = ...` field (and `package.json` `version` for
-   `hyperdb-api-node`). The `publish` job fails fast if `hyperdb-api-core`'s
-   version doesn't match the tag, so CI will catch a forgotten bump.
-2. **Promote each crate's `## [Unreleased]` section to a dated `## [X.Y.Z] - YYYY-MM-DD`
-   section** in its `CHANGELOG.md`. The recommended pattern: keep an empty
-   `## [Unreleased]` heading at the top, then add `## [X.Y.Z] - YYYY-MM-DD`
-   below it with all the bullets that accumulated under `[Unreleased]` since
-   the last release. Contributors maintain `[Unreleased]` per the
-   [Authoring changes](../CONTRIBUTING.md#authoring-changes-every-contributor)
-   guide. (A [release-please-config.json](../release-please-config.json)
-   exists but is not currently wired to a workflow — this step is manual today.)
-3. **Open a PR and merge to `main`.** CI must be green.
-4. **Tag the merge commit:**
-   ```bash
-   git fetch origin
-   git tag -a v0.2.0 -m "v0.2.0" origin/main
-   git push origin v0.2.0
-   ```
-   For pre-releases, use `v0.2.0-rc.1` etc.
-5. **Watch the `release` workflow run.** Expected time: ~30-50 min total
-   (verify + 4 parallel binary builds + publish with 45 s gaps ×7).
-6. **Verify the release page.** Once the workflow goes green:
-   - https://github.com/tableau/hyper-api-rust/releases should list the
-     new tag with 8 `.tar.gz` / `.zip` archives (4 targets × 2 binaries)
-     plus `SHA256SUMS.txt`.
-   - Each crate should appear on crates.io under its new version.
+### How it flows
+
+1. Contributors land PRs into `main` with conventional-commit titles
+   (`feat:`, `fix:`, `chore:`, etc. — see
+   [CONTRIBUTING.md](../CONTRIBUTING.md#commit-message-format)).
+2. The [release-please workflow](../.github/workflows/release-please.yml)
+   runs on every push to `main`. It opens (or updates) a single
+   **release PR** titled `chore(main): release X.Y.Z`. That PR contains:
+   - All 7 workspace crates' versions bumped (Cargo.toml + package.json).
+   - The `optionalDependencies` and inter-crate version pins updated.
+   - A new dated section in each crate's `CHANGELOG.md` summarizing the
+     conventional commits that landed since the last release.
+   - An updated `.release-please-manifest.json`.
+3. A maintainer reviews the release PR. Adjust the version manually if a
+   different bump is needed (e.g., promote a `0.x.0` patch to a minor) by
+   editing the PR or by tagging commits with
+   [`Release-As: X.Y.Z`](https://github.com/googleapis/release-please?tab=readme-ov-file#how-can-i-fix-release-notes).
+4. **Merge the release PR.** release-please then:
+   - Creates a `vX.Y.Z` git tag on the merge commit.
+   - Creates a GitHub Release with the auto-generated changelog.
+5. The tag push fires [release.yml](../.github/workflows/release.yml),
+   which publishes the 6 Rust crates to crates.io.
+6. The GitHub Release publication fires
+   [npm-build-publish.yml](../.github/workflows/npm-build-publish.yml),
+   which builds and publishes `hyperdb-mcp` and `hyperdb-api-node` (plus
+   their per-platform packages) to npm.
+
+### How commits drive version bumps
+
+release-please reads the [Conventional Commits](https://www.conventionalcommits.org/)
+prefix on each commit since the last release tag and picks the largest
+bump implied. Mark a commit as a breaking change by either appending `!`
+after the type (e.g. `feat!:`) or by adding a `BREAKING CHANGE:` footer
+in the commit body.
+
+**Important pre-1.0 caveat:** while the workspace is on a `0.x.y`
+version, semver treats the entire `0.x` line as unstable, and
+release-please follows suit — a breaking change bumps the **minor**
+component, not the major. The major component stays at `0` until you
+explicitly opt into `1.0.0`.
+
+| Commit prefix on `main` | Bump from `0.1.0` to |
+|---|---|
+| `fix:`, `fix(scope):` | `0.1.1` (patch) |
+| `feat:`, `feat(scope):` | `0.2.0` (minor) |
+| `feat!:` / `fix!:` / `BREAKING CHANGE:` footer | `0.2.0` (still minor — no major bump while pre-1.0) |
+| `chore:`, `docs:`, `refactor:`, `test:`, `style:`, `ci:`, `perf:`, `build:` | no release |
+| Manual `Release-As: 1.0.0` footer | `1.0.0` (forces the major bump) |
+
+After the workspace is on `1.x.y`, the same prefixes follow normal
+semver: `feat!:` will bump `1.2.3` → `2.0.0` as expected. To stabilize
+the API and cut `1.0.0`, add a `Release-As: 1.0.0` footer to a
+conventional-commit on `main`:
+
+```
+feat: stabilize public API
+
+Release-As: 1.0.0
+```
+
+### Pre-releases
+
+For an `-rc.N` / `-alpha.N` / `-beta.N` release, add a footer to a
+commit on `main`:
+
+```
+Release-As: 0.2.0-rc.1
+```
+
+release-please will produce a release PR with that exact version on the
+next run. Pre-release tags flow through `release.yml` and
+`npm-build-publish.yml` exactly as stable releases do; the GitHub
+Release is auto-flagged as `prerelease: true`, and the npm `dist-tag` is
+set to `rc` / `alpha` / `beta` instead of `latest` so `npm install
+hyperdb-mcp` doesn't pull a pre-release by default.
+
+### Lockstep versioning
+
+All 7 workspace crates share a single version number, enforced by the
+`linked-versions` plugin in
+[release-please-config.json](../release-please-config.json). When any
+crate's commits trigger a bump, every crate moves together. This keeps
+`cargo publish`'s strict inter-crate version pins (`= "X.Y.Z"`) in sync
+without manual edits.
+
+### Verifying a release
+
+Once both `release.yml` and `npm-build-publish.yml` go green:
+
+- https://github.com/tableau/hyper-api-rust/releases should list the
+  new tag with auto-generated release notes.
+- Each crate appears on crates.io under the new version: e.g.
+  https://crates.io/crates/hyperdb-api/X.Y.Z.
+- `npm view hyperdb-mcp version` and
+  `npm view hyperdb-api-node version` report the new version.
 
 ### Re-running a partial failure
 
 The `release` workflow is mostly idempotent but there are two sharp edges:
 
-- **crates.io is append-only.** If the workflow publishes `hyperdb-api-core v0.2.0`
-  and then fails on `hyperdb-api`, you cannot republish `hyperdb-api-core v0.2.0`
-  — that version is burned. Bump the patch version, re-tag, and run again.
-  This is why `build-binaries` runs **before** `publish` — if the binary
-  build fails, nothing has hit crates.io yet and you can fix and re-tag
-  without a version bump.
-- **`softprops/action-gh-release@v2` appends assets.** If an asset was
-  uploaded on a failed run, the re-run will **not** overwrite it with the
-  new one. Delete stale assets by hand first:
-  ```bash
-  gh release delete-asset v0.2.0 <filename> --yes
-  ```
-  Then re-run the failed workflow from the GitHub Actions UI.
+- **crates.io is append-only.** If the workflow publishes `hyperdb-api-core
+  v0.2.0` and then fails on `hyperdb-api`, you cannot republish
+  `hyperdb-api-core v0.2.0` — that version is burned. The fix is to land a
+  follow-up `fix:` commit on `main`, let release-please open a release PR
+  for `0.2.1`, and merge that.
+- **rate limits during the first publish of a brand-new crate.** crates.io
+  caps "new crate" creations at one per ~10 minutes. The first time we
+  publish a fresh crate name, the workflow may 429 partway through the
+  `Publish in dependency order` step. Wait for the cooldown printed in the
+  error and rerun via Actions → `release` → "Run workflow", entering the
+  same tag name in the `tag` input. Already-published crates fail loudly
+  with "already uploaded" and the run will continue past them via the
+  per-crate retry below.
 
-### Manual release dispatch
+### Re-running release.yml against an existing tag
 
-For a release where the tag already exists in `origin` (e.g. you want to
-rerun the release workflow after a CI fix that didn't change the tag
-contents), use the Actions UI:
+For cases where the tag already exists in `origin` (e.g. you want to
+rerun `release.yml` after a transient infra failure), use the Actions UI:
 
 1. Actions → `release` → "Run workflow".
 2. Enter the existing tag name in the `tag` input (e.g. `v0.2.0`).
 3. Click Run.
 
-The workflow's same regex validator rejects malformed tag names, and
-`concurrency: release` still prevents racing with an in-flight run.
+The workflow's regex validator rejects malformed tag names, and
+`concurrency: release` prevents racing with an in-flight run.
 
 ## Secrets
 
 | Secret | Used by | Scope |
 |---|---|---|
-| `CRATES_IO_TOKEN` | [release.yml](../.github/workflows/release.yml) `publish` job | `cargo publish` to crates.io |
+| `CARGO_REGISTRY_TOKEN` | [release.yml](../.github/workflows/release.yml) `publish` job | `cargo publish` to crates.io |
 | `NPM_TOKEN` | [npm-build-publish.yml](../.github/workflows/npm-build-publish.yml) `publish-npm` job | `npm publish` to npmjs.org |
-| `GITHUB_TOKEN` | Every workflow | Auto-provided by GitHub Actions; used to fetch protoc, post releases, download artifacts, verify CI status |
-
-No Apple Developer ID cert is configured today — macOS binaries are
-unsigned. See the "macOS Gatekeeper" note in the README's
-[Pre-built binaries](../README.md#pre-built-binaries) section for the
-user-side workaround. Proper `codesign` + `notarytool` would require a
-`APPLE_DEVELOPER_ID_CERT` + `APPLE_DEVELOPER_ID_CERT_PASSWORD` +
-`APPLE_API_KEY_ID` / `APPLE_API_KEY_ISSUER_ID` / `APPLE_API_KEY` set of
-secrets and is a future task.
+| `GITHUB_TOKEN` | Every workflow | Auto-provided by GitHub Actions; used to post releases, download artifacts, verify CI status |
 
 ## Issue & PR templates
 
@@ -302,12 +352,15 @@ Check the actual live settings under
 - **CI failures on `main`:** investigate and fix forward. The cancel-on-new-push
   concurrency only applies to PRs; main-branch runs always complete, so a
   broken main is a real signal.
-- **`release` workflow failure before `publish`:** fix and re-tag
-  (deleting the stale tag locally and on `origin` first,
-  `git push origin :v0.2.0-rc.1`).
-- **`release` workflow failure during `publish`:** do *not* re-tag — the
-  already-published crates are burned. Bump to the next patch version
-  and try again.
+- **`release` workflow failure during `verify`:** the tag already exists,
+  so manual re-tagging isn't needed. Land the fix on `main`, then re-run
+  `release.yml` against the same tag from the Actions UI (`Run workflow`
+  → enter tag → run). Or, if the fix changes the tag contents, let the
+  next release-please PR mint a fresh patch tag.
+- **`release` workflow failure during `publish`:** the already-published
+  crates are burned (crates.io is append-only). Land a `fix:` commit on
+  `main` and merge the next release-please PR. Don't try to retag the
+  partially-published version.
 - **`verify-hyperd-pin` failure:** the pinned hyperd release URL 404'd.
   Check the Tableau releases page, update
   [`hyperdb-bootstrap/hyperd-version.toml`](../hyperdb-bootstrap/hyperd-version.toml)
@@ -322,4 +375,4 @@ Check the actual live settings under
 - [docs/RUST_GUIDELINES.md](RUST_GUIDELINES.md) — coding standards enforced by `ci.yml`.
 - [AGENTS.md](../AGENTS.md) — codebase architecture and build commands for contributors.
 - [deny.toml](../deny.toml) — `cargo deny` policy (licenses, advisories).
-- [README.md#pre-built-binaries](../README.md#pre-built-binaries) — user-side install snippet for the binaries this workflow produces.
+- [README.md → Installing the CLIs](../README.md#installing-the-clis) — user-side install paths (npm + cargo install).

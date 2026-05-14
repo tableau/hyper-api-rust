@@ -11,7 +11,9 @@ const { platform, arch } = process
 function getPlatformPackage() {
   switch (platform) {
     case 'darwin':
-      return arch === 'arm64' ? 'hyperdb-mcp-darwin-arm64' : 'hyperdb-mcp-darwin-x64'
+      // darwin-x64 builds are disabled until macos-13 GHA runners are
+      // reliable again — see npm-build-publish.yml matrix.
+      return arch === 'arm64' ? 'hyperdb-mcp-darwin-arm64' : null
     case 'linux':
       return 'hyperdb-mcp-linux-x64-gnu'
     case 'win32':

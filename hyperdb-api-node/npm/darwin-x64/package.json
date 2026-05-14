@@ -16,6 +16,6 @@
   "description": "hyperdb-api-node native binding for macOS x64 (Intel)",
   "license": "MIT OR Apache-2.0",
   "engines": {
-    "node": ">= 18"
+    "node": ">= 21"
   }
 }
