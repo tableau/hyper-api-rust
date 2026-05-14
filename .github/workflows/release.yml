@@ -56,10 +56,11 @@ jobs:
       - name: Install system libraries
         run: sudo apt-get update -q && sudo apt-get install -y libfontconfig1-dev mold protobuf-compiler
 
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          key: release-verify
+          toolchain: stable
+          cache-key: release-verify
+          rustflags: ""
 
       - name: Cache hyperd binary
         id: hyperd-cache
@@ -99,10 +100,11 @@ jobs:
       - name: Install system libraries
         run: sudo apt-get update -q && sudo apt-get install -y libfontconfig1-dev mold protobuf-compiler
 
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          key: release-publish
+          toolchain: stable
+          cache-key: release-publish
+          rustflags: ""
 
       - name: Resolve tag name
         id: tag
