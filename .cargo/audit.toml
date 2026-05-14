@@ -16,3 +16,11 @@ ignore = [
     # observable to a remote attacker. Threat model does not apply.
     "RUSTSEC-2023-0071",
 ]
+
+# Forward-looking note (no waiver yet — RustSec hasn't issued an ID):
+# CVE-2026-43868 / GHSA-2f9f-gq7v-9h6m affects the `thrift` Rust crate
+# (≤ 0.22.0). Latest published is 0.17.0; Apache Thrift hasn't released
+# a fixed Rust crate (the "0.23.0 fix" is in C++/Java/Python only). We
+# pull thrift transitively via `parquet` in hyperdb-mcp. When RustSec
+# assigns a `RUSTSEC-2026-NNNN` ID, add it to the ignore list above
+# with the matching entry in deny.toml.
