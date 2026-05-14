@@ -69,6 +69,17 @@ ignore = [
     { id = "RUSTSEC-2023-0071", reason = "rsa used only for outbound JWT signing where Marvin Attack threat model does not apply" },
 ]
 
+# Forward-looking note (no waiver yet — RustSec hasn't issued an ID):
+# CVE-2026-43868 / GHSA-2f9f-gq7v-9h6m affects the `thrift` Rust crate
+# (≤ 0.22.0). The latest published version on crates.io is 0.17.0 — Apache
+# Thrift has not released a fixed Rust crate (the project's "0.23.0 fix"
+# is in C++/Java/Python only). We pull `thrift` transitively via `parquet`
+# in hyperdb-mcp (parquet metadata parsing only — used against operator-
+# supplied local files via `load_file`/`query_file`/`export`). When
+# RustSec assigns a `RUSTSEC-2026-NNNN` ID, add it to the ignore list
+# above with rationale: "thrift transitively via parquet; no fix
+# available on crates.io; operator-controlled inputs only."
+
 # -------------------------------------------------------------------------
 # Banned / duplicate crates
 # -------------------------------------------------------------------------
