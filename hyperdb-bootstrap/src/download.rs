@@ -86,6 +86,10 @@ pub fn download_and_verify(
     Ok(())
 }
 
+#[expect(
+    clippy::format_collect,
+    reason = "readable hex/string formatting loop; refactoring to fold! obscures intent"
+)]
 fn hash_file(path: &Path) -> Result<String, Error> {
     let mut file = File::open(path).map_err(|source| Error::Io {
         context: format!("opening {} for hashing", path.display()),
@@ -103,5 +107,9 @@ fn hash_file(path: &Path) -> Result<String, Error> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    // sha2 0.11 returns `Array<u8, _>` from `finalize()`, which (unlike
+    // the previous `GenericArray`) does not implement `LowerHex`. Iterate
+    // over the byte slice and lower-hex each byte ourselves.
+    let digest = hasher.finalize();
+    Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
 }

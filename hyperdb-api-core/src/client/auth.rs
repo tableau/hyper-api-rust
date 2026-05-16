@@ -45,7 +45,7 @@
 //! upstream copyright and reproduced license text.
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use md5::{Digest, Md5};
 use pbkdf2::pbkdf2_hmac;
 use rand::RngExt;
