@@ -17,7 +17,7 @@
 //!     // Create a pool configuration
 //!     let config = PoolConfig::new("localhost:7483", "example.hyper")
 //!         .create_mode(CreateMode::CreateIfNotExists)
-//!         .max_size(32);
+//!         .max_size(16);
 //!
 //!     // Build the pool
 //!     let pool = create_pool(config)?;
