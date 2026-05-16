@@ -64,7 +64,7 @@ jobs:
 
       - name: Cache hyperd binary
         id: hyperd-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .hyperd
           key: hyperd-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('hyperdb-bootstrap/hyperd-version.toml') }}
@@ -163,7 +163,7 @@ jobs:
           publish sea-query-hyperdb
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.name }}
           prerelease: ${{ contains(steps.tag.outputs.name, '-rc.') || contains(steps.tag.outputs.name, '-alpha.') || contains(steps.tag.outputs.name, '-beta.') }}

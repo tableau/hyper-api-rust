@@ -124,7 +124,7 @@ jobs:
         # (hyperdb-bootstrap/hyperd-version.toml) invalidates the cache
         # automatically and the next run re-downloads.
         id: hyperd-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .hyperd
           key: hyperd-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('hyperdb-bootstrap/hyperd-version.toml') }}
