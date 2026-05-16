@@ -25,9 +25,9 @@
     "example:ts": "npx tsx examples/typed-analytics.mts"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^3",
+    "@napi-rs/cli": "^3.6.2",
     "apache-arrow": "^21.1.0",
-    "tsx": "^4.21.0"
+    "tsx": "^4.22.0"
   },
   "optionalDependencies": {
     "hyperdb-api-node-darwin-arm64": "0.1.1",
