@@ -20,7 +20,7 @@ tracing = { workspace = true }
 # Arrow for result parsing (used by both TCP and gRPC transports)
 arrow = { version = "58", default-features = false, features = ["ipc"] }
 # SmallVec for memory-efficient collections that are typically small
-smallvec = "1.13"
+smallvec = "1.15"
 # Deadpool - async connection pool
 deadpool = { version = "0.13" }
 # tokio sync primitives — already present transitively via hyperdb-api-core's
