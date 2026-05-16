@@ -36,7 +36,7 @@ fn main() -> Result<()> {
     let hyper = HyperProcess::new(None, None)?;
 
     // Connect to a database
-    let conn = Connection::new(&hyper, "example.hyper", CreateMode::CreateIfNotExists)?;
+    let conn = Connection::new(&hyper, "example1.hyper", CreateMode::CreateIfNotExists)?;
 
     // Create a table
     let table_def = TableDefinition::from("users")
