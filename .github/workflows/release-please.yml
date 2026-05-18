@@ -28,6 +28,7 @@ permissions:
 
 jobs:
   release-please:
+    if: github.repository == 'tableau/hyper-api-rust'
     runs-on: ubuntu-latest
     steps:
       - uses: googleapis/release-please-action@v5
