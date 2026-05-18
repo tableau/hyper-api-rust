@@ -27,7 +27,7 @@
       "component": "hyper-api-rust",
       "changelog-path": "CHANGELOG.md",
       "extra-files": [
-        { "type": "generic", "path": "Cargo.toml" },
+        { "type": "toml", "path": "Cargo.toml", "jsonpath": "$.workspace.package.version" },
         { "type": "generic", "path": "hyperdb-api-core/Cargo.toml" },
         { "type": "generic", "path": "hyperdb-api/Cargo.toml" },
         {

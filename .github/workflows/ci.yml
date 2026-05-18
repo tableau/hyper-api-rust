@@ -222,7 +222,7 @@ jobs:
       - name: Check version.txt matches Cargo.toml workspace version
         run: |
           set -euo pipefail
-          CARGO_VERSION=$(grep -A1 'x-release-please-version' Cargo.toml | tail -1 | sed 's/.*"\(.*\)".*/\1/')
+          CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
           TXT_VERSION=$(cat version.txt | tr -d '[:space:]')
           if [[ "$CARGO_VERSION" != "$TXT_VERSION" ]]; then
             echo "::error::version.txt ($TXT_VERSION) does not match Cargo.toml workspace version ($CARGO_VERSION)"
