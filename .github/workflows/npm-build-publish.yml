@@ -28,24 +28,35 @@ jobs:
     name: verify CI passed
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.release.tag_name }}
 
-      - name: Check CI status for commit
+      - name: Wait for CI to pass
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           SHA=$(git rev-parse HEAD)
-          echo "Checking CI status for $SHA"
-          STATE=$(gh api "repos/${{ github.repository }}/commits/$SHA/status" --jq '.state')
-          echo "Combined status: $STATE"
-          if [[ "$STATE" != "success" ]]; then
-            echo "::error::CI has not passed for $SHA (state: $STATE). Aborting publish."
-            exit 1
-          fi
+          echo "Waiting for CI status on $SHA"
+          MAX_ATTEMPTS=30
+          SLEEP_SECONDS=60
+          for i in $(seq 1 $MAX_ATTEMPTS); do
+            STATE=$(gh api "repos/${{ github.repository }}/commits/$SHA/status" --jq '.state')
+            echo "Attempt $i/$MAX_ATTEMPTS: state=$STATE"
+            if [[ "$STATE" == "success" ]]; then
+              echo "CI passed."
+              exit 0
+            elif [[ "$STATE" == "failure" || "$STATE" == "error" ]]; then
+              echo "::error::CI failed for $SHA (state: $STATE). Aborting publish."
+              exit 1
+            fi
+            echo "CI still pending, waiting ${SLEEP_SECONDS}s..."
+            sleep $SLEEP_SECONDS
+          done
+          echo "::error::Timed out waiting for CI to pass ($SHA). State: $STATE"
+          exit 1
 
   build-npm:
     name: build-npm (${{ matrix.platform }})

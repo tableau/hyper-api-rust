@@ -3,10 +3,16 @@ name: release
 # Publish to crates.io.
 #
 # Triggered by:
-#   - a GitHub Release published event (release-please drives this on
-#     merge of the release PR), or
-#   - a direct `git push origin v0.X.Y` tag push (emergency releases),
-#   - or a manual workflow_dispatch with an explicit existing tag.
+#   - a GitHub Release published event (release-please drives this via
+#     PAT, so this fires automatically on merge of the release PR), or
+#   - a manual workflow_dispatch with an explicit existing tag (for
+#     re-runs or emergency releases).
+#
+# Note: the `push: tags:` trigger was removed because release-please
+# now uses a PAT (RELEASE_PLEASE_TOKEN) that fires both `release:
+# published` AND `push: tags:` events. Keeping both caused duplicate
+# runs. For emergency releases that bypass release-please, use
+# workflow_dispatch.
 #
 # Stable tags (v0.1.0) mark the GitHub release as latest; pre-release
 # tags (v0.1.0-rc.1) mark it as prerelease so it doesn't show as
@@ -19,16 +25,8 @@ name: release
 # consistent for downstream crates.
 
 on:
-  # release-please drives most releases by merging the release PR and
-  # publishing a GitHub Release; that fires the `release: published`
-  # event below. Direct `git push origin v0.X.Y` tag pushes also work
-  # (e.g. for emergency releases that bypass release-please).
   release:
     types: [published]
-  push:
-    tags:
-      - "v*.*.*-rc.*"
-      - "v*.*.*"
   workflow_dispatch:
     inputs:
       tag:
@@ -147,7 +145,14 @@ jobs:
           publish() {
             local crate="$1"
             echo "::group::Publishing $crate"
-            cargo publish -p "$crate"
+            if ! cargo publish -p "$crate" 2>&1 | tee /tmp/publish_out; then
+              if grep -q "already exists on" /tmp/publish_out; then
+                echo "::warning::$crate already published — skipping"
+              else
+                echo "::endgroup::"
+                return 1
+              fi
+            fi
             echo "::endgroup::"
             # crates.io index propagation: downstream crates' own
             # `cargo publish` verification step resolves their deps
