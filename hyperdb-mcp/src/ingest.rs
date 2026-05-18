@@ -684,18 +684,23 @@ pub fn ingest_csv(
     // Write CSV to a temp file before starting the transaction (it's a pure
     // filesystem operation and doesn't need to be atomic with the DB work).
     //
-    // The filename mixes PID and a nanosecond timestamp so parallel tests
-    // (and parallel ingest calls from a multi-client MCP) don't race on
-    // the same path and produce `unable to read from external source`
-    // errors when one caller's COPY overlaps another's write/remove.
-    let temp_dir = std::env::temp_dir();
-    let temp_path = temp_dir.join(format!(
-        "hyperdb_mcp_csv_{}_{}.csv",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos())
-    ));
+    // Uses `tempfile::NamedTempFile` for OS-guaranteed unique paths — the
+    // previous PID+nanosecond scheme could collide on macOS where timer
+    // resolution is coarser, causing parallel tests to race on the same file.
+    // `into_temp_path()` closes the file handle immediately while retaining
+    // the auto-delete-on-drop guarantee. This is required on Windows where
+    // `hyperd` cannot open a file held by another process.
+    let temp_path = tempfile::Builder::new()
+        .prefix("hyperdb_mcp_csv_")
+        .suffix(".csv")
+        .tempfile()
+        .map_err(|e| {
+            McpError::new(
+                ErrorCode::InternalError,
+                format!("Failed to create temp CSV file: {e}"),
+            )
+        })?
+        .into_temp_path();
     std::fs::write(&temp_path, csv_text).map_err(|e| {
         McpError::new(
             ErrorCode::InternalError,
@@ -724,8 +729,8 @@ pub fn ingest_csv(
         engine.execute_command(&copy_sql)
     });
 
-    // Always clean up the temp file, success or failure.
-    let _ = std::fs::remove_file(&temp_path);
+    // `temp_path` (TempPath) auto-deletes the file when dropped at end of scope.
+    drop(temp_path);
     let row_count = row_count?;
 
     let elapsed = timer.elapsed_ms();

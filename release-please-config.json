@@ -28,6 +28,8 @@
       "changelog-path": "CHANGELOG.md",
       "extra-files": [
         "Cargo.toml",
+        "hyperdb-api-core/Cargo.toml",
+        "hyperdb-api/Cargo.toml",
         {
           "type": "json",
           "path": "hyperdb-mcp/npm/package.json",
