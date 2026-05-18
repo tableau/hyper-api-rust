@@ -154,7 +154,11 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/) t
 | `feat:` | Minor (0.1.0 → 0.2.0) | `feat: add connection pooling` |
 | `fix:` | Patch (0.1.0 → 0.1.1) | `fix: resolve memory leak in query execution` |
 | `feat!:` | Major (0.1.0 → 1.0.0) | `feat!: remove deprecated API` |
-| `docs:`, `chore:`, `style:`, `refactor:`, `test:` | No release | `chore: update dependencies` |
+| `docs:`, `chore:`, `ci:`, `style:`, `refactor:`, `test:` | No release | `chore: update dependencies` |
+
+> **Tip:** Use `ci:` for workflow/infrastructure fixes — not `fix:`. Reserve
+> `fix:` for changes that end-users of the crate or npm package would notice.
+> A `fix(ci):` commit will trigger an unintended patch release.
 
 ## Examples
 
@@ -164,6 +168,8 @@ feat: add support for batch query execution
 fix(hyperdb-api-core): resolve type mismatch
 
 feat!: remove deprecated ResultSet methods
+
+ci: fix chmod step in npm-build-publish workflow
 
 chore: update arrow dependency to 56
 ```
