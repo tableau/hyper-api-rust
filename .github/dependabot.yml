@@ -1,0 +1,132 @@
+# Dependabot configuration.
+#
+# Opens automated PRs for dependency updates across the three ecosystems
+# this repo touches: Cargo (workspace + every member crate), npm (the
+# napi bindings), and GitHub Actions (workflow `uses:` lines).
+#
+# Conventions:
+#   - Weekly cadence on every ecosystem. Daily generates churn, monthly
+#     misses urgent advisories.
+#   - `open-pull-requests-limit` per ecosystem prevents an avalanche the
+#     first week and on backlog catch-ups.
+#   - `groups` bundle lockstep dep families (tonic+prost, arrow+parquet,
+#     RustCrypto traits) into single PRs so we don't get five separate
+#     bumps for what is logically one upgrade.
+#   - `ignore` blocks skip semver-major bumps for deps whose major
+#     migration we've explicitly deferred. Each entry is annotated with
+#     the reason; remove the entry when the workspace is ready to take
+#     that major. Patch and minor bumps still flow through unblocked.
+
+version: 2
+updates:
+  # ---------------------------------------------------------------------------
+  # Rust workspace
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "rust"
+    groups:
+      # gRPC stack moves in lockstep — bumping `tonic` without `prost`
+      # (or vice versa) is rarely useful.
+      tonic-prost:
+        patterns:
+          - "tonic"
+          - "tonic-build"
+          - "tonic-prost"
+          - "tonic-prost-build"
+          - "prost"
+          - "prost-types"
+      # arrow-rs ships `arrow` and `parquet` together at the same version.
+      arrow-parquet:
+        patterns:
+          - "arrow"
+          - "parquet"
+      # RustCrypto traits move together; we bumped them as one commit
+      # in the dep-refresh PR and want future bumps to follow suit.
+      rustcrypto:
+        patterns:
+          - "sha2"
+          - "hmac"
+          - "pbkdf2"
+          - "md-5"
+      # napi-rs ships the runtime crate, derive macro, and build helper
+      # together; pinning them to a single PR avoids three-way version
+      # skew on the Node bindings.
+      napi-rs:
+        patterns:
+          - "napi"
+          - "napi-derive"
+          - "napi-build"
+    ignore:
+      # Major bumps deferred to dedicated PRs with their own audits —
+      # see the "Out of scope" section of PR #6 (dep refresh).
+      #
+      # Remove an entry below once the workspace is ready to take that
+      # major; patch/minor bumps continue to flow through automatically
+      # in the meantime.
+      - dependency-name: "arrow"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "parquet"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "tonic"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "tonic-build"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "tonic-prost"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "tonic-prost-build"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "prost"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "prost-types"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "rmcp"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "napi"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "napi-derive"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "napi-build"
+        update-types: ["version-update:semver-major"]
+
+  # ---------------------------------------------------------------------------
+  # npm — hyperdb-api-node (the only package.json with real upgradable deps)
+  # ---------------------------------------------------------------------------
+  # Other package.json files in the tree (root, hyperdb-mcp/npm/*,
+  # hyperdb-api-node/npm/*) are platform-binding shells whose deps are
+  # generated artifacts, not real upgradable packages.
+  - package-ecosystem: "npm"
+    directory: "/hyperdb-api-node"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "npm"
+
+  # ---------------------------------------------------------------------------
+  # GitHub Actions — `uses:` references in every workflow under
+  # .github/workflows/. Catches new majors of cache, checkout, etc.
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "github-actions"
