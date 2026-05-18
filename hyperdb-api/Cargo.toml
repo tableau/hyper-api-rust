@@ -13,7 +13,8 @@ categories = ["database"]
 autobenches = false
 
 [dependencies]
-hyperdb-api-core = { path = "../hyperdb-api-core", version = "=0.1.1" }
+# x-release-please-version
+hyperdb-api-core = { path = "../hyperdb-api-core", version = "=0.1.2" }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
