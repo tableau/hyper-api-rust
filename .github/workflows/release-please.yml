@@ -6,11 +6,10 @@ name: release-please
 # last release. Merging that PR creates a GitHub Release and a v{X.Y.Z}
 # tag.
 #
-# The downstream workflows trigger off the GitHub Release publish event
-# (release.yml → crates.io, npm-build-publish.yml → npm) rather than the
-# tag push. This avoids the GitHub Actions limitation where tags pushed
-# by GITHUB_TOKEN don't fire `on: push: tags:` workflows — which would
-# otherwise require a custom PAT.
+# Uses a fine-grained PAT (RELEASE_PLEASE_TOKEN) instead of the default
+# GITHUB_TOKEN so that PRs and tags created by this workflow trigger
+# downstream CI and publish workflows. With GITHUB_TOKEN, GitHub
+# suppresses workflow triggers on events it creates (anti-recursion).
 #
 # Maintainers don't run anything by hand:
 #   1. Land conventional-commit PRs into main.
@@ -35,3 +34,4 @@ jobs:
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}

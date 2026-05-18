@@ -329,9 +329,85 @@ The workflow's regex validator rejects malformed tag names, and
 
 | Secret | Used by | Scope |
 |---|---|---|
+| `RELEASE_PLEASE_TOKEN` | [release-please.yml](../.github/workflows/release-please.yml) | Fine-grained PAT; triggers CI on release-please PRs/tags (see below) |
 | `CARGO_REGISTRY_TOKEN` | [release.yml](../.github/workflows/release.yml) `publish` job | `cargo publish` to crates.io |
 | `NPM_TOKEN` | [npm-build-publish.yml](../.github/workflows/npm-build-publish.yml) `publish-npm` job | `npm publish` to npmjs.org |
 | `GITHUB_TOKEN` | Every workflow | Auto-provided by GitHub Actions; used to post releases, download artifacts, verify CI status |
+
+### Why release-please needs a PAT
+
+GitHub Actions suppresses workflow triggers on events created by
+`GITHUB_TOKEN` (anti-recursion protection). Without a PAT, PRs opened
+by release-please don't trigger CI, and tags it pushes don't trigger
+`release.yml` or `npm-build-publish.yml`. The workaround is a
+fine-grained PAT stored as `RELEASE_PLEASE_TOKEN`.
+
+### Option A: Fine-grained PAT (current setup)
+
+1. Go to **Settings → Developer settings → Personal access tokens →
+   Fine-grained tokens → Generate new token**.
+2. Configure:
+   - **Token name:** `release-please-hyper-api-rust`
+   - **Expiration:** 90 days (set a calendar reminder to rotate)
+   - **Resource owner:** `tableau`
+   - **Repository access:** Only select → `tableau/hyper-api-rust`
+   - **Permissions → Repository:**
+     - Contents: Read and write
+     - Pull requests: Read and write
+3. Click "Generate token" and copy it.
+4. Add it as a repo secret:
+   ```bash
+   gh secret set RELEASE_PLEASE_TOKEN --repo tableau/hyper-api-rust
+   ```
+5. The [release-please workflow](../.github/workflows/release-please.yml)
+   references this secret via `token: ${{ secrets.RELEASE_PLEASE_TOKEN }}`.
+
+**Rotation:** when the PAT expires, generate a new one with the same
+settings and update the secret. Release-please will fail with a 401
+until the secret is refreshed — CI on `main` pushes will still show the
+failure clearly.
+
+### Option B: GitHub App token (recommended for larger teams)
+
+A GitHub App token isn't tied to any individual's account and never
+expires (tokens are minted per-run). Preferred for org-owned repos or
+when multiple maintainers need the pipeline to work independently.
+
+1. **Create a GitHub App** (org-level: Settings → Developer settings →
+   GitHub Apps → New):
+   - **Name:** `hyper-api-rust-release-please`
+   - **Permissions → Repository:**
+     - Contents: Read and write
+     - Pull requests: Read and write
+   - No webhook URL needed (uncheck "Active" under Webhook)
+   - Generate a private key and download it
+2. **Install the App** on `tableau/hyper-api-rust` (or all repos in the
+   org if you want it shared).
+3. **Store credentials** as repo secrets:
+   ```bash
+   gh secret set APP_ID --repo tableau/hyper-api-rust        # numeric App ID
+   gh secret set APP_PRIVATE_KEY --repo tableau/hyper-api-rust  # PEM file contents
+   ```
+4. **Update the workflow** to mint a short-lived token each run:
+   ```yaml
+   jobs:
+     release-please:
+       runs-on: ubuntu-latest
+       steps:
+         - uses: actions/create-github-app-token@v2
+           id: app-token
+           with:
+             app-id: ${{ secrets.APP_ID }}
+             private-key: ${{ secrets.APP_PRIVATE_KEY }}
+         - uses: googleapis/release-please-action@v5
+           with:
+             config-file: release-please-config.json
+             manifest-file: .release-please-manifest.json
+             token: ${{ steps.app-token.outputs.token }}
+   ```
+
+This mints a token scoped to the installation that expires in 1 hour —
+no rotation needed, no personal account dependency.
 
 ## Issue & PR templates
 
