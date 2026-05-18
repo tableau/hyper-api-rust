@@ -209,3 +209,22 @@ jobs:
           rustflags: ""
       - run: cargo install cargo-audit --locked
       - run: cargo audit --deny warnings
+
+  version-consistency:
+    # Ensures version.txt (release-please source of truth) stays in sync
+    # with Cargo.toml workspace version. Catches release-please PRs that
+    # bump one but not the other.
+    name: version consistency
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check version.txt matches Cargo.toml workspace version
+        run: |
+          set -euo pipefail
+          CARGO_VERSION=$(grep -A1 'x-release-please-version' Cargo.toml | tail -1 | sed 's/.*"\(.*\)".*/\1/')
+          TXT_VERSION=$(cat version.txt | tr -d '[:space:]')
+          if [[ "$CARGO_VERSION" != "$TXT_VERSION" ]]; then
+            echo "::error::version.txt ($TXT_VERSION) does not match Cargo.toml workspace version ($CARGO_VERSION)"
+            exit 1
+          fi
