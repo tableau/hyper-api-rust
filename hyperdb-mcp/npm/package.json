@@ -11,7 +11,8 @@
     "hyperdb-mcp-win32-x64-msvc": "0.1.1"
   },
   "files": [
-    "bin.js"
+    "bin.js",
+    "README.md"
   ],
   "keywords": [
     "hyper",

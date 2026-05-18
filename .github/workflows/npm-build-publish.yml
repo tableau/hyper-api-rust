@@ -263,6 +263,9 @@ jobs:
             done
           done
 
+      - name: Copy README into hyperdb-mcp npm publish directory
+        run: cp hyperdb-mcp/README.md hyperdb-mcp/npm/README.md
+
       - name: Determine npm dist-tag
         id: dist-tag
         run: |
