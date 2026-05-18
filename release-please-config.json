@@ -1,6 +1,5 @@
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
-  "release-type": "rust",
   "include-component-in-tag": false,
   "separate-pull-requests": false,
   "plugins": [
@@ -24,10 +23,11 @@
   ],
   "packages": {
     ".": {
-      "release-type": "rust",
+      "release-type": "simple",
       "component": "hyper-api-rust",
       "changelog-path": "CHANGELOG.md",
       "extra-files": [
+        "Cargo.toml",
         {
           "type": "json",
           "path": "hyperdb-mcp/npm/package.json",
