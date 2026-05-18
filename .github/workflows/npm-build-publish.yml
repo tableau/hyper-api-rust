@@ -258,8 +258,8 @@ jobs:
           set -euo pipefail
           for d in hyperdb-mcp/npm/* hyperdb-api-node/npm/*; do
             [[ -d "$d" ]] || continue
-            for f in "$d"/hyperdb-mcp "$d"/hyperd; do
-              [[ -f "$f" ]] && chmod +x "$f"
+            for f in "$d"/hyperdb-mcp "$d"/hyperdb-mcp.exe "$d"/hyperd "$d"/hyperd.exe; do
+              [[ -f "$f" ]] && chmod +x "$f" || true
             done
           done
 
