@@ -1,11 +1,7 @@
 {
-  "hyperdb-api-core": "0.1.1",
-  "hyperdb-api": "0.1.1",
-  "hyperdb-api-salesforce": "0.1.1",
-  "hyperdb-mcp": "0.1.1",
-  "hyperdb-bootstrap": "0.1.1",
-  "sea-query-hyperdb": "0.1.1",
+  ".": "0.1.1",
   "hyperdb-api-node": "0.1.1",
+  "hyperdb-mcp/npm": "0.1.1",
   "hyperdb-mcp/npm/darwin-arm64": "0.1.1",
   "hyperdb-mcp/npm/linux-x64-gnu": "0.1.1",
   "hyperdb-mcp/npm/win32-x64-msvc": "0.1.1",

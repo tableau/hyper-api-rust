@@ -8,13 +8,9 @@
       "type": "linked-versions",
       "groupName": "hyper-api-rust",
       "components": [
-        "hyperdb-api-core",
-        "hyperdb-api",
-        "hyperdb-api-salesforce",
-        "hyperdb-mcp",
-        "hyperdb-bootstrap",
-        "sea-query-hyperdb",
+        "hyper-api-rust",
         "hyperdb-api-node",
+        "hyperdb-mcp-npm",
         "hyperdb-mcp-darwin-arm64",
         "hyperdb-mcp-linux-x64-gnu",
         "hyperdb-mcp-win32-x64-msvc",
@@ -27,92 +23,110 @@
     }
   ],
   "packages": {
-    "hyperdb-api-core": {
-      "component": "hyperdb-api-core",
-      "changelog-path": "CHANGELOG.md"
-    },
-    "hyperdb-api": {
-      "component": "hyperdb-api",
-      "changelog-path": "CHANGELOG.md"
-    },
-    "hyperdb-api-salesforce": {
-      "component": "hyperdb-api-salesforce",
-      "changelog-path": "CHANGELOG.md"
-    },
-    "hyperdb-mcp": {
-      "component": "hyperdb-mcp",
+    ".": {
+      "release-type": "rust",
+      "component": "hyper-api-rust",
       "changelog-path": "CHANGELOG.md",
       "extra-files": [
-        "npm/package.json"
+        {
+          "type": "json",
+          "path": "hyperdb-mcp/npm/package.json",
+          "jsonpath": "$.optionalDependencies['hyperdb-mcp-darwin-arm64']"
+        },
+        {
+          "type": "json",
+          "path": "hyperdb-mcp/npm/package.json",
+          "jsonpath": "$.optionalDependencies['hyperdb-mcp-linux-x64-gnu']"
+        },
+        {
+          "type": "json",
+          "path": "hyperdb-mcp/npm/package.json",
+          "jsonpath": "$.optionalDependencies['hyperdb-mcp-win32-x64-msvc']"
+        },
+        {
+          "type": "json",
+          "path": "hyperdb-api-node/package.json",
+          "jsonpath": "$.optionalDependencies['hyperdb-api-node-darwin-arm64']"
+        },
+        {
+          "type": "json",
+          "path": "hyperdb-api-node/package.json",
+          "jsonpath": "$.optionalDependencies['hyperdb-api-node-linux-arm64-gnu']"
+        },
+        {
+          "type": "json",
+          "path": "hyperdb-api-node/package.json",
+          "jsonpath": "$.optionalDependencies['hyperdb-api-node-linux-x64-gnu']"
+        },
+        {
+          "type": "json",
+          "path": "hyperdb-api-node/package.json",
+          "jsonpath": "$.optionalDependencies['hyperdb-api-node-linux-x64-musl']"
+        },
+        {
+          "type": "json",
+          "path": "hyperdb-api-node/package.json",
+          "jsonpath": "$.optionalDependencies['hyperdb-api-node-win32-x64-msvc']"
+        }
       ]
-    },
-    "hyperdb-bootstrap": {
-      "component": "hyperdb-bootstrap",
-      "changelog-path": "CHANGELOG.md"
-    },
-    "sea-query-hyperdb": {
-      "component": "sea-query-hyperdb",
-      "changelog-path": "CHANGELOG.md"
     },
     "hyperdb-api-node": {
       "release-type": "node",
       "component": "hyperdb-api-node",
       "changelog-path": "CHANGELOG.md"
     },
+    "hyperdb-mcp/npm": {
+      "release-type": "node",
+      "component": "hyperdb-mcp-npm",
+      "skip-github-release": true,
+      "changelog-path": false
+    },
     "hyperdb-mcp/npm/darwin-arm64": {
       "release-type": "node",
       "component": "hyperdb-mcp-darwin-arm64",
       "skip-github-release": true,
-      "skip-github-pull-request": false,
       "changelog-path": false
     },
     "hyperdb-mcp/npm/linux-x64-gnu": {
       "release-type": "node",
       "component": "hyperdb-mcp-linux-x64-gnu",
       "skip-github-release": true,
-      "skip-github-pull-request": false,
       "changelog-path": false
     },
     "hyperdb-mcp/npm/win32-x64-msvc": {
       "release-type": "node",
       "component": "hyperdb-mcp-win32-x64-msvc",
       "skip-github-release": true,
-      "skip-github-pull-request": false,
       "changelog-path": false
     },
     "hyperdb-api-node/npm/darwin-arm64": {
       "release-type": "node",
       "component": "hyperdb-api-node-darwin-arm64",
       "skip-github-release": true,
-      "skip-github-pull-request": false,
       "changelog-path": false
     },
     "hyperdb-api-node/npm/linux-arm64-gnu": {
       "release-type": "node",
       "component": "hyperdb-api-node-linux-arm64-gnu",
       "skip-github-release": true,
-      "skip-github-pull-request": false,
       "changelog-path": false
     },
     "hyperdb-api-node/npm/linux-x64-gnu": {
       "release-type": "node",
       "component": "hyperdb-api-node-linux-x64-gnu",
       "skip-github-release": true,
-      "skip-github-pull-request": false,
       "changelog-path": false
     },
     "hyperdb-api-node/npm/linux-x64-musl": {
       "release-type": "node",
       "component": "hyperdb-api-node-linux-x64-musl",
       "skip-github-release": true,
-      "skip-github-pull-request": false,
       "changelog-path": false
     },
     "hyperdb-api-node/npm/win32-x64-msvc": {
       "release-type": "node",
       "component": "hyperdb-api-node-win32-x64-msvc",
       "skip-github-release": true,
-      "skip-github-pull-request": false,
       "changelog-path": false
     }
   }
