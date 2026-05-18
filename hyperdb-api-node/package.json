@@ -1,6 +1,6 @@
 {
   "name": "hyperdb-api-node",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Node.js bindings for the Hyper database API, powered by napi-rs",
   "main": "index.js",
   "types": "index.d.ts",
