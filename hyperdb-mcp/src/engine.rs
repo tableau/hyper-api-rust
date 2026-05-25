@@ -145,6 +145,33 @@ fn path_stem(path: &Path) -> String {
 /// - **Daemon** — a shared daemon manages `hyperd`; the engine only holds a connection.
 ///
 /// Database layout:
+/// RAII guard that restores the `schema_search_path` to the primary
+/// database when dropped. Created by [`Engine::scoped_search_path`].
+/// If the restore fails, logs a warning — the engine mutex serializes
+/// calls so the stale path only persists until the next tool call's
+/// own `scoped_search_path` or until `with_engine` replaces the engine
+/// on a `ConnectionLost` error.
+#[derive(Debug)]
+pub struct ScopedSearchPath<'a> {
+    engine: &'a Engine,
+    restore_to: String,
+}
+
+impl Drop for ScopedSearchPath<'_> {
+    fn drop(&mut self) {
+        let sql = format!(
+            "SET schema_search_path = '{}'",
+            self.restore_to.replace('\'', "''")
+        );
+        if let Err(e) = self.engine.execute_command(&sql) {
+            tracing::warn!(
+                error = %e.message,
+                "failed to restore schema_search_path — next tool call may route incorrectly"
+            );
+        }
+    }
+}
+
 /// - The connection is *bound* to the ephemeral primary at
 ///   [`Self::ephemeral_path`]. Unqualified SQL routes here.
 /// - When [`Self::persistent_path`] is `Some`, the server attaches that
@@ -495,6 +522,27 @@ impl Engine {
         }
     }
 
+    /// Temporarily redirect the schema search path to `alias` for the
+    /// duration of a tool call. Returns an RAII guard that restores the
+    /// search path to the primary when dropped.
+    ///
+    /// The engine `Mutex` is held by the caller (`with_engine` closure),
+    /// so concurrent tool calls cannot observe the redirected path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError`] if the SET statement fails (e.g. invalid alias
+    /// or connection lost).
+    pub fn scoped_search_path(&self, alias: &str) -> Result<ScopedSearchPath<'_>, McpError> {
+        let primary = self.primary_db_name();
+        let set_sql = format!("SET schema_search_path = '{}'", alias.replace('\'', "''"));
+        self.execute_command(&set_sql)?;
+        Ok(ScopedSearchPath {
+            engine: self,
+            restore_to: primary,
+        })
+    }
+
     /// Directory where `hyperd` writes its log files. The MCP binary should
     /// also drop its own client-side log here so debugging starts in one
     /// place.
@@ -775,15 +823,29 @@ impl Engine {
         columns: &[ColumnSchema],
         replace: bool,
     ) -> Result<(), McpError> {
+        self.create_table_in(table_name, columns, replace, None)
+    }
+
+    /// Create a table, optionally in a non-primary database. When
+    /// `target_db` is `Some`, the table identifier is fully qualified as
+    /// `"db"."public"."table"`; when `None`, it's just `"table"`.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::create_table`].
+    pub fn create_table_in(
+        &self,
+        table_name: &str,
+        columns: &[ColumnSchema],
+        replace: bool,
+        target_db: Option<&str>,
+    ) -> Result<(), McpError> {
         if columns.is_empty() {
             return Err(McpError::new(
                 ErrorCode::EmptyData,
                 "No columns to create table from",
             ));
         }
-        // Validate every column's type name is known before issuing any DDL.
-        // This catches typos in schema overrides before we start mutating the
-        // database.
         for col in columns {
             if crate::schema::map_hyper_type(&col.hyper_type).is_none() {
                 return Err(McpError::new(
@@ -796,7 +858,14 @@ impl Engine {
             }
         }
 
-        let quoted_table = format!("\"{}\"", table_name.replace('"', "\"\""));
+        let quoted_table = match target_db {
+            Some(db) => {
+                let esc_db = db.replace('"', "\"\"");
+                let esc_tbl = table_name.replace('"', "\"\"");
+                format!("\"{esc_db}\".\"public\".\"{esc_tbl}\"")
+            }
+            None => format!("\"{}\"", table_name.replace('"', "\"\"")),
+        };
         if replace {
             self.connection
                 .execute_command(&format!("DROP TABLE IF EXISTS {quoted_table}"))

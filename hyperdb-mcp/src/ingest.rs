@@ -130,6 +130,24 @@ pub struct IngestOptions {
     /// in merge mode; rejected in any other mode (the per-call site validates
     /// up-front so the lower ingest paths can stay format-agnostic).
     pub merge_key: Option<Vec<String>>,
+    /// Resolved database alias for fully-qualified SQL. `None` means the
+    /// primary (ephemeral); `Some("persistent")` or `Some("user_alias")`
+    /// qualifies table references as `"<db>"."public"."<table>"`.
+    /// Must be pre-resolved via `Engine::resolve_target_db` before setting.
+    pub target_db: Option<String>,
+}
+
+/// Build a SQL table identifier from `IngestOptions`. When `target_db` is
+/// set, returns `"db"."public"."table"`; otherwise `"table"` (unqualified).
+pub fn qualified_table(opts: &IngestOptions) -> String {
+    match &opts.target_db {
+        Some(db) => {
+            let esc_db = db.replace('"', "\"\"");
+            let esc_tbl = opts.table.replace('"', "\"\"");
+            format!("\"{esc_db}\".\"public\".\"{esc_tbl}\"")
+        }
+        None => format!("\"{}\"", opts.table.replace('"', "\"\"")),
+    }
 }
 
 /// Returned by every ingest function with the row count, resolved schema,
@@ -338,6 +356,7 @@ where
         mode: "replace".into(),
         schema_override: opts.schema_override.clone(),
         merge_key: None,
+        target_db: None,
     };
     let tmp_result = replace_load(&tmp_opts)?;
 

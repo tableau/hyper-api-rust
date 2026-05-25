@@ -241,6 +241,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     let ingest_result = ingest_csv_file(&engine, csv_path.to_str().unwrap(), &ingest_opts)?;
     println!(

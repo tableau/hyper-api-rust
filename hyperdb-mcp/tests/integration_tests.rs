@@ -26,6 +26,7 @@ fn full_pipeline_json_to_query() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     ingest_json(&te.engine, orders, &opts).unwrap();
 
@@ -38,6 +39,7 @@ fn full_pipeline_json_to_query() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     ingest_json(&te.engine, customers, &opts).unwrap();
 
@@ -61,6 +63,7 @@ fn full_pipeline_csv_ingest_and_export() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     ingest_csv(&te.engine, csv_data, &opts).unwrap();
 
@@ -141,12 +144,14 @@ fn append_mode_accumulates_data() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     let opts_append = IngestOptions {
         table: "acc".into(),
         mode: "append".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
 
     ingest_json(&te.engine, batch1, &opts_replace).unwrap();

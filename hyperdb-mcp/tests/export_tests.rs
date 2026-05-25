@@ -537,6 +537,7 @@ fn parquet_export_round_trips_through_load_file() {
             mode: "replace".into(),
             schema_override: None,
             merge_key: None,
+            target_db: None,
         },
     )
     .unwrap();
@@ -632,6 +633,7 @@ fn arrow_ipc_export_round_trips_through_load_file() {
             mode: "replace".into(),
             schema_override: None,
             merge_key: None,
+            target_db: None,
         },
     )
     .unwrap();

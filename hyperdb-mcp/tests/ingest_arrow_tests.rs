@@ -86,6 +86,7 @@ fn ingest_parquet() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     let result = ingest_parquet_file(&te.engine, path_str, &opts).unwrap();
     assert_eq!(result.rows, 3);
@@ -152,6 +153,7 @@ fn ingest_parquet_decimal128_not_null_preserves_values() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     let result = ingest_parquet_file(&te.engine, path_str, &opts).unwrap();
     assert_eq!(result.rows, 3);
@@ -215,6 +217,7 @@ fn ingest_parquet_reports_accurate_row_count_above_131072() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     let result = ingest_parquet_file(&te.engine, path_str, &opts).unwrap();
 
@@ -248,6 +251,7 @@ fn ingest_parquet_append_adds_to_existing_rows() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     let r1 = ingest_parquet_file(&te.engine, path_str, &opts_replace).unwrap();
     assert_eq!(r1.rows, 3);
@@ -257,6 +261,7 @@ fn ingest_parquet_append_adds_to_existing_rows() {
         mode: "append".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     let r2 = ingest_parquet_file(&te.engine, path_str, &opts_append).unwrap();
     assert_eq!(r2.rows, 3);
@@ -288,6 +293,7 @@ fn ingest_parquet_applies_schema_override() {
         mode: "replace".into(),
         schema_override: Some(override_map),
         merge_key: None,
+        target_db: None,
     };
     let result = ingest_parquet_file(&te.engine, path_str, &opts).unwrap();
     assert_eq!(result.rows, 3);
@@ -328,6 +334,7 @@ fn ingest_arrow_ipc() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     let result = ingest_arrow_ipc_file(&te.engine, path_str, &opts).unwrap();
     assert_eq!(result.rows, 2);
@@ -382,6 +389,7 @@ fn ingest_arrow_ipc_decimal128_not_null_preserves_values() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     let result = ingest_arrow_ipc_file(&te.engine, path_str, &opts).unwrap();
     assert_eq!(result.rows, 3);
@@ -420,6 +428,7 @@ fn ingest_arrow_ipc_append_adds_to_existing_rows() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     let r1 = ingest_arrow_ipc_file(&te.engine, path_str, &opts_replace).unwrap();
     assert_eq!(r1.rows, 2);
@@ -429,6 +438,7 @@ fn ingest_arrow_ipc_append_adds_to_existing_rows() {
         mode: "append".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     let r2 = ingest_arrow_ipc_file(&te.engine, path_str, &opts_append).unwrap();
     assert_eq!(r2.rows, 2);
@@ -458,6 +468,7 @@ fn ingest_arrow_ipc_rejects_schema_override() {
         mode: "replace".into(),
         schema_override: Some(override_map),
         merge_key: None,
+        target_db: None,
     };
     let Err(err) = ingest_arrow_ipc_file(&te.engine, path_str, &opts) else {
         panic!("override on IPC should be rejected")
@@ -543,6 +554,7 @@ async fn load_files_runs_parallel_parquet_ingests() {
                 mode: "replace".into(),
                 schema_override: None,
                 merge_key: None,
+                target_db: None,
             };
             ingest_parquet_file_async(&conn, &path, &opts)
                 .await
@@ -610,6 +622,7 @@ fn ingest_arrow_ipc_accepts_stream_format() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     let result = ingest_arrow_ipc_file(&te.engine, path_str, &opts).unwrap();
     assert_eq!(result.rows, 3);
@@ -639,6 +652,7 @@ fn ingest_parquet_merge_basic() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     let r1 =
         ingest_parquet_file(&te.engine, initial_path.to_str().unwrap(), &opts_replace).unwrap();
@@ -673,6 +687,7 @@ fn ingest_parquet_merge_basic() {
         mode: "merge".into(),
         schema_override: None,
         merge_key: Some(vec!["id".into()]),
+        target_db: None,
     };
     ingest_parquet_file(&te.engine, merge_path.to_str().unwrap(), &opts_merge).unwrap();
 
@@ -703,6 +718,7 @@ fn ingest_arrow_ipc_merge_basic() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     let r1 =
         ingest_arrow_ipc_file(&te.engine, initial_path.to_str().unwrap(), &opts_replace).unwrap();
@@ -737,6 +753,7 @@ fn ingest_arrow_ipc_merge_basic() {
         mode: "merge".into(),
         schema_override: None,
         merge_key: Some(vec!["x".into()]),
+        target_db: None,
     };
     ingest_arrow_ipc_file(&te.engine, merge_path.to_str().unwrap(), &opts_merge).unwrap();
 

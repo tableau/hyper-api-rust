@@ -674,6 +674,7 @@ async fn ingest_one_ready_file(
         mode: "append".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     let data_str = data_path
         .to_str()

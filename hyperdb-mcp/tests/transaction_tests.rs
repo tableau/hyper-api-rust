@@ -134,6 +134,7 @@ fn failed_json_ingest_rolls_back_partial_inserts() {
         mode: "append".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
 
     let result = ingest_json(&te.engine, data, &opts);
@@ -172,6 +173,7 @@ fn successful_replace_commits_atomically() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     let result = ingest_json(&te.engine, data, &opts).unwrap();
     assert_eq!(result.rows, 2);
@@ -218,6 +220,7 @@ fn failed_replace_leaves_empty_table_not_partial() {
         mode: "replace".into(),
         schema_override: Some(override_map),
         merge_key: None,
+        target_db: None,
     };
 
     let result = ingest_json(&te.engine, data, &opts);

@@ -911,6 +911,63 @@ impl HyperMcpServer {
         }
     }
 
+    /// Resolve the effective database alias from a tool's `database` and
+    /// `persist` parameters. Returns `None` when the target is the primary
+    /// (ephemeral) — callers should leave SQL unqualified. Returns
+    /// `Some(alias)` when targeting a non-primary database.
+    ///
+    /// When `require_writable` is true, verifies the target alias is
+    /// either the primary, `"persistent"` (always writable), or a
+    /// user-attached database with `writable: true`.
+    fn resolve_db(
+        &self,
+        engine: &Engine,
+        database: Option<&str>,
+        persist: Option<bool>,
+        require_writable: bool,
+    ) -> Result<Option<String>, McpError> {
+        let effective = match (database, persist) {
+            (Some(db), _) => Some(db),
+            (None, Some(true)) => Some(Engine::PERSISTENT_ALIAS),
+            _ => None,
+        };
+        // Filter LOCAL_ALIAS ("local") — treat as primary
+        let effective = effective.filter(|s| !s.eq_ignore_ascii_case(crate::attach::LOCAL_ALIAS));
+
+        let resolved = engine.resolve_target_db(effective)?;
+        let primary = engine.primary_db_name();
+
+        if resolved == primary {
+            return Ok(None);
+        }
+
+        if require_writable && resolved != Engine::PERSISTENT_ALIAS {
+            match self.attachments.get(&resolved) {
+                None => {
+                    return Err(McpError::new(
+                        ErrorCode::InvalidArgument,
+                        format!(
+                            "database '{resolved}' is not attached. \
+                             Call attach_database first, or use \"persistent\"."
+                        ),
+                    ));
+                }
+                Some(entry) if !entry.writable => {
+                    return Err(McpError::new(
+                        ErrorCode::InvalidArgument,
+                        format!(
+                            "database '{resolved}' was attached read-only. \
+                             Re-attach with writable:true to write to it."
+                        ),
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Some(resolved))
+    }
+
     /// Lazily start the Hyper engine on first use, returning a mutex guard
     /// that holds a reference to the initialized `Engine`.
     ///
@@ -1208,6 +1265,7 @@ impl HyperMcpServer {
                 mode: "replace".into(),
                 schema_override,
                 merge_key: None,
+                target_db: None,
             };
 
             let ingest_result = match fmt.as_str() {
@@ -1255,6 +1313,7 @@ impl HyperMcpServer {
                 mode: "replace".into(),
                 schema_override,
                 merge_key: None,
+                target_db: None,
             };
 
             let ingest_result = if let Some(ref json_path) = params.json_extract_path {
@@ -1324,6 +1383,7 @@ impl HyperMcpServer {
                 mode: mode.clone(),
                 schema_override,
                 merge_key: None,
+                target_db: None,
             };
 
             let ingest_result = match fmt.as_str() {
@@ -1414,6 +1474,7 @@ impl HyperMcpServer {
                 mode: mode.clone(),
                 schema_override,
                 merge_key: merge_key_vec.clone(),
+                target_db: None,
             };
 
             let ingest_result = if let Some(ref json_path) = params.json_extract_path {
@@ -1641,6 +1702,7 @@ impl HyperMcpServer {
                             mode: mode.clone(),
                             schema_override,
                             merge_key: None,
+                            target_db: None,
                         };
 
                         // Check out a connection from the pool. Held only

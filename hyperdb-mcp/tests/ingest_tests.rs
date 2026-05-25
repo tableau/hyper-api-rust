@@ -24,6 +24,7 @@ fn ingest_json_basic() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     let result = ingest_json(&te.engine, data, &opts).unwrap();
     assert_eq!(result.rows, 2);
@@ -48,12 +49,14 @@ fn ingest_json_append_mode() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     let opts_append = IngestOptions {
         table: "t".into(),
         mode: "append".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     ingest_json(&te.engine, data1, &opts_replace).unwrap();
     ingest_json(&te.engine, data2, &opts_append).unwrap();
@@ -78,6 +81,7 @@ fn ingest_csv_basic() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     let result = ingest_csv(&te.engine, csv_text, &opts).unwrap();
     assert_eq!(result.rows, 2);
@@ -106,6 +110,7 @@ fn ingest_json_with_schema_override() {
         mode: "replace".into(),
         schema_override: Some(schema),
         merge_key: None,
+        target_db: None,
     };
     let result = ingest_json(&te.engine, data, &opts).unwrap();
     assert_eq!(result.rows, 1);
@@ -122,6 +127,7 @@ fn ingest_json_empty_returns_error() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     let result = ingest_json(&te.engine, data, &opts);
     assert!(result.is_err());
@@ -164,6 +170,7 @@ fn ingest_json_file_loads_json_array() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     let result = ingest_json_file(&te.engine, &path, &opts).unwrap();
     assert_eq!(result.rows, 3);
@@ -194,6 +201,7 @@ fn ingest_json_file_loads_jsonl() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     let result = ingest_json_file(&te.engine, &path, &opts).unwrap();
     assert_eq!(result.rows, 3, "blank lines are skipped, data rows count 3");
@@ -222,6 +230,7 @@ fn ingest_json_file_reports_bad_jsonl_line() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     let Err(err) = ingest_json_file(&te.engine, &path, &opts) else {
         panic!("expected malformed JSONL to error")
@@ -250,6 +259,7 @@ fn ingest_csv_empty_cells_become_null() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     let result = ingest_csv(&te.engine, csv_text, &opts).unwrap();
     assert_eq!(result.rows, 3);
@@ -388,6 +398,7 @@ fn ingest_json_file_handles_log_extension_via_content_sniff() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     let result = ingest_json_file(&te.engine, &path, &opts).unwrap();
     assert_eq!(result.rows, 2);
@@ -406,6 +417,7 @@ fn ingest_csv_file_empty_cells_become_null() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     let result = ingest_csv_file(&te.engine, &path, &opts).unwrap();
     assert_eq!(result.rows, 3);
@@ -559,6 +571,7 @@ fn extract_json_path_then_ingest() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     let result = ingest_json(&te.engine, &extracted, &opts).unwrap();
     assert_eq!(result.rows, 2);
@@ -597,6 +610,7 @@ fn ingest_json_merge_basic() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     ingest_json(&te.engine, initial, &opts_replace).unwrap();
 
@@ -605,6 +619,7 @@ fn ingest_json_merge_basic() {
         mode: "merge".into(),
         schema_override: None,
         merge_key: Some(vec!["id".into()]),
+        target_db: None,
     };
     let merge_result = ingest_json(&te.engine, updates, &opts_merge).unwrap();
     // No new columns in this merge → schema_changed must remain false so
@@ -646,6 +661,7 @@ fn ingest_json_merge_adds_new_column() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     ingest_json(&te.engine, initial, &opts_replace).unwrap();
 
@@ -654,6 +670,7 @@ fn ingest_json_merge_adds_new_column() {
         mode: "merge".into(),
         schema_override: None,
         merge_key: Some(vec!["id".into()]),
+        target_db: None,
     };
     let merge_result = ingest_json(&te.engine, with_host, &opts_merge).unwrap();
     // ALTER TABLE fired → schema_changed must be true so the server
@@ -694,6 +711,7 @@ fn ingest_json_merge_target_does_not_exist() {
         mode: "merge".into(),
         schema_override: None,
         merge_key: Some(vec!["id".into()]),
+        target_db: None,
     };
     let result = ingest_json(&te.engine, data, &opts_merge).unwrap();
     assert_eq!(result.rows, 1);
@@ -724,6 +742,7 @@ fn ingest_json_merge_missing_key_param() {
         mode: "merge".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     let err = ingest_json(&te.engine, data, &opts).unwrap_err();
     assert!(
@@ -746,6 +765,7 @@ fn ingest_json_merge_key_not_in_target() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     ingest_json(&te.engine, r#"[{"id": 1}]"#, &opts_replace).unwrap();
 
@@ -754,6 +774,7 @@ fn ingest_json_merge_key_not_in_target() {
         mode: "merge".into(),
         schema_override: None,
         merge_key: Some(vec!["not_a_col".into()]),
+        target_db: None,
     };
     let err = ingest_json(&te.engine, r#"[{"id": 2, "not_a_col": "x"}]"#, &opts_merge).unwrap_err();
     assert!(
@@ -787,6 +808,7 @@ fn ingest_json_merge_key_type_mismatch() {
         mode: "replace".into(),
         schema_override: Some(so),
         merge_key: None,
+        target_db: None,
     };
     ingest_json(&te.engine, r#"[{"id": 1, "name": "a"}]"#, &opts_replace).unwrap();
 
@@ -796,6 +818,7 @@ fn ingest_json_merge_key_type_mismatch() {
         mode: "merge".into(),
         schema_override: None,
         merge_key: Some(vec!["id".into()]),
+        target_db: None,
     };
     let err = ingest_json(&te.engine, r#"[{"id": "1", "name": "a"}]"#, &opts_merge).unwrap_err();
     assert!(
@@ -818,6 +841,7 @@ fn ingest_json_merge_existing_column_type_mismatch() {
         mode: "replace".into(),
         schema_override: Some(so),
         merge_key: None,
+        target_db: None,
     };
     ingest_json(&te.engine, r#"[{"id": 1, "score": 99.5}]"#, &opts_replace).unwrap();
 
@@ -827,6 +851,7 @@ fn ingest_json_merge_existing_column_type_mismatch() {
         mode: "merge".into(),
         schema_override: None,
         merge_key: Some(vec!["id".into()]),
+        target_db: None,
     };
     let err = ingest_json(
         &te.engine,
@@ -853,6 +878,7 @@ fn ingest_json_merge_no_orphan_tmp_on_failure() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     ingest_json(&te.engine, r#"[{"id": 1}]"#, &opts_replace).unwrap();
 
@@ -861,6 +887,7 @@ fn ingest_json_merge_no_orphan_tmp_on_failure() {
         mode: "merge".into(),
         schema_override: None,
         merge_key: Some(vec!["bogus_key".into()]),
+        target_db: None,
     };
     let _ = ingest_json(&te.engine, r#"[{"id": 2, "bogus_key": "x"}]"#, &opts_merge);
 
@@ -909,6 +936,7 @@ fn ingest_json_merge_multi_key() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     ingest_json(&te.engine, initial, &opts_replace).unwrap();
 
@@ -922,6 +950,7 @@ fn ingest_json_merge_multi_key() {
         mode: "merge".into(),
         schema_override: None,
         merge_key: Some(vec!["region".into(), "year".into()]),
+        target_db: None,
     };
     ingest_json(&te.engine, updates, &opts_merge).unwrap();
 
@@ -967,6 +996,7 @@ fn ingest_json_merge_type_canonicalization_does_not_false_reject() {
         mode: "replace".into(),
         schema_override: Some(so_int),
         merge_key: None,
+        target_db: None,
     };
     ingest_json(&te.engine, r#"[{"id": 1, "name": "a"}]"#, &opts_replace).unwrap();
 
@@ -992,6 +1022,7 @@ fn ingest_json_merge_type_canonicalization_does_not_false_reject() {
         mode: "merge".into(),
         schema_override: Some(so_integer),
         merge_key: Some(vec!["id".into()]),
+        target_db: None,
     };
     let result = ingest_json(
         &te.engine,
@@ -1032,6 +1063,7 @@ fn ingest_csv_merge_basic() {
         mode: "replace".into(),
         schema_override: None,
         merge_key: None,
+        target_db: None,
     };
     ingest_csv(&te.engine, initial, &opts_replace).unwrap();
 
@@ -1040,6 +1072,7 @@ fn ingest_csv_merge_basic() {
         mode: "merge".into(),
         schema_override: None,
         merge_key: Some(vec!["id".into()]),
+        target_db: None,
     };
     let merge_result = ingest_csv(&te.engine, updates, &opts_merge).unwrap();
     assert!(
