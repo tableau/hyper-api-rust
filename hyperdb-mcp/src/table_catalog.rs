@@ -478,8 +478,9 @@ pub fn set_metadata_in(
     fields: &MetadataFields,
     target_db: Option<&str>,
 ) -> Result<CatalogEntry, McpError> {
-    ensure_exists_in(engine, target_db)?;
-
+    // Validate caller intent BEFORE seeding the catalog. Both the
+    // empty-fields and missing-row paths return an error; we don't
+    // want them to mutate the target DB's schema as a side effect.
     if fields.is_empty() {
         return Err(McpError::new(
             ErrorCode::EmptyData,
@@ -491,7 +492,10 @@ pub fn set_metadata_in(
     // Require an existing row so we don't accidentally create catalog
     // entries for tables that don't exist. The server wires the catalog
     // up to ingest + execute so any real table should already have a
-    // stub row.
+    // stub row. `get_in` returns None when the catalog table itself
+    // doesn't exist yet; treat that as "no row" without seeding the
+    // catalog (the user gets a clean TableNotFound and the .hyper file
+    // is left untouched).
     let existing = get_in(engine, table_name, target_db)?.ok_or_else(|| {
         let where_clause = match target_db {
             Some(alias) if !alias.eq_ignore_ascii_case(Engine::PERSISTENT_ALIAS) => {

@@ -410,4 +410,25 @@ async fn watcher_ingests_into_persistent_target() {
         .unwrap()
         .unwrap();
     assert_eq!(count, 2);
+
+    // The watcher must also stamp persistent's _table_catalog after the
+    // ingest. Without this row, set_table_metadata against the table
+    // would error confusingly even though the table exists. This is
+    // the C1 fix from the post-merge architectural review.
+    let catalog_rows: i64 = engine
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .connection()
+        .execute_scalar_query(
+            "SELECT COUNT(*) FROM \"persistent\".\"public\".\"_table_catalog\" \
+             WHERE table_name = 'events' AND load_tool = 'watch_directory'",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        catalog_rows, 1,
+        "watcher must stamp _table_catalog with load_tool='watch_directory'"
+    );
 }

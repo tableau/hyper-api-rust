@@ -855,6 +855,41 @@ async fn process_ready_with_recovery(
                 data_path.display(),
                 table
             );
+            // Update _table_catalog on the engine's main connection
+            // (which sees both ephemeral and persistent + any user-
+            // attached aliases). The pool wrote the data into the
+            // target's .hyper file; the engine connection now stamps
+            // a stub row in that DB's per-DB _table_catalog.
+            //
+            // Errors here are logged but never block the success
+            // bookkeeping above — the data is in. Mirrors the sync
+            // load_file/load_data handlers' best-effort contract.
+            let row_count_i64 = i64::try_from(rows).unwrap_or(i64::MAX);
+            let load_params = serde_json::to_string(&json!({
+                "watch_directory": dir.to_string_lossy(),
+                "database": target_db.unwrap_or("local"),
+            }))
+            .ok();
+            if let Ok(guard) = engine.lock() {
+                if let Some(eng) = guard.as_ref() {
+                    if let Err(e) = crate::table_catalog::upsert_stub_in(
+                        eng,
+                        table,
+                        "watch_directory",
+                        load_params.as_deref(),
+                        Some(row_count_i64),
+                        true,
+                        target_db,
+                    ) {
+                        tracing::warn!(
+                            table = %table,
+                            target_db = ?target_db,
+                            err = %e.message,
+                            "watcher: failed to update _table_catalog after ingest"
+                        );
+                    }
+                }
+            }
             if let Some(subs) = subscriptions {
                 for uri in uris_for_table_change(table) {
                     subs.notify_updated(&uri);

@@ -27,6 +27,42 @@ or shell pipelines: it parses files faster, runs SQL natively, and keeps
 intermediate state in a workspace database the LLM can re-query without
 re-loading.
 
+## Workspace model
+
+Every session has TWO databases, plus optional user-attached ones:
+
+- **Ephemeral primary** (default destination). Created fresh per
+  session, deleted on exit. Unqualified SQL routes here. Use for
+  scratch work and intermediate transformations the user doesn't
+  need to keep.
+- **Persistent attachment** under alias `\"persistent\"`. Survives
+  across sessions at the platform-default path (or override via
+  `--persistent-db`). Use when the user wants the data to stick
+  around. Disabled when the server runs with `--ephemeral-only`.
+- **User-attached writable databases** via `attach_database` with
+  `writable: true`. Each lives in its own `.hyper` file under a
+  user-chosen alias.
+
+Pick a destination in one of two ways:
+
+- **`database` parameter** (preferred for tools that build their own
+  SQL): `query`, `execute`, `load_data`, `load_file`, `load_files`,
+  `watch_directory`, `describe`, `sample`, `chart`, `export`, and
+  `set_table_metadata` accept `database: \"persistent\"`,
+  `database: \"local\"` (= primary), or any user-attached writable
+  alias. Case-insensitive. Defaults to primary.
+- **`persist: true` shorthand** on `load_data`, `load_file`,
+  `load_files`, `watch_directory` — equivalent to
+  `database: \"persistent\"`.
+- **Fully-qualified SQL** for power users:
+  `INSERT INTO \"persistent\".\"public\".\"customers\" SELECT ...`
+
+Each writable database carries its own `_table_catalog` table that
+tracks load tool, params, timestamps, and any prose metadata set via
+`set_table_metadata` — lazily seeded on first ingest into that DB.
+`detach_database` rejects with `InvalidArgument` if any active
+watcher targets the alias; call `unwatch_directory` first.
+
 ## Tool index
 
 ### Query

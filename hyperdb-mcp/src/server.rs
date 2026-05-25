@@ -1484,9 +1484,11 @@ impl HyperMcpServer {
                 })
                 .collect();
 
-            // Catalog bookkeeping: the helper itself short-circuits for
-            // user-attached writable databases (per-DB catalog ships in
-            // a follow-up iter).
+            // Catalog bookkeeping: the helper routes the upsert to
+            // target_db's per-DB _table_catalog (lazily seeded on
+            // first ingest). Persistent and ephemeral primary share
+            // persistent's catalog; user-attached writable DBs each
+            // get their own.
             {
                 let load_params = serde_json::to_string(&json!({
                     "mode": mode,
@@ -1605,7 +1607,7 @@ impl HyperMcpServer {
                 })
                 .collect();
 
-            // Catalog: helper short-circuits for non-persistent targets.
+            // Catalog: helper routes to target_db's per-DB catalog.
             {
                 let load_params = serde_json::to_string(&json!({
                     "source_path": params.path,
@@ -1659,7 +1661,7 @@ impl HyperMcpServer {
     /// Each entry behaves like a standalone `load_file` call; failures are
     /// reported per-file rather than aborting the whole batch.
     #[tool(
-        description = "Ingest multiple files in parallel. Each entry is equivalent to a standalone `load_file` call (same formats and same format-selection guidance: prefer Parquet > CSV > Arrow IPC > JSON for large imports). The batch runs across a pool of async connections sized by `concurrency` (default `min(files.len(), 8)`), so independent files finish roughly in max-time rather than sum-time. Per-file errors are captured in the response and do not abort the rest of the batch; the top-level call still returns Ok. For Apache Iceberg tables, call `load_iceberg` per table instead — this tool only handles single-file formats. **Note: `mode = \"merge\"` is not supported here — use `load_file` once per file when you need merge/upsert semantics.**"
+        description = "Ingest multiple files in parallel. Each entry is equivalent to a standalone `load_file` call (same formats and same format-selection guidance: prefer Parquet > CSV > Arrow IPC > JSON for large imports). The batch runs across a pool of async connections sized by `concurrency` (default `min(files.len(), 8)`), so independent files finish roughly in max-time rather than sum-time. Per-file errors are captured in the response and do not abort the rest of the batch; the top-level call still returns Ok. For Apache Iceberg tables, call `load_iceberg` per table instead — this tool only handles single-file formats.\n\nUse `database` (or shorthand `persist: true`) to target a non-primary database; the same value applies to every entry in the batch. **Note: `mode = \"merge\"` is not supported here — use `load_file` once per file when you need merge/upsert semantics.**"
     )]
     fn load_files(
         &self,
@@ -1979,8 +1981,7 @@ impl HyperMcpServer {
 
         // Update the per-table catalog stubs for every success. Requires
         // the engine, so we run this inside `with_engine`. The helper
-        // short-circuits non-persistent targets (per-DB catalog ships
-        // in a follow-up iter).
+        // routes the upsert to target_db's per-DB _table_catalog.
         if let Err(e) = self.with_engine(|engine| {
             for o in &outcomes {
                 if let Some((rows, _, _)) = &o.ok {
@@ -2388,7 +2389,7 @@ impl HyperMcpServer {
     /// Begin watching a directory for `.ready` sentinel files. See
     /// [`crate::watcher`] for the full producer/consumer protocol.
     #[tool(
-        description = "Watch a directory for files to auto-ingest. Producers write data file + companion <name>.ready sentinel; the watcher appends the data file to the given table and deletes both on success. Disabled in read-only mode."
+        description = "Watch a directory for files to auto-ingest. Producers write data file + companion <name>.ready sentinel; the watcher appends the data file to the given table and deletes both on success. Use `database` (or shorthand `persist: true`) to target a non-primary database — the watcher's connection pool opens that file directly. `detach_database` rejects while a watcher is active; call `unwatch_directory` first. Disabled in read-only mode."
     )]
     fn watch_directory(
         &self,
@@ -2537,7 +2538,7 @@ impl HyperMcpServer {
     /// Export query results or a table to CSV, Parquet, Arrow IPC,
     /// Apache Iceberg, or a new `.hyper` file.
     #[tool(
-        description = "Export query results or a table to a file via hyperd's native writers. Every format listed here is server-side — hyperd writes the file directly, with zero per-row work in the MCP process — and every format round-trips cleanly through the matching loader (`load_file` or `load_iceberg`).\n\nWhen choosing a format for *data leaving* Hyper, prefer in this order:\n  1. **Parquet** (recommended default): smallest output, fastest write, preserves every type (NUMERIC precision/scale, DATE, TIMESTAMP, etc.). `path` is a single file.\n  2. **Iceberg**: produces a full Apache Iceberg table directory (`metadata/` + `data/`). Use when the consumer is a data-lake tool (Spark, Trino, DuckDB, etc.). `path` is a directory that hyperd creates.\n  3. **Arrow IPC Stream** (`arrow_ipc`): same wire shape Hyper uses internally; great for handing data to another Arrow-aware process. Larger than Parquet (no compression) but extremely fast to read back. `path` is a single file.\n  4. **CSV**: portable and human-readable but the largest output and types are lost (everything becomes text). Use for spreadsheet / shell-pipeline interop. Includes header row.\n  5. **Hyper**: an entire `.hyper` database file openable directly in Tableau Desktop. `sql`/`table` are ignored — every user table is copied.\n\nAll formats except Iceberg and Hyper require either `sql` or `table`. Iceberg output is a directory; all others are single files."
+        description = "Export query results or a table to a file via hyperd's native writers. Every format listed here is server-side — hyperd writes the file directly, with zero per-row work in the MCP process — and every format round-trips cleanly through the matching loader (`load_file` or `load_iceberg`).\n\nWhen choosing a format for *data leaving* Hyper, prefer in this order:\n  1. **Parquet** (recommended default): smallest output, fastest write, preserves every type (NUMERIC precision/scale, DATE, TIMESTAMP, etc.). `path` is a single file.\n  2. **Iceberg**: produces a full Apache Iceberg table directory (`metadata/` + `data/`). Use when the consumer is a data-lake tool (Spark, Trino, DuckDB, etc.). `path` is a directory that hyperd creates.\n  3. **Arrow IPC Stream** (`arrow_ipc`): same wire shape Hyper uses internally; great for handing data to another Arrow-aware process. Larger than Parquet (no compression) but extremely fast to read back. `path` is a single file.\n  4. **CSV**: portable and human-readable but the largest output and types are lost (everything becomes text). Use for spreadsheet / shell-pipeline interop. Includes header row.\n  5. **Hyper**: an entire `.hyper` database file openable directly in Tableau Desktop. `sql`/`table` are ignored — every user table is copied.\n\nAll formats except Iceberg and Hyper require either `sql` or `table`. Iceberg output is a directory; all others are single files.\n\nUse `database` to read from a non-primary source: for `format=\"hyper\"` it selects which database is snapshotted; for the row-oriented formats it routes the SELECT through the named database (when `table` is set) or pins `schema_search_path` for the call (when `sql` is set)."
     )]
     fn export(
         &self,
@@ -2710,7 +2711,7 @@ impl HyperMcpServer {
 
     /// Update prose metadata for a table in the `_table_catalog`.
     #[tool(
-        description = "Update prose metadata for a table in the `_table_catalog`: source_url, source_description, purpose, license, notes. Fields you omit stay unchanged; pass an explicit empty string (\"\") to clear a field. Mechanical fields (load_tool, load_params, loaded_at, last_refreshed_at, row_count) are managed by the server. Requires an existing catalog entry — load the table first (load_file / load_data / execute CREATE TABLE) so the stub row is created automatically. Disabled in read-only mode and when the catalog table doesn't exist on the target database."
+        description = "Update prose metadata for a table in the `_table_catalog`: source_url, source_description, purpose, license, notes. Fields you omit stay unchanged; pass an explicit empty string (\"\") to clear a field. Mechanical fields (load_tool, load_params, loaded_at, last_refreshed_at, row_count) are managed by the server. Requires an existing catalog entry — load the table first (load_file / load_data / execute CREATE TABLE) so the stub row is created automatically. Use `database` to target the metadata for a table in a non-primary writable database; read-only attachments are rejected with a clear re-attach-with-writable message. Disabled in read-only mode."
     )]
     fn set_table_metadata(
         &self,
