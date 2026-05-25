@@ -748,13 +748,11 @@ pub struct HyperMcpServer {
     /// calls [`AttachRegistry::replay_all`] after building a fresh
     /// engine.
     attachments: Arc<AttachRegistry>,
+    /// Path to the persistent `.hyper` file, or `None` for `--ephemeral-only`.
+    /// Threaded into `Engine::new` so the engine can attach it under the
+    /// reserved `"persistent"` alias.
     workspace_path: Option<String>,
     read_only: bool,
-    /// Bare mode: skip all MCP-managed auxiliary tables (catalog *and*
-    /// saved-queries persistence). Saved queries fall back to
-    /// [`crate::saved_queries::SessionStore`] and the catalog is never
-    /// created or updated.
-    bare: bool,
     /// Skip the shared daemon and spawn a private `hyperd` (legacy behavior).
     no_daemon: bool,
     /// Last time a heartbeat was sent to the daemon (debounced to avoid per-call TCP overhead).
@@ -772,9 +770,9 @@ pub struct HyperMcpServer {
 impl std::fmt::Debug for HyperMcpServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HyperMcpServer")
-            .field("workspace_path", &self.workspace_path)
+            .field("persistent_path", &self.workspace_path)
             .field("read_only", &self.read_only)
-            .field("bare", &self.bare)
+            .field("no_daemon", &self.no_daemon)
             .finish_non_exhaustive()
     }
 }
@@ -797,63 +795,43 @@ impl HyperMcpServer {
     /// When `bare` is `true`, the server does not create or maintain the
     /// `_table_catalog` table, and saved queries fall back to the in-memory
     /// [`crate::saved_queries::SessionStore`] regardless of `workspace_path`
-    /// — so no `_hyperdb_*` or `_table_catalog` tables are written to the
-    /// workspace file. Useful when callers want a pristine `.hyper` file
-    /// containing only their own data.
-    pub fn new(workspace_path: Option<String>, read_only: bool, bare: bool) -> Self {
-        Self::with_options(workspace_path, read_only, bare, false)
+    /// `persistent_path` is the resolved path to the persistent database
+    /// (`Some`) or `None` for `--ephemeral-only` mode.
+    pub fn new(persistent_path: Option<String>, read_only: bool) -> Self {
+        Self::with_options(persistent_path, read_only, false)
     }
 
     /// Create a server instance with explicit daemon control.
     pub fn with_no_daemon(
-        workspace_path: Option<String>,
+        persistent_path: Option<String>,
         read_only: bool,
-        bare: bool,
         no_daemon: bool,
     ) -> Self {
-        Self::with_options(workspace_path, read_only, bare, no_daemon)
+        Self::with_options(persistent_path, read_only, no_daemon)
     }
 
-    fn with_options(
-        workspace_path: Option<String>,
-        read_only: bool,
-        bare: bool,
-        no_daemon: bool,
-    ) -> Self {
-        // Bare mode forces a SessionStore regardless of workspace so the
-        // `_hyperdb_saved_queries` meta-table is never created.
-        let saved_queries: Arc<dyn SavedQueryStore> = if bare {
-            build_store(None)
-        } else {
-            build_store(workspace_path.as_deref())
-        };
+    fn with_options(persistent_path: Option<String>, read_only: bool, no_daemon: bool) -> Self {
+        // Saved queries persist when a persistent database is available;
+        // session storage takes over for `--ephemeral-only` sessions.
+        let saved_queries: Arc<dyn SavedQueryStore> = build_store(persistent_path.as_deref());
         Self {
             engine: Arc::new(Mutex::new(None)),
             catalog_ready: Arc::new(Mutex::new(false)),
             watchers: Arc::new(crate::watcher::WatcherRegistry::new()),
             saved_queries,
             subscriptions: Arc::new(SubscriptionRegistry::new()),
-            // Bare servers never seed `_table_catalog` into any
-            // attached database — pristine workspaces stay pristine
-            // even when used as scratch targets for `attach_database`
-            // with `on_missing: create`.
-            attachments: Arc::new(AttachRegistry::with_catalog_policy(!bare)),
-            workspace_path,
+            // The catalog policy is now uniform: seed `_table_catalog`
+            // whenever MCP creates a fresh `.hyper` file. The opt-out
+            // `--bare` path was removed; users wanting a pristine file
+            // can `DROP TABLE _table_catalog` after creation.
+            attachments: Arc::new(AttachRegistry::new()),
+            workspace_path: persistent_path,
             read_only,
-            bare,
             no_daemon,
             last_heartbeat: std::sync::Mutex::new(std::time::Instant::now()),
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
         }
-    }
-
-    /// `true` when `--bare` was passed. Exposed so handlers (e.g.
-    /// `set_table_metadata`) can short-circuit with a clear error rather
-    /// than silently no-op.
-    #[must_use]
-    pub fn is_bare(&self) -> bool {
-        self.bare
     }
 
     /// Return a clone of the subscription registry so background tasks
@@ -948,8 +926,8 @@ impl HyperMcpServer {
             .map_err(|_| McpError::new(ErrorCode::InternalError, "Lock poisoned"))?;
         if guard.is_none() {
             tracing::info!(
-                workspace = self.workspace_path.as_deref().unwrap_or("<ephemeral>"),
-                bare = self.bare,
+                persistent_db = self.workspace_path.as_deref().unwrap_or("<ephemeral-only>"),
+                no_daemon = self.no_daemon,
                 "initializing hyper engine"
             );
             let engine = if self.no_daemon {
@@ -994,7 +972,7 @@ impl HyperMcpServer {
     /// legitimate query. The `catalog_ready` flag still flips to `true`
     /// so we don't retry the same failing bootstrap on every call.
     fn ensure_catalog_ready(&self, engine: &Engine) {
-        if self.bare || self.read_only {
+        if self.read_only {
             return;
         }
         let Ok(mut ready) = self.catalog_ready.lock() else {
@@ -1014,7 +992,14 @@ impl HyperMcpServer {
 
     /// Best-effort catalog upsert after a successful ingest. Logs and
     /// swallows errors — a bookkeeping failure should never fail an
-    /// otherwise-successful load. No-op in bare mode.
+    /// otherwise-successful load.
+    ///
+    /// `&self` is kept for consistency with sibling helpers and because
+    /// upcoming work (per-DB catalog presence cache) will need it.
+    #[expect(
+        clippy::unused_self,
+        reason = "kept for forthcoming per-DB catalog presence cache"
+    )]
     fn after_ingest_catalog_update(
         &self,
         engine: &Engine,
@@ -1023,9 +1008,6 @@ impl HyperMcpServer {
         load_params: Option<&str>,
         row_count: Option<i64>,
     ) {
-        if self.bare {
-            return;
-        }
         if let Err(e) = crate::table_catalog::upsert_stub(
             engine,
             table_name,
@@ -1044,10 +1026,11 @@ impl HyperMcpServer {
 
     /// Best-effort catalog reconcile after a DDL/DML `execute`. Same
     /// error-swallowing rationale as [`Self::after_ingest_catalog_update`].
+    #[expect(
+        clippy::unused_self,
+        reason = "kept for forthcoming per-DB catalog presence cache"
+    )]
     fn after_execute_catalog_update(&self, engine: &Engine) {
-        if self.bare {
-            return;
-        }
         if let Err(e) = crate::table_catalog::reconcile(engine) {
             tracing::warn!(
                 err = %e.message,
@@ -2468,7 +2451,7 @@ impl HyperMcpServer {
 
     /// Update prose metadata for a table in the `_table_catalog`.
     #[tool(
-        description = "Update prose metadata for a table in the `_table_catalog`: source_url, source_description, purpose, license, notes. Fields you omit stay unchanged; pass an explicit empty string (\"\") to clear a field. Mechanical fields (load_tool, load_params, loaded_at, last_refreshed_at, row_count) are managed by the server. Requires an existing catalog entry — load the table first (load_file / load_data / execute CREATE TABLE) so the stub row is created automatically. Disabled in read-only and --bare mode."
+        description = "Update prose metadata for a table in the `_table_catalog`: source_url, source_description, purpose, license, notes. Fields you omit stay unchanged; pass an explicit empty string (\"\") to clear a field. Mechanical fields (load_tool, load_params, loaded_at, last_refreshed_at, row_count) are managed by the server. Requires an existing catalog entry — load the table first (load_file / load_data / execute CREATE TABLE) so the stub row is created automatically. Disabled in read-only mode and when the catalog table doesn't exist on the target database."
     )]
     fn set_table_metadata(
         &self,
@@ -2476,14 +2459,6 @@ impl HyperMcpServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         if let Err(e) = self.check_writable("set_table_metadata") {
             return Self::err_content(e);
-        }
-        if self.bare {
-            return Self::err_content(McpError::new(
-                ErrorCode::ReadOnlyViolation,
-                "set_table_metadata is disabled in --bare mode because the \
-                 _table_catalog is never created. Restart without --bare if \
-                 you want per-table provenance tracking.",
-            ));
         }
         let fields = crate::table_catalog::MetadataFields {
             source_url: params.source_url,

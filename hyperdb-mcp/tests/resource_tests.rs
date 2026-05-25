@@ -11,7 +11,7 @@ use tempfile::TempDir;
 /// ephemeral primary with a test table, and return both the server and
 /// the temp dir.
 ///
-/// The server is constructed in `--bare` mode so the MCP-managed
+/// The server is constructed without a persistent path so the MCP-managed
 /// `_table_catalog` doesn't appear alongside `widgets` and perturb the
 /// exact table counts these tests assert against. Catalog behavior is
 /// covered in `tests/table_catalog_tests.rs`.
@@ -26,8 +26,7 @@ use tempfile::TempDir;
 fn server_with_test_table() -> (HyperMcpServer, TempDir) {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("workspace.hyper");
-    let server =
-        HyperMcpServer::with_no_daemon(Some(path.to_str().unwrap().into()), false, true, true);
+    let server = HyperMcpServer::with_no_daemon(Some(path.to_str().unwrap().into()), false, true);
     // Trigger lazy engine init.
     let _ = server.resource_body_for_uri("hyper://workspace");
     // Seed the test table in the server's ephemeral primary so the
@@ -190,9 +189,8 @@ fn read_readme_resource_lists_tables_in_markdown() {
 fn read_readme_resource_handles_empty_workspace() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("empty.hyper");
-    // `bare` so `_table_catalog` doesn't make the workspace non-empty.
-    let server =
-        HyperMcpServer::with_no_daemon(Some(path.to_str().unwrap().into()), false, true, true);
+    // No persistent path so `_table_catalog` doesn't make the workspace non-empty.
+    let server = HyperMcpServer::with_no_daemon(Some(path.to_str().unwrap().into()), false, true);
     let body = server
         .resource_body_for_uri("hyper://readme")
         .unwrap()

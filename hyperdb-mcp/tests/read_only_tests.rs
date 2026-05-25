@@ -73,9 +73,9 @@ fn strips_leading_comments() {
 /// server does not.
 #[test]
 fn server_read_only_flag_is_respected() {
-    let ro = HyperMcpServer::with_no_daemon(None, true, false, true);
+    let ro = HyperMcpServer::with_no_daemon(None, true, true);
     assert!(ro.is_read_only());
 
-    let rw = HyperMcpServer::with_no_daemon(None, false, false, true);
+    let rw = HyperMcpServer::with_no_daemon(None, false, true);
     assert!(!rw.is_read_only());
 }

@@ -460,31 +460,28 @@ pub fn reconcile(engine: &Engine) -> Result<(), McpError> {
 // --- Internals --------------------------------------------------------------
 
 /// List user-facing tables (excludes `_hyperdb_*` internals and the
-/// catalog itself).
+/// catalog itself). Reads the raw table list from `Catalog` directly
+/// rather than going through `describe_tables`, which already filters
+/// out internal tables (including `_table_catalog` itself) and would
+/// hide the rows we want to compare against.
 fn user_tables(engine: &Engine) -> Result<Vec<String>, McpError> {
-    let describe = engine.describe_tables()?;
-    let mut names = Vec::new();
-    for table in describe {
-        if let Some(name) = table.get("name").and_then(|v| v.as_str()) {
-            if name == TABLE_CATALOG_TABLE || is_internal_table(name) {
-                continue;
-            }
-            names.push(name.to_string());
-        }
-    }
-    Ok(names)
+    let catalog = hyperdb_api::Catalog::new(engine.connection());
+    let names = catalog.get_table_names("public").map_err(McpError::from)?;
+    Ok(names
+        .into_iter()
+        .filter(|name| name != TABLE_CATALOG_TABLE && !is_internal_table(name))
+        .collect())
 }
 
 /// `true` when `_table_catalog` is already present in the workspace.
 /// Used by read paths to return an empty result instead of erroring on a
-/// brand-new workspace where the table hasn't been created yet.
+/// brand-new workspace where the table hasn't been created yet. Reads
+/// the raw catalog directly so the result isn't affected by the
+/// internal-table filter applied to user-facing `describe_tables`.
 fn table_present(engine: &Engine) -> Result<bool, McpError> {
-    let describe = engine.describe_tables()?;
-    Ok(describe.iter().any(|t| {
-        t.get("name")
-            .and_then(|v| v.as_str())
-            .is_some_and(|n| n == TABLE_CATALOG_TABLE)
-    }))
+    let catalog = hyperdb_api::Catalog::new(engine.connection());
+    let names = catalog.get_table_names("public").map_err(McpError::from)?;
+    Ok(names.iter().any(|n| n == TABLE_CATALOG_TABLE))
 }
 
 /// Return `COUNT(*)` for a user table. Quoted to handle mixed-case or

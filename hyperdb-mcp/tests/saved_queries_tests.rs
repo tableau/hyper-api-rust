@@ -202,7 +202,7 @@ fn workspace_persists_across_restarts() {
 /// resource list → resource read chain.
 #[test]
 fn server_ephemeral_session_store_exposes_query_resources() {
-    let server = HyperMcpServer::with_no_daemon(None, false, false, true);
+    let server = HyperMcpServer::with_no_daemon(None, false, true);
     // Reach into the store directly via its resource helper by saving a
     // query through the store (wiring of the tool itself is covered
     // indirectly — the public testable surface is the store + resource).
@@ -250,7 +250,7 @@ fn server_workspace_store_exposes_saved_queries_via_resources() {
 
     // with_no_daemon ensures the server spawns its own hyperd rather than
     // connecting to a daemon left over from daemon_tests.
-    let server = HyperMcpServer::with_no_daemon(Some(path_str), false, false, true);
+    let server = HyperMcpServer::with_no_daemon(Some(path_str), false, true);
 
     // The URI catalog lists both the definition and result resources.
     let uris = server.list_resource_uris();

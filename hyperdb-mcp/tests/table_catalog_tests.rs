@@ -29,12 +29,16 @@ fn workspace_engine() -> (Engine, TempDir) {
 }
 
 /// `true` if the workspace has a public-schema table named `name`.
+/// Goes through the underlying Catalog directly so it reflects raw
+/// presence — `Engine::describe_tables` filters out internal tables
+/// (including `_table_catalog`), and we want to assert on those too.
 fn table_exists(engine: &Engine, name: &str) -> bool {
-    engine
-        .describe_tables()
-        .unwrap()
+    let catalog = hyperdb_api::Catalog::new(engine.connection());
+    catalog
+        .get_table_names("public")
+        .unwrap_or_default()
         .iter()
-        .any(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
+        .any(|n| n == name)
 }
 
 // --- Catalog module ---------------------------------------------------------
@@ -344,7 +348,8 @@ fn default_server_auto_creates_catalog_on_first_engine_use() {
     let path_str = path.to_str().unwrap().to_string();
 
     {
-        let server = HyperMcpServer::with_no_daemon(Some(path_str.clone()), false, false, true);
+        let server = HyperMcpServer::with_no_daemon(Some(path_str.clone()), false, true);
+        // Any tool that takes the engine lazily triggers bootstrap.
         let _ = server.resource_body_for_uri("hyper://workspace").unwrap();
     }
 
@@ -352,31 +357,6 @@ fn default_server_auto_creates_catalog_on_first_engine_use() {
     assert!(
         table_exists(&engine, TABLE_CATALOG_TABLE),
         "_table_catalog must be present in the workspace after a default server has touched it"
-    );
-}
-
-/// `--bare`: the catalog is never created, even after the engine has run
-/// tool calls. The workspace file stays free of MCP bookkeeping.
-#[test]
-fn bare_server_does_not_create_catalog() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("ws.hyper");
-    let path_str = path.to_str().unwrap().to_string();
-
-    {
-        let server = HyperMcpServer::with_no_daemon(Some(path_str.clone()), false, true, true);
-        assert!(server.is_bare());
-        let _ = server.resource_body_for_uri("hyper://workspace").unwrap();
-    }
-
-    let engine = Engine::new_no_daemon(Some(path_str)).unwrap();
-    assert!(
-        !table_exists(&engine, TABLE_CATALOG_TABLE),
-        "_table_catalog must NOT be present when the server was started with --bare"
-    );
-    assert!(
-        !table_exists(&engine, "_hyperdb_saved_queries"),
-        "saved-queries meta-table must NOT be present in bare mode either"
     );
 }
 
@@ -400,7 +380,7 @@ fn read_only_server_does_not_create_catalog() {
     }
 
     {
-        let server = HyperMcpServer::with_no_daemon(Some(path_str.clone()), true, false, true);
+        let server = HyperMcpServer::with_no_daemon(Some(path_str.clone()), true, true);
         let _ = server.resource_body_for_uri("hyper://workspace").unwrap();
     }
 
@@ -435,7 +415,7 @@ fn backfill_stubs_preexisting_tables_on_reopen() {
     }
 
     {
-        let server = HyperMcpServer::with_no_daemon(Some(path_str.clone()), false, false, true);
+        let server = HyperMcpServer::with_no_daemon(Some(path_str.clone()), false, true);
         let _ = server.resource_body_for_uri("hyper://workspace").unwrap();
     }
 
@@ -451,14 +431,4 @@ fn backfill_stubs_preexisting_tables_on_reopen() {
         Some("unknown"),
         "backfilled rows are tagged as unknown origin"
     );
-}
-
-/// `is_bare()` reflects the constructor argument (trivial, but guards
-/// against regression of the accessor wiring).
-#[test]
-fn is_bare_reflects_constructor_argument() {
-    let bare = HyperMcpServer::with_no_daemon(None, false, true, true);
-    let normal = HyperMcpServer::with_no_daemon(None, false, false, true);
-    assert!(bare.is_bare());
-    assert!(!normal.is_bare());
 }

@@ -26,6 +26,7 @@ use hyperdb_mcp::daemon::discovery;
 use hyperdb_mcp::daemon::health;
 use hyperdb_mcp::daemon::run::DaemonConfig;
 use hyperdb_mcp::engine::{resolve_log_dir, CLIENT_LOG_FILE_NAME};
+use hyperdb_mcp::paths;
 use hyperdb_mcp::server::HyperMcpServer;
 use rmcp::ServiceExt;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -45,23 +46,61 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Path to the `.hyper` workspace file for persistent mode (omit for ephemeral mode)
+    /// Path to the persistent `.hyper` file. Defaults to the platform
+    /// data dir (e.g. `~/Library/Application Support/hyperdb/workspace.hyper`
+    /// on macOS) or the `HYPERDB_PERSISTENT_DB` env var if set.
     #[arg(long, global = true)]
+    persistent_db: Option<String>,
+
+    /// DEPRECATED alias for `--persistent-db`. Will be removed in a
+    /// future release.
+    #[arg(long, global = true, hide = true)]
     workspace: Option<String>,
+
+    /// Skip opening any persistent database. The session has only the
+    /// ephemeral primary plus any user-attached databases. Disables
+    /// `save_query` persistence (queries fall back to session storage).
+    #[arg(long, global = true)]
+    ephemeral_only: bool,
 
     /// Run in read-only mode: disables execute, `load_data`, `load_file`, and export to hyper format
     #[arg(long, global = true)]
     read_only: bool,
 
-    /// Bare mode: disable MCP-managed auxiliary tables. Skips creating
-    /// `_table_catalog` and forces saved queries into in-memory
-    /// (non-persistent) storage, even with --workspace.
-    #[arg(long, global = true)]
-    bare: bool,
-
     /// Disable the shared daemon and spawn a private `hyperd` (legacy behavior)
     #[arg(long, global = true)]
     no_daemon: bool,
+}
+
+impl Cli {
+    /// Translate the deprecated `--workspace` flag to `--persistent-db`,
+    /// emitting a one-time deprecation warning, and resolve the final
+    /// persistent path according to the precedence rules in
+    /// [`paths::resolve_persistent_db_path`]. Returns `None` only when
+    /// `--ephemeral-only` is set.
+    ///
+    /// Errors out if both `--persistent-db` and `--workspace` are
+    /// supplied — there's no sensible "winner", so be loud about it.
+    fn resolve_persistent_path(&self) -> Result<Option<std::path::PathBuf>, &'static str> {
+        if self.ephemeral_only {
+            if self.persistent_db.is_some() || self.workspace.is_some() {
+                return Err("--ephemeral-only is incompatible with --persistent-db / --workspace");
+            }
+            return Ok(None);
+        }
+        if self.persistent_db.is_some() && self.workspace.is_some() {
+            return Err("Both --persistent-db and --workspace were supplied. \
+                 --workspace is a deprecated alias; pass only --persistent-db.");
+        }
+        if self.workspace.is_some() {
+            eprintln!(
+                "warning: --workspace is deprecated; use --persistent-db instead. \
+                 The old flag will be removed in a future release."
+            );
+        }
+        let cli_value = self.persistent_db.as_deref().or(self.workspace.as_deref());
+        Ok(paths::resolve_persistent_db_path(cli_value))
+    }
 }
 
 #[derive(Subcommand)]
@@ -143,7 +182,19 @@ async fn run_daemon_mode(
 }
 
 async fn run_mcp_mode(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    let log_dir = resolve_log_dir(cli.workspace.as_deref());
+    let persistent_path = match cli.resolve_persistent_path() {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            std::process::exit(2);
+        }
+    };
+    // Pass the resolved path to log-dir resolution: ephemeral-only
+    // sessions land in the per-pid temp dir.
+    let persistent_str = persistent_path
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned());
+    let log_dir = resolve_log_dir(persistent_str.as_deref());
     if let Err(e) = std::fs::create_dir_all(&log_dir) {
         eprintln!(
             "warning: failed to create log directory {}: {e} — client logs will go to stderr only",
@@ -165,15 +216,14 @@ async fn run_mcp_mode(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(
         log_dir = %log_dir.display(),
-        workspace = cli.workspace.as_deref().unwrap_or("<ephemeral>"),
+        persistent_db = persistent_str.as_deref().unwrap_or("<ephemeral-only>"),
         read_only = cli.read_only,
-        bare = cli.bare,
+        ephemeral_only = cli.ephemeral_only,
         no_daemon = cli.no_daemon,
         "hyperdb-mcp starting"
     );
 
-    let server =
-        HyperMcpServer::with_no_daemon(cli.workspace, cli.read_only, cli.bare, cli.no_daemon);
+    let server = HyperMcpServer::with_no_daemon(persistent_str, cli.read_only, cli.no_daemon);
     let service = server.serve(rmcp::transport::io::stdio()).await?;
     service.waiting().await?;
 
