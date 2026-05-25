@@ -749,6 +749,14 @@ pub struct SetTableMetadataParams {
     pub license: Option<String>,
     /// Free-form notes: refresh instructions, known gotchas, caveats.
     pub notes: Option<String>,
+    /// Target database alias for the catalog write. Omit (or pass
+    /// `"local"` / `"persistent"`) to update the persistent catalog —
+    /// matches the default for the ephemeral primary's tables.
+    /// Pass any user-attached writable alias to update that DB's
+    /// per-database `_table_catalog` instead. Read-only attachments
+    /// are rejected with a clear "re-attach with writable:true"
+    /// message.
+    pub database: Option<String>,
 }
 
 // --- Prompt argument structs ---
@@ -2719,8 +2727,20 @@ impl HyperMcpServer {
             notes: params.notes,
         };
         let table_name = params.table.clone();
-        let result = self
-            .with_engine(|engine| crate::table_catalog::set_metadata(engine, &table_name, &fields));
+        let result = self.with_engine(|engine| {
+            // Resolve target with require_writable=true so read-only
+            // attachments are rejected BEFORE any catalog write
+            // (defense-in-depth: ensure_exists_in's CREATE TABLE
+            // would also fail at the Hyper layer, but the resolve_db
+            // error is more actionable).
+            let target_db = self.resolve_db(engine, params.database.as_deref(), None, true)?;
+            crate::table_catalog::set_metadata_in(
+                engine,
+                &table_name,
+                &fields,
+                target_db.as_deref(),
+            )
+        });
         match result {
             Ok(entry) => Self::ok_content(entry.to_json()),
             Err(e) => Self::err_content(e),

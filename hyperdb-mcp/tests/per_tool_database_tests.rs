@@ -733,9 +733,137 @@ fn reconcile_in_per_db_does_not_touch_persistent_catalog() {
     );
 }
 
+// --- set_table_metadata + database (Iter 5) --------------------------------
+
+/// `set_metadata_in(target_db=Some("user_db"))` updates prose fields
+/// in the user-attached database's catalog after a stub row exists
+/// there (the typical flow: load_data into the user DB seeds the
+/// catalog automatically; set_table_metadata then updates prose).
+#[test]
+fn set_metadata_in_routes_to_user_attached_db() {
+    use hyperdb_mcp::attach::{AttachRegistry, AttachRequest, AttachSource, OnMissing};
+    use hyperdb_mcp::table_catalog::MetadataFields;
+
+    let dir = TempDir::new().unwrap();
+    let primary = dir.path().join("primary.hyper");
+    let attached = dir.path().join("attached.hyper");
+
+    let engine = Engine::new_no_daemon(Some(primary.to_string_lossy().into())).unwrap();
+    let reg = AttachRegistry::new();
+    reg.attach(
+        &engine,
+        AttachRequest {
+            alias: "user_db".into(),
+            source: AttachSource::LocalFile { path: attached },
+            writable: true,
+            on_missing: OnMissing::Create,
+        },
+    )
+    .unwrap();
+
+    // Stub a row first (set_metadata requires an existing entry).
+    engine
+        .execute_command("CREATE TABLE \"user_db\".\"public\".\"events\" (id INT)")
+        .unwrap();
+    hyperdb_mcp::table_catalog::upsert_stub_in(
+        &engine,
+        "events",
+        "load_data",
+        None,
+        Some(0),
+        true,
+        Some("user_db"),
+    )
+    .unwrap();
+
+    // Update prose via set_metadata_in.
+    let fields = MetadataFields {
+        source_url: Some("s3://bucket/events.parquet".into()),
+        source_description: Some("Tracking events".into()),
+        purpose: Some("daily reports".into()),
+        license: None,
+        notes: None,
+    };
+    let entry =
+        hyperdb_mcp::table_catalog::set_metadata_in(&engine, "events", &fields, Some("user_db"))
+            .unwrap();
+    assert_eq!(
+        entry.source_url.as_deref(),
+        Some("s3://bucket/events.parquet")
+    );
+    assert_eq!(entry.purpose.as_deref(), Some("daily reports"));
+
+    // Visible in the user_db catalog.
+    let rows = engine
+        .execute_query_to_json(
+            "SELECT source_url, purpose FROM \"user_db\".\"public\".\"_table_catalog\" \
+             WHERE table_name = 'events'",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["source_url"], "s3://bucket/events.parquet");
+    assert_eq!(rows[0]["purpose"], "daily reports");
+}
+
+/// `set_metadata_in` errors with TableNotFound + a target-DB-named
+/// message when the row is in a different DB than the caller asked
+/// for. Specifically: row in persistent's catalog, ask user_db.
+#[test]
+fn set_metadata_in_missing_row_names_target_database_in_error() {
+    use hyperdb_mcp::attach::{AttachRegistry, AttachRequest, AttachSource, OnMissing};
+    use hyperdb_mcp::table_catalog::MetadataFields;
+
+    let dir = TempDir::new().unwrap();
+    let primary = dir.path().join("primary.hyper");
+    let attached = dir.path().join("attached.hyper");
+
+    let engine = Engine::new_no_daemon(Some(primary.to_string_lossy().into())).unwrap();
+    let reg = AttachRegistry::new();
+    reg.attach(
+        &engine,
+        AttachRequest {
+            alias: "user_db".into(),
+            source: AttachSource::LocalFile { path: attached },
+            writable: true,
+            on_missing: OnMissing::Create,
+        },
+    )
+    .unwrap();
+
+    // Stub in PERSISTENT, not user_db.
+    engine
+        .execute_command("CREATE TABLE \"persistent\".\"public\".\"per_t\" (id INT)")
+        .unwrap();
+    hyperdb_mcp::table_catalog::upsert_stub_in(
+        &engine,
+        "per_t",
+        "load_data",
+        None,
+        Some(0),
+        true,
+        None,
+    )
+    .unwrap();
+
+    let fields = MetadataFields {
+        source_url: Some("anything".into()),
+        ..Default::default()
+    };
+    let err =
+        hyperdb_mcp::table_catalog::set_metadata_in(&engine, "per_t", &fields, Some("user_db"))
+            .expect_err("must error: row exists in persistent, not user_db");
+    assert_eq!(err.code, ErrorCode::TableNotFound);
+    assert!(
+        err.message.contains("user_db"),
+        "error must name the target db; got: {}",
+        err.message
+    );
+}
+
 // Note on coverage: server-handler-level rejection paths
 // (load_files+database, watch_directory+database, export
-// format=hyper+database, attach-readonly+writable-required) are not
+// format=hyper+database, attach-readonly+writable-required,
+// set_table_metadata.database with read-only target) are not
 // reachable from this integration test layer without going through
 // the rmcp tool router. They land in the end-to-end MCP test harness
 // (Iter 6).
