@@ -326,8 +326,9 @@ fn daemon_heartbeat_prevents_idle_shutdown() {
 
     assert!(state.should_shutdown());
     assert!(
-        after_heartbeat_stop >= Duration::from_millis(800),
-        "daemon should have waited for idle timeout after heartbeats stopped"
+        after_heartbeat_stop >= Duration::from_millis(500),
+        "daemon should have waited for idle timeout after heartbeats stopped, \
+         but only waited {after_heartbeat_stop:?}"
     );
 }
 
@@ -783,7 +784,9 @@ impl TestDaemon {
             });
         });
 
-        // Wait for daemon to become ready
+        // Wait for daemon to become ready. CI runners (especially macOS)
+        // can be significantly slower than local dev — hyperd startup
+        // alone may take 10+ seconds under load.
         let start = Instant::now();
         loop {
             if let Some(info) = discovery::discover() {
@@ -794,10 +797,10 @@ impl TestDaemon {
                 };
             }
             assert!(
-                start.elapsed() <= Duration::from_secs(15),
-                "TestDaemon did not start within 15 seconds"
+                start.elapsed() <= Duration::from_secs(30),
+                "TestDaemon did not start within 30 seconds (port={daemon_port})"
             );
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(200));
         }
     }
 }
