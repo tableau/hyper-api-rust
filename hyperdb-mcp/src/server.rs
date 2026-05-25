@@ -197,8 +197,6 @@ pub struct LoadFileParams {
     /// Target database alias. Omit (or pass `"local"`) to write to the
     /// ephemeral primary. Pass `"persistent"` to write to the durable
     /// database. Other values target a user-attached writable database.
-    /// Note: `mode: "merge"` with a non-primary database is not yet
-    /// supported and will return an error.
     pub database: Option<String>,
     /// Shorthand for `database: "persistent"`. If both `database` and
     /// `persist` are set, `database` wins.
@@ -1532,16 +1530,6 @@ impl HyperMcpServer {
         let result = self.with_engine(|engine| {
             let target_db =
                 self.resolve_db(engine, params.database.as_deref(), params.persist, true)?;
-            // Merge mode + non-primary database is not yet supported
-            // (cross-database DML for temp tables is unverified).
-            if mode == "merge" && target_db.is_some() {
-                return Err(McpError::new(
-                    ErrorCode::InvalidArgument,
-                    "merge mode with a non-primary database is not yet supported. \
-                     Use replace or append mode, or omit the database parameter."
-                        .to_string(),
-                ));
-            }
             crate::attach::validate_input_path(&params.path, "data file")?;
             let schema_override = crate::schema::normalize_schema_param(params.schema.as_ref())?;
             let opts = IngestOptions {

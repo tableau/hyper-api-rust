@@ -171,14 +171,19 @@ pub struct IngestResult {
 struct TempTableGuard<'a> {
     engine: &'a Engine,
     name: String,
+    /// Target database the temp lives in. `None` → primary (unqualified
+    /// drop). `Some(alias)` → emit `"alias"."public"."<name>"` so the
+    /// drop lands in the same DB the temp was created in.
+    target_db: Option<String>,
     armed: bool,
 }
 
 impl<'a> TempTableGuard<'a> {
-    fn new(engine: &'a Engine, name: String) -> Self {
+    fn new(engine: &'a Engine, name: String, target_db: Option<String>) -> Self {
         Self {
             engine,
             name,
+            target_db,
             armed: true,
         }
     }
@@ -198,10 +203,15 @@ impl Drop for TempTableGuard<'_> {
         // have learned about the temp leak otherwise" — the latter is
         // the load-bearing case for this guard's existence.
         let panicking = std::thread::panicking();
-        let drop_sql = format!(
-            "DROP TABLE IF EXISTS \"{}\"",
-            self.name.replace('"', "\"\"")
-        );
+        let quoted = match &self.target_db {
+            Some(db) => format!(
+                "\"{}\".\"public\".\"{}\"",
+                db.replace('"', "\"\""),
+                self.name.replace('"', "\"\""),
+            ),
+            None => format!("\"{}\"", self.name.replace('"', "\"\"")),
+        };
+        let drop_sql = format!("DROP TABLE IF EXISTS {quoted}");
         match self.engine.execute_command(&drop_sql) {
             Ok(_) => {
                 if panicking {
@@ -351,25 +361,32 @@ where
         std::process::id(),
     );
 
+    // The temp table lives in the same database as the target. That
+    // way every DML statement below (CREATE TABLE AS, DELETE-USING,
+    // INSERT-SELECT) stays within a single DB — no cross-DB DML — and
+    // the merge works the same regardless of whether the target is
+    // primary, persistent, or any user-attached writable database.
     let tmp_opts = IngestOptions {
         table: tmp.clone(),
         mode: "replace".into(),
         schema_override: opts.schema_override.clone(),
         merge_key: None,
-        target_db: None,
+        target_db: opts.target_db.clone(),
     };
     let tmp_result = replace_load(&tmp_opts)?;
 
     // Arm the cleanup guard immediately after the load so any later
-    // failure (or panic) drops the temp table on unwind.
-    let mut guard = TempTableGuard::new(engine, tmp.clone());
+    // failure (or panic) drops the temp table on unwind. The guard
+    // tracks `target_db` so the DROP lands in the same DB the temp
+    // was created in.
+    let mut guard = TempTableGuard::new(engine, tmp.clone(), opts.target_db.clone());
 
     // Belt-and-suspenders check: a per-format `replace_load` that returns
     // `Ok` without actually creating the table would surface as opaque
     // "table not found" errors from the catalog read in step 4. Catch
     // it here with a clear message so the contract violation is named
     // outright.
-    if !engine.table_exists(&tmp)? {
+    if !engine.table_exists_in(opts.target_db.as_deref(), &tmp)? {
         return Err(McpError::new(
             ErrorCode::InternalError,
             format!(
@@ -380,10 +397,21 @@ where
     }
 
     // Step 3 — if target doesn't exist, rename temp → target.
-    if !engine.table_exists(&opts.table)? {
-        let quoted_tmp = format!("\"{}\"", tmp.replace('"', "\"\""));
-        let quoted_tgt = format!("\"{}\"", opts.table.replace('"', "\"\""));
-        engine.execute_command(&format!("ALTER TABLE {quoted_tmp} RENAME TO {quoted_tgt}"))?;
+    if !engine.table_exists_in(opts.target_db.as_deref(), &opts.table)? {
+        let qualified_tmp_opts = IngestOptions {
+            table: tmp.clone(),
+            mode: "replace".into(),
+            schema_override: None,
+            merge_key: None,
+            target_db: opts.target_db.clone(),
+        };
+        let quoted_tmp = qualified_table(&qualified_tmp_opts);
+        // RENAME TO accepts an unqualified new name (Hyper / PostgreSQL
+        // semantics — the schema/database stays the same as the source).
+        let escaped_new = opts.table.replace('"', "\"\"");
+        engine.execute_command(&format!(
+            "ALTER TABLE {quoted_tmp} RENAME TO \"{escaped_new}\""
+        ))?;
         // The temp is now the target; the guard must NOT try to drop it.
         guard.disarm();
         return Ok(IngestResult {
@@ -407,9 +435,13 @@ where
         });
     }
 
-    // Step 4 — schema reconciliation.
-    let target_cols = engine.column_metadata(&opts.table)?;
-    let tmp_cols = engine.column_metadata(&tmp)?;
+    // Step 4 — schema reconciliation. Read both schemas from the
+    // target DB; in cross-DB merges the connection-bound `Catalog`
+    // wouldn't see the attached database, so route via
+    // `column_metadata_in` which falls back to the qualified
+    // `pg_catalog.pg_attribute` probe.
+    let target_cols = engine.column_metadata_in(opts.target_db.as_deref(), &opts.table)?;
+    let tmp_cols = engine.column_metadata_in(opts.target_db.as_deref(), &tmp)?;
     // Every key must exist in both, with matching type.
     for k in keys {
         let in_target = target_cols.iter().find(|c| c.name == *k);
@@ -476,11 +508,20 @@ where
         })
         .collect();
     let schema_changed = !new_cols.is_empty();
-    engine.alter_table_add_columns(&opts.table, &new_cols)?;
+    engine.alter_table_add_columns_in(opts.target_db.as_deref(), &opts.table, &new_cols)?;
 
     // Step 6 — DELETE matching rows by key, then INSERT all temp rows.
-    let quoted_tgt = format!("\"{}\"", opts.table.replace('"', "\"\""));
-    let quoted_tmp = format!("\"{}\"", tmp.replace('"', "\"\""));
+    // Both target and temp share `opts.target_db`, so qualifying via
+    // `qualified_table` keeps the DML scoped to one DB.
+    let quoted_tgt = qualified_table(opts);
+    let qualified_tmp_opts = IngestOptions {
+        table: tmp.clone(),
+        mode: "replace".into(),
+        schema_override: None,
+        merge_key: None,
+        target_db: opts.target_db.clone(),
+    };
+    let quoted_tmp = qualified_table(&qualified_tmp_opts);
     let key_eq = keys
         .iter()
         .map(|k| {
@@ -507,7 +548,7 @@ where
     let inserted = engine.execute_command(&insert_sql)?;
 
     // Re-read target schema for the result so callers see the post-merge shape.
-    let final_schema = engine.column_metadata(&opts.table)?;
+    let final_schema = engine.column_metadata_in(opts.target_db.as_deref(), &opts.table)?;
 
     // The guard drops the temp table when it falls out of scope here.
     Ok(IngestResult {

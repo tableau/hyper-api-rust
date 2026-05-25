@@ -926,6 +926,52 @@ impl Engine {
             .collect())
     }
 
+    /// Like [`Self::column_metadata`] but for a table in `target_db`.
+    /// `None` falls back to `column_metadata` (primary). `Some(alias)`
+    /// reads via the qualified `pg_catalog.pg_attribute` join used by
+    /// `describe_columns_via_pg_catalog` — the connection-bound
+    /// `Catalog` API can't see attached databases.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::TableNotFound`] when no rows come back from
+    /// the qualified probe. Propagates connection errors.
+    pub fn column_metadata_in(
+        &self,
+        target_db: Option<&str>,
+        table: &str,
+    ) -> Result<Vec<ColumnSchema>, McpError> {
+        let Some(db) = target_db else {
+            return self.column_metadata(table);
+        };
+        let rows = describe_columns_via_pg_catalog(self, db, table)?;
+        if rows.is_empty() {
+            return Err(McpError::new(
+                ErrorCode::TableNotFound,
+                format!("Table '{table}' does not exist in database '{db}'"),
+            ));
+        }
+        Ok(rows
+            .into_iter()
+            .map(|r| ColumnSchema {
+                name: r
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                hyper_type: r
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                nullable: r
+                    .get("nullable")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true),
+            })
+            .collect())
+    }
+
     /// Returns true if `table` exists in the `public` schema. Avoids
     /// the per-version error-string ambiguity of
     /// [`Catalog::get_table_definition`] by listing names instead.
@@ -938,6 +984,29 @@ impl Engine {
         let catalog = Catalog::new(&self.connection);
         let names = catalog.get_table_names("public").map_err(McpError::from)?;
         Ok(names.iter().any(|n| n.as_str() == table))
+    }
+
+    /// Like [`Self::table_exists`] but for a table in `target_db`.
+    /// `None` falls back to `table_exists` (primary). `Some(alias)`
+    /// probes the qualified `pg_catalog.pg_tables` of the attached
+    /// database — the connection-bound `Catalog` API can't see
+    /// attached databases.
+    ///
+    /// # Errors
+    ///
+    /// Propagates connection errors from the probe query.
+    pub fn table_exists_in(&self, target_db: Option<&str>, table: &str) -> Result<bool, McpError> {
+        let Some(db) = target_db else {
+            return self.table_exists(table);
+        };
+        let esc_db = db.replace('"', "\"\"");
+        let esc_tbl = table.replace('\'', "''");
+        let sql = format!(
+            "SELECT 1 AS one FROM \"{esc_db}\".pg_catalog.pg_tables \
+             WHERE schemaname = 'public' AND tablename = '{esc_tbl}'"
+        );
+        let rows = self.execute_query_to_json(&sql)?;
+        Ok(!rows.is_empty())
     }
 
     /// Issue a single `ALTER TABLE "<table>" ADD COLUMN "<n1>" <t1>,
@@ -969,6 +1038,23 @@ impl Engine {
         table: &str,
         cols: &[ColumnSchema],
     ) -> Result<(), McpError> {
+        self.alter_table_add_columns_in(None, table, cols)
+    }
+
+    /// Like [`Self::alter_table_add_columns`] but for a table in
+    /// `target_db`. `None` keeps the unqualified identifier; `Some(alias)`
+    /// emits `"db"."public"."table"` so the ALTER lands in the attached
+    /// database.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::alter_table_add_columns`].
+    pub fn alter_table_add_columns_in(
+        &self,
+        target_db: Option<&str>,
+        table: &str,
+        cols: &[ColumnSchema],
+    ) -> Result<(), McpError> {
         if cols.is_empty() {
             return Ok(());
         }
@@ -983,7 +1069,14 @@ impl Engine {
                 ));
             }
         }
-        let quoted_table = format!("\"{}\"", table.replace('"', "\"\""));
+        let quoted_table = match target_db {
+            Some(db) => {
+                let esc_db = db.replace('"', "\"\"");
+                let esc_tbl = table.replace('"', "\"\"");
+                format!("\"{esc_db}\".\"public\".\"{esc_tbl}\"")
+            }
+            None => format!("\"{}\"", table.replace('"', "\"\"")),
+        };
         let add_clauses = cols
             .iter()
             .map(|c| {

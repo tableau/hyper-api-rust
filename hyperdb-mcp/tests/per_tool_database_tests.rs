@@ -395,12 +395,137 @@ fn resolve_target_db_persistent_uppercase_errors_in_ephemeral_only() {
     assert_eq!(err.code, ErrorCode::InvalidArgument);
 }
 
-// Note on coverage: server-handler-level rejection paths (load_file
-// merge+database, load_files+database, watch_directory+database,
-// export format=hyper+database, attach-readonly+writable-required)
-// are not reachable from this integration test layer without going
-// through the rmcp tool router. The compile-time signatures of
-// `create_table_async` / `build_parquet_ingest_sql` exercising the
-// new `target_db` parameter cover the structural contract; the
-// runtime rejection paths are covered by manual smoke tests and
-// will land in a follow-up end-to-end MCP test harness.
+// --- Cross-database merge (Iter 1) -----------------------------------------
+
+/// Merge into persistent when the target table doesn't exist yet:
+/// the temp is renamed into the target slot. Verifies the rename path
+/// works against a non-primary database.
+#[test]
+fn merge_into_persistent_creates_table_when_missing() {
+    let te = TestEngine::new_ephemeral();
+    let opts = IngestOptions {
+        table: "merged_persist".into(),
+        mode: "merge".into(),
+        schema_override: None,
+        merge_key: Some(vec!["id".into()]),
+        target_db: Some("persistent".into()),
+    };
+    let data = r#"[{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]"#;
+    let result = ingest_json(&te.engine, data, &opts).unwrap();
+    assert_eq!(result.rows, 2);
+    assert!(
+        result.stats.schema_changed,
+        "newly-created target should report schema_changed=true"
+    );
+
+    let rows = te
+        .engine
+        .execute_query_to_json(
+            "SELECT id, name FROM \"persistent\".\"public\".\"merged_persist\" ORDER BY id",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["name"], "Alice");
+}
+
+/// Merge into persistent when the target exists with overlapping keys:
+/// matching rows are replaced, unmatched rows are appended.
+#[test]
+fn merge_into_persistent_replaces_matching_and_appends_new() {
+    let te = TestEngine::new_ephemeral();
+    // Seed target with two rows.
+    let seed_opts = IngestOptions {
+        table: "merge_target".into(),
+        mode: "replace".into(),
+        schema_override: None,
+        merge_key: None,
+        target_db: Some("persistent".into()),
+    };
+    ingest_json(
+        &te.engine,
+        r#"[{"id": 1, "name": "old1"}, {"id": 2, "name": "old2"}]"#,
+        &seed_opts,
+    )
+    .unwrap();
+
+    // Merge: id=1 replaces, id=3 appends, id=2 stays.
+    let merge_opts = IngestOptions {
+        table: "merge_target".into(),
+        mode: "merge".into(),
+        schema_override: None,
+        merge_key: Some(vec!["id".into()]),
+        target_db: Some("persistent".into()),
+    };
+    let result = ingest_json(
+        &te.engine,
+        r#"[{"id": 1, "name": "new1"}, {"id": 3, "name": "new3"}]"#,
+        &merge_opts,
+    )
+    .unwrap();
+    assert_eq!(result.rows, 2, "INSERT row count from merge");
+
+    let rows = te
+        .engine
+        .execute_query_to_json(
+            "SELECT id, name FROM \"persistent\".\"public\".\"merge_target\" ORDER BY id",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0]["name"], "new1", "id=1 replaced");
+    assert_eq!(rows[1]["name"], "old2", "id=2 untouched");
+    assert_eq!(rows[2]["name"], "new3", "id=3 appended");
+}
+
+/// Merge into persistent that introduces a new column triggers ALTER
+/// TABLE ADD COLUMN against the persistent target, and the new column
+/// shows up in the post-merge schema with NULL for pre-existing rows.
+#[test]
+fn merge_into_persistent_alters_when_incoming_has_new_column() {
+    let te = TestEngine::new_ephemeral();
+    let seed_opts = IngestOptions {
+        table: "widens".into(),
+        mode: "replace".into(),
+        schema_override: None,
+        merge_key: None,
+        target_db: Some("persistent".into()),
+    };
+    ingest_json(&te.engine, r#"[{"id": 1, "name": "Alice"}]"#, &seed_opts).unwrap();
+
+    let merge_opts = IngestOptions {
+        table: "widens".into(),
+        mode: "merge".into(),
+        schema_override: None,
+        merge_key: Some(vec!["id".into()]),
+        target_db: Some("persistent".into()),
+    };
+    let result = ingest_json(
+        &te.engine,
+        r#"[{"id": 2, "name": "Bob", "email": "bob@x.com"}]"#,
+        &merge_opts,
+    )
+    .unwrap();
+    assert!(
+        result.stats.schema_changed,
+        "new column 'email' should signal schema_changed"
+    );
+
+    let rows = te
+        .engine
+        .execute_query_to_json(
+            "SELECT id, name, email FROM \"persistent\".\"public\".\"widens\" ORDER BY id",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows[0]["email"].is_null(),
+        "pre-existing row gets NULL for new column"
+    );
+    assert_eq!(rows[1]["email"], "bob@x.com");
+}
+
+// Note on coverage: server-handler-level rejection paths
+// (load_files+database, watch_directory+database, export
+// format=hyper+database, attach-readonly+writable-required) are not
+// reachable from this integration test layer without going through
+// the rmcp tool router. They land in the end-to-end MCP test harness
+// (Iter 6).
