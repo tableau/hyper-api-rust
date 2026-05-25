@@ -607,8 +607,9 @@ pub fn ingest_json(
     // All mutations run inside a transaction so a partial failure leaves
     // zero side effects.
     let is_replace = opts.mode != "append";
+    let qualified = qualified_table(opts);
     let row_count = engine.execute_in_transaction(|engine| {
-        engine.create_table(&opts.table, &columns, is_replace)?;
+        engine.create_table_in(&opts.table, &columns, is_replace, opts.target_db.as_deref())?;
         let mut row_count = 0u64;
         let col_names: Vec<String> = columns.iter().map(|c| format!("\"{}\"", c.name)).collect();
         for obj in &array {
@@ -624,8 +625,8 @@ pub fn ingest_json(
                 .collect();
 
             let sql = format!(
-                "INSERT INTO \"{}\" ({}) VALUES ({})",
-                opts.table,
+                "INSERT INTO {} ({}) VALUES ({})",
+                qualified,
                 col_names.join(", "),
                 values.join(", ")
             );
@@ -734,9 +735,10 @@ pub fn ingest_csv(
     // breaking downstream `WHERE col IS NULL` and failing outright on
     // numeric columns.
     let canonical_temp = canonicalize_for_copy(&temp_path);
+    let qualified = qualified_table(opts);
     let copy_sql = format!(
-        "COPY \"{}\" FROM {} WITH (FORMAT csv, NULL '', DELIMITER ',', HEADER)",
-        opts.table,
+        "COPY {} FROM {} WITH (FORMAT csv, NULL '', DELIMITER ',', HEADER)",
+        qualified,
         hyperdb_api::escape_string_literal(canonical_temp.to_str().unwrap_or(""))
     );
 
@@ -744,7 +746,7 @@ pub fn ingest_csv(
     // unwinds the table creation.
     let is_replace = opts.mode != "append";
     let row_count = engine.execute_in_transaction(|engine| {
-        engine.create_table(&opts.table, &columns, is_replace)?;
+        engine.create_table_in(&opts.table, &columns, is_replace, opts.target_db.as_deref())?;
         engine.execute_command(&copy_sql)
     });
 
@@ -827,17 +829,18 @@ pub fn ingest_csv_file(
 
     // COPY FROM the file directly, inside a transaction with CREATE TABLE.
     let canonical = canonicalize_for_copy(abs_path);
+    let qualified = qualified_table(opts);
     // See `ingest_csv` above for the NULL-handling rationale: `NULL ''`
     // makes unquoted empty cells load as SQL NULL.
     let copy_sql = format!(
-        "COPY \"{}\" FROM {} WITH (FORMAT csv, NULL '', DELIMITER ',', HEADER)",
-        opts.table,
+        "COPY {} FROM {} WITH (FORMAT csv, NULL '', DELIMITER ',', HEADER)",
+        qualified,
         hyperdb_api::escape_string_literal(canonical.to_str().unwrap_or(""))
     );
 
     let is_replace = opts.mode != "append";
     let row_count = engine.execute_in_transaction(|engine| {
-        engine.create_table(&opts.table, &columns, is_replace)?;
+        engine.create_table_in(&opts.table, &columns, is_replace, opts.target_db.as_deref())?;
         engine.execute_command(&copy_sql)
     })?;
 

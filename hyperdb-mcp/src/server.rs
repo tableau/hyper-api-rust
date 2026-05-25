@@ -153,6 +153,15 @@ pub struct LoadDataParams {
     /// Partial schema override keyed by column name: `{"col": "BIGINT", ...}`.
     /// See the docs on `QueryDataParams` for the full spec.
     pub schema: Option<Value>,
+    /// Target database alias. Omit (or pass `"local"`) to write to the
+    /// ephemeral primary. Pass `"persistent"` to write to the durable
+    /// database that survives across sessions. Other values target a
+    /// user-attached database (must be writable).
+    pub database: Option<String>,
+    /// Shorthand for `database: "persistent"`. When true, data is written
+    /// to the persistent database. If both `database` and `persist` are
+    /// set, `database` wins.
+    pub persist: Option<bool>,
 }
 
 /// Parameters for the `load_file` workspace tool.
@@ -185,6 +194,15 @@ pub struct LoadFileParams {
     /// (`["cell", "job_id"]`). Required for merge; rejected with a clear
     /// error if set for `replace` or `append`.
     pub merge_key: Option<MergeKey>,
+    /// Target database alias. Omit (or pass `"local"`) to write to the
+    /// ephemeral primary. Pass `"persistent"` to write to the durable
+    /// database. Other values target a user-attached writable database.
+    /// Note: `mode: "merge"` with a non-primary database is not yet
+    /// supported and will return an error.
+    pub database: Option<String>,
+    /// Shorthand for `database: "persistent"`. If both `database` and
+    /// `persist` are set, `database` wins.
+    pub persist: Option<bool>,
 }
 
 /// One or many column names. Accepts either a JSON string `"col"` or
@@ -290,6 +308,14 @@ pub struct LoadFilesParams {
     /// hyperd's side; more connections don't help past a certain point
     /// and can starve the primary connection.
     pub concurrency: Option<u32>,
+    /// Target database alias. **Currently only the primary (ephemeral)
+    /// database is supported for parallel ingest.** Passing `"persistent"`
+    /// or another alias returns an error — use `load_file` with
+    /// `persist: true` instead for single-file persistent ingest.
+    pub database: Option<String>,
+    /// Shorthand for `database: "persistent"`. Same limitation as
+    /// `database` applies — not yet supported for parallel ingest.
+    pub persist: Option<bool>,
 }
 
 /// Validate the (`mode`, `merge_key`) combination at the tool boundary.
@@ -1376,6 +1402,8 @@ impl HyperMcpServer {
         // closure so we can pick the right notifications after success.
         let mode = params.mode.clone().unwrap_or_else(|| "replace".into());
         let result = self.with_engine(|engine| {
+            let target_db =
+                self.resolve_db(engine, params.database.as_deref(), params.persist, true)?;
             let fmt = params.format.unwrap_or_else(|| detect_format(&params.data));
             let schema_override = crate::schema::normalize_schema_param(params.schema.as_ref())?;
             let opts = IngestOptions {
@@ -1383,7 +1411,7 @@ impl HyperMcpServer {
                 mode: mode.clone(),
                 schema_override,
                 merge_key: None,
-                target_db: None,
+                target_db: target_db.clone(),
             };
 
             let ingest_result = match fmt.as_str() {
@@ -1403,22 +1431,23 @@ impl HyperMcpServer {
                 })
                 .collect();
 
-            // Best-effort catalog bookkeeping. Runs inside `with_engine`
-            // so the ConnectionLost recovery path also covers it, but
-            // errors are swallowed inside — a bad catalog write must
-            // never fail a good load.
-            let load_params = serde_json::to_string(&json!({
-                "mode": mode,
-                "format": fmt,
-            }))
-            .ok();
-            self.after_ingest_catalog_update(
-                engine,
-                &params.table,
-                "load_data",
-                load_params.as_deref(),
-                i64::try_from(ingest_result.rows).ok(),
-            );
+            // Catalog bookkeeping: only for primary or persistent targets.
+            // User-attached databases are not tracked in the catalog.
+            if target_db.is_none() || target_db.as_deref() == Some(Engine::PERSISTENT_ALIAS) {
+                let load_params = serde_json::to_string(&json!({
+                    "mode": mode,
+                    "format": fmt,
+                    "database": target_db.as_deref().unwrap_or("local"),
+                }))
+                .ok();
+                self.after_ingest_catalog_update(
+                    engine,
+                    &params.table,
+                    "load_data",
+                    load_params.as_deref(),
+                    i64::try_from(ingest_result.rows).ok(),
+                );
+            }
 
             Ok(json!({
                 "rows": ingest_result.rows,
@@ -1467,6 +1496,18 @@ impl HyperMcpServer {
         // an `ALTER TABLE ADD COLUMN`. `replace` always changes shape;
         // `merge` only does conditionally; `append` never does.
         let result = self.with_engine(|engine| {
+            let target_db =
+                self.resolve_db(engine, params.database.as_deref(), params.persist, true)?;
+            // Merge mode + non-primary database is not yet supported
+            // (cross-database DML for temp tables is unverified).
+            if mode == "merge" && target_db.is_some() {
+                return Err(McpError::new(
+                    ErrorCode::InvalidArgument,
+                    "merge mode with a non-primary database is not yet supported. \
+                     Use replace or append mode, or omit the database parameter."
+                        .to_string(),
+                ));
+            }
             crate::attach::validate_input_path(&params.path, "data file")?;
             let schema_override = crate::schema::normalize_schema_param(params.schema.as_ref())?;
             let opts = IngestOptions {
@@ -1474,7 +1515,7 @@ impl HyperMcpServer {
                 mode: mode.clone(),
                 schema_override,
                 merge_key: merge_key_vec.clone(),
-                target_db: None,
+                target_db: target_db.clone(),
             };
 
             let ingest_result = if let Some(ref json_path) = params.json_extract_path {
@@ -1519,24 +1560,25 @@ impl HyperMcpServer {
                 })
                 .collect();
 
-            // Capture enough load context for a future refresh (source
-            // path, mode, schema override, json_extract_path). See
-            // `load_data` for the matching pattern.
-            let load_params = serde_json::to_string(&json!({
-                "source_path": params.path,
-                "mode": mode,
-                "schema": params.schema,
-                "json_extract_path": params.json_extract_path,
-                "merge_key": merge_key_vec,
-            }))
-            .ok();
-            self.after_ingest_catalog_update(
-                engine,
-                &params.table,
-                "load_file",
-                load_params.as_deref(),
-                i64::try_from(ingest_result.rows).ok(),
-            );
+            // Catalog: only for primary or persistent targets.
+            if target_db.is_none() || target_db.as_deref() == Some(Engine::PERSISTENT_ALIAS) {
+                let load_params = serde_json::to_string(&json!({
+                    "source_path": params.path,
+                    "mode": mode,
+                    "schema": params.schema,
+                    "json_extract_path": params.json_extract_path,
+                    "merge_key": merge_key_vec,
+                    "database": target_db.as_deref().unwrap_or("local"),
+                }))
+                .ok();
+                self.after_ingest_catalog_update(
+                    engine,
+                    &params.table,
+                    "load_file",
+                    load_params.as_deref(),
+                    i64::try_from(ingest_result.rows).ok(),
+                );
+            }
 
             Ok((
                 json!({
@@ -1587,6 +1629,18 @@ impl HyperMcpServer {
             return Self::err_content(McpError::new(
                 ErrorCode::EmptyData,
                 "load_files: `files` must not be empty",
+            ));
+        }
+
+        // Parallel ingest uses a connection pool that only sees the ephemeral
+        // primary — non-primary targets are not yet supported.
+        if params.database.is_some() || params.persist == Some(true) {
+            return Self::err_content(McpError::new(
+                ErrorCode::InvalidArgument,
+                "load_files does not yet support the `database` or `persist` parameter \
+                 because parallel ingest uses a connection pool bound to the primary database. \
+                 Use `load_file` with `persist: true` for single-file persistent ingest."
+                    .to_string(),
             ));
         }
 

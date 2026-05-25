@@ -177,8 +177,21 @@ fn parquet_select_projection(inferred: &[ColumnSchema], final_columns: &[ColumnS
 ///
 /// The caller is responsible for issuing a preceding `DROP TABLE IF EXISTS`
 /// in replace mode — hyperd's `CREATE TABLE AS` fails rather than replacing.
-fn build_parquet_ingest_sql(table: &str, path: &str, projection: &str, is_replace: bool) -> String {
-    let quoted_table = format!("\"{}\"", table.replace('"', "\"\""));
+fn build_parquet_ingest_sql(
+    table: &str,
+    path: &str,
+    projection: &str,
+    is_replace: bool,
+    target_db: Option<&str>,
+) -> String {
+    let quoted_table = match target_db {
+        Some(db) => {
+            let esc_db = db.replace('"', "\"\"");
+            let esc_tbl = table.replace('"', "\"\"");
+            format!("\"{esc_db}\".\"public\".\"{esc_tbl}\"")
+        }
+        None => format!("\"{}\"", table.replace('"', "\"\"")),
+    };
     let quoted_path = hyperdb_api::escape_string_literal(path);
     if is_replace {
         format!(
@@ -290,7 +303,13 @@ pub fn ingest_parquet_file(
     let projection = parquet_select_projection(&inferred, &final_columns);
 
     let is_replace = opts.mode != "append";
-    let sql = build_parquet_ingest_sql(&opts.table, &absolute_path, &projection, is_replace);
+    let sql = build_parquet_ingest_sql(
+        &opts.table,
+        &absolute_path,
+        &projection,
+        is_replace,
+        opts.target_db.as_deref(),
+    );
 
     // Issue the ingest DDL/DML. `CREATE TABLE ... AS SELECT` auto-commits
     // (Hyper treats all DDL that way), so wrapping it in `execute_in_transaction`
@@ -298,8 +317,8 @@ pub fn ingest_parquet_file(
     // path that runs the transaction prelude + drops if needed.
     let affected = engine.execute_in_transaction(|engine| {
         if is_replace {
-            let quoted_table = format!("\"{}\"", opts.table.replace('"', "\"\""));
-            engine.execute_command(&format!("DROP TABLE IF EXISTS {quoted_table}"))?;
+            let qualified = crate::ingest::qualified_table(opts);
+            engine.execute_command(&format!("DROP TABLE IF EXISTS {qualified}"))?;
         }
         engine.execute_command(&sql)
     })?;
@@ -375,13 +394,19 @@ pub async fn ingest_parquet_file_async(
 
     let projection = parquet_select_projection(&inferred, &final_columns);
     let is_replace = opts.mode != "append";
-    let sql = build_parquet_ingest_sql(&opts.table, &absolute_path, &projection, is_replace);
+    let sql = build_parquet_ingest_sql(
+        &opts.table,
+        &absolute_path,
+        &projection,
+        is_replace,
+        opts.target_db.as_deref(),
+    );
 
     conn.begin_transaction().await.map_err(McpError::from)?;
     let result: Result<u64, McpError> = async {
         if is_replace {
-            let quoted_table = format!("\"{}\"", opts.table.replace('"', "\"\""));
-            conn.execute_command(&format!("DROP TABLE IF EXISTS {quoted_table}"))
+            let qualified = crate::ingest::qualified_table(opts);
+            conn.execute_command(&format!("DROP TABLE IF EXISTS {qualified}"))
                 .await
                 .map_err(McpError::from)?;
         }
@@ -575,8 +600,16 @@ pub fn ingest_arrow_ipc_file(
     let (columns, batches) = read_arrow_ipc_file(path)?;
 
     let is_replace = opts.mode != "append";
+    // Arrow IPC uses the binary COPY protocol which resolves table names via
+    // the search path. When targeting a non-primary database, temporarily
+    // redirect the search path for the duration of the transaction.
+    let _search_guard = if let Some(ref db) = opts.target_db {
+        Some(engine.scoped_search_path(db)?)
+    } else {
+        None
+    };
     let row_count = engine.execute_in_transaction(|engine| {
-        engine.create_table(&opts.table, &columns, is_replace)?;
+        engine.create_table_in(&opts.table, &columns, is_replace, opts.target_db.as_deref())?;
 
         // Stream RecordBatches through the binary COPY protocol. Each
         // batch is written to an IPC Stream segment internally — no
