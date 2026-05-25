@@ -8,33 +8,6 @@ Each section follows a loose template: Motivation → Architecture sketch → Es
 
 ---
 
-## Shared `hyperd` daemon for cross-workspace JOINs
-
-**Motivation.** Today, each MCP server (one per entry in `mcp.json`) spawns its own `hyperd` subprocess via `HyperProcess::new()` in `Engine::new`. Two MCP servers ⇒ two `hyperd` processes ⇒ two fully-isolated databases with no ability to JOIN across them. Users who want to query data that spans two workspaces have to either (a) consolidate everything into one workspace, or (b) manually shuffle data between workspaces via the [export bridge](#raw-fallbacks-for-cross-workspace-data-movement) below.
-
-**Architecture.** Switch the Engine to support *connecting to* an existing `hyperd` rather than always spawning a new one:
-
-1. New CLI flag: `--hyperd-url tab.tcp://localhost:PORT`. When set, skip `HyperProcess::new` and build a `Connection` directly against the given address.
-2. One long-lived `hyperd` daemon (outside any MCP server), managed via `launchd` on macOS / `systemd` on Linux / `hyperd &` in a scratch shell.
-3. Each MCP server in `mcp.json` gets `--hyperd-url` pointing at the shared daemon plus its own `--workspace` (the per-instance `.hyper` file it manages).
-4. Inside the shared `hyperd`, each MCP server sees its own workspace as the default database via `ATTACH DATABASE ... AS workspace`. To JOIN across workspaces, the LLM issues an additional `ATTACH` for the *other* workspace and then uses fully-qualified table names (`other.public.tablename`).
-
-**Estimated size.** ~100–200 LOC:
-- `src/engine.rs`: split `Engine::new` into `spawn_hyperd_and_connect` vs. `connect_to_existing`, dispatch on the CLI flag.
-- `src/main.rs`: add the `--hyperd-url` flag to the clap parser.
-- Reconnection handling: when the shared `hyperd` restarts, detect and re-attach workspaces automatically.
-- Health check: `status` should report which mode is active (spawned vs. shared) and the daemon URL.
-
-**Risks / open questions.**
-- Port discovery: the shared daemon needs a stable known port, or a discovery file.
-- Lifecycle: who starts / stops the shared daemon? Not the MCP server (it might be one of several clients).
-- Observability: with many MCP servers sharing one `hyperd`, per-client logs get mixed. May need to rely on `request-id` / `session-id` tagging already in the hyperd log.
-- Memory savings on the shared `hyperd` are the motivation, but only really matter once you have ≥3 workspaces — two isn't a big deal on a dev laptop (~150–250 MB idle per `hyperd`).
-
-**Verdict.** Not urgent for current usage (two workspaces). Add when a concrete "I need to JOIN across sandbox + persistent data right now" use case shows up.
-
----
-
 ## Cross-database tools
 
 First-class tools for attaching additional `.hyper` databases and
@@ -108,7 +81,7 @@ keep these workarounds in mind:
 
 ## `switch_workspace` mid-session tool
 
-Lower-priority than the shared daemon, but conceptually clean: a `switch_workspace(path)` MCP tool that tears down the current Engine and re-instantiates against a different `.hyper` file without a process restart. Also resets the saved-queries store (back to ephemeral/persistent pick), subscription registry, and active watchers.
+Conceptually clean: a `switch_workspace(path)` MCP tool that tears down the current Engine and re-instantiates against a different `.hyper` file without a process restart. Also resets the saved-queries store (back to ephemeral/persistent pick), subscription registry, and active watchers.
 
 Useful if you'd rather "flip between N workspaces in one chat" than "have N MCP servers in the sidebar". Feasible as ~100 LOC in `server.rs` but introduces subtleties: what happens to in-flight subscriptions, watcher threads with state, and saved queries whose results reference the old workspace's tables. Probably gated behind a CLI flag so it's opt-in.
 
@@ -132,5 +105,6 @@ tables without issuing raw `pg_catalog` SQL:
   queries will rerun `pg_catalog` anyway).
 
 Also punts: remote kinds (`"tcp"` / `"grpc"`) on `attach_database`.
-Those need the shared-daemon + credential-profile infrastructure
-described above.
+Those need credential-profile infrastructure (auth tokens, key
+material) that doesn't exist yet — the shared-daemon work landed
+already, but it covers only the local-`hyperd` case.

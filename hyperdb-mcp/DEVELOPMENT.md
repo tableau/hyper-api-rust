@@ -198,10 +198,22 @@ Derived fields are merged into the serialized JSON so callers get a self-contain
 
 ## Workspace Modes Internals
 
-- **Ephemeral** — `Engine::new(None)` creates a temp directory (`$TMPDIR/hyperdb-mcp-<pid>/`) with a `workspace.hyper` file. Cleaned up on process exit.
+- **Ephemeral** — `Engine::new(None)` creates a temp directory (`$TMPDIR/hyperdb-mcp-<pid>/`) with a `workspace.hyper` file. Cleaned up on process exit. In daemon mode, `Engine::drop` issues `DETACH DATABASE` (releasing Hyper's file lock — required on Windows) before `remove_dir_all` deletes the temp directory.
 - **Persistent** — `Engine::new(Some(path))` uses the caller-supplied path. Parent directories are created automatically. `~` is expanded via `$HOME` (no shell crate dependency).
 
 Logs (both `hyperd` server logs and the MCP client log) land in the same directory as the workspace file. The `status` tool reports log paths so operators know where to look.
+
+## Daemon Mode Internals
+
+`Engine::new` defaults to *daemon mode* — it tries `daemon::spawn::ensure_daemon()` first, which discovers an existing daemon via `~/.hyperdb/daemon.json` (overridable via `HYPERDB_STATE_DIR`) or auto-spawns one as a detached background process. The Engine then connects via TCP (`Connection::connect(endpoint, …)`) without owning any `HyperProcess`.
+
+Falls back to local mode (per-session `hyperd` via `HyperProcess::new`) when the daemon can't be reached, or always when `--no-daemon` is passed.
+
+Cross-platform single-instance lock is the daemon's TCP health port — bind succeeds for exactly one process per user. Liveness is validated by the discovery flow before trusting the file: a stale `daemon.json` (daemon crashed) is detected and removed.
+
+The daemon's main loop tracks idle time via `DaemonState::last_activity`. `HEARTBEAT` commands from active clients reset the timer; clients debounce these to once per 60 seconds in `HyperMcpServer::with_engine`. Idle timeout (default 30 min) triggers graceful shutdown: discovery file removed → `hyperd` dropped → health listener exits.
+
+See `src/daemon/{mod,discovery,health,run,spawn}.rs` for the full implementation.
 
 ---
 
@@ -220,6 +232,6 @@ Logs (both `hyperd` server logs and the MCP client log) land in the same directo
 
 ## Forward-Looking Design Notes
 
-Feature-level ideas that aren't bugs or tech debt (which are tracked above) — shared `hyperd` daemon, cross-database tools, catalog awareness for attached databases, `switch_workspace`, and cross-workspace data-movement fallbacks — now live in [ROADMAP.md](ROADMAP.md). That split keeps this file focused on the current codebase and how to work in it, while ROADMAP.md captures the "not built yet but worth thinking about" material.
+Feature-level ideas that aren't bugs or tech debt (which are tracked above) — cross-database tools, catalog awareness for attached databases, `switch_workspace`, and cross-workspace data-movement fallbacks — now live in [ROADMAP.md](ROADMAP.md). That split keeps this file focused on the current codebase and how to work in it, while ROADMAP.md captures the "not built yet but worth thinking about" material.
 
 ---

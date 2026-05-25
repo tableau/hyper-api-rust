@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Single-instance `hyperd` daemon** — by default, all MCP clients now
+  share one `hyperd` process per user instead of each spawning their own.
+  Multiple AI clients (Claude Code, Cursor, VS Code Copilot, etc.) can
+  access the same persistent databases simultaneously with reduced
+  resource overhead. The daemon auto-spawns on first client connect and
+  shuts down after 30 minutes idle. Pass `--no-daemon` to opt out.
+- New `daemon` subcommand: `hyperdb-mcp daemon status` / `daemon stop`.
+- New environment variables: `HYPERDB_STATE_DIR`, `HYPERDB_DAEMON_PORT`,
+  `HYPERDB_DAEMON_IDLE_TIMEOUT`.
+- Ephemeral databases now `DETACH DATABASE` before deletion on session
+  end — required on Windows where the OS enforces file locks on open
+  Hyper files.
+
 ## [0.1.1] - 2026-05-13
 
 ### Added

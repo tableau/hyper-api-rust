@@ -15,6 +15,7 @@ LLMs are powerful at reasoning but cannot natively crunch millions of rows. This
 ## Features
 
 - **Zero setup** — `HyperProcess` auto-starts the Hyper server
+- **Shared `hyperd` daemon** — one Hyper process per user, shared across all MCP clients (Claude Code, Cursor, VS Code, etc.) for reduced memory overhead and concurrent access to the same persistent databases
 - **Any data in** — JSON, CSV, Parquet, Arrow IPC, Apache Iceberg; schema inferred or exact
 - **SQL at scale** — thousands to billions of rows
 - **Data out** — export to CSV, Parquet, Apache Iceberg, Arrow IPC, or `.hyper` (Tableau Desktop-ready)
@@ -135,7 +136,8 @@ For a **persistent workspace** (tables survive across sessions), add `"args"`:
 ```json
 "args": ["--workspace", "/path/to/my-project.hyper"]
 ```
-This is still **experimental** and will only work with only one session at a time since the Hyper database is locked by Hyper. Each session is isolated and has its own Hyper instance running. Future work will allow multiple sessions to share the same database but requires work to spin up a shared Hyper instance.
+
+Multiple MCP clients can point at the **same** persistent workspace simultaneously — they all connect through the shared `hyperd` daemon and use Hyper's MVCC transaction isolation. See [Operating Modes](#operating-modes) below.
 
 #### Claude Code / AI Suite
 
@@ -156,6 +158,49 @@ Edit `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (project root). Use the
 #### Other MCP Clients
 
 Any tool that supports the MCP stdio transport can use this server. Point it at the `hyperdb-mcp` binary and set `HYPERD_PATH` in the environment.
+
+---
+
+## Operating Modes
+
+The server has two independent mode dimensions: **how the Hyper engine is run** and **where the database is stored**.
+
+### Hyper engine
+
+| Mode | Flag | Behavior |
+|---|---|---|
+| **Shared daemon** *(default)* | *(none)* | One `hyperd` process per user, shared across all MCP clients. The first client auto-spawns the daemon; subsequent clients discover and reuse it. Idle for 30 minutes → daemon shuts itself down; the next client spawns a fresh one. |
+| **Private hyperd** | `--no-daemon` | Each MCP client spawns its own `hyperd` (legacy behavior, one per session). |
+
+The shared daemon is the bigger win for users running multiple AI clients (Claude Code + Cursor + VS Code) — they all share one Hyper engine instead of spawning three.
+
+### Database persistence
+
+| Mode | Flag | Behavior |
+|---|---|---|
+| **Ephemeral** *(default)* | *(none)* | A temp `.hyper` file is created per session and deleted on exit (DETACH + delete in daemon mode, Windows-safe). |
+| **Persistent** | `--workspace <PATH>` | Uses the supplied `.hyper` file; survives across sessions. Multiple clients can point at the same path simultaneously. |
+
+The two dimensions are orthogonal — any combination works. With the default (shared daemon + ephemeral), every client gets its own scratch database living inside the same shared engine; with `--workspace` added, multiple clients can collaborate on the same persistent dataset.
+
+### Daemon management
+
+The daemon is normally invisible — it auto-spawns and idle-times-out on its own. For diagnostics:
+
+```bash
+hyperdb-mcp daemon status   # Show running daemon (PID, endpoint, started_at, version)
+hyperdb-mcp daemon stop     # Gracefully shut down the daemon
+hyperdb-mcp daemon          # Run as a daemon explicitly (rarely needed)
+```
+
+State files live at `~/.hyperdb/` by default (override with `HYPERDB_STATE_DIR`).
+
+### Other behavioral flags
+
+| Flag | Behavior |
+|---|---|
+| `--read-only` | Disables `execute`, `load_data`, `load_file`, `watch_directory`, `save_query`, `delete_query`, and Hyper-format export. See [Read-Only Mode](#read-only-mode). |
+| `--bare` | Skips MCP-managed auxiliary tables (`_table_catalog`); saved queries are kept in-memory only, even with `--workspace`. |
 
 ---
 
@@ -639,15 +684,29 @@ Full reference: [Data Cloud SQL Reference](https://developer.salesforce.com/docs
 ## CLI Reference
 
 ```
-hyperdb-mcp [OPTIONS]
+hyperdb-mcp [OPTIONS] [COMMAND]
+
+Commands:
+  daemon                Run as a background daemon managing a shared hyperd process
 
 Options:
   --workspace <PATH>    Path to the `.hyper` workspace file for persistent mode (omit for ephemeral)
   --read-only           Disable mutating tools (execute, load_data, load_file, save_query, delete_query, watch_directory)
   --bare                Skip MCP-managed auxiliary tables (`_table_catalog`) and force saved queries into in-memory storage, even with --workspace
+  --no-daemon           Disable the shared daemon and spawn a private hyperd (legacy per-session behavior)
+
+Daemon subcommand:
+  hyperdb-mcp daemon                    Start the daemon (usually auto-spawned)
+  hyperdb-mcp daemon stop               Gracefully stop the running daemon
+  hyperdb-mcp daemon status             Show running daemon info
+  hyperdb-mcp daemon --port <PORT>      Override the health/lock port (default 7484)
+  hyperdb-mcp daemon --idle-timeout <SECS>   Override idle timeout (default 1800 = 30 min)
 
 Environment:
-  HYPERD_PATH           Path to hyperd binary (auto-detected if on PATH)
+  HYPERD_PATH                  Path to hyperd binary (auto-detected if on PATH)
+  HYPERDB_STATE_DIR            Override daemon state directory (default ~/.hyperdb/)
+  HYPERDB_DAEMON_PORT          Override daemon health/lock port (default 7484)
+  HYPERDB_DAEMON_IDLE_TIMEOUT  Override daemon idle timeout in seconds (default 1800)
 ```
 
 ---
