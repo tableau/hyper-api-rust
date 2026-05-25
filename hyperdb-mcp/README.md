@@ -186,7 +186,26 @@ The shared daemon is the bigger win for users running multiple AI clients (Claud
 
 ### Working with both databases
 
-Tool calls default to the ephemeral primary — that's the LLM's scratch space for exploratory work. To target the persistent attachment from SQL, use a fully-qualified table reference:
+Tool calls default to the ephemeral primary — that's the LLM's scratch space for exploratory work. There are two ways to reach the persistent attachment:
+
+**1. Per-tool `database` parameter** (preferred for ergonomic LLM workflows):
+
+```jsonc
+// Save a useful table to the persistent database
+load_data({ table: "customers", data: "[...]", persist: true })
+//   ↑ shorthand for `database: "persistent"`
+
+// Query from persistent
+query({ sql: "SELECT * FROM customers", database: "persistent" })
+
+// Inspect persistent tables
+describe({ database: "persistent" })
+sample({ table: "customers", database: "persistent" })
+```
+
+The `database` parameter is available on `query`, `query_data`, `query_file`, `execute`, `load_data`, `load_file`, `describe`, `sample`, `chart`, and `export`. The shorthand `persist: true` (sugar for `database: "persistent"`) is available on `load_data` and `load_file`. Pass any user-attached writable alias (created via `attach_database`) to target a custom database.
+
+**2. Fully-qualified SQL** (for power users or complex multi-DB joins):
 
 ```sql
 -- Read from persistent
@@ -198,6 +217,8 @@ CREATE TABLE "persistent"."public"."revenue_2026" AS
 ```
 
 The `_table_catalog` (which tracks MCP-managed metadata for your tables) lives in the persistent attachment automatically — there's nothing to manage. If you want a pristine `.hyper` file for export with no MCP bookkeeping, run `DROP TABLE "persistent"."public"."_table_catalog"` once and subsequent sessions opening that file will leave it dropped.
+
+**v1 limitations:** `load_files` and `watch_directory` use a connection pool bound to the primary database and don't yet accept `database`/`persist` — use `load_file` with `persist: true` for one-off persistent ingests. Merge mode (`load_file` with `mode: "merge"`) only works against the primary database in v1.
 
 ### Daemon management
 
