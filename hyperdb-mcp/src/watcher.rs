@@ -71,6 +71,53 @@ use tokio::task::JoinHandle;
 /// this to the full data file name (e.g. `orders.csv` → `orders.csv.ready`).
 pub const READY_SUFFIX: &str = ".ready";
 
+/// Build a watcher connection pool from the current engine. Pulled out
+/// of [`start_watching`] so the recovery path (post hyperd restart)
+/// can call it again to swap in a fresh pool.
+fn build_watcher_pool(
+    engine: &Arc<Mutex<Option<Engine>>>,
+    concurrency: usize,
+) -> Result<Arc<Pool>, McpError> {
+    let guard = engine
+        .lock()
+        .map_err(|_| McpError::new(ErrorCode::InternalError, "Engine lock poisoned"))?;
+    let eng = guard.as_ref().ok_or_else(|| {
+        McpError::new(
+            ErrorCode::InternalError,
+            "Engine not initialized when watcher pool requested",
+        )
+    })?;
+    let endpoint = eng.hyperd_endpoint()?;
+    // Watcher pool connects to the engine's primary (ephemeral). The
+    // user-supplied table on `watch_directory` always lives there
+    // unless a future flag routes it to the persistent attachment.
+    let workspace = eng.ephemeral_path().to_string_lossy().to_string();
+    let cfg = PoolConfig::new(endpoint, workspace)
+        .create_mode(CreateMode::DoNotCreate)
+        .max_size(concurrency);
+    Ok(Arc::new(create_pool(cfg).map_err(|e| {
+        McpError::new(
+            ErrorCode::InternalError,
+            format!("Failed to build watcher pool: {e}"),
+        )
+    })?))
+}
+
+/// Replace the watcher's pool atomically with a freshly-built one.
+/// Called from the ingest path when a connection-lost error suggests
+/// the underlying hyperd has been replaced (daemon restart, manual
+/// `hyperd kill`).
+async fn rebuild_watcher_pool(
+    pool_slot: &tokio::sync::RwLock<Arc<Pool>>,
+    engine: &Arc<Mutex<Option<Engine>>>,
+    concurrency: usize,
+) -> Result<(), McpError> {
+    let new_pool = build_watcher_pool(engine, concurrency)?;
+    let mut guard = pool_slot.write().await;
+    *guard = new_pool;
+    Ok(())
+}
+
 /// Default ceiling on parallel ingests per watcher. Chosen conservatively —
 /// each parallel ingest holds one open TCP connection to hyperd plus a
 /// transaction, and most workloads have fewer than 4 incoming streams at a
@@ -146,9 +193,12 @@ pub struct WatcherHandle {
     /// tokio mpsc channel. Joined on drop after the notify watcher is
     /// dropped (which closes the std sender and lets this thread exit).
     forwarder: Option<std::thread::JoinHandle<()>>,
-    /// Per-watcher connection pool. Kept here so it's torn down when the
-    /// handle is dropped — all outstanding connections close.
-    _pool: Arc<Pool>,
+    /// Per-watcher connection pool. Wrapped in a tokio `RwLock` so the
+    /// recovery path can swap in a fresh pool after a hyperd restart
+    /// without disturbing in-flight ingests on the old pool. Kept here
+    /// so the pool is torn down (all connections close) when the handle
+    /// is dropped.
+    _pool: Arc<tokio::sync::RwLock<Arc<Pool>>>,
 }
 
 impl Drop for WatcherHandle {
@@ -325,31 +375,13 @@ pub fn start_watching(
     // from the engine under a brief lock, then release it — the pool
     // itself operates independently of the sync connection the engine
     // still owns.
-    let pool = {
-        let guard = engine
-            .lock()
-            .map_err(|_| McpError::new(ErrorCode::InternalError, "Engine lock poisoned"))?;
-        let eng = guard.as_ref().ok_or_else(|| {
-            McpError::new(
-                ErrorCode::InternalError,
-                "Engine not initialized when watcher started",
-            )
-        })?;
-        let endpoint = eng.hyperd_endpoint()?;
-        // Watcher pool connects to the engine's primary (ephemeral). The
-        // user-supplied table on `watch_directory` always lives there
-        // unless a future flag routes it to the persistent attachment.
-        let workspace = eng.ephemeral_path().to_string_lossy().to_string();
-        let cfg = PoolConfig::new(endpoint, workspace)
-            .create_mode(CreateMode::DoNotCreate)
-            .max_size(concurrency);
-        Arc::new(create_pool(cfg).map_err(|e| {
-            McpError::new(
-                ErrorCode::InternalError,
-                format!("Failed to build watcher pool: {e}"),
-            )
-        })?)
-    };
+    // Build the pool wrapped in an Arc<RwLock<…>> so post-construction
+    // hyperd restarts can swap in a fresh pool without restarting the
+    // watcher.
+    let pool = Arc::new(tokio::sync::RwLock::new(build_watcher_pool(
+        &engine,
+        concurrency,
+    )?));
 
     let stats = Arc::new(Mutex::new(WatcherStats {
         // Concurrency is configured by the user via a `u32`-sized field
@@ -388,8 +420,10 @@ pub fn start_watching(
         tokio::task::block_in_place(|| {
             rt.block_on(async {
                 for ready_path in scan_ready_files(&canonical) {
-                    process_ready_async(
+                    process_ready_with_recovery(
                         &pool,
+                        &engine,
+                        concurrency,
                         subscriptions.as_deref(),
                         &canonical,
                         &table,
@@ -457,6 +491,7 @@ pub fn start_watching(
     // the consumer's point of view, with stats updated via shared Mutex.
     let task = {
         let pool = Arc::clone(&pool);
+        let engine_for_pool = Arc::clone(&engine);
         let subs = subscriptions.clone();
         let stats = Arc::clone(&stats);
         let in_flight = Arc::clone(&in_flight);
@@ -485,7 +520,8 @@ pub fn start_watching(
                     if !claimed {
                         continue;
                     }
-                    let pool = Arc::clone(&pool);
+                    let pool_slot = Arc::clone(&pool);
+                    let engine_handle = Arc::clone(&engine_for_pool);
                     let subs = subs.clone();
                     let stats = Arc::clone(&stats);
                     let in_flight = Arc::clone(&in_flight);
@@ -494,8 +530,17 @@ pub fn start_watching(
                     let table = table.clone();
                     tokio::spawn(async move {
                         let _guard = InFlightGuard::new(in_flight);
-                        process_ready_async(&pool, subs.as_deref(), &dir, &table, &path, &stats)
-                            .await;
+                        process_ready_with_recovery(
+                            &pool_slot,
+                            &engine_handle,
+                            concurrency,
+                            subs.as_deref(),
+                            &dir,
+                            &table,
+                            &path,
+                            &stats,
+                        )
+                        .await;
                         if let Ok(mut set) = in_flight_paths.lock() {
                             set.remove(&path);
                         }
@@ -608,8 +653,51 @@ fn strip_ready_suffix(ready_path: &Path) -> Option<PathBuf> {
 /// ingest (including the `BEGIN / COMMIT`) and released on scope exit
 /// via the `PooledConnection` Drop. Other ingest tasks run in parallel
 /// on their own connections, up to the pool's `max_size`.
-async fn process_ready_async(
+/// Ingest one ready file and return `Ok(rows)` on success, or the
+/// underlying error. Pure ingest path — no file moves, no stats writes.
+/// The wrapper layer ([`process_ready_with_recovery`]) handles those
+/// after deciding whether the error is recoverable.
+async fn ingest_one_ready_file(
     pool: &Arc<Pool>,
+    table: &str,
+    ready_path: &Path,
+    data_path: &Path,
+) -> Result<u64, McpError> {
+    let conn = pool.get().await.map_err(|e| {
+        McpError::new(
+            ErrorCode::InternalError,
+            format!("Failed to check out connection: {e}"),
+        )
+    })?;
+    let opts = IngestOptions {
+        table: table.to_string(),
+        mode: "append".into(),
+        schema_override: None,
+        merge_key: None,
+    };
+    let data_str = data_path
+        .to_str()
+        .ok_or_else(|| McpError::new(ErrorCode::InternalError, "Non-UTF-8 path"))?;
+    let res = match detect_file_format(data_path) {
+        InferredFileFormat::Parquet => ingest_parquet_file_async(&conn, data_str, &opts).await,
+        InferredFileFormat::ArrowIpc => ingest_arrow_ipc_file_async(&conn, data_str, &opts).await,
+        InferredFileFormat::Json => ingest_json_file_async(&conn, data_str, &opts).await,
+        InferredFileFormat::Csv => ingest_csv_file_async(&conn, data_str, &opts).await,
+    }?;
+    let _ = ready_path; // silence the unused-variable lint; the path is used by the caller
+    Ok(res.rows)
+}
+
+/// Ingest one ready file with one-shot pool-rebuild recovery. If the
+/// first attempt fails with a connection-lost error (hyperd was
+/// restarted by the daemon, or the pool's connections went stale), the
+/// watcher rebuilds its pool from the engine's *current* endpoint and
+/// retries the ingest exactly once. Persistent errors fall through to
+/// the standard `failed/` move.
+async fn process_ready_with_recovery(
+    pool_slot: &tokio::sync::RwLock<Arc<Pool>>,
+    engine: &Arc<Mutex<Option<Engine>>>,
+    concurrency: usize,
     subscriptions: Option<&SubscriptionRegistry>,
     dir: &Path,
     table: &str,
@@ -624,10 +712,6 @@ async fn process_ready_async(
     if !ready_path.exists() || !data_path.exists() {
         return;
     }
-    // Reject symlinks for both the sentinel and the data file. A symlink swap
-    // between this check and the open could redirect ingest to read sensitive
-    // files (e.g. /etc/passwd) into the table. Producers writing the sentinel
-    // and data file as regular files (the documented protocol) are unaffected.
     let is_symlink = |p: &std::path::Path| {
         p.symlink_metadata()
             .is_ok_and(|m| m.file_type().is_symlink())
@@ -641,34 +725,38 @@ async fn process_ready_async(
         return;
     }
 
-    let result = async {
-        let conn = pool.get().await.map_err(|e| {
-            McpError::new(
-                ErrorCode::InternalError,
-                format!("Failed to check out connection: {e}"),
-            )
-        })?;
+    // First attempt — uses whatever pool is currently in the slot.
+    let active_pool = pool_slot.read().await.clone();
+    let mut result = ingest_one_ready_file(&active_pool, table, ready_path, &data_path).await;
+    drop(active_pool);
 
-        let opts = IngestOptions {
-            table: table.to_string(),
-            mode: "append".into(),
-            schema_override: None,
-            merge_key: None,
-        };
-        let data_str = data_path
-            .to_str()
-            .ok_or_else(|| McpError::new(ErrorCode::InternalError, "Non-UTF-8 path"))?;
-        let res = match detect_file_format(&data_path) {
-            InferredFileFormat::Parquet => ingest_parquet_file_async(&conn, data_str, &opts).await,
-            InferredFileFormat::ArrowIpc => {
-                ingest_arrow_ipc_file_async(&conn, data_str, &opts).await
+    // If the first attempt failed with what looks like a connection
+    // loss, try rebuilding the pool once and retrying. Hyperd restarts
+    // (daemon-managed) reuse the same endpoint slot but invalidate
+    // every connection in the pool; without this branch the watcher
+    // would route every subsequent file to `failed/` until the user
+    // notices and re-issues `watch_directory`.
+    if let Err(ref err) = result {
+        if crate::error::is_connection_lost(&err.message) {
+            tracing::warn!(
+                err = %err.message,
+                "watcher: detected connection-lost error, rebuilding pool and retrying"
+            );
+            match rebuild_watcher_pool(pool_slot, engine, concurrency).await {
+                Ok(()) => {
+                    let active_pool = pool_slot.read().await.clone();
+                    result =
+                        ingest_one_ready_file(&active_pool, table, ready_path, &data_path).await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        err = %e.message,
+                        "watcher: pool rebuild failed; the original ingest error will surface"
+                    );
+                }
             }
-            InferredFileFormat::Json => ingest_json_file_async(&conn, data_str, &opts).await,
-            InferredFileFormat::Csv => ingest_csv_file_async(&conn, data_str, &opts).await,
-        }?;
-        Ok::<u64, McpError>(res.rows)
+        }
     }
-    .await;
 
     match result {
         Ok(rows) => {

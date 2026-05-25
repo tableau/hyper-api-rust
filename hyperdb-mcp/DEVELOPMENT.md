@@ -243,7 +243,7 @@ Two new code paths fire `report_hyperd_error_to_daemon` (best-effort, 200ms time
 ### Known limitations
 
 - **Hung-but-alive `hyperd`** (TCP listening, but unresponsive to queries) is NOT detected. The monitor's `try_wait()` returns `None` for a hung process; client tool calls hang on the read side without producing a `ConnectionLost` error. Operator recovery is `hyperdb-mcp daemon stop` followed by reconnect.
-- **Watchers (background tasks holding `AsyncConnection` handles in `WatcherRegistry`)** do not currently auto-reconnect after a hyperd restart. They will go quiet until the user re-issues `watch_directory`.
+- **Watchers** auto-recover from hyperd restarts: when an ingest fails with a connection-lost error, the watcher rebuilds its connection pool against the engine's current endpoint and retries the file once. Persistent failures (the second attempt also fails) fall through to the standard `failed/` move so a single broken file can't keep the watcher pinned in retry loops.
 
 See `src/daemon/{mod,discovery,health,run,spawn}.rs` for the full implementation.
 

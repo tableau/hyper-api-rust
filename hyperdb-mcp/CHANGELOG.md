@@ -59,6 +59,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   who want a pristine `.hyper` for export can `DROP TABLE _table_catalog`
   once after creation; subsequent opens won't recreate it.
 
+### Performance
+
+- **Per-engine `_table_catalog` presence cache.** Catalog reads/writes
+  used to round-trip a `pg_catalog.pg_tables` probe on every call;
+  now the existence check is cached for the engine's lifetime and
+  primed immediately after `CREATE TABLE IF NOT EXISTS`.
+
+### Fixed
+
+- **Watcher recovery after hyperd restart.** The watcher's connection
+  pool now auto-rebuilds when a per-file ingest hits a connection-lost
+  error (typically after the daemon restarts hyperd). Each ingest gets
+  one retry on a fresh pool; persistent failures still flow into the
+  standard `failed/` move so a single broken file can't pin the
+  watcher in retry loops.
+
 ## [0.1.1] - 2026-05-13
 
 ### Added
