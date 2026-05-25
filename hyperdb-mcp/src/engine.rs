@@ -522,7 +522,14 @@ impl Engine {
                 // and attachment registry lookups always agree.
                 Ok(Self::PERSISTENT_ALIAS.to_string())
             }
-            Some(other) => Ok(other.to_string()),
+            // Non-persistent aliases are also canonicalized to lowercase
+            // so qualified SQL like `"alias"."public"."t"` matches the
+            // ATTACH form, which `AttachRegistry::attach` lowercases.
+            // Without this, `database="MyDB"` would build qualified SQL
+            // referring to `"MyDB"` while the engine attached as
+            // `"mydb"`, and Hyper (case-sensitive on quoted identifiers)
+            // would reject the lookup.
+            Some(other) => Ok(other.to_ascii_lowercase()),
         }
     }
 

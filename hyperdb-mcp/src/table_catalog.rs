@@ -103,7 +103,12 @@ fn qualified_catalog_in(engine: &Engine, target_db: Option<&str>) -> Option<Stri
             }
             Engine::PERSISTENT_ALIAS.to_string()
         }
-        Some(a) => a.to_string(),
+        // User-attached alias: lowercase to match the form
+        // `AttachRegistry::attach` stores. Hyper is case-sensitive on
+        // quoted identifiers, so `"MyDB"` and `"mydb"` are different
+        // databases; the registry's lowercase storage is the only
+        // form ATTACH actually used.
+        Some(a) => a.to_ascii_lowercase(),
     };
     let alias_esc = alias.replace('"', "\"\"");
     Some(format!(
@@ -777,7 +782,9 @@ fn resolve_catalog_alias(engine: &Engine, target_db: Option<&str>) -> Option<Str
                 None
             }
         }
-        Some(a) => Some(a.to_string()),
+        // User-attached alias: lowercase to match the registry's
+        // canonical storage form (see `AttachRegistry::attach`).
+        Some(a) => Some(a.to_ascii_lowercase()),
     }
 }
 

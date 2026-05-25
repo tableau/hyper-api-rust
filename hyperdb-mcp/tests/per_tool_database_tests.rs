@@ -867,3 +867,145 @@ fn set_metadata_in_missing_row_names_target_database_in_error() {
 // reachable from this integration test layer without going through
 // the rmcp tool router. They land in the end-to-end MCP test harness
 // (Iter 6).
+
+// =====================================================================
+// M5 — alias canonicalization at attach time. The registry stores
+// aliases lowercased, every lookup canonicalizes the input, and
+// `Engine::resolve_target_db` lowercases non-persistent aliases so
+// qualified SQL identifiers match the form used in `ATTACH DATABASE`.
+// =====================================================================
+
+/// Attaching with mixed case stores the lowercased form. `list()`
+/// reflects the canonical form; `get()` accepts any case.
+#[test]
+fn attach_canonicalizes_alias_to_lowercase_at_attach_time() {
+    use hyperdb_mcp::attach::{AttachRegistry, AttachRequest, AttachSource, OnMissing};
+
+    let dir = TempDir::new().unwrap();
+    let primary = dir.path().join("primary.hyper");
+    let attached = dir.path().join("attached.hyper");
+
+    let engine = Engine::new_no_daemon(Some(primary.to_string_lossy().into())).unwrap();
+    let reg = AttachRegistry::new();
+    reg.attach(
+        &engine,
+        AttachRequest {
+            alias: "User_DB".into(),
+            source: AttachSource::LocalFile { path: attached },
+            writable: true,
+            on_missing: OnMissing::Create,
+        },
+    )
+    .unwrap();
+
+    let listed = reg.list();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed[0].alias, "user_db",
+        "attach must store the alias in lowercase"
+    );
+
+    // get() canonicalizes its input, so any casing finds the entry.
+    assert!(reg.get("user_db").is_some(), "lowercase get must find");
+    assert!(reg.get("User_DB").is_some(), "mixed-case get must find");
+    assert!(reg.get("USER_DB").is_some(), "uppercase get must find");
+}
+
+/// Detach accepts any casing — pre-M5 it returned `Ok(false)` when the
+/// case didn't match the stored form, leaving the catalog cache stale.
+#[test]
+fn detach_after_canonicalization_is_case_insensitive() {
+    use hyperdb_mcp::attach::{AttachRegistry, AttachRequest, AttachSource, OnMissing};
+
+    let dir = TempDir::new().unwrap();
+    let primary = dir.path().join("primary.hyper");
+    let attached = dir.path().join("attached.hyper");
+
+    let engine = Engine::new_no_daemon(Some(primary.to_string_lossy().into())).unwrap();
+    let reg = AttachRegistry::new();
+    reg.attach(
+        &engine,
+        AttachRequest {
+            alias: "User_DB".into(),
+            source: AttachSource::LocalFile { path: attached },
+            writable: true,
+            on_missing: OnMissing::Create,
+        },
+    )
+    .unwrap();
+
+    let detached = reg.detach(&engine, "user_db").unwrap();
+    assert!(detached, "detach with lowercase must succeed");
+    assert!(reg.list().is_empty());
+}
+
+/// After a mixed-case attach, the per-DB catalog is reachable via the
+/// canonical (lowercase) qualified SQL form. `Engine::resolve_target_db`
+/// now lowercases non-persistent aliases so the SQL identifier always
+/// matches the ATTACH form, which the registry lowercases.
+#[test]
+fn qualified_catalog_in_uses_canonical_alias_after_attach() {
+    use hyperdb_mcp::attach::{AttachRegistry, AttachRequest, AttachSource, OnMissing};
+
+    let dir = TempDir::new().unwrap();
+    let primary = dir.path().join("primary.hyper");
+    let attached = dir.path().join("attached.hyper");
+
+    let engine = Engine::new_no_daemon(Some(primary.to_string_lossy().into())).unwrap();
+    let reg = AttachRegistry::new();
+    reg.attach(
+        &engine,
+        AttachRequest {
+            alias: "User_DB".into(),
+            source: AttachSource::LocalFile { path: attached },
+            writable: true,
+            on_missing: OnMissing::Create,
+        },
+    )
+    .unwrap();
+
+    // The mixed-case input survives `resolve_target_db` as the
+    // canonical lowercase form, so qualified writes target the
+    // lowercase database name that ATTACH actually used.
+    let resolved = engine.resolve_target_db(Some("User_DB")).unwrap();
+    assert_eq!(resolved, "user_db");
+
+    // Direct qualified SELECT against the lowercase form must find the
+    // catalog seeded by attach-on-create.
+    let rows = engine
+        .execute_query_to_json(
+            "SELECT tablename FROM \"user_db\".pg_catalog.pg_tables \
+             WHERE schemaname = 'public' AND tablename = '_table_catalog'",
+        )
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "_table_catalog must exist under the canonical (lowercase) alias"
+    );
+
+    // Writing through `upsert_stub_in` with the user-typed mixed-case
+    // alias must land in the same canonical catalog. This is the
+    // round-trip that pre-M5 silently broke when the registry
+    // mismatched the qualified-SQL form.
+    engine
+        .execute_command("CREATE TABLE \"user_db\".\"public\".\"my_t\" (id INT)")
+        .unwrap();
+    hyperdb_mcp::table_catalog::upsert_stub_in(
+        &engine,
+        "my_t",
+        "load_data",
+        None,
+        Some(0),
+        true,
+        Some("User_DB"),
+    )
+    .unwrap();
+    let rows = engine
+        .execute_query_to_json(
+            "SELECT table_name FROM \"user_db\".\"public\".\"_table_catalog\" \
+             WHERE table_name = 'my_t'",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+}

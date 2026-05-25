@@ -107,6 +107,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `Engine::catalog_present_cache` field shape: `Mutex<Option<bool>>` → `Mutex<HashMap<String, bool>>` keyed by lowercased alias.
 - New `Engine::clear_catalog_cache_for(alias)` paired with `detach_database`.
 - `table_catalog::ensure_exists_in_database(engine, alias)` is now a deprecated wrapper over `ensure_exists_in(engine, Some(alias))`.
+- **Attach aliases are canonicalized to lowercase at attach time.**
+  `attach_database(alias="MyDB", …)` now stores `"mydb"` in the registry,
+  and `Engine::resolve_target_db` returns the lowercase form for any
+  alias. Eliminates the latent footgun where attaching as `"User_DB"`
+  and detaching as `"user_db"` silently no-op'd while leaving the
+  catalog-presence cache populated. Affects users who relied on
+  case-sensitive registry distinctness — pre-1.0, no migration is
+  shipped.
 
 ### Removed
 

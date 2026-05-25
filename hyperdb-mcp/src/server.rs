@@ -2885,18 +2885,20 @@ impl HyperMcpServer {
         &self,
         Parameters(params): Parameters<DetachDatabaseParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let alias = params.alias.clone();
+        // Canonicalize to the registry's stored form. Aliases are
+        // lowercased at attach time; watcher `target_db` is also stored
+        // canonicalized (via `Engine::resolve_target_db`), so an exact
+        // `==` comparison suffices below.
+        let alias = params.alias.to_ascii_lowercase();
         // Reject if any active watcher targets this alias. Otherwise the
         // watcher's pool would keep ingesting into the now-detached
         // workspace path; or, if the user re-attached the same alias to
         // a different file, into the wrong database. Fixed by stopping
         // the watcher first via `unwatch_directory`.
         if let Ok(watchers) = self.watchers.watchers.lock() {
-            let conflict = watchers.values().find(|h| {
-                h.target_db
-                    .as_deref()
-                    .is_some_and(|a| a.eq_ignore_ascii_case(&alias))
-            });
+            let conflict = watchers
+                .values()
+                .find(|h| h.target_db.as_deref() == Some(alias.as_str()));
             if let Some(h) = conflict {
                 return Self::err_content(McpError::new(
                     ErrorCode::InvalidArgument,

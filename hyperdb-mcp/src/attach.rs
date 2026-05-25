@@ -249,8 +249,16 @@ impl AttachRegistry {
     ///   (and the optional `CREATE DATABASE IF NOT EXISTS`) executed
     ///   on the engine's connection — surfaced through the `?` operator
     ///   in the body.
-    pub fn attach(&self, engine: &Engine, req: AttachRequest) -> Result<AttachedDb, McpError> {
+    pub fn attach(&self, engine: &Engine, mut req: AttachRequest) -> Result<AttachedDb, McpError> {
         validate_alias(&req.alias)?;
+        // Canonicalize the alias to lowercase before storage so the
+        // registry, the cache key in `Engine::catalog_present_cache`,
+        // and the SQL identifier in `qualified_catalog_in` all agree.
+        // Pre-canonicalization, attach was case-sensitive while the
+        // cache and the persistent-alias check were case-insensitive,
+        // which let `attach("User_DB")` + `detach("user_db")` silently
+        // no-op while the cache stayed populated.
+        req.alias = req.alias.to_ascii_lowercase();
 
         let mut guard = self.lock()?;
         if guard.iter().any(|a| a.alias == req.alias) {
@@ -413,6 +421,9 @@ impl AttachRegistry {
     ///   `schema_search_path` afterwards is logged but NOT surfaced as
     ///   an error — the detach itself already succeeded.
     pub fn detach(&self, engine: &Engine, alias: &str) -> Result<bool, McpError> {
+        // Aliases are stored lowercased (see `attach`); accept any case
+        // from the caller and canonicalize before lookup.
+        let alias = alias.to_ascii_lowercase();
         let mut guard = self.lock()?;
         let pos = guard.iter().position(|a| a.alias == alias);
         let Some(pos) = pos else {
@@ -444,8 +455,13 @@ impl AttachRegistry {
         self.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
-    /// Lookup by alias. `None` if absent.
+    /// Lookup by alias (case-insensitive). `None` if absent.
+    ///
+    /// Aliases are stored lowercased (see [`AttachRegistry::attach`]),
+    /// so any caller supplying a mixed-case alias still finds the
+    /// stored entry.
     pub fn get(&self, alias: &str) -> Option<AttachedDb> {
+        let alias = alias.to_ascii_lowercase();
         self.lock()
             .ok()
             .and_then(|g| g.iter().find(|a| a.alias == alias).cloned())
@@ -525,6 +541,12 @@ impl AttachRegistry {
 /// - `alias` is empty or longer than 63 characters.
 /// - The first character is neither an ASCII letter nor an underscore.
 /// - Any subsequent character is outside `[A-Za-z0-9_]`.
+///
+/// Validation does NOT lowercase the alias — error messages preserve
+/// the user-typed casing. [`AttachRegistry::attach`] canonicalizes the
+/// alias to lowercase before storing it, so all downstream lookups
+/// (registry, catalog presence cache, qualified SQL identifier) agree
+/// on a single form.
 ///
 /// # Panics
 ///
