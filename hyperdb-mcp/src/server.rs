@@ -1098,6 +1098,12 @@ impl HyperMcpServer {
                 if let Ok(mut ready) = self.catalog_ready.lock() {
                     *ready = false;
                 }
+                // Tell the daemon hyperd looks dead from over here. The daemon
+                // will pick up the flag on its next monitor tick and restart.
+                // Skipped in --no-daemon mode because there's no daemon to tell.
+                if !self.no_daemon {
+                    crate::daemon::health::report_hyperd_error_to_daemon();
+                }
             }
         }
         result

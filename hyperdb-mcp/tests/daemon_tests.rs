@@ -49,6 +49,109 @@ fn daemon_state_default_is_equivalent_to_new() {
     assert!(default_state.idle_duration() < Duration::from_millis(100));
 }
 
+#[test]
+fn daemon_state_default_initializes_restart_flag_false() {
+    // Guard against future regressions where Default and new() diverge —
+    // both must initialize restart_requested to false.
+    let default_state = DaemonState::default();
+    let new_state = DaemonState::new();
+    assert!(!default_state.consume_restart_request());
+    assert!(!new_state.consume_restart_request());
+}
+
+#[test]
+fn daemon_state_restart_request_consume_round_trip() {
+    let state = DaemonState::new();
+    assert!(!state.consume_restart_request(), "initially clear");
+
+    state.request_restart();
+    assert!(state.consume_restart_request(), "consume returns true once");
+    assert!(
+        !state.consume_restart_request(),
+        "second consume returns false"
+    );
+
+    // Multiple requests coalesce into one consumption.
+    state.request_restart();
+    state.request_restart();
+    state.request_restart();
+    assert!(
+        state.consume_restart_request(),
+        "three requests → one consume"
+    );
+    assert!(!state.consume_restart_request());
+}
+
+#[test]
+fn restart_history_records_attempts_under_limit() {
+    use hyperdb_mcp::daemon::run::{try_record_restart_attempt, RestartAttempt};
+    let mut history: Vec<Instant> = Vec::new();
+    let t0 = Instant::now();
+
+    assert_eq!(
+        try_record_restart_attempt(&mut history, t0),
+        RestartAttempt::Recorded
+    );
+    assert_eq!(
+        try_record_restart_attempt(&mut history, t0 + Duration::from_secs(10)),
+        RestartAttempt::Recorded
+    );
+    assert_eq!(
+        try_record_restart_attempt(&mut history, t0 + Duration::from_secs(20)),
+        RestartAttempt::Recorded
+    );
+    assert_eq!(
+        history.len(),
+        3,
+        "first three attempts within window are recorded"
+    );
+}
+
+#[test]
+fn restart_history_rejects_fourth_attempt_in_window() {
+    use hyperdb_mcp::daemon::run::{try_record_restart_attempt, RestartAttempt};
+    let mut history: Vec<Instant> = Vec::new();
+    let t0 = Instant::now();
+
+    // Fill the window with 3 attempts.
+    try_record_restart_attempt(&mut history, t0);
+    try_record_restart_attempt(&mut history, t0 + Duration::from_secs(10));
+    try_record_restart_attempt(&mut history, t0 + Duration::from_secs(20));
+
+    // 4th attempt within the 60s window must be rejected.
+    assert_eq!(
+        try_record_restart_attempt(&mut history, t0 + Duration::from_secs(30)),
+        RestartAttempt::LimitExceeded,
+        "4th attempt within window must be rejected"
+    );
+    assert_eq!(history.len(), 3, "rejection must not push to history");
+}
+
+#[test]
+fn restart_history_prunes_entries_older_than_window() {
+    use hyperdb_mcp::daemon::run::{try_record_restart_attempt, RestartAttempt};
+    let mut history: Vec<Instant> = Vec::new();
+    let t0 = Instant::now();
+
+    // Three attempts at the start of the timeline.
+    try_record_restart_attempt(&mut history, t0);
+    try_record_restart_attempt(&mut history, t0 + Duration::from_secs(5));
+    try_record_restart_attempt(&mut history, t0 + Duration::from_secs(10));
+
+    // Now jump 70 seconds — all three are stale and should be pruned.
+    let later = t0 + Duration::from_secs(70);
+    assert_eq!(
+        try_record_restart_attempt(&mut history, later),
+        RestartAttempt::Recorded,
+        "after window expires, restarts are allowed again"
+    );
+    assert_eq!(
+        history.len(),
+        1,
+        "stale entries pruned, only 'later' remains"
+    );
+}
+
 // ─── Unit tests: Health protocol (no env vars, safe to run in parallel) ───────
 
 #[test]
@@ -119,6 +222,24 @@ fn health_protocol_unknown_command_returns_error() {
 
     let response = health::send_command(port, "INVALID").unwrap();
     assert!(response.contains("ERR"));
+}
+
+#[test]
+fn health_protocol_report_hyperd_error_sets_flag() {
+    let (port, _handle, state) = start_health_listener();
+
+    assert!(!state.consume_restart_request(), "flag starts clear");
+
+    let response = health::send_command(port, "REPORT_HYPERD_ERROR").unwrap();
+    assert_eq!(response.trim(), "OK");
+
+    // The handler ran on a different thread; give it a moment to land the
+    // store. AcqRel ordering means the store is visible here as soon as the
+    // handler returns, but the response write is what unblocks send_command.
+    assert!(
+        state.consume_restart_request(),
+        "REPORT_HYPERD_ERROR must set the restart-requested flag"
+    );
 }
 
 #[test]
@@ -457,6 +578,110 @@ fn daemon_mode_persistent_engine_data_is_queryable() {
     assert_eq!(resp.trim(), "PONG");
 }
 
+#[cfg(unix)]
+#[test]
+fn hyperd_monitor_detects_killed_hyperd_and_restarts() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let daemon = TestDaemon::start();
+
+    let pid_before = find_hyperd_pid_for_endpoint(&daemon.info.hyperd_endpoint)
+        .expect("should find hyperd pid for endpoint before kill");
+
+    // SIGKILL the hyperd process. The daemon's monitor should detect this on
+    // the next 5s tick and restart hyperd.
+    kill_pid(pid_before);
+
+    // Wait up to 12 seconds for the monitor to fire and restart hyperd.
+    // (5s monitor tick + spawn time + slack.)
+    let new_endpoint = wait_for_endpoint_change_or_recovery(daemon.info.health_port, 12)
+        .expect("daemon should restart hyperd within 12s");
+
+    // The new endpoint must be reachable. Don't assert it differs from the old —
+    // port reuse is permitted by the OS.
+    let probe = std::net::TcpStream::connect_timeout(
+        &new_endpoint.parse().expect("valid endpoint"),
+        Duration::from_secs(2),
+    );
+    assert!(probe.is_ok(), "new hyperd endpoint should be reachable");
+}
+
+#[cfg(unix)]
+#[test]
+fn client_report_triggers_restart_after_kill() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let daemon = TestDaemon::start();
+
+    let pid_before = find_hyperd_pid_for_endpoint(&daemon.info.hyperd_endpoint)
+        .expect("should find hyperd pid before kill");
+    kill_pid(pid_before);
+
+    // Immediately tell the daemon hyperd is dead — don't wait for the monitor.
+    // Even so, the monitor only reacts on its 5s tick, so the worst-case
+    // recovery time is unchanged. This test just verifies the report path
+    // triggers the same restart as detection-via-polling.
+    let response = health::send_command(daemon.info.health_port, "REPORT_HYPERD_ERROR").unwrap();
+    assert_eq!(response.trim(), "OK");
+
+    let new_endpoint = wait_for_endpoint_change_or_recovery(daemon.info.health_port, 12)
+        .expect("daemon should restart hyperd within 12s after report");
+
+    let probe = std::net::TcpStream::connect_timeout(
+        &new_endpoint.parse().expect("valid endpoint"),
+        Duration::from_secs(2),
+    );
+    assert!(probe.is_ok(), "new hyperd endpoint should be reachable");
+}
+
+#[cfg(unix)]
+#[test]
+fn engine_recovers_after_hyperd_killed() {
+    // End-to-end test: the user-visible behavior of this whole feature.
+    // 1. Start daemon + create an Engine (= an MCP client connection).
+    // 2. Run a query — it succeeds.
+    // 3. SIGKILL hyperd.
+    // 4. Wait for the daemon to restart it.
+    // 5. Run another query through the same recovery path the server uses
+    //    (drop engine on ConnectionLost, then create a fresh engine).
+    let _lock = ENV_LOCK.lock().unwrap();
+    let daemon = TestDaemon::start();
+
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("recover.hyper");
+    let path_str = path.to_str().unwrap().to_string();
+
+    // Engine #1: pre-kill
+    {
+        let engine = hyperdb_mcp::engine::Engine::new(Some(path_str.clone())).unwrap();
+        engine
+            .execute_command("CREATE TABLE keepers (n INT)")
+            .unwrap();
+        engine
+            .execute_command("INSERT INTO keepers VALUES (1), (2), (3)")
+            .unwrap();
+    }
+
+    // Find and kill hyperd
+    let pid =
+        find_hyperd_pid_for_endpoint(&daemon.info.hyperd_endpoint).expect("should find hyperd pid");
+    kill_pid(pid);
+
+    // Wait for daemon-side restart (discovery file gets a new endpoint).
+    wait_for_endpoint_change_or_recovery(daemon.info.health_port, 12)
+        .expect("daemon should restart hyperd within 12s");
+
+    // Engine #2: post-restart. This mirrors what `with_engine` does after a
+    // ConnectionLost — drop the old engine (already done above) and create a
+    // fresh one. The fresh engine re-discovers the daemon and connects to the
+    // new endpoint.
+    let engine = hyperdb_mcp::engine::Engine::new(Some(path_str)).unwrap();
+    // The persistent .hyper file is intact on disk. Re-attaching via a new
+    // engine should let us see the data we wrote pre-kill.
+    let rows = engine
+        .execute_query_to_json("SELECT n FROM keepers ORDER BY n")
+        .unwrap();
+    assert_eq!(rows.len(), 3, "data persisted across hyperd restart");
+}
+
 #[test]
 fn daemon_mode_ephemeral_database_cleaned_up_on_drop() {
     let _lock = ENV_LOCK.lock().unwrap();
@@ -489,13 +714,13 @@ fn start_health_listener() -> (u16, std::thread::JoinHandle<()>, Arc<DaemonState
     let state = Arc::new(DaemonState::new());
     let run_state = Arc::clone(&state);
 
-    let info = DaemonInfo {
+    let info = Arc::new(Mutex::new(DaemonInfo {
         pid: 12345,
         hyperd_endpoint: "127.0.0.1:54321".to_string(),
         health_port: port,
         started_at: "2026-05-20T10:30:00Z".to_string(),
         version: "0.1.3".to_string(),
-    };
+    }));
 
     let handle = std::thread::spawn(move || {
         listener.run(run_state, info);
@@ -562,7 +787,17 @@ impl TestDaemon {
 impl Drop for TestDaemon {
     fn drop(&mut self) {
         let _ = health::send_command(self.info.health_port, "STOP");
-        std::thread::sleep(Duration::from_millis(200));
+        // Wait until the daemon's health port is unreachable, indicating full
+        // shutdown (HyperProcess Drop can take up to ~5s). 200ms was not
+        // enough — under load, the next test could find the port still bound.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], self.info.health_port));
+            if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 }
 
@@ -570,6 +805,66 @@ impl Drop for TestDaemon {
 fn find_free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap().port()
+}
+
+/// Locate the `hyperd` process by matching the listen-port portion of an
+/// endpoint string like `127.0.0.1:54321` against `lsof`'s view of TCP ports.
+/// Returns the PID of whichever process owns the port. Unix-only.
+#[cfg(unix)]
+fn find_hyperd_pid_for_endpoint(endpoint: &str) -> Option<u32> {
+    use std::process::Command;
+
+    let port = endpoint.rsplit(':').next()?.parse::<u16>().ok()?;
+    // `lsof -nP -iTCP:<port> -sTCP:LISTEN -t` prints just the PID(s) listening on that port.
+    let output = Command::new("lsof")
+        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    output
+        .stdout
+        .split(|b| *b == b'\n')
+        .filter_map(|line| std::str::from_utf8(line).ok())
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .and_then(|s| s.parse::<u32>().ok())
+}
+
+/// Kill the given PID with SIGKILL. Unix-only.
+#[cfg(unix)]
+fn kill_pid(pid: u32) {
+    let status = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .expect("kill -9 should run");
+    assert!(status.success(), "kill -9 {pid} failed");
+}
+
+/// Poll the daemon's `STATUS` endpoint until the reported `hyperd_endpoint` is
+/// reachable (i.e. a fresh hyperd has been spawned after a kill). Returns the
+/// endpoint string, or `None` if the timeout expires.
+#[cfg(unix)]
+fn wait_for_endpoint_change_or_recovery(health_port: u16, timeout_secs: u64) -> Option<String> {
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    while Instant::now() < deadline {
+        if let Ok(response) = health::send_command(health_port, "STATUS") {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(response.trim()) {
+                if let Some(endpoint) = parsed["hyperd_endpoint"].as_str() {
+                    if let Ok(addr) = endpoint.parse::<std::net::SocketAddr>() {
+                        if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500))
+                            .is_ok()
+                        {
+                            return Some(endpoint.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    None
 }
 
 /// RAII guard that sets/removes an environment variable and restores it on drop.

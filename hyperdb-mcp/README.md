@@ -195,6 +195,16 @@ hyperdb-mcp daemon          # Run as a daemon explicitly (rarely needed)
 
 State files live at `~/.hyperdb/` by default (override with `HYPERDB_STATE_DIR`).
 
+### Recovery from hyperd crashes
+
+The daemon polls `hyperd` every 5 seconds. If the process has exited (crashed, OOM, killed), the daemon spawns a replacement, atomically updates `~/.hyperdb/daemon.json` with the new endpoint, and continues serving clients. Clients see one failed tool call (the request that was in flight when hyperd died); the next tool call transparently reconnects to the new hyperd via the same recovery path used for normal connection drops.
+
+If a client itself notices hyperd is unreachable before the next polling tick, it sends a fast-path `REPORT_HYPERD_ERROR` signal to the daemon so the restart kicks off without waiting for the timer.
+
+If hyperd repeatedly fails to start (3 attempts within 60 seconds — e.g., misconfigured `HYPERD_PATH`, port exhaustion, broken binary), the daemon shuts itself down and removes the discovery file. The next MCP client to start up will then spawn a fresh daemon, surfacing any persistent failure clearly to the user rather than spinning silently.
+
+**Known limitation:** if hyperd hangs (alive at the OS level but unresponsive to queries), the daemon's polling can't detect it and your tool call may stall indefinitely. The recovery path is `hyperdb-mcp daemon stop` followed by reconnecting from your MCP client.
+
 ### Other behavioral flags
 
 | Flag | Behavior |

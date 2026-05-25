@@ -21,6 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Ephemeral databases now `DETACH DATABASE` before deletion on session
   end — required on Windows where the OS enforces file locks on open
   Hyper files.
+- **Daemon-side `hyperd` restart on crash.** The daemon polls `hyperd`
+  every 5 seconds via `Child::try_wait()` and automatically restarts it
+  if the process has exited, atomically updating the discovery file
+  with the new endpoint. Clients reconnect transparently via the
+  existing `ConnectionLost` recovery path. New `REPORT_HYPERD_ERROR`
+  health-protocol command lets clients fast-path the signal when they
+  detect a dead hyperd before the daemon's polling tick. Restart
+  attempts are rate-limited to 3 per 60 seconds; exceeding the limit
+  triggers daemon shutdown so the user sees the failure clearly
+  rather than spinning silently.
 
 ## [0.1.1] - 2026-05-13
 
