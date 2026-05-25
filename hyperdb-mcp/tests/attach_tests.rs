@@ -374,37 +374,6 @@ fn on_missing_create_seeds_table_catalog_by_default() {
     );
 }
 
-/// Bare policy (`with_catalog_policy(false)`): the registry never
-/// seeds `_table_catalog` into an attached database — even one we
-/// just created. Mirrors `--bare` at the server level, where no
-/// workspace file is allowed to accumulate MCP bookkeeping.
-#[test]
-fn on_missing_create_does_not_seed_under_bare_policy() {
-    let (engine, dir) = primary_workspace();
-    let target = dir.path().join("bare.hyper");
-    assert!(!target.exists());
-
-    let registry = AttachRegistry::with_catalog_policy(false);
-    registry
-        .attach(
-            &engine,
-            AttachRequest {
-                alias: "bare".into(),
-                source: AttachSource::LocalFile {
-                    path: target.clone(),
-                },
-                writable: true,
-                on_missing: OnMissing::Create,
-            },
-        )
-        .unwrap();
-
-    assert!(
-        !attached_db_has_table_catalog(&engine, "bare"),
-        "bare policy must not seed _table_catalog, even on a freshly created file"
-    );
-}
-
 /// Attaching an *existing* database in read/write mode never adds
 /// `_table_catalog`, regardless of policy — the attached file only
 /// gets seeded at creation time. This keeps the "treat existing DBs

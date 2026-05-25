@@ -205,50 +205,30 @@ pub struct AttachRequest {
 /// Live set of attachments keyed by alias. Thread-safe via an internal
 /// `Mutex`; all operations are serial, which matches the rest of the
 /// engine's single-connection model.
+///
+/// The registry holds *user-attached* databases — the default persistent
+/// database is attached directly by [`crate::engine::Engine`] and isn't
+/// tracked here. Replay-on-reconnect only re-issues the user attaches;
+/// the engine re-attaches persistent itself when it's reconstructed.
 #[derive(Debug)]
 pub struct AttachRegistry {
     // Insertion-ordered so replay happens in the same order the user
     // originally attached — matters if attachment B references objects
     // that rely on attachment A (not today, but cheap to preserve).
     inner: Mutex<Vec<AttachedDb>>,
-    /// When `true`, a successful `attach` that just created a fresh
-    /// `.hyper` file via `on_missing: create` also stamps an empty
-    /// `_table_catalog` into the new database (fully qualified as
-    /// `"{alias}"."public"."_table_catalog"`). Exactly mirrors the
-    /// primary-workspace policy in
-    /// [`crate::server::HyperMcpServer::ensure_catalog_ready`]:
-    /// non-bare servers get a catalog on newly-created databases,
-    /// bare servers never touch the file beyond the `ATTACH` itself.
-    /// Attaching an *existing* database never seeds regardless of
-    /// this flag.
-    seed_catalog_on_create: bool,
 }
 
 impl Default for AttachRegistry {
     fn default() -> Self {
-        Self::with_catalog_policy(true)
+        Self::new()
     }
 }
 
 impl AttachRegistry {
-    /// Convenience for tests and the default `HyperMcpServer` flow.
-    /// Seeds `_table_catalog` on newly-created databases (non-bare
-    /// policy). Bare servers must use
-    /// [`AttachRegistry::with_catalog_policy`] with `false` instead.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Explicit-policy constructor. `seed_catalog_on_create = false`
-    /// matches `--bare`: the registry will never stamp
-    /// `_table_catalog` into any attached database (neither freshly
-    /// created nor pre-existing).
-    #[must_use]
-    pub fn with_catalog_policy(seed_catalog_on_create: bool) -> Self {
         Self {
             inner: Mutex::new(Vec::new()),
-            seed_catalog_on_create,
         }
     }
 
@@ -374,19 +354,18 @@ impl AttachRegistry {
         // Seed `_table_catalog` into a freshly-created attached
         // database so opening that file as a primary workspace later
         // (on a fresh MCP instance) finds the catalog ready and skips
-        // the backfill sweep. Intentionally gated on *both*:
-        //
-        //   1. `file_was_created` — attaching an existing database
-        //      must never mutate its schema, regardless of contents.
-        //   2. `self.seed_catalog_on_create` — bare servers use
-        //      `with_catalog_policy(false)` so the workspace stays
-        //      pristine end-to-end.
+        // the backfill sweep. Gated on `file_was_created` only:
+        // attaching an *existing* database must never mutate its
+        // schema, regardless of contents. (`--bare` used to add a
+        // second gate via `seed_catalog_on_create`; that flag was
+        // removed when `--bare` was retired in favor of the uniform
+        // "always seed on create" policy.)
         //
         // On failure we roll back the attach to preserve the
         // all-or-nothing contract: the user asked for "create a new
-        // DB (non-bare)" which implicitly promises a catalog; leaving
-        // an attached-but-unseeded file would silently violate that.
-        if file_was_created && self.seed_catalog_on_create {
+        // DB" which implicitly promises a catalog; leaving an
+        // attached-but-unseeded file would silently violate that.
+        if file_was_created {
             if let Err(e) = crate::table_catalog::ensure_exists_in_database(engine, &req.alias) {
                 let detach_sql = format!("DETACH DATABASE \"{}\"", req.alias.replace('"', "\"\""));
                 if let Err(de) = engine.execute_command(&detach_sql) {
