@@ -507,7 +507,7 @@ impl Engine {
     pub fn resolve_target_db(&self, requested: Option<&str>) -> Result<String, McpError> {
         match requested.map(str::trim) {
             None | Some("") => Ok(self.primary_db_name()),
-            Some(Self::PERSISTENT_ALIAS) => {
+            Some(other) if other.eq_ignore_ascii_case(Self::PERSISTENT_ALIAS) => {
                 if self.persistent_path.is_none() {
                     return Err(McpError::new(
                         ErrorCode::InvalidArgument,
@@ -516,6 +516,8 @@ impl Engine {
                             .to_string(),
                     ));
                 }
+                // Canonicalize to the lowercase form so SQL identifiers
+                // and attachment registry lookups always agree.
                 Ok(Self::PERSISTENT_ALIAS.to_string())
             }
             Some(other) => Ok(other.to_string()),

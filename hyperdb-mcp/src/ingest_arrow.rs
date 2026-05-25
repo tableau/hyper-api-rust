@@ -693,8 +693,19 @@ pub async fn ingest_arrow_ipc_file_async(
 
     conn.begin_transaction().await.map_err(McpError::from)?;
     let result: Result<u64, McpError> = async {
-        crate::ingest::create_table_async(conn, &opts.table, &columns, is_replace).await?;
+        crate::ingest::create_table_async(
+            conn,
+            &opts.table,
+            &columns,
+            is_replace,
+            opts.target_db.as_deref(),
+        )
+        .await?;
 
+        // AsyncArrowInserter resolves table names via the connection's
+        // search path. When targeting a non-primary DB, qualify the
+        // TableDefinition with that database. (Same trick the sync
+        // Arrow IPC path uses via scoped_search_path.)
         let mut inserter =
             hyperdb_api::AsyncArrowInserter::new(conn, &table_def).map_err(McpError::from)?;
         inserter

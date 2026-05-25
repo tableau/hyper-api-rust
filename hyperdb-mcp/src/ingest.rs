@@ -918,10 +918,11 @@ pub async fn ingest_csv_file_async(
     let schema_ms = schema_timer.elapsed_ms();
 
     let canonical = canonicalize_for_copy(abs_path);
+    let qualified = qualified_table(opts);
     // `NULL ''` — unquoted empty cells load as SQL NULL (see sync twin).
     let copy_sql = format!(
-        "COPY \"{}\" FROM {} WITH (FORMAT csv, NULL '', DELIMITER ',', HEADER)",
-        opts.table,
+        "COPY {} FROM {} WITH (FORMAT csv, NULL '', DELIMITER ',', HEADER)",
+        qualified,
         hyperdb_api::escape_string_literal(canonical.to_str().unwrap_or(""))
     );
 
@@ -929,7 +930,14 @@ pub async fn ingest_csv_file_async(
 
     conn.begin_transaction().await.map_err(McpError::from)?;
     let inner: Result<u64, McpError> = async {
-        create_table_async(conn, &opts.table, &columns, is_replace).await?;
+        create_table_async(
+            conn,
+            &opts.table,
+            &columns,
+            is_replace,
+            opts.target_db.as_deref(),
+        )
+        .await?;
         conn.execute_command(&copy_sql)
             .await
             .map_err(McpError::from)
@@ -1068,10 +1076,18 @@ pub async fn ingest_json_async(
     }
 
     let is_replace = opts.mode != "append";
+    let qualified = qualified_table(opts);
 
     conn.begin_transaction().await.map_err(McpError::from)?;
     let inner: Result<u64, McpError> = async {
-        create_table_async(conn, &opts.table, &columns, is_replace).await?;
+        create_table_async(
+            conn,
+            &opts.table,
+            &columns,
+            is_replace,
+            opts.target_db.as_deref(),
+        )
+        .await?;
         let mut row_count = 0u64;
         let col_names: Vec<String> = columns.iter().map(|c| format!("\"{}\"", c.name)).collect();
         for obj in &array {
@@ -1087,8 +1103,8 @@ pub async fn ingest_json_async(
                 .collect();
 
             let sql = format!(
-                "INSERT INTO \"{}\" ({}) VALUES ({})",
-                opts.table,
+                "INSERT INTO {} ({}) VALUES ({})",
+                qualified,
                 col_names.join(", "),
                 values.join(", ")
             );
@@ -1187,6 +1203,7 @@ pub(crate) async fn create_table_async(
     table_name: &str,
     columns: &[ColumnSchema],
     replace: bool,
+    target_db: Option<&str>,
 ) -> Result<(), McpError> {
     if columns.is_empty() {
         return Err(McpError::new(
@@ -1206,7 +1223,14 @@ pub(crate) async fn create_table_async(
         }
     }
 
-    let quoted_table = format!("\"{}\"", table_name.replace('"', "\"\""));
+    let quoted_table = match target_db {
+        Some(db) => {
+            let esc_db = db.replace('"', "\"\"");
+            let esc_tbl = table_name.replace('"', "\"\"");
+            format!("\"{esc_db}\".\"public\".\"{esc_tbl}\"")
+        }
+        None => format!("\"{}\"", table_name.replace('"', "\"\"")),
+    };
     if replace {
         conn.execute_command(&format!("DROP TABLE IF EXISTS {quoted_table}"))
             .await

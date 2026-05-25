@@ -203,7 +203,9 @@ describe({ database: "persistent" })
 sample({ table: "customers", database: "persistent" })
 ```
 
-The `database` parameter is available on `query`, `query_data`, `query_file`, `execute`, `load_data`, `load_file`, `describe`, `sample`, `chart`, and `export`. The shorthand `persist: true` (sugar for `database: "persistent"`) is available on `load_data` and `load_file`. Pass any user-attached writable alias (created via `attach_database`) to target a custom database.
+The `database` parameter is available on `query`, `execute`, `load_data`, `load_file`, `describe`, `sample`, `chart`, and `export`. The shorthand `persist: true` (sugar for `database: "persistent"`) is available on `load_data` and `load_file`. Pass any user-attached writable alias (created via `attach_database`) to target a custom database.
+
+(`query_data` and `query_file` are one-shot tools that materialize the inline data into their own temp table and query it — they do not accept a `database` parameter because the data isn't in a persisted database to begin with.)
 
 **2. Fully-qualified SQL** (for power users or complex multi-DB joins):
 

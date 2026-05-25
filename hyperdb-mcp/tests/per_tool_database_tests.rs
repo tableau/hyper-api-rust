@@ -362,3 +362,45 @@ fn scoped_search_path_redirects_and_restores() {
         .unwrap();
     assert_eq!(rows.len(), 2, "search path restored to primary (2 rows)");
 }
+
+// --- Case-insensitive PERSISTENT_ALIAS matching ----------------------------
+
+/// `"Persistent"`, `"PERSISTENT"`, `"persistent"` all resolve to the
+/// canonical lowercase alias so the rest of the routing stack — quoted
+/// SQL identifiers, attachment registry — sees a single form.
+#[test]
+fn resolve_target_db_persistent_is_case_insensitive() {
+    let te = TestEngine::new_ephemeral();
+    for variant in ["persistent", "Persistent", "PERSISTENT", "PerSiStEnT"] {
+        let resolved = te
+            .engine
+            .resolve_target_db(Some(variant))
+            .unwrap_or_else(|e| panic!("variant {variant:?} should resolve: {}", e.message));
+        assert_eq!(
+            resolved, "persistent",
+            "variant {variant:?} must canonicalize to lowercase"
+        );
+    }
+}
+
+/// Case-insensitive matching also applies to the ephemeral-only error
+/// path: `"PERSISTENT"` in ephemeral-only mode returns `InvalidArgument`,
+/// not a confusing "database not found" later.
+#[test]
+fn resolve_target_db_persistent_uppercase_errors_in_ephemeral_only() {
+    let engine = Engine::new_no_daemon(None).expect("ephemeral engine");
+    let err = engine
+        .resolve_target_db(Some("PERSISTENT"))
+        .expect_err("uppercase persistent must reject too");
+    assert_eq!(err.code, ErrorCode::InvalidArgument);
+}
+
+// Note on coverage: server-handler-level rejection paths (load_file
+// merge+database, load_files+database, watch_directory+database,
+// export format=hyper+database, attach-readonly+writable-required)
+// are not reachable from this integration test layer without going
+// through the rmcp tool router. The compile-time signatures of
+// `create_table_async` / `build_parquet_ingest_sql` exercising the
+// new `target_db` parameter cover the structural contract; the
+// runtime rejection paths are covered by manual smoke tests and
+// will land in a follow-up end-to-end MCP test harness.

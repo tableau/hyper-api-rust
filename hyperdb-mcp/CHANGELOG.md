@@ -51,15 +51,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   live in the persistent attachment instead of the connection's
   primary, so saved queries automatically persist across sessions
   without any flag toggling.
-- **Per-tool `database` parameter.** `query`, `query_data`,
-  `query_file`, `execute`, `load_data`, `load_file`, `describe`,
-  `sample`, `chart`, and `export` now accept an optional
-  `database: string` parameter. Omit (or pass `"local"`) to target
-  the ephemeral primary; pass `"persistent"` to target the durable
-  database, or any user-attached writable alias. Tools that build
-  their own SQL fully qualify table references; tools that take
-  user-provided SQL temporarily redirect `schema_search_path` for
-  the call duration via an RAII guard that always restores on drop.
+- **Per-tool `database` parameter.** `query`, `execute`, `load_data`,
+  `load_file`, `describe`, `sample`, `chart`, and `export` now accept
+  an optional `database: string` parameter. Omit (or pass `"local"`)
+  to target the ephemeral primary; pass `"persistent"` to target the
+  durable database (case-insensitive), or any user-attached writable
+  alias. Tools that build their own SQL fully qualify table
+  references; tools that take user-provided SQL temporarily redirect
+  `schema_search_path` for the call duration via an RAII guard that
+  always restores on drop. (`query_data` and `query_file` materialize
+  inline data into a temp table; they don't accept the parameter.)
 - **`persist: true` shorthand on ingest tools.** `load_data` and
   `load_file` accept a boolean `persist` flag — equivalent to
   `database: "persistent"` — for ergonomic LLM workflows like
