@@ -376,6 +376,10 @@ pub struct LoadIcebergParams {
 pub struct QueryParams {
     /// SQL SELECT / WITH / EXPLAIN / SHOW / VALUES statement (read-only)
     pub sql: String,
+    /// Target database alias for unqualified name resolution. Omit to
+    /// query the ephemeral primary. Pass `"persistent"` to route to the
+    /// durable database, or any user-attached alias.
+    pub database: Option<String>,
 }
 
 /// Parameters for the mutating `execute` workspace tool.
@@ -383,6 +387,10 @@ pub struct QueryParams {
 pub struct ExecuteParams {
     /// DDL/DML SQL statement (CREATE, INSERT, UPDATE, DELETE, DROP, ALTER, COPY, etc.)
     pub sql: String,
+    /// Target database alias for unqualified name resolution. Omit to
+    /// run against the ephemeral primary. Pass `"persistent"` to write
+    /// to the durable database (or a writable user-attached alias).
+    pub database: Option<String>,
 }
 
 /// Parameters for the `sample` convenience tool.
@@ -392,6 +400,9 @@ pub struct SampleParams {
     pub table: String,
     /// Number of rows to return (default: 5, max: 100)
     pub n: Option<u64>,
+    /// Target database alias. Omit to sample from the ephemeral primary;
+    /// pass `"persistent"` or a user-attached alias to sample from there.
+    pub database: Option<String>,
 }
 
 /// Parameters for the `describe` tool. Both fields are optional to preserve
@@ -402,6 +413,10 @@ pub struct DescribeParams {
     /// If set, return the schema and row count for just this table. Omit to
     /// list every public table in the workspace.
     pub table: Option<String>,
+    /// Target database alias. Omit to describe tables in the ephemeral
+    /// primary; pass `"persistent"` or a user-attached alias to describe
+    /// tables in another database.
+    pub database: Option<String>,
 }
 
 /// Parameters for the `chart` tool.
@@ -467,6 +482,10 @@ pub struct ChartParams {
     /// and return `PERMISSION_DENIED` without touching it. Defaults to
     /// true (overwrite silently), matching the `export` tool.
     pub overwrite: Option<bool>,
+    /// Target database alias for unqualified name resolution in the
+    /// chart's SQL. Omit to query the ephemeral primary. Pass
+    /// `"persistent"` or a user-attached alias to chart from there.
+    pub database: Option<String>,
 }
 
 /// Parameters for the `watch_directory` tool.
@@ -549,6 +568,12 @@ pub struct ExportParams {
     ///
     /// Ignored for `format = "hyper"` (which isn't a `COPY`).
     pub format_options: Option<Value>,
+    /// Source database alias. Omit to read from the ephemeral primary.
+    /// Pass `"persistent"` or a user-attached alias to export from there.
+    /// In `table` mode, the table name is fully qualified against this
+    /// database. In `sql` mode, unqualified names in the SQL resolve
+    /// against this database for the duration of the call.
+    pub database: Option<String>,
 }
 
 /// Parameters for the `save_query` tool.
@@ -2039,6 +2064,13 @@ impl HyperMcpServer {
                     "The query tool only accepts read-only SQL (SELECT, WITH, EXPLAIN, SHOW, VALUES). Use the execute tool for DDL/DML.",
                 ));
             }
+            // Optional database routing — temporarily redirect search_path
+            // for the duration of this call. Restored on guard drop.
+            let target_db = self.resolve_db(engine, params.database.as_deref(), None, false)?;
+            let _search_guard = match target_db {
+                Some(ref alias) => Some(engine.scoped_search_path(alias)?),
+                None => None,
+            };
             // Cap result-set size sent back to the LLM. Larger result sets blow
             // the model's context window and stall the conversation. Users who
             // need full scans should use `export` to write to a file.
@@ -2114,6 +2146,13 @@ impl HyperMcpServer {
                     "The execute tool is for DDL/DML. Use the query tool for SELECT/WITH/EXPLAIN statements.",
                 ));
             }
+            // Optional database routing — temporarily redirect search_path.
+            // require_writable=true ensures non-primary aliases must be writable.
+            let target_db = self.resolve_db(engine, params.database.as_deref(), None, true)?;
+            let _search_guard = match target_db {
+                Some(ref alias) => Some(engine.scoped_search_path(alias)?),
+                None => None,
+            };
             let timer = crate::stats::StatsTimer::start();
             let affected = engine.execute_command(&params.sql)?;
             let elapsed = timer.elapsed_ms();
@@ -2154,9 +2193,10 @@ impl HyperMcpServer {
         Parameters(params): Parameters<SampleParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self.with_engine(|engine| {
+            let target_db = self.resolve_db(engine, params.database.as_deref(), None, false)?;
             let timer = crate::stats::StatsTimer::start();
             let n = params.n.unwrap_or(5);
-            let mut sample = engine.sample_table(&params.table, n)?;
+            let mut sample = engine.sample_table_in(target_db.as_deref(), &params.table, n)?;
             let elapsed = timer.elapsed_ms();
             if let Some(obj) = sample.as_object_mut() {
                 obj.insert(
@@ -2200,6 +2240,14 @@ impl HyperMcpServer {
                 params.format.as_deref(),
                 params.output_path.as_deref(),
             )?;
+
+            // Optional database routing — temporarily redirect search_path
+            // so unqualified names in the chart SQL resolve there.
+            let target_db = self.resolve_db(engine, params.database.as_deref(), None, false)?;
+            let _search_guard = match target_db {
+                Some(ref alias) => Some(engine.scoped_search_path(alias)?),
+                None => None,
+            };
 
             let timer = crate::stats::StatsTimer::start();
             let rows = engine.execute_query_to_json(&params.sql)?;
@@ -2371,9 +2419,14 @@ impl HyperMcpServer {
         &self,
         Parameters(params): Parameters<DescribeParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let result = self.with_engine(|engine| match params.table.as_deref() {
-            Some(name) => engine.describe_table(name).map(|t| vec![t]),
-            None => engine.describe_tables(),
+        let result = self.with_engine(|engine| {
+            let target_db = self.resolve_db(engine, params.database.as_deref(), None, false)?;
+            match params.table.as_deref() {
+                Some(name) => engine
+                    .describe_table_in(target_db.as_deref(), name)
+                    .map(|t| vec![t]),
+                None => engine.describe_tables_in(target_db.as_deref()),
+            }
         });
 
         match result {
@@ -2448,9 +2501,35 @@ impl HyperMcpServer {
                     ));
                 }
             };
+            // Database routing. Two strategies:
+            // - `table` mode + non-primary: synthesize a fully-qualified
+            //   SELECT and pass it as `sql` so export.rs's name-quoting
+            //   doesn't double-quote our identifier.
+            // - `sql` mode + non-primary: redirect search_path for the
+            //   call duration so unqualified names resolve correctly.
+            let target_db = self.resolve_db(engine, params.database.as_deref(), None, false)?;
+            let (effective_sql, effective_table) = match (&params.sql, &params.table, &target_db) {
+                (None, Some(t), Some(db)) => {
+                    let esc_db = db.replace('"', "\"\"");
+                    let esc_tbl = t.replace('"', "\"\"");
+                    (
+                        Some(format!(
+                            "SELECT * FROM \"{esc_db}\".\"public\".\"{esc_tbl}\""
+                        )),
+                        None,
+                    )
+                }
+                _ => (params.sql.clone(), params.table.clone()),
+            };
+            let _search_guard = match (&effective_sql, &target_db, &params.sql) {
+                // Only pin search_path when the user supplied raw SQL
+                // (not when we synthesized a fully-qualified SELECT).
+                (Some(_), Some(alias), Some(_)) => Some(engine.scoped_search_path(alias)?),
+                _ => None,
+            };
             let opts = ExportOptions {
-                sql: params.sql,
-                table: params.table,
+                sql: effective_sql,
+                table: effective_table,
                 path: params.path,
                 format: params.format,
                 overwrite: params.overwrite.unwrap_or(true),

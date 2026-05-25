@@ -1093,16 +1093,37 @@ impl Engine {
     ///   best-effort: their errors are swallowed so the sample payload
     ///   is still returned when available.
     pub fn sample_table(&self, table_name: &str, n: u64) -> Result<Value, McpError> {
-        let n = n.clamp(1, 100);
-        let quoted = table_name.replace('"', "\"\"");
+        self.sample_table_in(None, table_name, n)
+    }
 
-        let select_sql = format!("SELECT * FROM \"{quoted}\" LIMIT {n}");
+    /// Sample rows from a table in `target_db` (or the primary when `None`).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::sample_table`].
+    pub fn sample_table_in(
+        &self,
+        target_db: Option<&str>,
+        table_name: &str,
+        n: u64,
+    ) -> Result<Value, McpError> {
+        let n = n.clamp(1, 100);
+        let qualified = match target_db {
+            Some(db) => {
+                let esc_db = db.replace('"', "\"\"");
+                let esc_tbl = table_name.replace('"', "\"\"");
+                format!("\"{esc_db}\".\"public\".\"{esc_tbl}\"")
+            }
+            None => format!("\"{}\"", table_name.replace('"', "\"\"")),
+        };
+
+        let select_sql = format!("SELECT * FROM {qualified} LIMIT {n}");
         let rows = match self.execute_query_to_json(&select_sql) {
             Ok(r) => r,
             Err(e) => return Err(translate_table_missing(e, table_name)),
         };
 
-        let count_sql = format!("SELECT COUNT(*) AS cnt FROM \"{quoted}\"");
+        let count_sql = format!("SELECT COUNT(*) AS cnt FROM {qualified}");
         let row_count = self
             .execute_query_to_json(&count_sql)
             .ok()
@@ -1112,25 +1133,29 @@ impl Engine {
             })
             .unwrap_or(0);
 
-        let catalog = Catalog::new(&self.connection);
-        let columns: Vec<Value> = match catalog.get_table_definition(table_name) {
-            Ok(def) => def
-                .columns()
-                .iter()
-                .map(|col| {
-                    json!({
-                        "name": col.name,
-                        "type": col.type_name(),
-                        "nullable": col.nullable,
+        // Column metadata: when targeting the primary, use the
+        // connection-bound Catalog. For other databases, query
+        // pg_catalog.pg_attribute directly via fully-qualified SQL.
+        let columns: Vec<Value> = match target_db {
+            None => {
+                let catalog = Catalog::new(&self.connection);
+                catalog
+                    .get_table_definition(table_name)
+                    .map(|def| {
+                        def.columns()
+                            .iter()
+                            .map(|col| {
+                                json!({
+                                    "name": col.name,
+                                    "type": col.type_name(),
+                                    "nullable": col.nullable,
+                                })
+                            })
+                            .collect()
                     })
-                })
-                .collect(),
-            Err(_) => {
-                // Catalog read may fail transiently during wire desync. We
-                // already have the sample rows; return what we have without
-                // the column metadata rather than failing the whole call.
-                Vec::new()
+                    .unwrap_or_default()
             }
+            Some(db) => describe_columns_via_pg_catalog(self, db, table_name).unwrap_or_default(),
         };
 
         Ok(json!({
@@ -1140,6 +1165,94 @@ impl Engine {
             "schema": columns,
             "rows": rows,
         }))
+    }
+
+    /// List public tables in `target_db` (or the primary when `None`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError`] on catalog query failure.
+    pub fn describe_tables_in(&self, target_db: Option<&str>) -> Result<Vec<Value>, McpError> {
+        match target_db {
+            None => self.describe_tables(),
+            Some(db) => {
+                let esc_db = db.replace('"', "\"\"");
+                let list_sql = format!(
+                    "SELECT tablename FROM \"{esc_db}\".pg_catalog.pg_tables \
+                     WHERE schemaname = 'public' ORDER BY tablename"
+                );
+                let names_rows = self.execute_query_to_json(&list_sql)?;
+                let mut out = Vec::new();
+                for row in &names_rows {
+                    let Some(name) = row.get("tablename").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    if is_internal_table(name) {
+                        continue;
+                    }
+                    out.push(self.describe_table_in(Some(db), name)?);
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// Describe a single table in `target_db` (or the primary when `None`).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::describe_table`].
+    pub fn describe_table_in(
+        &self,
+        target_db: Option<&str>,
+        table_name: &str,
+    ) -> Result<Value, McpError> {
+        if is_internal_table(table_name) {
+            return Err(McpError::new(
+                ErrorCode::TableNotFound,
+                format!("Table '{table_name}' does not exist"),
+            ));
+        }
+        match target_db {
+            None => self.describe_table(table_name),
+            Some(db) => {
+                // Existence check via pg_catalog
+                let esc_db = db.replace('"', "\"\"");
+                let esc_tbl = table_name.replace('\'', "''");
+                let exists_sql = format!(
+                    "SELECT 1 FROM \"{esc_db}\".pg_catalog.pg_tables \
+                     WHERE schemaname = 'public' AND tablename = '{esc_tbl}'"
+                );
+                let rows = self.execute_query_to_json(&exists_sql)?;
+                if rows.is_empty() {
+                    return Err(McpError::new(
+                        ErrorCode::TableNotFound,
+                        format!("Table '{table_name}' does not exist in database '{db}'"),
+                    ));
+                }
+                // Columns via pg_catalog.pg_attribute
+                let columns = describe_columns_via_pg_catalog(self, db, table_name)?;
+                // Row count
+                let qualified = format!(
+                    "\"{esc_db}\".\"public\".\"{}\"",
+                    table_name.replace('"', "\"\"")
+                );
+                let count_sql = format!("SELECT COUNT(*) AS cnt FROM {qualified}");
+                let row_count = self
+                    .execute_query_to_json(&count_sql)
+                    .ok()
+                    .and_then(|rs| {
+                        rs.first()
+                            .and_then(|r| r.get("cnt").and_then(serde_json::Value::as_i64))
+                    })
+                    .unwrap_or(0);
+                Ok(json!({
+                    "name": table_name,
+                    "row_count": row_count,
+                    "columns": columns,
+                }))
+            }
+        }
     }
 
     /// Collect workspace health and size metrics for the `status` MCP tool.
@@ -1388,6 +1501,43 @@ pub fn resolve_log_dir(persistent_db_path: Option<&str>) -> PathBuf {
 /// (single) so both paths emit byte-identical shapes. A missing table
 /// surfaces as the underlying Hyper "relation does not exist" error; single-
 /// table callers should run it through `translate_table_missing`.
+/// Describe columns of `table_name` in attached database `db_alias` by
+/// querying that database's `pg_catalog.pg_attribute` directly. Used when
+/// the connection-bound `Catalog` API can't see the target database.
+fn describe_columns_via_pg_catalog(
+    engine: &Engine,
+    db_alias: &str,
+    table_name: &str,
+) -> Result<Vec<Value>, McpError> {
+    let esc_db = db_alias.replace('"', "\"\"");
+    let esc_tbl = table_name.replace('\'', "''");
+    let sql = format!(
+        "SELECT a.attname AS name, \
+                t.typname AS type_name, \
+                NOT a.attnotnull AS nullable, \
+                a.attnum AS ordinal \
+         FROM \"{esc_db}\".pg_catalog.pg_attribute a \
+         JOIN \"{esc_db}\".pg_catalog.pg_class c ON a.attrelid = c.oid \
+         JOIN \"{esc_db}\".pg_catalog.pg_namespace n ON c.relnamespace = n.oid \
+         JOIN \"{esc_db}\".pg_catalog.pg_type t ON a.atttypid = t.oid \
+         WHERE n.nspname = 'public' \
+           AND c.relname = '{esc_tbl}' \
+           AND a.attnum > 0 \
+         ORDER BY a.attnum"
+    );
+    let rows = engine.execute_query_to_json(&sql)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "name": r.get("name").cloned().unwrap_or(Value::Null),
+                "type": r.get("type_name").cloned().unwrap_or(Value::Null),
+                "nullable": r.get("nullable").cloned().unwrap_or(Value::Bool(true)),
+            })
+        })
+        .collect())
+}
+
 fn describe_table_with_catalog(catalog: &Catalog<'_>, name: &str) -> Result<Value, McpError> {
     let def = catalog.get_table_definition(name).map_err(McpError::from)?;
     let row_count = catalog.get_row_count(name).unwrap_or(0);
