@@ -22,7 +22,7 @@ path = "src/main.rs"
 [dependencies]
 hyperdb-api = { path = "../hyperdb-api", version = "0.1.1" }
 rmcp = { version = "1.7", features = ["server", "transport-io"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "signal", "time"] }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
 clap = { version = "4", features = ["derive"] }
@@ -41,6 +41,9 @@ notify = "8"
 tokio-util = { version = "0.7", features = ["rt"] }
 tempfile = { workspace = true }
 sqlformat = "0.5.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [lints]
 workspace = true

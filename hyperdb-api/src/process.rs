@@ -1005,6 +1005,28 @@ impl HyperProcess {
         }
     }
 
+    /// Returns true if the hyperd child process has exited (or no child exists).
+    ///
+    /// Uses [`std::process::Child::try_wait`] under the hood, which is correct
+    /// on both Unix and Windows. On Unix this also reaps any zombie state as a
+    /// side effect — a hyperd that has been SIGKILLed but not yet `wait()`ed
+    /// on by the parent will be observed as exited and cleaned up here.
+    ///
+    /// Prefer this over [`Self::is_running`] when the caller owns the
+    /// `HyperProcess` mutably and needs an authoritative liveness signal.
+    /// `is_running` uses `kill -0` on Unix (which incorrectly reports zombies
+    /// as alive) and is a no-op on Windows.
+    pub fn has_exited(&mut self) -> bool {
+        match self.child.as_mut() {
+            Some(child) => match child.try_wait() {
+                Ok(Some(_status)) => true,
+                Ok(None) => false,
+                Err(_) => true,
+            },
+            None => true,
+        }
+    }
+
     /// Shuts down the Hyper server gracefully with a timeout.
     ///
     /// This closes the callback connection, which signals Hyper to shut down gracefully.

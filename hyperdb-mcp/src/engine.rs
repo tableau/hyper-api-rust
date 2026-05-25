@@ -38,23 +38,29 @@
 //! optimization could use `spawn_blocking` or an async connection API, but the
 //! current approach is correct and simple.
 
+use crate::daemon;
 use crate::error::{ErrorCode, McpError};
 use crate::schema::ColumnSchema;
 use hyperdb_api::{Catalog, Connection, CreateMode, HyperProcess, Parameters, SqlType};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
-/// Owns a running `HyperProcess` and the single `Connection` to its workspace
-/// `.hyper` file. All SQL execution flows through this struct.
+/// Owns a connection to `hyperd` and the workspace `.hyper` file. All SQL
+/// execution flows through this struct.
 ///
-/// Two workspace modes are supported:
-/// - **Persistent** — caller supplies a path; the `.hyper` file survives across
-///   sessions so tables can be built up incrementally.
-/// - **Ephemeral** — a temp directory is created per process; everything is
-///   discarded when the server exits.
+/// Two process modes:
+/// - **Local** — this engine owns the `HyperProcess` subprocess directly.
+/// - **Daemon** — a shared daemon manages `hyperd`; the engine only holds a connection.
+///
+/// Two workspace modes:
+/// - **Persistent** — caller supplies a path; the `.hyper` file survives across sessions.
+/// - **Ephemeral** — a temp directory is created per process; discarded on exit.
 #[derive(Debug)]
 pub struct Engine {
-    hyper: HyperProcess,
+    /// `None` in daemon mode (the daemon owns the process).
+    hyper: Option<HyperProcess>,
+    /// Stored endpoint for daemon mode (the daemon advertises this).
+    daemon_endpoint: Option<String>,
     connection: Connection,
     workspace_path: PathBuf,
     log_dir: PathBuf,
@@ -62,17 +68,10 @@ pub struct Engine {
 }
 
 impl Engine {
-    #[expect(
-        clippy::needless_pass_by_value,
-        reason = "call-site ergonomics: function consumes logically-owned parameters, refactoring signatures is not worth per-site churn"
-    )]
     /// Create a new Engine. If `workspace_path` is Some, use that path (persistent mode).
     /// If None, use a temp file (ephemeral mode).
     ///
-    /// Logs from `hyperd` are written to the directory returned by
-    /// [`resolve_log_dir`]. The same directory should be used by the MCP
-    /// binary for its own client-side log so operators can find everything
-    /// in one place when debugging.
+    /// Connects to the shared daemon if available, falling back to a local `hyperd`.
     ///
     /// # Errors
     ///
@@ -85,6 +84,22 @@ impl Engine {
     ///   reports the `hyperd` executable is missing or unreachable via
     ///   `HYPERD_PATH`.
     pub fn new(workspace_path: Option<String>) -> Result<Self, McpError> {
+        Self::new_with_mode(workspace_path, false)
+    }
+
+    /// Create an engine that bypasses the shared daemon and spawns a private `hyperd`.
+    ///
+    /// # Errors
+    /// Same as [`Self::new`].
+    pub fn new_no_daemon(workspace_path: Option<String>) -> Result<Self, McpError> {
+        Self::new_with_mode(workspace_path, true)
+    }
+
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "Option<String> is consumed by the workspace path resolution logic"
+    )]
+    fn new_with_mode(workspace_path: Option<String>, no_daemon: bool) -> Result<Self, McpError> {
         let (path, is_persistent) = if let Some(ref p) = workspace_path {
             let path = PathBuf::from(shellexpand_tilde(p));
             if let Some(parent) = path.parent() {
@@ -115,6 +130,14 @@ impl Engine {
             )
         })?;
 
+        // Try daemon mode first unless disabled
+        if !no_daemon {
+            if let Some(engine) = Self::try_daemon_mode(&path, &log_dir, is_persistent)? {
+                return Ok(engine);
+            }
+        }
+
+        // Fall back to spawning a local HyperProcess
         let mut params = Parameters::new();
         params.set("log_file_max_count", "2");
         params.set("log_file_size_limit", "100M");
@@ -135,20 +158,11 @@ impl Engine {
                 McpError::new(ErrorCode::InternalError, format!("Failed to connect: {e}"))
             })?;
 
-        // Ensure the `public` schema exists in the workspace database so that
-        // `load_file`, `load_data`, and unqualified `CREATE TABLE` statements
-        // resolve without a "could not resolve the schema (3F000)" error.
-        connection
-            .execute_command("CREATE SCHEMA IF NOT EXISTS public")
-            .map_err(|e| {
-                McpError::new(
-                    ErrorCode::InternalError,
-                    format!("Failed to bootstrap public schema: {e}"),
-                )
-            })?;
+        bootstrap_public_schema(&connection)?;
 
         Ok(Self {
-            hyper,
+            hyper: Some(hyper),
+            daemon_endpoint: None,
             connection,
             workspace_path: path,
             log_dir,
@@ -156,22 +170,84 @@ impl Engine {
         })
     }
 
-    /// Whether the `hyperd` child process is still alive.
-    pub fn is_running(&self) -> bool {
-        self.hyper.is_running()
+    /// Attempt to connect via the shared daemon. Returns `None` if the daemon
+    /// cannot be reached (falls back to local mode).
+    fn try_daemon_mode(
+        path: &Path,
+        log_dir: &Path,
+        is_persistent: bool,
+    ) -> Result<Option<Self>, McpError> {
+        let port = daemon::discovery::resolve_port();
+        let info = match daemon::spawn::ensure_daemon(port) {
+            Ok(info) => info,
+            Err(e) => {
+                tracing::debug!(error = %e, "daemon unavailable, falling back to local mode");
+                return Ok(None);
+            }
+        };
+
+        let endpoint = &info.hyperd_endpoint;
+        let connection = Connection::connect(
+            endpoint,
+            &path.to_string_lossy(),
+            CreateMode::CreateIfNotExists,
+        )
+        .map_err(|e| {
+            // The daemon's discovery file points at this endpoint but we can't
+            // reach it — hyperd is likely dead. Tell the daemon so it can
+            // restart it on its next monitor tick.
+            daemon::health::report_hyperd_error_to_daemon();
+            McpError::new(
+                ErrorCode::InternalError,
+                format!("Failed to connect to daemon hyperd at {endpoint}: {e}"),
+            )
+        })?;
+
+        bootstrap_public_schema(&connection)?;
+
+        // Send heartbeat so daemon knows we're active
+        let _ = daemon::health::send_command(info.health_port, "HEARTBEAT");
+
+        Ok(Some(Self {
+            hyper: None,
+            daemon_endpoint: Some(info.hyperd_endpoint),
+            connection,
+            workspace_path: path.to_path_buf(),
+            log_dir: log_dir.to_path_buf(),
+            is_persistent,
+        }))
     }
 
-    /// `host:port` endpoint of the hyperd child process. Used by the
+    /// Whether the backing `hyperd` process is still alive.
+    /// In daemon mode, checks the daemon health port.
+    pub fn is_running(&self) -> bool {
+        if let Some(ref hyper) = self.hyper {
+            hyper.is_running()
+        } else {
+            // Daemon mode: check if daemon is still reachable
+            daemon::discovery::discover().is_some()
+        }
+    }
+
+    /// `host:port` endpoint of the `hyperd` process. Used by the
     /// watcher to build additional async connections via `hyperdb_api::pool`
     /// without touching the primary sync connection this engine holds.
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorCode::InternalError`] if the underlying
-    /// [`HyperProcess::require_endpoint`] call fails — typically when
-    /// `hyperd` has exited or never successfully reported an endpoint.
+    /// Returns [`ErrorCode::InternalError`] if the endpoint is unavailable.
     pub fn hyperd_endpoint(&self) -> Result<String, McpError> {
+        if let Some(ref endpoint) = self.daemon_endpoint {
+            return Ok(endpoint.clone());
+        }
         self.hyper
+            .as_ref()
+            .ok_or_else(|| {
+                McpError::new(
+                    ErrorCode::InternalError,
+                    "no hyperd endpoint available".to_string(),
+                )
+            })?
             .require_endpoint()
             .map(std::string::ToString::to_string)
             .map_err(|e| McpError::new(ErrorCode::InternalError, e.to_string()))
@@ -766,7 +842,7 @@ impl Engine {
         };
 
         Ok(json!({
-            "hyperd_running": self.hyper.is_running(),
+            "hyperd_running": self.is_running(),
             "workspace_path": self.workspace_path.to_string_lossy(),
             "workspace_mode": if self.is_persistent { "persistent" } else { "ephemeral" },
             "table_count": table_count,
@@ -1068,6 +1144,34 @@ fn strip_leading_sql_comments(sql: &str) -> &str {
         }
     }
     s
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // In daemon mode with ephemeral databases, DETACH the workspace from hyperd
+        // (releases the file handle — critical on Windows) then delete the temp file.
+        if !self.is_persistent && self.daemon_endpoint.is_some() {
+            let db_name = self.primary_db_name();
+            let detach = format!("DETACH DATABASE \"{db_name}\"");
+            let _ = self.connection.execute_command(&detach);
+            // Remove the temp directory containing the ephemeral .hyper file
+            if let Some(parent) = self.workspace_path.parent() {
+                let _ = std::fs::remove_dir_all(parent);
+            }
+        }
+    }
+}
+
+fn bootstrap_public_schema(connection: &Connection) -> Result<(), McpError> {
+    connection
+        .execute_command("CREATE SCHEMA IF NOT EXISTS public")
+        .map(|_| ())
+        .map_err(|e| {
+            McpError::new(
+                ErrorCode::InternalError,
+                format!("Failed to bootstrap public schema: {e}"),
+            )
+        })
 }
 
 /// Minimal `~/` (and `~\` on Windows) expansion. Resolves the home

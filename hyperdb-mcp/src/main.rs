@@ -4,6 +4,7 @@
 //! Binary entry point for the `hyperdb-mcp` MCP server.
 //!
 //! Starts an MCP server on stdio, optionally backed by a persistent workspace.
+//! Can also run in daemon mode to manage a shared `hyperd` process.
 //!
 //! # Logging
 //!
@@ -19,7 +20,11 @@
 //! [`hyperdb_mcp::engine::resolve_log_dir`]). Check the `status` tool for
 //! the exact paths.
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
+use hyperdb_mcp::daemon;
+use hyperdb_mcp::daemon::discovery;
+use hyperdb_mcp::daemon::health;
+use hyperdb_mcp::daemon::run::DaemonConfig;
 use hyperdb_mcp::engine::{resolve_log_dir, CLIENT_LOG_FILE_NAME};
 use hyperdb_mcp::server::HyperMcpServer;
 use rmcp::ServiceExt;
@@ -37,29 +42,107 @@ const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), ".r", env!("HYPERDB_GIT
     about = "MCP server for Hyper database analytics"
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
     /// Path to the `.hyper` workspace file for persistent mode (omit for ephemeral mode)
-    #[arg(long)]
+    #[arg(long, global = true)]
     workspace: Option<String>,
 
     /// Run in read-only mode: disables execute, `load_data`, `load_file`, and export to hyper format
-    #[arg(long)]
+    #[arg(long, global = true)]
     read_only: bool,
 
     /// Bare mode: disable MCP-managed auxiliary tables. Skips creating
     /// `_table_catalog` and forces saved queries into in-memory
     /// (non-persistent) storage, even with --workspace.
-    #[arg(long)]
+    #[arg(long, global = true)]
     bare: bool,
+
+    /// Disable the shared daemon and spawn a private `hyperd` (legacy behavior)
+    #[arg(long, global = true)]
+    no_daemon: bool,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Run as a background daemon managing a shared hyperd process
+    Daemon {
+        #[command(subcommand)]
+        action: Option<DaemonAction>,
+
+        /// TCP port for health listener and single-instance lock
+        #[arg(long, default_value_t = daemon::DEFAULT_DAEMON_PORT)]
+        port: u16,
+
+        /// Idle timeout in seconds before the daemon shuts down
+        #[arg(long)]
+        idle_timeout: Option<u64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Stop a running daemon
+    Stop,
+    /// Show status of the running daemon
+    Status,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Parse CLI first so the log directory matches whatever workspace the
-    // user requested. This has to happen before tracing is initialized so
-    // the file layer points at the right place.
     let cli = Cli::parse();
 
-    // Compute and create the log dir (same logic Engine will use later).
+    match cli.command {
+        Some(Commands::Daemon {
+            action: Some(DaemonAction::Stop),
+            port,
+            ..
+        }) => {
+            daemon_stop(port);
+            Ok(())
+        }
+        Some(Commands::Daemon {
+            action: Some(DaemonAction::Status),
+            ..
+        }) => {
+            daemon_status();
+            Ok(())
+        }
+        Some(Commands::Daemon {
+            action: None,
+            port,
+            idle_timeout,
+        }) => run_daemon_mode(port, idle_timeout).await,
+        None => run_mcp_mode(cli).await,
+    }
+}
+
+async fn run_daemon_mode(
+    port: u16,
+    idle_timeout: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Daemon logs go to ~/.hyperdb/logs/
+    let log_dir = discovery::state_dir()?.join("logs");
+    std::fs::create_dir_all(&log_dir)?;
+
+    let file_appender = tracing_appender::rolling::never(&log_dir, "hyperdb-daemon.log");
+    let (file_writer, _file_guard) = tracing_appender::non_blocking(file_appender);
+
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,hyperdb_mcp=debug"));
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer().with_writer(std::io::stderr))
+        .with(fmt::layer().with_writer(file_writer).with_ansi(false))
+        .init();
+
+    let config = DaemonConfig::from_args(port, idle_timeout);
+    daemon::run::run_daemon(config).await
+}
+
+async fn run_mcp_mode(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let log_dir = resolve_log_dir(cli.workspace.as_deref());
     if let Err(e) = std::fs::create_dir_all(&log_dir) {
         eprintln!(
@@ -68,13 +151,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // tracing_appender writes via a background thread; we keep the guard
-    // alive for the duration of `main` so buffered logs get flushed cleanly.
     let file_appender = tracing_appender::rolling::never(&log_dir, CLIENT_LOG_FILE_NAME);
     let (file_writer, _file_guard) = tracing_appender::non_blocking(file_appender);
 
-    // Default to `info` when RUST_LOG is unset so the log files are actually
-    // populated. Users can still override via RUST_LOG=debug,hyperdb_api=trace etc.
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,hyperdb_mcp=debug"));
 
@@ -89,12 +168,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         workspace = cli.workspace.as_deref().unwrap_or("<ephemeral>"),
         read_only = cli.read_only,
         bare = cli.bare,
+        no_daemon = cli.no_daemon,
         "hyperdb-mcp starting"
     );
 
-    let server = HyperMcpServer::new(cli.workspace, cli.read_only, cli.bare);
+    let server =
+        HyperMcpServer::with_no_daemon(cli.workspace, cli.read_only, cli.bare, cli.no_daemon);
     let service = server.serve(rmcp::transport::io::stdio()).await?;
     service.waiting().await?;
 
     Ok(())
+}
+
+fn daemon_stop(port: u16) {
+    match health::send_command(port, "STOP") {
+        Ok(response) => {
+            println!("Daemon responded: {}", response.trim());
+        }
+        Err(e) => {
+            eprintln!("No daemon running on port {port} (or cannot connect): {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn daemon_status() {
+    if let Some(info) = discovery::discover() {
+        println!("Daemon is running:");
+        println!("  PID:            {}", info.pid);
+        println!("  Hyperd endpoint: {}", info.hyperd_endpoint);
+        println!("  Health port:    {}", info.health_port);
+        println!("  Started:        {}", info.started_at);
+        println!("  Version:        {}", info.version);
+    } else {
+        eprintln!("No daemon is currently running.");
+        std::process::exit(1);
+    }
 }

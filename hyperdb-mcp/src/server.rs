@@ -755,6 +755,10 @@ pub struct HyperMcpServer {
     /// [`crate::saved_queries::SessionStore`] and the catalog is never
     /// created or updated.
     bare: bool,
+    /// Skip the shared daemon and spawn a private `hyperd` (legacy behavior).
+    no_daemon: bool,
+    /// Last time a heartbeat was sent to the daemon (debounced to avoid per-call TCP overhead).
+    last_heartbeat: std::sync::Mutex<std::time::Instant>,
     // Under rmcp 1.x the router fields are constructed for downstream
     // macro-generated dispatch but not read through a direct field access
     // that the compiler can see. Keep them; the `#[tool_router]` /
@@ -797,6 +801,25 @@ impl HyperMcpServer {
     /// workspace file. Useful when callers want a pristine `.hyper` file
     /// containing only their own data.
     pub fn new(workspace_path: Option<String>, read_only: bool, bare: bool) -> Self {
+        Self::with_options(workspace_path, read_only, bare, false)
+    }
+
+    /// Create a server instance with explicit daemon control.
+    pub fn with_no_daemon(
+        workspace_path: Option<String>,
+        read_only: bool,
+        bare: bool,
+        no_daemon: bool,
+    ) -> Self {
+        Self::with_options(workspace_path, read_only, bare, no_daemon)
+    }
+
+    fn with_options(
+        workspace_path: Option<String>,
+        read_only: bool,
+        bare: bool,
+        no_daemon: bool,
+    ) -> Self {
         // Bare mode forces a SessionStore regardless of workspace so the
         // `_hyperdb_saved_queries` meta-table is never created.
         let saved_queries: Arc<dyn SavedQueryStore> = if bare {
@@ -818,6 +841,8 @@ impl HyperMcpServer {
             workspace_path,
             read_only,
             bare,
+            no_daemon,
+            last_heartbeat: std::sync::Mutex::new(std::time::Instant::now()),
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
         }
@@ -927,7 +952,11 @@ impl HyperMcpServer {
                 bare = self.bare,
                 "initializing hyper engine"
             );
-            let engine = Engine::new(self.workspace_path.clone())?;
+            let engine = if self.no_daemon {
+                Engine::new_no_daemon(self.workspace_path.clone())?
+            } else {
+                Engine::new(self.workspace_path.clone())?
+            };
             tracing::info!(
                 workspace_path = %engine.workspace_path().display(),
                 log_dir = %engine.log_dir().display(),
@@ -1045,6 +1074,11 @@ impl HyperMcpServer {
         // catalog SQL can see errors classified via the normal error
         // path. No-op in bare or read-only mode.
         self.ensure_catalog_ready(engine);
+        // In daemon mode, send a heartbeat so the daemon knows we're still active.
+        // Debounced to avoid per-call TCP overhead (only sends if >60s since last).
+        if !self.no_daemon {
+            self.maybe_send_heartbeat();
+        }
         let result = f(engine);
         if let Err(e) = &result {
             tracing::debug!(code = ?e.code, message = %e.message, "tool call returned error");
@@ -1064,9 +1098,33 @@ impl HyperMcpServer {
                 if let Ok(mut ready) = self.catalog_ready.lock() {
                     *ready = false;
                 }
+                // Tell the daemon hyperd looks dead from over here. The daemon
+                // will pick up the flag on its next monitor tick and restart.
+                // Skipped in --no-daemon mode because there's no daemon to tell.
+                if !self.no_daemon {
+                    crate::daemon::health::report_hyperd_error_to_daemon();
+                }
             }
         }
         result
+    }
+
+    /// Best-effort heartbeat to keep the daemon alive while this client is active.
+    /// Debounced: only sends if more than 60 seconds have elapsed since the last heartbeat,
+    /// avoiding a new TCP connection on every tool call.
+    fn maybe_send_heartbeat(&self) {
+        const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+        let should_send = self
+            .last_heartbeat
+            .lock()
+            .is_ok_and(|guard| guard.elapsed() >= HEARTBEAT_INTERVAL);
+        if should_send {
+            let port = crate::daemon::discovery::resolve_port();
+            let _ = crate::daemon::health::send_command(port, "HEARTBEAT");
+            if let Ok(mut guard) = self.last_heartbeat.lock() {
+                *guard = std::time::Instant::now();
+            }
+        }
     }
 
     /// Run a closure that accesses the saved-query store.

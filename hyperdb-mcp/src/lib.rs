@@ -38,6 +38,7 @@
 
 pub mod attach;
 pub mod chart;
+pub mod daemon;
 pub mod engine;
 pub mod error;
 pub mod export;
