@@ -14,7 +14,7 @@ autobenches = false
 
 [dependencies]
 # x-release-please-start-version
-hyperdb-api-core = { path = "../hyperdb-api-core", version = "=0.1.3" }
+hyperdb-api-core = { path = "../hyperdb-api-core", version = "=0.2.0" }
 # x-release-please-end
 bytes = { workspace = true }
 thiserror = { workspace = true }

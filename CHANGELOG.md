@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/tableau/hyper-api-rust/compare/v0.1.3...v0.2.0) (2026-05-25)
+
+
+### Features
+
+* single-instance daemon for shared hyperd across MCP clients ([#26](https://github.com/tableau/hyper-api-rust/issues/26)) ([e2c6204](https://github.com/tableau/hyper-api-rust/commit/e2c6204ee22970d853d478e7679b6963e31bbc66))
+
 ## [0.1.3](https://github.com/tableau/hyper-api-rust/compare/v0.1.2...v0.1.3) (2026-05-18)
 
 
