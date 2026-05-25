@@ -313,7 +313,10 @@ fn sample_table_in_persistent_returns_rows() {
         sample.get("table").and_then(|v| v.as_str()),
         Some("samples")
     );
-    assert_eq!(sample.get("row_count").and_then(|v| v.as_i64()), Some(3));
+    assert_eq!(
+        sample.get("row_count").and_then(serde_json::Value::as_i64),
+        Some(3)
+    );
     let rows = sample
         .get("rows")
         .and_then(|v| v.as_array())
