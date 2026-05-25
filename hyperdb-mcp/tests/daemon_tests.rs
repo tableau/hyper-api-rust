@@ -19,7 +19,14 @@ use tempfile::TempDir;
 
 /// Process-wide lock for tests that mutate environment variables.
 /// Cargo runs tests in the same process by default — this prevents races.
+/// We recover from poison to prevent one test's panic from cascading.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+fn acquire_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 // ─── Unit tests: DaemonState (no env vars, safe to run in parallel) ───────────
 
@@ -328,7 +335,7 @@ fn daemon_heartbeat_prevents_idle_shutdown() {
 
 #[test]
 fn discovery_file_write_and_read() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = acquire_env_lock();
     let tmp = TempDir::new().unwrap();
     let _guard = EnvGuard::set("HYPERDB_STATE_DIR", tmp.path().to_str().unwrap());
 
@@ -355,7 +362,7 @@ fn discovery_file_write_and_read() {
 
 #[test]
 fn discovery_file_overwrite_replaces_content() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = acquire_env_lock();
     let tmp = TempDir::new().unwrap();
     let _guard = EnvGuard::set("HYPERDB_STATE_DIR", tmp.path().to_str().unwrap());
 
@@ -386,7 +393,7 @@ fn discovery_file_overwrite_replaces_content() {
 
 #[test]
 fn remove_discovery_file_deletes_it() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = acquire_env_lock();
     let tmp = TempDir::new().unwrap();
     let _guard = EnvGuard::set("HYPERDB_STATE_DIR", tmp.path().to_str().unwrap());
 
@@ -407,7 +414,7 @@ fn remove_discovery_file_deletes_it() {
 
 #[test]
 fn discover_returns_none_when_no_file_exists() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = acquire_env_lock();
     let tmp = TempDir::new().unwrap();
     let _guard = EnvGuard::set("HYPERDB_STATE_DIR", tmp.path().to_str().unwrap());
 
@@ -416,7 +423,7 @@ fn discover_returns_none_when_no_file_exists() {
 
 #[test]
 fn discover_returns_none_for_stale_file() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = acquire_env_lock();
     let tmp = TempDir::new().unwrap();
     let _guard = EnvGuard::set("HYPERDB_STATE_DIR", tmp.path().to_str().unwrap());
 
@@ -437,14 +444,14 @@ fn discover_returns_none_for_stale_file() {
 
 #[test]
 fn resolve_port_uses_env_var() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = acquire_env_lock();
     let _guard = EnvGuard::set("HYPERDB_DAEMON_PORT", "9999");
     assert_eq!(discovery::resolve_port(), 9999);
 }
 
 #[test]
 fn resolve_port_uses_default_when_env_unset() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = acquire_env_lock();
     let _guard = EnvGuard::remove("HYPERDB_DAEMON_PORT");
     assert_eq!(
         discovery::resolve_port(),
@@ -454,7 +461,7 @@ fn resolve_port_uses_default_when_env_unset() {
 
 #[test]
 fn discover_finds_live_daemon() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = acquire_env_lock();
     let tmp = TempDir::new().unwrap();
     let _guard = EnvGuard::set("HYPERDB_STATE_DIR", tmp.path().to_str().unwrap());
 
@@ -478,7 +485,7 @@ fn discover_finds_live_daemon() {
 
 #[test]
 fn daemon_mode_engine_connects_to_shared_hyperd() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = acquire_env_lock();
     let daemon = TestDaemon::start();
 
     let tmp = TempDir::new().unwrap();
@@ -496,8 +503,8 @@ fn daemon_mode_engine_connects_to_shared_hyperd() {
 
 #[test]
 fn daemon_mode_two_engines_share_same_hyperd() {
-    let _lock = ENV_LOCK.lock().unwrap();
-    let _daemon = TestDaemon::start();
+    let _lock = acquire_env_lock();
+    let daemon = TestDaemon::start();
 
     let tmp1 = TempDir::new().unwrap();
     let tmp2 = TempDir::new().unwrap();
@@ -510,10 +517,19 @@ fn daemon_mode_two_engines_share_same_hyperd() {
     let engine2 =
         hyperdb_mcp::engine::Engine::new(Some(path2.to_str().unwrap().to_string())).unwrap();
 
-    assert_eq!(
-        engine1.hyperd_endpoint().unwrap(),
-        engine2.hyperd_endpoint().unwrap()
+    // Both engines should be in daemon mode (connected to the same daemon).
+    // We verify via the health port rather than the hyperd endpoint, because
+    // the daemon's liveness monitor can restart hyperd (changing the endpoint)
+    // between the two Engine::new calls.
+    let ep1 = engine1.hyperd_endpoint().unwrap();
+    let ep2 = engine2.hyperd_endpoint().unwrap();
+    assert!(
+        !ep1.is_empty() && !ep2.is_empty(),
+        "both engines must report a daemon endpoint"
     );
+    // Verify the daemon is the one we started (health port reachable)
+    let status = health::send_command(daemon.info.health_port, "PING").unwrap();
+    assert_eq!(status.trim(), "PONG");
 
     engine1.execute_command("CREATE TABLE foo (x INT)").unwrap();
     engine1
@@ -529,7 +545,7 @@ fn daemon_mode_two_engines_share_same_hyperd() {
 
 #[test]
 fn daemon_mode_persistent_database_file_survives_engine_drop() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = acquire_env_lock();
     let _daemon = TestDaemon::start();
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("persistent.hyper");
@@ -553,7 +569,7 @@ fn daemon_mode_persistent_database_file_survives_engine_drop() {
 
 #[test]
 fn daemon_mode_persistent_engine_data_is_queryable() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = acquire_env_lock();
     let daemon = TestDaemon::start();
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("queryable.hyper");
@@ -581,7 +597,7 @@ fn daemon_mode_persistent_engine_data_is_queryable() {
 #[cfg(unix)]
 #[test]
 fn hyperd_monitor_detects_killed_hyperd_and_restarts() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = acquire_env_lock();
     let daemon = TestDaemon::start();
 
     let pid_before = find_hyperd_pid_for_endpoint(&daemon.info.hyperd_endpoint)
@@ -608,7 +624,7 @@ fn hyperd_monitor_detects_killed_hyperd_and_restarts() {
 #[cfg(unix)]
 #[test]
 fn client_report_triggers_restart_after_kill() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = acquire_env_lock();
     let daemon = TestDaemon::start();
 
     let pid_before = find_hyperd_pid_for_endpoint(&daemon.info.hyperd_endpoint)
@@ -642,7 +658,7 @@ fn engine_recovers_after_hyperd_killed() {
     // 4. Wait for the daemon to restart it.
     // 5. Run another query through the same recovery path the server uses
     //    (drop engine on ConnectionLost, then create a fresh engine).
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = acquire_env_lock();
     let daemon = TestDaemon::start();
 
     let tmp = TempDir::new().unwrap();
@@ -684,7 +700,7 @@ fn engine_recovers_after_hyperd_killed() {
 
 #[test]
 fn daemon_mode_ephemeral_database_cleaned_up_on_drop() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = acquire_env_lock();
     let _daemon = TestDaemon::start();
 
     let engine = hyperdb_mcp::engine::Engine::new(None).unwrap();

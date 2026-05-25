@@ -14,19 +14,17 @@ use tempfile::TempDir;
 /// `_table_catalog` doesn't appear alongside `widgets` and perturb the
 /// exact table counts these tests assert against. Catalog behavior is
 /// covered in `tests/table_catalog_tests.rs`.
+///
+/// Uses `no_daemon` mode to avoid interference from any daemon running
+/// in parallel (e.g. from daemon_tests in the same `cargo test` run).
 fn server_with_test_table() -> (HyperMcpServer, TempDir) {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("workspace.hyper");
-    let server = HyperMcpServer::new(Some(path.to_str().unwrap().into()), false, true);
-    // Use the server's public helper to drive engine creation via a resource read
-    // so the engine is initialized. Then seed a table via the internal pathway:
-    // we can't call the private `with_engine` from here, but reading
-    // `hyper://workspace` lazily starts it. Then we populate through a second
-    // server? Simpler: use Engine directly once, then discard, since the
-    // workspace file persists.
+    let server =
+        HyperMcpServer::with_no_daemon(Some(path.to_str().unwrap().into()), false, true, true);
     {
         use hyperdb_mcp::engine::Engine;
-        let engine = Engine::new(Some(path.to_str().unwrap().into())).unwrap();
+        let engine = Engine::new_no_daemon(Some(path.to_str().unwrap().into())).unwrap();
         engine
             .execute_command("CREATE TABLE widgets (id INT NOT NULL, name TEXT)")
             .unwrap();
@@ -176,7 +174,8 @@ fn read_readme_resource_handles_empty_workspace() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("empty.hyper");
     // `bare` so `_table_catalog` doesn't make the workspace non-empty.
-    let server = HyperMcpServer::new(Some(path.to_str().unwrap().into()), false, true);
+    let server =
+        HyperMcpServer::with_no_daemon(Some(path.to_str().unwrap().into()), false, true, true);
     let body = server
         .resource_body_for_uri("hyper://readme")
         .unwrap()

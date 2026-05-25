@@ -19,10 +19,12 @@ use tempfile::TempDir;
 /// Build a fresh engine against a temp `.hyper` workspace file. Matches
 /// the pattern used by `saved_queries_tests::workspace_engine` so the
 /// module interop surface stays consistent.
+/// Uses `new_no_daemon` to avoid interference from any daemon running
+/// in parallel (e.g. from daemon_tests in the same `cargo test` run).
 fn workspace_engine() -> (Engine, TempDir) {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("ws.hyper");
-    let engine = Engine::new(Some(path.to_str().unwrap().into())).unwrap();
+    let engine = Engine::new_no_daemon(Some(path.to_str().unwrap().into())).unwrap();
     (engine, dir)
 }
 
@@ -327,6 +329,11 @@ fn delete_for_is_idempotent() {
 }
 
 // --- HyperMcpServer integration --------------------------------------------
+//
+// Uses `with_no_daemon` / `new_no_daemon` to avoid interference from any
+// daemon running in parallel (e.g. from daemon_tests in the same `cargo test`
+// run). Without this, the server or engine may connect to a daemon left over
+// from another test file, causing "database still in use" errors on Windows.
 
 /// Default (non-bare) server: the catalog is created on first engine
 /// use and survives across reopens of the workspace file.
@@ -337,12 +344,11 @@ fn default_server_auto_creates_catalog_on_first_engine_use() {
     let path_str = path.to_str().unwrap().to_string();
 
     {
-        let server = HyperMcpServer::new(Some(path_str.clone()), false, false);
-        // Any tool that takes the engine lazily triggers bootstrap.
+        let server = HyperMcpServer::with_no_daemon(Some(path_str.clone()), false, false, true);
         let _ = server.resource_body_for_uri("hyper://workspace").unwrap();
     }
 
-    let engine = Engine::new(Some(path_str)).unwrap();
+    let engine = Engine::new_no_daemon(Some(path_str)).unwrap();
     assert!(
         table_exists(&engine, TABLE_CATALOG_TABLE),
         "_table_catalog must be present in the workspace after a default server has touched it"
@@ -358,12 +364,12 @@ fn bare_server_does_not_create_catalog() {
     let path_str = path.to_str().unwrap().to_string();
 
     {
-        let server = HyperMcpServer::new(Some(path_str.clone()), false, true);
+        let server = HyperMcpServer::with_no_daemon(Some(path_str.clone()), false, true, true);
         assert!(server.is_bare());
         let _ = server.resource_body_for_uri("hyper://workspace").unwrap();
     }
 
-    let engine = Engine::new(Some(path_str)).unwrap();
+    let engine = Engine::new_no_daemon(Some(path_str)).unwrap();
     assert!(
         !table_exists(&engine, TABLE_CATALOG_TABLE),
         "_table_catalog must NOT be present when the server was started with --bare"
@@ -387,18 +393,18 @@ fn read_only_server_does_not_create_catalog() {
     // to report; without this, `hyper://workspace` still runs fine, but
     // we want to make sure the reconciler doesn't fire either.
     {
-        let engine = Engine::new(Some(path_str.clone())).unwrap();
+        let engine = Engine::new_no_daemon(Some(path_str.clone())).unwrap();
         engine
             .execute_command("CREATE TABLE widgets (id INT)")
             .unwrap();
     }
 
     {
-        let server = HyperMcpServer::new(Some(path_str.clone()), true, false);
+        let server = HyperMcpServer::with_no_daemon(Some(path_str.clone()), true, false, true);
         let _ = server.resource_body_for_uri("hyper://workspace").unwrap();
     }
 
-    let engine = Engine::new(Some(path_str)).unwrap();
+    let engine = Engine::new_no_daemon(Some(path_str)).unwrap();
     assert!(
         !table_exists(&engine, TABLE_CATALOG_TABLE),
         "_table_catalog must NOT be created by a read-only server"
@@ -416,7 +422,7 @@ fn backfill_stubs_preexisting_tables_on_reopen() {
 
     // Seed with two user tables, no catalog.
     {
-        let engine = Engine::new(Some(path_str.clone())).unwrap();
+        let engine = Engine::new_no_daemon(Some(path_str.clone())).unwrap();
         engine
             .execute_command("CREATE TABLE alpha (id INT)")
             .unwrap();
@@ -429,11 +435,11 @@ fn backfill_stubs_preexisting_tables_on_reopen() {
     }
 
     {
-        let server = HyperMcpServer::new(Some(path_str.clone()), false, false);
+        let server = HyperMcpServer::with_no_daemon(Some(path_str.clone()), false, false, true);
         let _ = server.resource_body_for_uri("hyper://workspace").unwrap();
     }
 
-    let engine = Engine::new(Some(path_str)).unwrap();
+    let engine = Engine::new_no_daemon(Some(path_str)).unwrap();
     let entries = table_catalog::list(&engine).unwrap();
     let names: Vec<_> = entries.iter().map(|e| e.table_name.clone()).collect();
     assert!(names.contains(&"alpha".to_string()));
@@ -451,8 +457,8 @@ fn backfill_stubs_preexisting_tables_on_reopen() {
 /// against regression of the accessor wiring).
 #[test]
 fn is_bare_reflects_constructor_argument() {
-    let bare = HyperMcpServer::new(None, false, true);
-    let normal = HyperMcpServer::new(None, false, false);
+    let bare = HyperMcpServer::with_no_daemon(None, false, true, true);
+    let normal = HyperMcpServer::with_no_daemon(None, false, false, true);
     assert!(bare.is_bare());
     assert!(!normal.is_bare());
 }

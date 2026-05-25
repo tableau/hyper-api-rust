@@ -28,7 +28,9 @@ permissions:
 
 jobs:
   release-please:
-    if: github.repository == 'tableau/hyper-api-rust'
+    # Temporarily disabled until post-daemon/two-db-model work is complete.
+    # Re-enable by removing the `false &&` prefix below.
+    if: false && github.repository == 'tableau/hyper-api-rust'
     runs-on: ubuntu-latest
     steps:
       - uses: googleapis/release-please-action@v5

@@ -80,10 +80,12 @@ fn session_delete_returns_true_when_present_false_otherwise() {
 
 /// Build a fresh engine against a temp workspace file. Holding onto the
 /// `TempDir` return keeps the directory alive for the caller's scope.
+/// Uses `new_no_daemon` to avoid interference from any daemon running
+/// in parallel (e.g. from daemon_tests in the same `cargo test` run).
 fn workspace_engine() -> (Engine, TempDir) {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("ws.hyper");
-    let engine = Engine::new(Some(path.to_str().unwrap().into())).unwrap();
+    let engine = Engine::new_no_daemon(Some(path.to_str().unwrap().into())).unwrap();
     (engine, dir)
 }
 
@@ -173,7 +175,7 @@ fn workspace_persists_across_restarts() {
     let path_str = path.to_str().unwrap().to_string();
 
     {
-        let engine = Engine::new(Some(path_str.clone())).unwrap();
+        let engine = Engine::new_no_daemon(Some(path_str.clone())).unwrap();
         let store = WorkspaceStore::new();
         store
             .save(Some(&engine), mk_query("persisted", "SELECT 42"))
@@ -183,7 +185,7 @@ fn workspace_persists_across_restarts() {
         drop(engine);
     }
 
-    let engine = Engine::new(Some(path_str)).unwrap();
+    let engine = Engine::new_no_daemon(Some(path_str)).unwrap();
     let store = WorkspaceStore::new();
     let fetched = store.get(Some(&engine), "persisted").unwrap().unwrap();
     assert_eq!(fetched.sql, "SELECT 42");
@@ -200,7 +202,7 @@ fn workspace_persists_across_restarts() {
 /// resource list → resource read chain.
 #[test]
 fn server_ephemeral_session_store_exposes_query_resources() {
-    let server = HyperMcpServer::new(None, false, false);
+    let server = HyperMcpServer::with_no_daemon(None, false, false, true);
     // Reach into the store directly via its resource helper by saving a
     // query through the store (wiring of the tool itself is covered
     // indirectly — the public testable surface is the store + resource).
@@ -233,9 +235,10 @@ fn server_workspace_store_exposes_saved_queries_via_resources() {
     let path_str = path.to_str().unwrap().to_string();
 
     // Seed the workspace with one saved query by going through the same
-    // store type the server will use.
+    // store type the server will use. Uses new_no_daemon to avoid
+    // interference from any daemon running in parallel.
     {
-        let engine = Engine::new(Some(path_str.clone())).unwrap();
+        let engine = Engine::new_no_daemon(Some(path_str.clone())).unwrap();
         let store = WorkspaceStore::new();
         store
             .save(
@@ -245,7 +248,9 @@ fn server_workspace_store_exposes_saved_queries_via_resources() {
             .unwrap();
     }
 
-    let server = HyperMcpServer::new(Some(path_str), false, false);
+    // with_no_daemon ensures the server spawns its own hyperd rather than
+    // connecting to a daemon left over from daemon_tests.
+    let server = HyperMcpServer::with_no_daemon(Some(path_str), false, false, true);
 
     // The URI catalog lists both the definition and result resources.
     let uris = server.list_resource_uris();

@@ -252,7 +252,7 @@ fn unwatch_unknown_dir_errors() {
 /// we can verify the gate that it relies on.
 #[test]
 fn read_only_server_blocks_writes() {
-    let ro = hyperdb_mcp::server::HyperMcpServer::new(None, true, false);
+    let ro = hyperdb_mcp::server::HyperMcpServer::with_no_daemon(None, true, false, true);
     assert!(ro.is_read_only());
 }
 

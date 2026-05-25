@@ -23,7 +23,7 @@ use tempfile::TempDir;
 fn primary_workspace() -> (Engine, TempDir) {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("primary.hyper");
-    let engine = Engine::new(Some(path.to_string_lossy().into())).unwrap();
+    let engine = Engine::new_no_daemon(Some(path.to_string_lossy().into())).unwrap();
     engine
         .execute_command("CREATE TABLE primary_t (x INT)")
         .unwrap();
@@ -40,7 +40,7 @@ fn primary_workspace() -> (Engine, TempDir) {
 fn build_source_hyper_file(dir: &TempDir, name: &str, rows: &[(i32, &str)]) -> std::path::PathBuf {
     let path = dir.path().join(name);
     {
-        let engine = Engine::new(Some(path.to_string_lossy().into())).unwrap();
+        let engine = Engine::new_no_daemon(Some(path.to_string_lossy().into())).unwrap();
         engine
             .execute_command("CREATE TABLE t (a INT, b TEXT)")
             .unwrap();
@@ -579,7 +579,7 @@ fn replay_reattaches_on_fresh_engine() {
 
     let registry = AttachRegistry::new();
     {
-        let engine_a = Engine::new(Some(primary_path.to_string_lossy().into())).unwrap();
+        let engine_a = Engine::new_no_daemon(Some(primary_path.to_string_lossy().into())).unwrap();
         registry
             .attach(
                 &engine_a,
@@ -595,7 +595,7 @@ fn replay_reattaches_on_fresh_engine() {
             .unwrap();
     } // engine_a dropped here, closes its connection; attach state is gone on hyperd.
 
-    let engine_b = Engine::new(Some(primary_path.to_string_lossy().into())).unwrap();
+    let engine_b = Engine::new_no_daemon(Some(primary_path.to_string_lossy().into())).unwrap();
     // Without replay the attachment is invisible to engine_b.
     assert!(engine_b
         .execute_query_to_json("SELECT 1 FROM \"src\".public.t LIMIT 0")
@@ -695,7 +695,7 @@ fn replay_drops_missing_files() {
 
     let registry = AttachRegistry::new();
     {
-        let engine_a = Engine::new(Some(primary_path.to_string_lossy().into())).unwrap();
+        let engine_a = Engine::new_no_daemon(Some(primary_path.to_string_lossy().into())).unwrap();
         registry
             .attach(
                 &engine_a,
@@ -715,7 +715,7 @@ fn replay_drops_missing_files() {
     // — the call should succeed but the entry should be pruned.
     std::fs::remove_file(&source).unwrap();
 
-    let engine_b = Engine::new(Some(primary_path.to_string_lossy().into())).unwrap();
+    let engine_b = Engine::new_no_daemon(Some(primary_path.to_string_lossy().into())).unwrap();
     registry.replay_all(&engine_b).unwrap();
     assert!(registry.list().is_empty());
 }
@@ -871,7 +871,7 @@ fn replay_restores_schema_search_path_pin() {
     let dir = TempDir::new().unwrap();
     let primary_path = dir.path().join("primary.hyper");
     {
-        let engine = Engine::new(Some(primary_path.to_string_lossy().into())).unwrap();
+        let engine = Engine::new_no_daemon(Some(primary_path.to_string_lossy().into())).unwrap();
         engine
             .execute_command("CREATE TABLE primary_t (x INT)")
             .unwrap();
@@ -883,7 +883,7 @@ fn replay_restores_schema_search_path_pin() {
 
     let registry = AttachRegistry::new();
     {
-        let engine_a = Engine::new(Some(primary_path.to_string_lossy().into())).unwrap();
+        let engine_a = Engine::new_no_daemon(Some(primary_path.to_string_lossy().into())).unwrap();
         registry
             .attach(
                 &engine_a,
@@ -899,7 +899,7 @@ fn replay_restores_schema_search_path_pin() {
             .unwrap();
     } // engine_a dropped; next engine starts fresh with default search_path.
 
-    let engine_b = Engine::new(Some(primary_path.to_string_lossy().into())).unwrap();
+    let engine_b = Engine::new_no_daemon(Some(primary_path.to_string_lossy().into())).unwrap();
     registry.replay_all(&engine_b).unwrap();
 
     // Unqualified access to the primary must work after replay.

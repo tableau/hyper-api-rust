@@ -21,7 +21,7 @@ impl TestEngine {
     pub(crate) fn new_ephemeral() -> Self {
         let temp_dir = TempDir::new().expect("failed to create temp dir");
         let workspace_path = temp_dir.path().join("workspace.hyper");
-        let engine = Engine::new(Some(workspace_path.to_str().unwrap().to_string()))
+        let engine = Engine::new_no_daemon(Some(workspace_path.to_str().unwrap().to_string()))
             .expect("failed to create engine");
         Self {
             engine,
