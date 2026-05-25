@@ -9,7 +9,6 @@
 //! are process-global, these tests MUST run sequentially. We enforce this via a
 //! shared mutex — every test that touches env vars acquires `ENV_LOCK` first.
 
-use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -768,20 +767,30 @@ impl TestDaemon {
 
         let state_dir_guard = EnvGuard::set("HYPERDB_STATE_DIR", tmp.path().to_str().unwrap());
 
-        let port = find_free_port();
-        let port_guard = EnvGuard::set("HYPERDB_DAEMON_PORT", &port.to_string());
+        // Pass port 0 so the daemon's HealthListener binds an OS-assigned
+        // free port and reports it back via the discovery file. We avoid
+        // the find_free_port → set env → daemon binds later TOCTOU race
+        // where another process could grab the port between pick and bind
+        // (a real source of flakes on busy CI runners). The
+        // `HYPERDB_DAEMON_PORT` env var only matters for the
+        // spawn-daemon-if-missing path; once we've written the discovery
+        // file, clients read `health_port` directly from it.
+        let port_guard = EnvGuard::set("HYPERDB_DAEMON_PORT", "0");
 
-        // Start the daemon in a background tokio runtime
-        let daemon_port = port;
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
+        // Start the daemon in a background tokio runtime. Capture errors
+        // via a JoinHandle so a bind/spawn failure fails the test fast
+        // with a real message instead of a 30s timeout.
+        let daemon_handle = std::thread::spawn(move || -> Result<(), String> {
+            let rt = tokio::runtime::Runtime::new().map_err(|e| format!("rt: {e}"))?;
             rt.block_on(async {
                 let config = hyperdb_mcp::daemon::run::DaemonConfig {
-                    port: daemon_port,
+                    port: 0,
                     idle_timeout: Duration::from_secs(300),
                 };
-                let _ = hyperdb_mcp::daemon::run::run_daemon(config).await;
-            });
+                hyperdb_mcp::daemon::run::run_daemon(config)
+                    .await
+                    .map_err(|e| format!("run_daemon: {e}"))
+            })
         });
 
         // Wait for daemon to become ready. CI runners (especially macOS)
@@ -796,9 +805,19 @@ impl TestDaemon {
                     _port_guard: port_guard,
                 };
             }
+            // Fail fast if the daemon thread has already exited (bind error,
+            // spawn error, etc.). Avoids the unhelpful 30s-timeout panic.
+            if daemon_handle.is_finished() {
+                let msg = match daemon_handle.join() {
+                    Ok(Ok(())) => "daemon thread exited cleanly without writing discovery".into(),
+                    Ok(Err(e)) => format!("daemon thread errored: {e}"),
+                    Err(_) => "daemon thread panicked".into(),
+                };
+                panic!("TestDaemon failed to start: {msg}");
+            }
             assert!(
                 start.elapsed() <= Duration::from_secs(30),
-                "TestDaemon did not start within 30 seconds (port={daemon_port})"
+                "TestDaemon did not start within 30 seconds"
             );
             std::thread::sleep(Duration::from_millis(200));
         }
@@ -820,12 +839,6 @@ impl Drop for TestDaemon {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
-}
-
-/// Find a free TCP port by binding to port 0 and reading the assigned port.
-fn find_free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
 }
 
 /// Locate the `hyperd` process by matching the listen-port portion of an
