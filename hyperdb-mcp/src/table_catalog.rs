@@ -19,15 +19,20 @@
 //! | `license`          | User / LLM |
 //! | `notes`            | User / LLM |
 //!
-//! The backing table is `_table_catalog` (single underscore, *not*
-//! `_hyperdb_`) so it shows up in `describe` and the resource catalog — the
-//! catalog is meant to be read by humans and LLMs, it isn't internal
-//! bookkeeping. The `_` prefix signals "workspace meta" without triggering
-//! [`crate::engine::is_internal_table`]'s hidden-table filter.
+//! The backing table is `_table_catalog`. After the ephemeral-primary
+//! migration, the catalog tracks tables in the **persistent** database
+//! only — ephemeral scratch tables aren't worth cataloguing because the
+//! database is replaced every session. All operations therefore target
+//! the persistent attachment via fully-qualified SQL
+//! (`"persistent"."public"."_table_catalog"`); when the engine has no
+//! persistent attachment (`--ephemeral-only`), catalog operations are
+//! no-ops.
 //!
-//! All operations no-op quietly when [`HyperMcpServer`] was constructed with
-//! `--bare`: the module never gets called in that mode, so the table is
-//! never created and the workspace file stays pristine.
+//! `_table_catalog` is hidden from the user-visible
+//! [`Engine::describe_tables`] output (see
+//! [`crate::engine::is_internal_table`]) so the LLM doesn't see it
+//! alongside its data tables; users who want to inspect it directly
+//! can run `SELECT * FROM "persistent"."public"."_table_catalog"`.
 //!
 //! [`HyperMcpServer`]: crate::server::HyperMcpServer
 
@@ -37,9 +42,28 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Backing table name. Visible in `describe`; users can `SELECT * FROM
-/// _table_catalog` directly.
+/// Backing table name. Lives in the persistent attachment under
+/// `"persistent"."public"."_table_catalog"`. Hidden from
+/// `Engine::describe_tables`; users who want to inspect it directly can
+/// run a fully-qualified SELECT.
 pub const TABLE_CATALOG_TABLE: &str = "_table_catalog";
+
+/// Returns the fully-qualified SQL reference for `_table_catalog` in the
+/// engine's persistent attachment, or `None` when the engine has no
+/// persistent attachment (the `--ephemeral-only` case). All catalog
+/// read/write helpers consult this; `None` means catalog operations are
+/// no-ops because there's nowhere durable to put bookkeeping.
+fn qualified_catalog(engine: &Engine) -> Option<String> {
+    if engine.has_persistent() {
+        Some(format!(
+            "\"{}\".\"public\".\"{}\"",
+            Engine::PERSISTENT_ALIAS,
+            TABLE_CATALOG_TABLE
+        ))
+    } else {
+        None
+    }
+}
 
 /// One row in [`TABLE_CATALOG_TABLE`].
 ///
@@ -144,7 +168,13 @@ const CATALOG_COLUMNS: &str = "(\
 /// `CREATE TABLE IF NOT EXISTS` statement — typically connection loss
 /// or permission failures.
 pub fn ensure_exists(engine: &Engine) -> Result<(), McpError> {
-    let ddl = format!("CREATE TABLE IF NOT EXISTS \"{TABLE_CATALOG_TABLE}\" {CATALOG_COLUMNS}");
+    let Some(qualified) = qualified_catalog(engine) else {
+        // No persistent attachment — there's nowhere durable to put the
+        // catalog. Treat as success so callers don't have to special-case
+        // the ephemeral-only mode.
+        return Ok(());
+    };
+    let ddl = format!("CREATE TABLE IF NOT EXISTS {qualified} {CATALOG_COLUMNS}");
     engine.execute_command(&ddl)?;
     Ok(())
 }
@@ -188,6 +218,9 @@ pub fn ensure_exists_in_database(engine: &Engine, db_alias: &str) -> Result<(), 
 /// - Propagates [`ErrorCode::SchemaMismatch`] from `row_to_entry` if
 ///   a persisted row cannot be decoded into a [`CatalogEntry`].
 pub fn list(engine: &Engine) -> Result<Vec<CatalogEntry>, McpError> {
+    let Some(qualified) = qualified_catalog(engine) else {
+        return Ok(Vec::new());
+    };
     if !table_present(engine)? {
         return Ok(Vec::new());
     }
@@ -195,7 +228,7 @@ pub fn list(engine: &Engine) -> Result<Vec<CatalogEntry>, McpError> {
         "SELECT table_name, source_url, source_description, purpose, \
                 load_tool, load_params, license, loaded_at, last_refreshed_at, \
                 row_count, notes \
-         FROM \"{TABLE_CATALOG_TABLE}\" ORDER BY table_name"
+         FROM {qualified} ORDER BY table_name"
     );
     let rows = engine.execute_query_to_json(&sql)?;
     rows.iter().map(row_to_entry).collect()
@@ -208,6 +241,9 @@ pub fn list(engine: &Engine) -> Result<Vec<CatalogEntry>, McpError> {
 /// Same as [`list`]: propagates errors from `table_present`, the
 /// Hyper `SELECT`, or row decoding.
 pub fn get(engine: &Engine, table_name: &str) -> Result<Option<CatalogEntry>, McpError> {
+    let Some(qualified) = qualified_catalog(engine) else {
+        return Ok(None);
+    };
     if !table_present(engine)? {
         return Ok(None);
     }
@@ -215,7 +251,7 @@ pub fn get(engine: &Engine, table_name: &str) -> Result<Option<CatalogEntry>, Mc
         "SELECT table_name, source_url, source_description, purpose, \
                 load_tool, load_params, license, loaded_at, last_refreshed_at, \
                 row_count, notes \
-         FROM \"{TABLE_CATALOG_TABLE}\" WHERE table_name = {}",
+         FROM {qualified} WHERE table_name = {}",
         sql_literal(table_name)
     );
     let rows = engine.execute_query_to_json(&sql)?;
@@ -258,6 +294,10 @@ pub fn upsert_stub(
     bump_refresh: bool,
 ) -> Result<(), McpError> {
     ensure_exists(engine)?;
+    let Some(qualified) = qualified_catalog(engine) else {
+        // No persistent attachment; nothing to write to.
+        return Ok(());
+    };
 
     let existing = get(engine, table_name)?;
     let now = Utc::now();
@@ -281,13 +321,13 @@ pub fn upsert_stub(
 
     engine.execute_in_transaction(|engine| {
         let delete_sql = format!(
-            "DELETE FROM \"{TABLE_CATALOG_TABLE}\" WHERE table_name = {}",
+            "DELETE FROM {qualified} WHERE table_name = {}",
             sql_literal(table_name)
         );
         engine.execute_command(&delete_sql)?;
 
         let insert_sql = format!(
-            "INSERT INTO \"{TABLE_CATALOG_TABLE}\" \
+            "INSERT INTO {qualified} \
              (table_name, source_url, source_description, purpose, load_tool, \
               load_params, license, loaded_at, last_refreshed_at, row_count, notes) \
              VALUES ({name}, {source_url}, {source_description}, {purpose}, {load_tool}, \
@@ -375,8 +415,15 @@ pub fn set_metadata(
         assignments.push(format!("notes = {}", sql_literal_or_null_if_empty(v)));
     }
 
+    let qualified = qualified_catalog(engine).ok_or_else(|| {
+        McpError::new(
+            ErrorCode::ReadOnlyViolation,
+            "set_table_metadata is unavailable in --ephemeral-only mode \
+             because the catalog has nowhere durable to live.",
+        )
+    })?;
     let update_sql = format!(
-        "UPDATE \"{TABLE_CATALOG_TABLE}\" SET {assigns} WHERE table_name = {name}",
+        "UPDATE {qualified} SET {assigns} WHERE table_name = {name}",
         assigns = assignments.join(", "),
         name = sql_literal(table_name),
     );
@@ -397,11 +444,14 @@ pub fn set_metadata(
 /// Propagates any error from `table_present` or from the `DELETE`
 /// statement against the catalog table.
 pub fn delete_for(engine: &Engine, table_name: &str) -> Result<bool, McpError> {
+    let Some(qualified) = qualified_catalog(engine) else {
+        return Ok(false);
+    };
     if !table_present(engine)? {
         return Ok(false);
     }
     let sql = format!(
-        "DELETE FROM \"{TABLE_CATALOG_TABLE}\" WHERE table_name = {}",
+        "DELETE FROM {qualified} WHERE table_name = {}",
         sql_literal(table_name)
     );
     let affected = engine.execute_command(&sql)?;
@@ -459,38 +509,61 @@ pub fn reconcile(engine: &Engine) -> Result<(), McpError> {
 
 // --- Internals --------------------------------------------------------------
 
-/// List user-facing tables (excludes `_hyperdb_*` internals and the
-/// catalog itself). Reads the raw table list from `Catalog` directly
-/// rather than going through `describe_tables`, which already filters
-/// out internal tables (including `_table_catalog` itself) and would
-/// hide the rows we want to compare against.
+/// List user-facing tables in the **persistent** attachment (excludes
+/// `_hyperdb_*` internals and the catalog itself). Returns an empty Vec
+/// when no persistent attachment is present. Uses a fully-qualified
+/// `pg_catalog.pg_tables` probe so it sees inside the attachment;
+/// `Catalog::get_table_names` would target the connection's primary
+/// (ephemeral) by default.
 fn user_tables(engine: &Engine) -> Result<Vec<String>, McpError> {
-    let catalog = hyperdb_api::Catalog::new(engine.connection());
-    let names = catalog.get_table_names("public").map_err(McpError::from)?;
-    Ok(names
+    if !engine.has_persistent() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT tablename FROM \"{}\".pg_catalog.pg_tables \
+         WHERE schemaname = 'public'",
+        Engine::PERSISTENT_ALIAS
+    );
+    let rows = engine.execute_query_to_json(&sql)?;
+    Ok(rows
         .into_iter()
+        .filter_map(|r| {
+            r.get("tablename")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
         .filter(|name| name != TABLE_CATALOG_TABLE && !is_internal_table(name))
         .collect())
 }
 
-/// `true` when `_table_catalog` is already present in the workspace.
-/// Used by read paths to return an empty result instead of erroring on a
-/// brand-new workspace where the table hasn't been created yet. Reads
-/// the raw catalog directly so the result isn't affected by the
-/// internal-table filter applied to user-facing `describe_tables`.
+/// `true` when `_table_catalog` is present inside the persistent
+/// attachment. Returns `false` if there is no persistent attachment.
 fn table_present(engine: &Engine) -> Result<bool, McpError> {
-    let catalog = hyperdb_api::Catalog::new(engine.connection());
-    let names = catalog.get_table_names("public").map_err(McpError::from)?;
-    Ok(names.iter().any(|n| n == TABLE_CATALOG_TABLE))
+    if !engine.has_persistent() {
+        return Ok(false);
+    }
+    let sql = format!(
+        "SELECT tablename FROM \"{}\".pg_catalog.pg_tables \
+         WHERE schemaname = 'public' AND tablename = {}",
+        Engine::PERSISTENT_ALIAS,
+        sql_literal(TABLE_CATALOG_TABLE)
+    );
+    let rows = engine.execute_query_to_json(&sql)?;
+    Ok(!rows.is_empty())
 }
 
-/// Return `COUNT(*)` for a user table. Quoted to handle mixed-case or
-/// keyword-like names. The `describe_tables` path already gives us a row
-/// count, but only after a full schema read; this dedicated query is
-/// cheaper when we only need the number.
+/// Return `COUNT(*)` for a user table inside the persistent attachment.
+/// Quoted to handle mixed-case or keyword-like names. Returns 0 if no
+/// persistent attachment is present.
 fn row_count_of(engine: &Engine, table_name: &str) -> Result<i64, McpError> {
+    if !engine.has_persistent() {
+        return Ok(0);
+    }
     let quoted = table_name.replace('"', "\"\"");
-    let sql = format!("SELECT COUNT(*) AS cnt FROM \"{quoted}\"");
+    let sql = format!(
+        "SELECT COUNT(*) AS cnt FROM \"{}\".\"public\".\"{quoted}\"",
+        Engine::PERSISTENT_ALIAS
+    );
     let rows = engine.execute_query_to_json(&sql)?;
     Ok(rows
         .first()
@@ -506,8 +579,11 @@ fn refresh_row_count(
     table_name: &str,
     row_count: Option<i64>,
 ) -> Result<(), McpError> {
+    let Some(qualified) = qualified_catalog(engine) else {
+        return Ok(());
+    };
     let sql = format!(
-        "UPDATE \"{TABLE_CATALOG_TABLE}\" SET row_count = {count} WHERE table_name = {name}",
+        "UPDATE {qualified} SET row_count = {count} WHERE table_name = {name}",
         count = row_count.map_or_else(|| "NULL".into(), |n| n.to_string()),
         name = sql_literal(table_name),
     );

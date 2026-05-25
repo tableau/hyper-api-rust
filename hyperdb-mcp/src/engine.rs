@@ -1219,22 +1219,17 @@ pub const CLIENT_LOG_FILE_NAME: &str = "hyperdb-mcp.log";
 /// automatically — no per-table filter list to keep in sync.
 pub const HYPERDB_INTERNAL_PREFIX: &str = "_hyperdb_";
 
-/// Names of MCP-managed tables that don't follow the `_hyperdb_` prefix
-/// but are also infrastructure rather than user data. Currently just
-/// `_table_catalog`. Added because `--bare` (the historical opt-out for
-/// catalog creation) was removed, so the catalog table now reliably
-/// appears alongside user tables; filtering it from the user-visible
-/// list and counts keeps the LLM's mental model clean.
-const HYPERDB_NAMED_INTERNAL_TABLES: &[&str] = &[crate::table_catalog::TABLE_CATALOG_TABLE];
-
-/// Returns true when `name` is one of `HyperDB`'s own internal tables —
-/// either matching [`HYPERDB_INTERNAL_PREFIX`] (saved-queries, watcher
-/// state, etc.) or appearing in [`HYPERDB_NAMED_INTERNAL_TABLES`] (the
-/// `_table_catalog`, which predates the prefix convention). Factored
-/// into a helper so every filter site calls the same predicate.
+/// Returns true when `name` is one of `HyperDB`'s own internal tables
+/// (matches [`HYPERDB_INTERNAL_PREFIX`]). Factored into a helper so
+/// every filter site calls the same predicate and a future move to a
+/// more nuanced scheme (e.g. per-table allowlist) is a single edit.
+///
+/// Note: `_table_catalog` lives in the persistent attachment, not the
+/// ephemeral primary, so it doesn't show up in `describe_tables` even
+/// without the filter — `describe_tables` only enumerates the primary.
 #[must_use]
 pub fn is_internal_table(name: &str) -> bool {
-    name.starts_with(HYPERDB_INTERNAL_PREFIX) || HYPERDB_NAMED_INTERNAL_TABLES.contains(&name)
+    name.starts_with(HYPERDB_INTERNAL_PREFIX)
 }
 
 /// Compute the log directory for both `hyperd` output and the client-side

@@ -636,17 +636,28 @@ fn copy_create_stubs_table_catalog_on_primary_workspace() {
         "load_params should echo target_table: {params}"
     );
 
-    // Catalog table must be present (this test seeded it explicitly
-    // but the real code path goes through `after_ingest_catalog_update`
-    // which also calls `ensure_exists` via `upsert_stub`).
+    // The catalog lives in the persistent attachment now; verify by
+    // probing `pg_tables` there directly.
+    let catalog_present = engine
+        .execute_query_to_json(
+            "SELECT tablename FROM \"persistent\".pg_catalog.pg_tables \
+             WHERE schemaname = 'public' AND tablename = '_table_catalog'",
+        )
+        .unwrap();
+    assert!(
+        !catalog_present.is_empty(),
+        "_table_catalog must be present in the persistent attachment"
+    );
+    // `derived` was seeded into the ephemeral primary, so it appears in
+    // the engine's regular table listing.
     let names: Vec<String> = engine
         .describe_tables()
         .unwrap()
         .iter()
         .filter_map(|t| t.get("name").and_then(|v| v.as_str()).map(str::to_string))
         .collect();
-    assert!(names.iter().any(|n| n == TABLE_CATALOG_TABLE));
     assert!(names.iter().any(|n| n == "derived"));
+    let _ = TABLE_CATALOG_TABLE; // keep import live (referenced via prose-only assertion)
 }
 
 /// A replay where the source file has been deleted should drop that

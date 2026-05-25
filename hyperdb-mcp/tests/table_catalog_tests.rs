@@ -28,17 +28,19 @@ fn workspace_engine() -> (Engine, TempDir) {
     (engine, dir)
 }
 
-/// `true` if the workspace has a public-schema table named `name`.
-/// Goes through the underlying Catalog directly so it reflects raw
-/// presence — `Engine::describe_tables` filters out internal tables
-/// (including `_table_catalog`), and we want to assert on those too.
+/// `true` if `name` exists in the persistent attachment's `public`
+/// schema. The catalog tests target the persistent DB because that's
+/// where MCP-managed bookkeeping lives in the new model; user-data
+/// tables only matter to these tests in the same scope.
 fn table_exists(engine: &Engine, name: &str) -> bool {
-    let catalog = hyperdb_api::Catalog::new(engine.connection());
-    catalog
-        .get_table_names("public")
-        .unwrap_or_default()
-        .iter()
-        .any(|n| n == name)
+    let sql = format!(
+        "SELECT tablename FROM \"persistent\".pg_catalog.pg_tables \
+         WHERE schemaname = 'public' AND tablename = '{}'",
+        name.replace('\'', "''")
+    );
+    engine
+        .execute_query_to_json(&sql)
+        .is_ok_and(|rows| !rows.is_empty())
 }
 
 // --- Catalog module ---------------------------------------------------------
@@ -60,7 +62,7 @@ fn ensure_exists_is_idempotent() {
 fn upsert_stub_creates_row_with_null_prose_fields() {
     let (engine, _dir) = workspace_engine();
     engine
-        .execute_command("CREATE TABLE widgets (id INT)")
+        .execute_command("CREATE TABLE \"persistent\".\"public\".widgets (id INT)")
         .unwrap();
     table_catalog::upsert_stub(
         &engine,
@@ -92,7 +94,7 @@ fn upsert_stub_creates_row_with_null_prose_fields() {
 fn upsert_stub_preserves_prose_on_reload() {
     let (engine, _dir) = workspace_engine();
     engine
-        .execute_command("CREATE TABLE widgets (id INT)")
+        .execute_command("CREATE TABLE \"persistent\".\"public\".widgets (id INT)")
         .unwrap();
     table_catalog::upsert_stub(&engine, "widgets", "load_file", None, Some(10), true).unwrap();
     table_catalog::set_metadata(
@@ -129,7 +131,7 @@ fn upsert_stub_preserves_prose_on_reload() {
 fn upsert_stub_bump_refresh_updates_last_refreshed_not_loaded_at() {
     let (engine, _dir) = workspace_engine();
     engine
-        .execute_command("CREATE TABLE widgets (id INT)")
+        .execute_command("CREATE TABLE \"persistent\".\"public\".widgets (id INT)")
         .unwrap();
     table_catalog::upsert_stub(&engine, "widgets", "load_file", None, Some(1), true).unwrap();
     let first = table_catalog::get(&engine, "widgets").unwrap().unwrap();
@@ -155,7 +157,7 @@ fn upsert_stub_bump_refresh_updates_last_refreshed_not_loaded_at() {
 fn set_metadata_updates_prose_without_touching_mechanical_fields() {
     let (engine, _dir) = workspace_engine();
     engine
-        .execute_command("CREATE TABLE widgets (id INT)")
+        .execute_command("CREATE TABLE \"persistent\".\"public\".widgets (id INT)")
         .unwrap();
     table_catalog::upsert_stub(&engine, "widgets", "load_file", None, Some(10), true).unwrap();
     let before = table_catalog::get(&engine, "widgets").unwrap().unwrap();
@@ -183,7 +185,7 @@ fn set_metadata_updates_prose_without_touching_mechanical_fields() {
 fn set_metadata_empty_string_clears_field() {
     let (engine, _dir) = workspace_engine();
     engine
-        .execute_command("CREATE TABLE widgets (id INT)")
+        .execute_command("CREATE TABLE \"persistent\".\"public\".widgets (id INT)")
         .unwrap();
     table_catalog::upsert_stub(&engine, "widgets", "load_file", None, Some(1), true).unwrap();
     table_catalog::set_metadata(
@@ -215,7 +217,7 @@ fn set_metadata_empty_string_clears_field() {
 fn set_metadata_rejects_empty_payload() {
     let (engine, _dir) = workspace_engine();
     engine
-        .execute_command("CREATE TABLE widgets (id INT)")
+        .execute_command("CREATE TABLE \"persistent\".\"public\".widgets (id INT)")
         .unwrap();
     table_catalog::upsert_stub(&engine, "widgets", "load_file", None, Some(1), true).unwrap();
     let err =
@@ -252,16 +254,16 @@ fn reconcile_inserts_stubs_drops_orphans_refreshes_counts() {
     // Three user tables exist; the catalog starts with an entry for a
     // table that was dropped, and only one of the three live tables.
     engine
-        .execute_command("CREATE TABLE alpha (id INT)")
+        .execute_command("CREATE TABLE \"persistent\".\"public\".alpha (id INT)")
         .unwrap();
     engine
-        .execute_command("INSERT INTO alpha VALUES (1), (2)")
+        .execute_command("INSERT INTO \"persistent\".\"public\".alpha VALUES (1), (2)")
         .unwrap();
     engine
-        .execute_command("CREATE TABLE beta (id INT)")
+        .execute_command("CREATE TABLE \"persistent\".\"public\".beta (id INT)")
         .unwrap();
     engine
-        .execute_command("CREATE TABLE gamma (id INT)")
+        .execute_command("CREATE TABLE \"persistent\".\"public\".gamma (id INT)")
         .unwrap();
 
     // Pre-populate catalog: known `alpha` (stale count) + orphan `zeta`.
@@ -303,7 +305,7 @@ fn reconcile_inserts_stubs_drops_orphans_refreshes_counts() {
 fn reconcile_skips_internal_tables() {
     let (engine, _dir) = workspace_engine();
     engine
-        .execute_command("CREATE TABLE alpha (id INT)")
+        .execute_command("CREATE TABLE \"persistent\".\"public\".alpha (id INT)")
         .unwrap();
     // Force-create a `_hyperdb_*` table the way `saved_queries` would.
     engine
@@ -324,7 +326,7 @@ fn reconcile_skips_internal_tables() {
 fn delete_for_is_idempotent() {
     let (engine, _dir) = workspace_engine();
     engine
-        .execute_command("CREATE TABLE widgets (id INT)")
+        .execute_command("CREATE TABLE \"persistent\".\"public\".widgets (id INT)")
         .unwrap();
     table_catalog::upsert_stub(&engine, "widgets", "load_file", None, Some(1), true).unwrap();
     assert!(table_catalog::delete_for(&engine, "widgets").unwrap());
@@ -375,7 +377,7 @@ fn read_only_server_does_not_create_catalog() {
     {
         let engine = Engine::new_no_daemon(Some(path_str.clone())).unwrap();
         engine
-            .execute_command("CREATE TABLE widgets (id INT)")
+            .execute_command("CREATE TABLE \"persistent\".\"public\".widgets (id INT)")
             .unwrap();
     }
 
@@ -404,13 +406,13 @@ fn backfill_stubs_preexisting_tables_on_reopen() {
     {
         let engine = Engine::new_no_daemon(Some(path_str.clone())).unwrap();
         engine
-            .execute_command("CREATE TABLE alpha (id INT)")
+            .execute_command("CREATE TABLE \"persistent\".\"public\".alpha (id INT)")
             .unwrap();
         engine
-            .execute_command("INSERT INTO alpha VALUES (1), (2), (3)")
+            .execute_command("INSERT INTO \"persistent\".\"public\".alpha VALUES (1), (2), (3)")
             .unwrap();
         engine
-            .execute_command("CREATE TABLE beta (id INT)")
+            .execute_command("CREATE TABLE \"persistent\".\"public\".beta (id INT)")
             .unwrap();
     }
 
