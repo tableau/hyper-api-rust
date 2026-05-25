@@ -211,17 +211,27 @@ impl WorkspaceStore {
         Self::default()
     }
 
-    /// Idempotently create the meta-table. Called at the top of every
-    /// public method to keep each entry point self-contained.
+    /// Fully-qualified table reference inside the persistent attachment.
+    /// Saved queries are user reference material — they belong with
+    /// curated, long-lived data, which lives in the persistent DB.
+    fn qualified_table() -> String {
+        format!(
+            "\"{}\".\"public\".\"{}\"",
+            Engine::PERSISTENT_ALIAS,
+            SAVED_QUERIES_TABLE
+        )
+    }
+
+    /// Idempotently create the meta-table inside the persistent
+    /// attachment. Called at the top of every public method to keep
+    /// each entry point self-contained.
     ///
     /// The `initialized` flag is intentionally **not** reset on a
     /// `ConnectionLost` reconnect. That's safe because `WorkspaceStore`
-    /// only ever backs persistent workspaces (ephemeral workspaces use
-    /// `SessionStore`), and the meta-table lives in the `.hyper` file
-    /// itself — a reconnect opens the same file and finds the table
-    /// already there. If this class is ever reused with an in-memory or
-    /// recreate-on-reconnect engine the flag will need to be tied to the
-    /// engine's lifetime.
+    /// only ever backs persistent attachments (ephemeral-only sessions
+    /// use `SessionStore`), and the meta-table lives in the `.hyper`
+    /// file itself — a reconnect opens the same file and finds the table
+    /// already there.
     fn ensure_table(&self, engine: &Engine) -> Result<(), McpError> {
         let mut flag = self
             .initialized
@@ -235,12 +245,13 @@ impl WorkspaceStore {
         // `PRIMARY KEY` because Hyper does not support indexes; name
         // uniqueness is enforced application-side in [`Self::save`].
         let ddl = format!(
-            "CREATE TABLE IF NOT EXISTS \"{SAVED_QUERIES_TABLE}\" (\
+            "CREATE TABLE IF NOT EXISTS {table} (\
                  name TEXT NOT NULL, \
                  sql TEXT NOT NULL, \
                  description TEXT, \
                  created_at TIMESTAMP NOT NULL\
-             )"
+             )",
+            table = Self::qualified_table()
         );
         engine.execute_command(&ddl)?;
         *flag = true;
@@ -321,11 +332,12 @@ impl SavedQueryStore for WorkspaceStore {
             )
         })?;
         self.ensure_table(engine)?;
+        let table = Self::qualified_table();
 
         // Up-front existence check — clearer error than Hyper's raw PK
         // violation message, and matches SessionStore's behaviour.
         let existing_sql = format!(
-            "SELECT name FROM \"{SAVED_QUERIES_TABLE}\" WHERE name = {}",
+            "SELECT name FROM {table} WHERE name = {}",
             sql_literal(&query.name)
         );
         let rows = engine.execute_query_to_json(&existing_sql)?;
@@ -345,7 +357,7 @@ impl SavedQueryStore for WorkspaceStore {
             None => "NULL".into(),
         };
         let insert_sql = format!(
-            "INSERT INTO \"{SAVED_QUERIES_TABLE}\" (name, sql, description, created_at) \
+            "INSERT INTO {table} (name, sql, description, created_at) \
              VALUES ({name}, {sql}, {desc}, TIMESTAMP {ts})",
             name = sql_literal(&query.name),
             sql = sql_literal(&query.sql),
@@ -368,8 +380,9 @@ impl SavedQueryStore for WorkspaceStore {
         self.ensure_table(engine)?;
         let sql = format!(
             "SELECT name, sql, description, created_at \
-             FROM \"{SAVED_QUERIES_TABLE}\" WHERE name = {}",
-            sql_literal(name)
+             FROM {table} WHERE name = {}",
+            sql_literal(name),
+            table = Self::qualified_table(),
         );
         let rows = engine.execute_query_to_json(&sql)?;
         match rows.first() {
@@ -388,7 +401,8 @@ impl SavedQueryStore for WorkspaceStore {
         self.ensure_table(engine)?;
         let sql = format!(
             "SELECT name, sql, description, created_at \
-             FROM \"{SAVED_QUERIES_TABLE}\" ORDER BY name"
+             FROM {table} ORDER BY name",
+            table = Self::qualified_table(),
         );
         let rows = engine.execute_query_to_json(&sql)?;
         rows.iter().map(row_to_saved_query).collect()
@@ -403,8 +417,9 @@ impl SavedQueryStore for WorkspaceStore {
         })?;
         self.ensure_table(engine)?;
         let sql = format!(
-            "DELETE FROM \"{SAVED_QUERIES_TABLE}\" WHERE name = {}",
-            sql_literal(name)
+            "DELETE FROM {table} WHERE name = {}",
+            sql_literal(name),
+            table = Self::qualified_table(),
         );
         let affected = engine.execute_command(&sql)?;
         Ok(affected > 0)
