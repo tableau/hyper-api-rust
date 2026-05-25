@@ -1009,3 +1009,97 @@ fn qualified_catalog_in_uses_canonical_alias_after_attach() {
         .unwrap();
     assert_eq!(rows.len(), 1);
 }
+
+// =====================================================================
+// M4 — `execute` reconciles the user-attached target's catalog as well
+// as persistent's. Pre-fix, raw DDL like `DROP TABLE` against a
+// user-attached alias left the dropped table's row stranded in that
+// DB's `_table_catalog` indefinitely. Bootstrap reconcile only walks
+// persistent.
+// =====================================================================
+
+/// Simulates the post-fix `after_execute_catalog_update` flow: after a
+/// DROP TABLE in a user-attached writable DB, both reconciles run and
+/// the dropped table's stub row disappears from that DB's catalog.
+/// Persistent's catalog stays untouched (no row was ever there).
+#[test]
+fn execute_drop_table_in_user_attached_reconciles_that_dbs_catalog() {
+    use hyperdb_mcp::attach::{AttachRegistry, AttachRequest, AttachSource, OnMissing};
+
+    let dir = TempDir::new().unwrap();
+    let primary = dir.path().join("primary.hyper");
+    let attached = dir.path().join("attached.hyper");
+
+    let engine = Engine::new_no_daemon(Some(primary.to_string_lossy().into())).unwrap();
+    let reg = AttachRegistry::new();
+    reg.attach(
+        &engine,
+        AttachRequest {
+            alias: "user_db".into(),
+            source: AttachSource::LocalFile { path: attached },
+            writable: true,
+            on_missing: OnMissing::Create,
+        },
+    )
+    .unwrap();
+
+    // Seed a stub row in user_db's catalog (mimics what load_data
+    // against the user-attached DB does).
+    engine
+        .execute_command("CREATE TABLE \"user_db\".\"public\".\"to_drop\" (id INT)")
+        .unwrap();
+    hyperdb_mcp::table_catalog::upsert_stub_in(
+        &engine,
+        "to_drop",
+        "load_data",
+        None,
+        Some(0),
+        true,
+        Some("user_db"),
+    )
+    .unwrap();
+
+    // Confirm the row landed.
+    let before = engine
+        .execute_query_to_json(
+            "SELECT table_name FROM \"user_db\".\"public\".\"_table_catalog\" \
+             WHERE table_name = 'to_drop'",
+        )
+        .unwrap();
+    assert_eq!(before.len(), 1, "stub must exist before DROP");
+
+    // Now drop the table — the user's `execute("DROP TABLE …")` would
+    // run this exact SQL.
+    engine
+        .execute_command("DROP TABLE \"user_db\".\"public\".\"to_drop\"")
+        .unwrap();
+
+    // Mirror `after_execute_catalog_update`'s post-fix behavior: it
+    // calls reconcile for persistent, then for the user target.
+    hyperdb_mcp::table_catalog::reconcile_in(&engine, None).unwrap();
+    hyperdb_mcp::table_catalog::reconcile_in(&engine, Some("user_db")).unwrap();
+
+    // The stranded row in user_db's catalog must be gone.
+    let after = engine
+        .execute_query_to_json(
+            "SELECT table_name FROM \"user_db\".\"public\".\"_table_catalog\" \
+             WHERE table_name = 'to_drop'",
+        )
+        .unwrap();
+    assert_eq!(
+        after.len(),
+        0,
+        "post-execute reconcile must drop catalog rows for tables removed by raw DDL in the user-attached DB"
+    );
+
+    // And persistent's catalog never had a row for `to_drop` to begin
+    // with; reconcile_in(None) must not have created one as a side
+    // effect.
+    let in_persistent = engine
+        .execute_query_to_json(
+            "SELECT table_name FROM \"persistent\".\"public\".\"_table_catalog\" \
+             WHERE table_name = 'to_drop'",
+        )
+        .unwrap();
+    assert_eq!(in_persistent.len(), 0);
+}

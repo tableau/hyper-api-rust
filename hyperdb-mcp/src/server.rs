@@ -1162,16 +1162,34 @@ impl HyperMcpServer {
 
     /// Best-effort catalog reconcile after a DDL/DML `execute`. Same
     /// error-swallowing rationale as [`Self::after_ingest_catalog_update`].
+    ///
+    /// Reconciles persistent first, then the user-attached writable
+    /// target if one was passed and it isn't persistent. Without the
+    /// second pass, raw DDL like `DROP TABLE` against a user-attached
+    /// alias leaves the dropped table's row stranded in that DB's
+    /// `_table_catalog` indefinitely (bootstrap reconcile only walks
+    /// persistent, and tools like `describe` would keep listing it).
     #[expect(
         clippy::unused_self,
         reason = "kept for symmetry; runs inside with_engine"
     )]
-    fn after_execute_catalog_update(&self, engine: &Engine) {
-        if let Err(e) = crate::table_catalog::reconcile(engine) {
+    fn after_execute_catalog_update(&self, engine: &Engine, target_db: Option<&str>) {
+        if let Err(e) = crate::table_catalog::reconcile_in(engine, None) {
             tracing::warn!(
                 err = %e.message,
-                "failed to reconcile _table_catalog after execute"
+                "failed to reconcile persistent _table_catalog after execute"
             );
+        }
+        if let Some(alias) = target_db {
+            if !alias.eq_ignore_ascii_case(Engine::PERSISTENT_ALIAS) {
+                if let Err(e) = crate::table_catalog::reconcile_in(engine, Some(alias)) {
+                    tracing::warn!(
+                        target_db = alias,
+                        err = %e.message,
+                        "failed to reconcile user-DB _table_catalog after execute"
+                    );
+                }
+            }
         }
     }
 
@@ -2206,8 +2224,12 @@ impl HyperMcpServer {
             // Reconcile before returning so clients see the updated
             // catalog immediately (e.g. a subsequent `describe` picks up
             // a freshly-CREATEd table's stub row, and DROPped tables
-            // disappear from the catalog). No-op in bare mode.
-            self.after_execute_catalog_update(engine);
+            // disappear from the catalog). Threads `target_db` so a
+            // raw DDL against a user-attached alias also reconciles
+            // that DB's catalog (otherwise the dropped table's row
+            // stays stranded — bootstrap reconcile only walks
+            // persistent).
+            self.after_execute_catalog_update(engine, target_db.as_deref());
             Ok(json!({
                 "sql": Self::fmt_sql(&params.sql),
                 "affected_rows": affected,

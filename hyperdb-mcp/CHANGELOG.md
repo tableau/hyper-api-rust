@@ -140,6 +140,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   one retry on a fresh pool; persistent failures still flow into the
   standard `failed/` move so a single broken file can't pin the
   watcher in retry loops.
+- **`execute` now reconciles the user-attached target's `_table_catalog`.**
+  Pre-fix, raw DDL like `execute(database="foo", sql="DROP TABLE bar")`
+  removed the table from the user-attached DB but left its stub row
+  stranded in `"foo"."public"."_table_catalog"` indefinitely (bootstrap
+  reconcile and the post-execute reconcile both walked persistent
+  only). `after_execute_catalog_update` now reconciles persistent
+  first and then the user-attached target if non-persistent.
 
 ## [0.1.1] - 2026-05-13
 
