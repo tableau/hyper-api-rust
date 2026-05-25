@@ -196,12 +196,16 @@ Derived fields are merged into the serialized JSON so callers get a self-contain
 
 ---
 
-## Workspace Modes Internals
+## Two-Database Engine Model
 
-- **Ephemeral** — `Engine::new(None)` creates a temp directory (`$TMPDIR/hyperdb-mcp-<pid>/`) with a `workspace.hyper` file. Cleaned up on process exit. In daemon mode, `Engine::drop` issues `DETACH DATABASE` (releasing Hyper's file lock — required on Windows) before `remove_dir_all` deletes the temp directory.
-- **Persistent** — `Engine::new(Some(path))` uses the caller-supplied path. Parent directories are created automatically. `~` is expanded via `$HOME` (no shell crate dependency).
+Every `Engine` holds:
 
-Logs (both `hyperd` server logs and the MCP client log) land in the same directory as the workspace file. The `status` tool reports log paths so operators know where to look.
+- **Ephemeral primary** at `$TMPDIR/hyperdb-mcp-<pid>-<seq>/scratch.hyper`. Created fresh on each `Engine::new` (`<seq>` is a process-wide atomic so parallel test runners and restart-after-ConnectionLost reconnects get distinct files). The connection is *bound* to this database — unqualified SQL routes here. `Engine::drop` always deletes the per-engine temp directory.
+- **Persistent attachment** under the alias `"persistent"`. When `Engine::new(Some(path))` is called, the engine runs `CREATE DATABASE IF NOT EXISTS '<path>'` (creating the file if missing) and `ATTACH DATABASE '<path>' AS "persistent"`. Then `SET schema_search_path = '<primary_db>'` keeps unqualified resolution routing into the ephemeral primary. `Engine::new(None)` skips this step (the `--ephemeral-only` mode); `engine.has_persistent()` reflects which mode was selected.
+
+Catalog and saved-queries meta-tables live in the persistent attachment, qualified via `"persistent"."public"."_table_catalog"` etc. When the engine has no persistent attachment, those operations no-op. See `crate::table_catalog::qualified_catalog` and `crate::saved_queries::WorkspaceStore::qualified_table` for the routing helpers.
+
+Logs land next to the persistent file when one is supplied (so users find them in a stable per-project location); ephemeral-only sessions log to `$TMPDIR/hyperdb-mcp-<pid>/`. The `status` tool reports `ephemeral_path`, `persistent_path`, and `has_persistent` so operators can confirm where data lives.
 
 ## Daemon Mode Internals
 

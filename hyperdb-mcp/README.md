@@ -31,7 +31,7 @@ LLMs are powerful at reasoning but cannot natively crunch millions of rows. This
 - **Pre-ingest file inspection** — `inspect_file` dry-runs the same inference without touching Hyper so LLMs can build safe schema overrides in one shot
 - **Partial schema overrides** — supply just the columns you want to correct (e.g. `{"population":"BIGINT"}`) — the rest keep their inferred type
 - **Rich resource surface** — workspace readme, per-table JSON and CSV samples, and one JSON + one CSV resource per table so LLMs can orient themselves via `resources/list` without any tool calls
-- **Saved queries** — register named read-only SQL with `save_query`; each query becomes `hyper://queries/{name}/definition` (metadata) + `hyper://queries/{name}/result` (live re-run). Persisted in `--workspace` mode, session-only otherwise
+- **Saved queries** — register named read-only SQL with `save_query`; each query becomes `hyper://queries/{name}/definition` (metadata) + `hyper://queries/{name}/result` (live re-run). Persisted in the persistent attachment, session-only when `--ephemeral-only`
 - **Live resource-update notifications** — MCP clients can `resources/subscribe` to any `hyper://...` URI; the server fires `notifications/resources/updated` after every ingest, DDL, watcher event, or saved-query mutation
 
 ---
@@ -132,12 +132,12 @@ Or if you built from source:
 }
 ```
 
-For a **persistent workspace** (tables survive across sessions), add `"args"`:
+By default, persistent storage lives at the platform data dir (`~/Library/Application Support/hyperdb/workspace.hyper` on macOS, `~/.local/share/hyperdb/workspace.hyper` on Linux, `%APPDATA%\hyperdb\workspace.hyper` on Windows). To use a custom path:
 ```json
-"args": ["--workspace", "/path/to/my-project.hyper"]
+"args": ["--persistent-db", "/path/to/my-project.hyper"]
 ```
 
-Multiple MCP clients can point at the **same** persistent workspace simultaneously — they all connect through the shared `hyperd` daemon and use Hyper's MVCC transaction isolation. See [Operating Modes](#operating-modes) below.
+Multiple MCP clients can point at the **same** persistent file simultaneously — they all connect through the shared `hyperd` daemon and use Hyper's MVCC transaction isolation. See [Operating Modes](#operating-modes) below.
 
 #### Claude Code / AI Suite
 
@@ -163,7 +163,7 @@ Any tool that supports the MCP stdio transport can use this server. Point it at 
 
 ## Operating Modes
 
-The server has two independent mode dimensions: **how the Hyper engine is run** and **where the database is stored**.
+Each session has **two databases**: an ephemeral primary (always created fresh per session, deleted on exit) and a persistent attachment (stored at the platform-default location or a path you supply). Unqualified SQL targets the ephemeral primary; the persistent attachment is reachable as the `"persistent"` alias and survives across sessions.
 
 ### Hyper engine
 
@@ -174,14 +174,30 @@ The server has two independent mode dimensions: **how the Hyper engine is run** 
 
 The shared daemon is the bigger win for users running multiple AI clients (Claude Code + Cursor + VS Code) — they all share one Hyper engine instead of spawning three.
 
-### Database persistence
+### Database storage
 
 | Mode | Flag | Behavior |
 |---|---|---|
-| **Ephemeral** *(default)* | *(none)* | A temp `.hyper` file is created per session and deleted on exit (DETACH + delete in daemon mode, Windows-safe). |
-| **Persistent** | `--workspace <PATH>` | Uses the supplied `.hyper` file; survives across sessions. Multiple clients can point at the same path simultaneously. |
+| **Default** | *(none)* | Ephemeral primary in `$TMPDIR/hyperdb-mcp-<pid>-<n>/scratch.hyper` + persistent attachment at the platform data dir (e.g. `~/Library/Application Support/hyperdb/workspace.hyper` on macOS). |
+| **Custom persistent path** | `--persistent-db <PATH>` | Same as default but the persistent file lives at `<PATH>`. The deprecated `--workspace <PATH>` is accepted as an alias with a stderr warning. |
+| **Ephemeral-only** | `--ephemeral-only` | No persistent attachment; the session has only the ephemeral primary plus any user-attached databases via `attach_database`. Saved queries fall back to in-memory storage and disappear when the session ends. |
 
-The two dimensions are orthogonal — any combination works. With the default (shared daemon + ephemeral), every client gets its own scratch database living inside the same shared engine; with `--workspace` added, multiple clients can collaborate on the same persistent dataset.
+`HYPERDB_PERSISTENT_DB` overrides the default persistent path the same way `--persistent-db` does.
+
+### Working with both databases
+
+Tool calls default to the ephemeral primary — that's the LLM's scratch space for exploratory work. To target the persistent attachment from SQL, use a fully-qualified table reference:
+
+```sql
+-- Read from persistent
+SELECT * FROM "persistent"."public"."customers";
+
+-- Write to persistent
+CREATE TABLE "persistent"."public"."revenue_2026" AS
+  SELECT region, SUM(amount) FROM scratch_orders GROUP BY region;
+```
+
+The `_table_catalog` (which tracks MCP-managed metadata for your tables) lives in the persistent attachment automatically — there's nothing to manage. If you want a pristine `.hyper` file for export with no MCP bookkeeping, run `DROP TABLE "persistent"."public"."_table_catalog"` once and subsequent sessions opening that file will leave it dropped.
 
 ### Daemon management
 
@@ -210,7 +226,34 @@ If hyperd repeatedly fails to start (3 attempts within 60 seconds — e.g., misc
 | Flag | Behavior |
 |---|---|
 | `--read-only` | Disables `execute`, `load_data`, `load_file`, `watch_directory`, `save_query`, `delete_query`, and Hyper-format export. See [Read-Only Mode](#read-only-mode). |
-| `--bare` | Skips MCP-managed auxiliary tables (`_table_catalog`); saved queries are kept in-memory only, even with `--workspace`. |
+
+### Daemon management
+
+The daemon is normally invisible — it auto-spawns and idle-times-out on its own. For diagnostics:
+
+```bash
+hyperdb-mcp daemon status   # Show running daemon (PID, endpoint, started_at, version)
+hyperdb-mcp daemon stop     # Gracefully shut down the daemon
+hyperdb-mcp daemon          # Run as a daemon explicitly (rarely needed)
+```
+
+State files live at `~/.hyperdb/` by default (override with `HYPERDB_STATE_DIR`).
+
+### Recovery from hyperd crashes
+
+The daemon polls `hyperd` every 5 seconds. If the process has exited (crashed, OOM, killed), the daemon spawns a replacement, atomically updates `~/.hyperdb/daemon.json` with the new endpoint, and continues serving clients. Clients see one failed tool call (the request that was in flight when hyperd died); the next tool call transparently reconnects to the new hyperd via the same recovery path used for normal connection drops.
+
+If a client itself notices hyperd is unreachable before the next polling tick, it sends a fast-path `REPORT_HYPERD_ERROR` signal to the daemon so the restart kicks off without waiting for the timer.
+
+If hyperd repeatedly fails to start (3 attempts within 60 seconds — e.g., misconfigured `HYPERD_PATH`, port exhaustion, broken binary), the daemon shuts itself down and removes the discovery file. The next MCP client to start up will then spawn a fresh daemon, surfacing any persistent failure clearly to the user rather than spinning silently.
+
+**Known limitation:** if hyperd hangs (alive at the OS level but unresponsive to queries), the daemon's polling can't detect it and your tool call may stall indefinitely. The recovery path is `hyperdb-mcp daemon stop` followed by reconnecting from your MCP client.
+
+### Other behavioral flags
+
+| Flag | Behavior |
+|---|---|
+| `--read-only` | Disables `execute`, `load_data`, `load_file`, `watch_directory`, `save_query`, `delete_query`, and Hyper-format export. See [Read-Only Mode](#read-only-mode). |
 
 ---
 
@@ -398,10 +441,10 @@ Each saved query produces **two** resources:
 - `hyper://queries/{name}/result` — re-runs the SQL on every read and
   returns `{ name, result: [...], stats: {...} }`.
 
-**Persistence:** queries saved while `--workspace <path>` is set are
-stored in the `_hyperdb_saved_queries` meta-table inside the `.hyper`
-file and survive server restarts. In ephemeral workspaces they live only
-for the lifetime of the server process.
+**Persistence:** saved queries land in the persistent attachment's
+`_hyperdb_saved_queries` meta-table (`"persistent"."public"."_hyperdb_saved_queries"`)
+and survive server restarts. In `--ephemeral-only` sessions they live
+only for the lifetime of the server process.
 
 #### `save_query`
 
@@ -588,7 +631,7 @@ Four guided analytical workflows registered as MCP **Prompts**.
 ## Read-Only Mode
 
 ```bash
-hyperdb-mcp --workspace ~/analytics.hyper --read-only
+hyperdb-mcp --persistent-db ~/analytics.hyper --read-only
 ```
 
 - **Allowed:** `query`, `query_data`, `query_file`, `describe`, `sample`, `inspect_file`, `status`, `export`
@@ -697,23 +740,34 @@ Full reference: [Data Cloud SQL Reference](https://developer.salesforce.com/docs
 hyperdb-mcp [OPTIONS] [COMMAND]
 
 Commands:
-  daemon                Run as a background daemon managing a shared hyperd process
+  daemon                  Run as a background daemon managing a shared hyperd process
 
 Options:
-  --workspace <PATH>    Path to the `.hyper` workspace file for persistent mode (omit for ephemeral)
-  --read-only           Disable mutating tools (execute, load_data, load_file, save_query, delete_query, watch_directory)
-  --bare                Skip MCP-managed auxiliary tables (`_table_catalog`) and force saved queries into in-memory storage, even with --workspace
-  --no-daemon           Disable the shared daemon and spawn a private hyperd (legacy per-session behavior)
+  --persistent-db <PATH>  Path to the persistent .hyper file. Defaults to the platform
+                          data dir (~/Library/Application Support/hyperdb/workspace.hyper
+                          on macOS, ~/.local/share/hyperdb/workspace.hyper on Linux,
+                          %APPDATA%\hyperdb\workspace.hyper on Windows). Override via
+                          the HYPERDB_PERSISTENT_DB env var.
+  --ephemeral-only        Skip the persistent attachment entirely. Disables save_query
+                          persistence (queries fall back to session storage).
+  --read-only             Disable mutating tools (execute, load_data, load_file,
+                          save_query, delete_query, watch_directory)
+  --no-daemon             Disable the shared daemon and spawn a private hyperd
+
+Deprecated:
+  --workspace <PATH>      Old name for --persistent-db. Still accepted, emits a
+                          stderr warning, and will be removed in a future release.
 
 Daemon subcommand:
-  hyperdb-mcp daemon                    Start the daemon (usually auto-spawned)
-  hyperdb-mcp daemon stop               Gracefully stop the running daemon
-  hyperdb-mcp daemon status             Show running daemon info
-  hyperdb-mcp daemon --port <PORT>      Override the health/lock port (default 7484)
-  hyperdb-mcp daemon --idle-timeout <SECS>   Override idle timeout (default 1800 = 30 min)
+  hyperdb-mcp daemon                          Start the daemon (usually auto-spawned)
+  hyperdb-mcp daemon stop                     Gracefully stop the running daemon
+  hyperdb-mcp daemon status                   Show running daemon info
+  hyperdb-mcp daemon --port <PORT>            Override the health/lock port (default 7484)
+  hyperdb-mcp daemon --idle-timeout <SECS>    Override idle timeout (default 1800 = 30 min)
 
 Environment:
   HYPERD_PATH                  Path to hyperd binary (auto-detected if on PATH)
+  HYPERDB_PERSISTENT_DB        Override the default persistent-db path
   HYPERDB_STATE_DIR            Override daemon state directory (default ~/.hyperdb/)
   HYPERDB_DAEMON_PORT          Override daemon health/lock port (default 7484)
   HYPERDB_DAEMON_IDLE_TIMEOUT  Override daemon idle timeout in seconds (default 1800)

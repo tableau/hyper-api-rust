@@ -31,6 +31,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   attempts are rate-limited to 3 per 60 seconds; exceeding the limit
   triggers daemon shutdown so the user sees the failure clearly
   rather than spinning silently.
+- **Two-database engine model.** Every session now has both an
+  ephemeral primary (created fresh per-session, deleted on exit) AND
+  a persistent attachment under the alias `"persistent"`. Unqualified
+  SQL routes to the ephemeral primary (the LLM's scratch space);
+  fully-qualified SQL like
+  `INSERT INTO "persistent"."public"."customers" ...` writes to
+  storage that survives across sessions.
+- **Platform-default persistent path.** When `--persistent-db` is
+  unset, the persistent file lives at the platform data directory:
+  `~/Library/Application Support/hyperdb/workspace.hyper` on macOS,
+  `~/.local/share/hyperdb/workspace.hyper` on Linux,
+  `%APPDATA%\hyperdb\workspace.hyper` on Windows. Override with
+  `HYPERDB_PERSISTENT_DB`.
+- **New CLI flags:** `--persistent-db <PATH>` (replaces `--workspace`,
+  which is kept as a deprecated alias with a stderr warning); and
+  `--ephemeral-only` to skip the persistent attachment entirely.
+- The `_table_catalog` and `_hyperdb_saved_queries` meta-tables now
+  live in the persistent attachment instead of the connection's
+  primary, so saved queries automatically persist across sessions
+  without any flag toggling.
+
+### Removed
+
+- **`--bare` flag.** Catalog seeding is now uniform: created when MCP
+  creates a fresh `.hyper`, never touched on existing files. Users
+  who want a pristine `.hyper` for export can `DROP TABLE _table_catalog`
+  once after creation; subsequent opens won't recreate it.
 
 ## [0.1.1] - 2026-05-13
 
