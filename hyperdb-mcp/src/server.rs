@@ -499,6 +499,15 @@ pub struct WatchDirectoryParams {
     /// Each in-flight ingest holds one connection to hyperd plus a transaction.
     #[serde(default)]
     pub max_concurrent: Option<u32>,
+    /// Target database alias. **Currently only the primary (ephemeral)
+    /// database is supported by the watcher** — the connection pool is
+    /// bound to the primary file. Passing `"persistent"` returns an
+    /// error. Use `load_file` with `persist: true` for one-off persistent
+    /// ingests.
+    pub database: Option<String>,
+    /// Shorthand for `database: "persistent"`. Same limitation applies —
+    /// not yet supported by the watcher.
+    pub persist: Option<bool>,
 }
 
 /// Parameters for the `unwatch_directory` tool.
@@ -2350,6 +2359,17 @@ impl HyperMcpServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         if let Err(e) = self.check_writable("watch_directory") {
             return Self::err_content(e);
+        }
+        // Watcher uses a connection pool bound to the primary database;
+        // non-primary targets are not yet supported.
+        if params.database.is_some() || params.persist == Some(true) {
+            return Self::err_content(McpError::new(
+                ErrorCode::InvalidArgument,
+                "watch_directory does not yet support `database` or `persist`. \
+                 The watcher's connection pool is bound to the primary database. \
+                 Use `load_file` with `persist: true` for one-off persistent ingests."
+                    .to_string(),
+            ));
         }
         let canonical = match crate::attach::validate_input_path(&params.path, "watch directory") {
             Ok(p) => p,
