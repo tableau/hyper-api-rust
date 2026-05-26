@@ -584,3 +584,51 @@ fn line_chart_many_timestamps_auto_thins() {
     let result = render_chart(&rows, &opts).unwrap();
     assert_eq!(result.rows_plotted, 30);
 }
+
+/// Regression: a 90-point hourly TIMESTAMP series used to render with
+/// only ONE visible x-axis label because the old `shorten_labels`
+/// blanked non-step indices and `plotters` picked tick positions that
+/// rarely landed on a kept index. The fix tells `plotters` how many
+/// ticks to draw up front, so every tick position carries a real label.
+///
+/// Uses SVG mode so we can inspect the rendered text content directly.
+#[test]
+fn line_chart_long_timestamp_series_renders_multiple_visible_labels() {
+    let rows: Vec<_> = (0..90)
+        .map(|i| {
+            json!({
+                "ts": format!("2026-01-{:02} {:02}:00:00", (i / 24) + 1, i % 24),
+                "value": i
+            })
+        })
+        .collect();
+    let opts = ChartOptions {
+        chart_type: ChartType::Line,
+        format: ChartFormat::Svg,
+        x_column: Some("ts".into()),
+        y_column: Some("value".into()),
+        width: 800,
+        height: 480,
+        ..ChartOptions::default()
+    };
+    let result = render_chart(&rows, &opts).unwrap();
+    assert_eq!(result.rows_plotted, 90);
+    let svg = String::from_utf8(result.bytes).expect("SVG must be UTF-8");
+    // Each visible x-axis tick label is rendered as an SVG <text>
+    // element containing the literal label string. Every label in this
+    // series starts with "2026-01-", so counting that prefix gives the
+    // number of *visible* x-axis labels (the y-axis labels are numeric
+    // and won't match).
+    let visible_labels = svg.matches("2026-01-").count();
+    assert!(
+        visible_labels >= 3,
+        "expected >= 3 visible x-axis labels for a 90-point series, got {visible_labels} \
+         (regression: pre-fix value was 1)"
+    );
+    // Also bound the upper end — too many would mean labels overlap;
+    // 800 / (19chars * 7px + 10px) ≈ 5 is the heuristic target.
+    assert!(
+        visible_labels <= 12,
+        "expected <= 12 visible labels (no overlap on 800px wide chart), got {visible_labels}"
+    );
+}

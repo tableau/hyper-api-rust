@@ -132,8 +132,11 @@ watcher targets the alias; call `unwatch_directory` first.
   Arrow IPC, CSV, .hyper).
 - `chart` — render a bar / line / scatter / histogram PNG from a SQL
   query. Data must be long-format (one numeric y column; use a `series`
-  column for grouping). DATE/TIMESTAMP/TEXT x columns are auto-detected
-  as categorical for line/scatter. Wide-format data must be reshaped
+  column for grouping). On line/scatter charts, DATE / TIMESTAMP /
+  TIMESTAMPTZ x columns auto-detect to a **proportional time axis**
+  (real-world gaps reflected in spacing); TEXT x falls back to evenly
+  spaced categorical mode. Pass `x_as_category: true` to force
+  categorical even on temporal data. Wide-format data must be reshaped
   with UNION ALL.
 - `copy_query` — run a SELECT across local + attached databases and
   insert the result into a target table (`mode`: `create`, `append`,

@@ -38,6 +38,7 @@
 )]
 
 use crate::error::{ErrorCode, McpError};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use plotters::prelude::*;
 use plotters::style::colors;
 use serde_json::Value;
@@ -388,18 +389,24 @@ pub struct ChartOptions {
     /// Override the chart-type-specific default for how the x column is
     /// interpreted:
     ///
-    /// - `None` (default): use the chart type's natural behavior — `Bar`
-    ///   treats x as categorical, `Line` / `Scatter` require numeric x.
-    /// - `Some(true)`: force categorical even on `Line` / `Scatter`.
-    ///   Essential for plotting values whose natural axis is a string /
-    ///   date / enum (e.g. `SELECT day, happiness_score` where `day` is a
-    ///   `DATE`).
-    /// - `Some(false)`: force numeric even on `Bar` (rarely useful — bar
-    ///   charts are almost always categorical).
+    /// - `None` (default): auto-detect from the first row's x value.
+    ///   - For `Bar`: always categorical.
+    ///   - For `Line` / `Scatter`: numeric x → numeric axis;
+    ///     DATE / TIMESTAMP / TIMESTAMPTZ string → **proportional time
+    ///     axis** (positions are real Unix epoch seconds, ticks formatted
+    ///     in the matching kind); TEXT → categorical fallback.
+    /// - `Some(true)`: force categorical layout (synthetic sequential
+    ///   x positions, original strings as tick labels). Useful when you
+    ///   want even spacing on temporal data — e.g. one bar per business
+    ///   day with no visual gap for weekends.
+    /// - `Some(false)`: force numeric x. Errors for non-numeric inputs
+    ///   on `Line` / `Scatter`. Rarely useful on `Bar`.
     ///
     /// When categorical mode is active the rendered x axis uses the
     /// original string representation of each distinct x value as its
-    /// tick label, in the order x values are first seen.
+    /// tick label, in the order x values are first seen. When time mode
+    /// is active, gaps between data points reflect real wall-clock time
+    /// rather than insertion order.
     pub x_as_category: Option<bool>,
     /// Fix the x-axis range as `[min, max]`. When set, auto-scaling is
     /// skipped and all frames/charts share the same x extent. Useful for
@@ -600,58 +607,88 @@ fn as_string(v: &Value) -> String {
     }
 }
 
-/// Shorten categorical tick labels for display. Two passes:
+/// Compact categorical tick labels by stripping a shared trailing
+/// timezone offset, when every label ends with the same one (typical
+/// for TIMESTAMPTZ data stored in UTC where every row reports `+00:00`).
 ///
-/// 1. **Strip shared timezone offset** — if every label ends with the
-///    same `+HH:MM` or `+00:00` (common for TIMESTAMPTZ), drop that
-///    suffix since it adds no information.
-/// 2. **Auto-thin** — if there are more labels than can fit without
-///    overlap (estimated at `chart_width / (avg_char_count * 7px)`),
-///    keep only every Nth label and blank the rest.
-fn shorten_labels(labels: &[String], chart_width: u32) -> Vec<String> {
-    if labels.is_empty() {
-        return Vec::new();
+/// Returns labels unchanged when there's no shared suffix or fewer than
+/// two labels. Tick *count* selection lives in [`auto_tick_count`]; this
+/// pass is purely about removing redundant characters from each label.
+fn strip_shared_tz_suffix(labels: &[String]) -> Vec<String> {
+    if labels.len() <= 1 {
+        return labels.to_vec();
     }
-    // Pass 1: strip shared timezone suffix (e.g. "+00:00", "+05:30")
-    let stripped: Vec<String> = if labels.len() > 1 {
-        let suffix = shared_tz_suffix(labels);
-        if let Some(ref sfx) = suffix {
-            labels
-                .iter()
-                .map(|l| l.strip_suffix(sfx.as_str()).unwrap_or(l).trim().to_string())
-                .collect()
-        } else {
-            labels.to_vec()
-        }
-    } else {
-        labels.to_vec()
+    let Some(suffix) = shared_tz_suffix(labels) else {
+        return labels.to_vec();
     };
-
-    // Pass 2: auto-thin if labels would overlap
-    let max_len = stripped.iter().map(String::len).max().unwrap_or(1);
-    let char_px = 7_u32;
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "label length is bounded by real-world string sizes (< 200 chars)"
-    )]
-    let label_px = (max_len as u32) * char_px + 10;
-    let fits = (chart_width / label_px.max(1)) as usize;
-    if fits >= stripped.len() || stripped.len() <= 2 {
-        return stripped;
-    }
-    // Show every Nth label, always including first and last
-    let step = (stripped.len() + fits - 1) / fits.max(1);
-    stripped
+    labels
         .iter()
-        .enumerate()
-        .map(|(i, l)| {
-            if i == 0 || i == stripped.len() - 1 || i % step == 0 {
-                l.clone()
-            } else {
-                String::new()
-            }
-        })
+        .map(|l| l.strip_suffix(suffix.as_str()).unwrap_or(l).trim().to_string())
         .collect()
+}
+
+/// Decide how many tick labels `plotters` should draw on a categorical
+/// x-axis given the labels we plan to render and the chart pixel width.
+///
+/// We pass the result to `.x_labels(N)` so `plotters` distributes tick
+/// positions across the categorical range. The formatter then renders
+/// the *real* label at each position — never blanks — so the user sees
+/// a usable, evenly-spaced subset rather than a sea of empty strings.
+///
+/// Heuristic: estimate per-label pixel width as
+/// `max_label_chars * 7px + 10px` (close to plotters' default mesh
+/// font), divide the chart width by that, then clamp to
+/// `[2, labels.len()]`. Returns `labels.len()` directly when there
+/// are 0 or 1 labels.
+///
+/// # Why not blank labels at non-step indices?
+///
+/// `plotters` picks its own tick *positions* on the float axis (e.g.
+/// `0.0, 4.7, 9.4, …` for a 0..89 categorical range). Rounding those
+/// back to integer indices rarely lands on the same indices a "keep
+/// every Nth, blank the rest" rule would preserve, so most ticks
+/// would render as empty strings. Telling `plotters` how many ticks
+/// to draw and always returning a real label is the only stable fix.
+///
+/// # Caveat: `plotters` rounds down to the next "nice" subdivision
+///
+/// `plotters::compute_f64_key_points` picks the smallest scale (most
+/// ticks) such that `npoints ≤ max_points`, drawing scales from a
+/// fixed band table `{1, 2, 5, 10, 20, 50, 100, …}`. So a wider chart
+/// requesting 9 ticks across a 0..89 range still ends up with 5 ticks
+/// (band 20), because the next denser band gives 10 ticks > 9. The
+/// fix for that is *not* to multiply the request — at 800 px width 10
+/// labels of 19 chars each (1430 px) would overlap. The proper fix
+/// for time-series charts is the proportional time-axis path, where
+/// `plotters` picks nice time intervals against real epoch positions
+/// and the band-rounding artifact disappears entirely.
+fn auto_tick_count(labels: &[String], chart_width: u32) -> usize {
+    if labels.len() <= 1 {
+        return labels.len();
+    }
+    let max_chars = labels
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(1);
+    tick_count_for_label_width(max_chars, chart_width).min(labels.len())
+}
+
+/// Compute how many tick labels can fit horizontally, given a typical
+/// label character count and the chart pixel width. Pure width math —
+/// no clamping against a label count or label slice. Use this when
+/// the actual label list isn't available up front (e.g. the temporal
+/// branch generates labels lazily inside the formatter closure).
+///
+/// Returns at least 2 so the axis stays informative even when labels
+/// would technically overlap.
+fn tick_count_for_label_width(label_chars: usize, chart_width: u32) -> usize {
+    let per_label_px = u32::try_from(label_chars)
+        .unwrap_or(u32::MAX)
+        .saturating_mul(7)
+        .saturating_add(10);
+    let fits = chart_width.saturating_div(per_label_px.max(1)) as usize;
+    fits.max(2)
 }
 
 /// If all labels share a trailing timezone offset pattern like `+00:00`
@@ -714,6 +751,156 @@ fn collect_categories(groups: &SeriesMap) -> Vec<(f64, String)> {
         .collect()
 }
 
+/// Discriminator for temporal x-axis input formats. Drives both the
+/// date parser ([`parse_temporal`]) and the time-axis label formatter,
+/// so a chart with `DATE` x values doesn't waste pixels on `00:00:00`
+/// suffixes and a `TIMESTAMPTZ` chart preserves its timezone offset on
+/// rendered tick labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TemporalKind {
+    /// `YYYY-MM-DD` — labels rendered as `%Y-%m-%d`, ticks land at
+    /// midnight UTC.
+    Date,
+    /// `YYYY-MM-DD HH:MM:SS` — labels rendered as `%Y-%m-%d %H:%M:%S`,
+    /// positioned at their face-value UTC equivalent (TIMESTAMP is
+    /// timezone-naive by definition).
+    DateTime,
+    /// `YYYY-MM-DD HH:MM:SS+HH:MM` — wrapped offset is the seconds
+    /// east of UTC parsed from the *first* row. Subsequent rows are
+    /// positioned in true UTC and re-rendered in this offset's local
+    /// time, so a chart over uniformly-`+00:00` data displays UTC
+    /// labels and a chart over `+05:30` data displays IST.
+    DateTimeTz(i32),
+}
+
+/// How to interpret the x column when extracting f64 axis positions.
+///
+/// Drives [`group_series`] and the corresponding rendering branch in
+/// [`line_or_scatter`] / [`draw_bar`]. `Temporal` is the new mode added
+/// for proportional time-axis rendering: x positions are real Unix
+/// epoch seconds (so 6 hours apart on the wire are 6 hours apart on
+/// the chart), and tick labels are formatted via chrono.
+#[derive(Debug, Clone, Copy)]
+enum XMode {
+    /// X values must be JSON numbers; positions pass through directly.
+    Numeric,
+    /// X values are stringified and assigned synthetic sequential
+    /// indices in first-seen order. All positions are integers, so
+    /// gaps in real-world spacing are flattened.
+    Categorical,
+    /// X values are parsed as temporal strings and positioned at their
+    /// Unix epoch seconds. Spacing is proportional to real time; tick
+    /// labels use a chrono format derived from the detected `kind`.
+    Temporal(TemporalKind),
+}
+
+/// Parse a SQL temporal string ([`Value`] of `String` shape) into
+/// `(kind, epoch_seconds_as_f64)`. Returns `None` when the value isn't
+/// a recognized DATE / TIMESTAMP / TIMESTAMPTZ form.
+///
+/// Recognized formats (most-specific first):
+/// - `YYYY-MM-DD HH:MM:SS+HH:MM` and `T` separator → [`TemporalKind::DateTimeTz`]
+/// - `YYYY-MM-DD HH:MM:SS+HHMM` (no colon in offset)
+/// - `YYYY-MM-DD HH:MM:SS` (and fractional seconds) → [`TemporalKind::DateTime`]
+/// - `YYYY-MM-DD HH:MM` (no seconds) → [`TemporalKind::DateTime`]
+/// - `YYYY-MM-DD` → [`TemporalKind::Date`]
+///
+/// `DateTime` strings are treated as UTC for positioning purposes —
+/// they're naive by definition, so we have no other choice. The label
+/// formatter will reproduce the input format faithfully.
+fn parse_temporal(s: &str) -> Option<(TemporalKind, f64)> {
+    const TZ_FORMATS: &[&str] = &[
+        "%Y-%m-%d %H:%M:%S%:z",
+        "%Y-%m-%dT%H:%M:%S%:z",
+        "%Y-%m-%d %H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%d %H:%M:%S%.f%:z",
+        "%Y-%m-%dT%H:%M:%S%.f%:z",
+    ];
+    for fmt in TZ_FORMATS {
+        if let Ok(dt) = DateTime::<FixedOffset>::parse_from_str(s, fmt) {
+            let offset = dt.offset().local_minus_utc();
+            return Some((TemporalKind::DateTimeTz(offset), dt.timestamp() as f64));
+        }
+    }
+
+    const DT_FORMATS: &[&str] = &[
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M",
+    ];
+    for fmt in DT_FORMATS {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(s, fmt) {
+            return Some((TemporalKind::DateTime, Utc.from_utc_datetime(&dt).timestamp() as f64));
+        }
+    }
+
+    if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        let dt = date.and_hms_opt(0, 0, 0)?;
+        return Some((TemporalKind::Date, Utc.from_utc_datetime(&dt).timestamp() as f64));
+    }
+
+    None
+}
+
+/// Decide the x mode for a line/scatter chart from the first row's
+/// x value. Used when the caller didn't explicitly set `x_as_category`.
+///
+/// Priority:
+/// 1. Numeric (JSON number) → [`XMode::Numeric`].
+/// 2. String parsing as DATE/TIMESTAMP/TIMESTAMPTZ → [`XMode::Temporal`].
+/// 3. Anything else (TEXT, missing) → [`XMode::Categorical`] fallback.
+fn detect_line_x_mode(rows: &[Value], x_col: &str) -> XMode {
+    let Some(x_raw) = rows
+        .first()
+        .and_then(Value::as_object)
+        .and_then(|obj| obj.get(x_col))
+    else {
+        return XMode::Categorical;
+    };
+    if as_number(x_raw).is_some() {
+        return XMode::Numeric;
+    }
+    if let Some(s) = x_raw.as_str() {
+        if let Some((kind, _)) = parse_temporal(s) {
+            return XMode::Temporal(kind);
+        }
+    }
+    XMode::Categorical
+}
+
+/// Format a Unix epoch seconds tick value as a human-readable date
+/// string in a form matching the originally detected [`TemporalKind`].
+fn format_temporal_tick(seconds: f64, kind: TemporalKind) -> String {
+    if !seconds.is_finite() {
+        return String::new();
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "tick positions for typical chart ranges (1970..2100) fit comfortably in i64; pre-flight is_finite() guards NaN/inf, and timestamp_opt() returns None on out-of-range values which we map to empty string"
+    )]
+    let secs_i64 = seconds.round() as i64;
+    match kind {
+        TemporalKind::Date => Utc
+            .timestamp_opt(secs_i64, 0)
+            .single()
+            .map(|dt| dt.format("%Y-%m-%d").to_string())
+            .unwrap_or_default(),
+        TemporalKind::DateTime => Utc
+            .timestamp_opt(secs_i64, 0)
+            .single()
+            .map(|dt| dt.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_default(),
+        TemporalKind::DateTimeTz(tz_offset) => FixedOffset::east_opt(tz_offset)
+            .and_then(|off| off.timestamp_opt(secs_i64, 0).single())
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S%:z").to_string())
+            .unwrap_or_default(),
+    }
+}
+
 /// Group rows into (`series_name`, points) buckets, extracting x and y values.
 /// When `series_col` is None, all points land in a single unnamed series.
 fn group_series(
@@ -721,7 +908,7 @@ fn group_series(
     x_col: &str,
     y_col: &str,
     series_col: Option<&str>,
-    x_as_category: bool,
+    x_mode: XMode,
 ) -> Result<SeriesMap, McpError> {
     let mut groups: SeriesMap = BTreeMap::new();
     let mut category_index: BTreeMap<String, f64> = BTreeMap::new();
@@ -738,16 +925,27 @@ fn group_series(
 
         let x_raw = obj.get(x_col).cloned().unwrap_or(Value::Null);
         let x_label = as_string(&x_raw);
-        let x_val = if x_as_category {
-            let next = category_index.len() as f64;
-            *category_index.entry(x_label.clone()).or_insert(next)
-        } else {
-            as_number(&x_raw).ok_or_else(|| {
+        let x_val = match x_mode {
+            XMode::Categorical => {
+                let next = category_index.len() as f64;
+                *category_index.entry(x_label.clone()).or_insert(next)
+            }
+            XMode::Numeric => as_number(&x_raw).ok_or_else(|| {
                 McpError::new(
                     ErrorCode::SchemaMismatch,
                     format!("Column '{x_col}' is missing or not numeric in at least one row"),
                 )
-            })?
+            })?,
+            XMode::Temporal(_) => parse_temporal(&x_label)
+                .map(|(_, ts)| ts)
+                .ok_or_else(|| {
+                    McpError::new(
+                        ErrorCode::SchemaMismatch,
+                        format!(
+                            "Column '{x_col}' value '{x_label}' is not a recognized DATE / TIMESTAMP / TIMESTAMPTZ form"
+                        ),
+                    )
+                })?,
         };
 
         let series_key = match series_col {
@@ -822,16 +1020,16 @@ where
     let x_col = require_column(&opts.x_column, "x")?;
     let y_col = require_column(&opts.y_column, "y")?;
 
-    // Bar charts default to categorical x axis; `ChartOptions::x_as_category`
-    // lets callers force numeric if they really want to.
-    let x_as_category = opts.x_as_category.unwrap_or(true);
-    let groups = group_series(
-        rows,
-        x_col,
-        y_col,
-        opts.series_column.as_deref(),
-        x_as_category,
-    )?;
+    // Bar charts default to categorical x axis; `ChartOptions::x_as_category=Some(false)`
+    // lets callers force numeric if they really want to. Bar charts never
+    // use temporal mode — even time-series bar charts visually expect
+    // discrete bars at evenly-spaced positions.
+    let x_mode = if opts.x_as_category == Some(false) {
+        XMode::Numeric
+    } else {
+        XMode::Categorical
+    };
+    let groups = group_series(rows, x_col, y_col, opts.series_column.as_deref(), x_mode)?;
 
     let categories = collect_categories(&groups);
 
@@ -864,10 +1062,11 @@ where
         .map_err(draw_err)?;
 
     let raw_labels: Vec<String> = categories.iter().map(|(_, l)| l.clone()).collect();
-    let labels = shorten_labels(&raw_labels, opts.width);
+    let labels = strip_shared_tz_suffix(&raw_labels);
+    let tick_count = auto_tick_count(&labels, opts.width);
     chart
         .configure_mesh()
-        .x_labels(categories.len().min(20))
+        .x_labels(tick_count)
         .x_label_formatter(&|v| {
             #[expect(
                 clippy::cast_possible_truncation,
@@ -958,22 +1157,19 @@ where
 {
     let x_col = require_column(&opts.x_column, "x")?;
     let y_col = require_column(&opts.y_column, "y")?;
-    // Auto-detect categorical x: if the caller didn't explicitly set
-    // x_as_category and the first row's x value isn't numeric (e.g.
-    // DATE, TIMESTAMP, TEXT), flip to categorical mode automatically.
-    let x_as_category = opts.x_as_category.unwrap_or_else(|| {
-        rows.first()
-            .and_then(Value::as_object)
-            .and_then(|obj| obj.get(x_col))
-            .is_some_and(|v| as_number(v).is_none())
-    });
-    let groups = group_series(
-        rows,
-        x_col,
-        y_col,
-        opts.series_column.as_deref(),
-        x_as_category,
-    )?;
+    // Decide the x mode:
+    // - Explicit `x_as_category=Some(true)` → Categorical (force).
+    // - Explicit `x_as_category=Some(false)` → Numeric (force).
+    // - Default (None): peek at the first row's x value:
+    //   - parses as DATE/TIMESTAMP/TIMESTAMPTZ → Temporal (proportional time axis).
+    //   - non-numeric (TEXT) → Categorical fallback.
+    //   - numeric → Numeric.
+    let x_mode = match opts.x_as_category {
+        Some(true) => XMode::Categorical,
+        Some(false) => XMode::Numeric,
+        None => detect_line_x_mode(rows, x_col),
+    };
+    let groups = group_series(rows, x_col, y_col, opts.series_column.as_deref(), x_mode)?;
 
     let auto = bounds(&groups);
     let (rx_min, rx_max, ry_min, ry_max) = apply_ranges(auto, opts);
@@ -988,45 +1184,71 @@ where
     let mut chart = ChartBuilder::on(root)
         .caption(&title, ("sans-serif", 22))
         .margin(10)
-        .x_label_area_size(if x_as_category { 60 } else { 50 })
+        .x_label_area_size(match x_mode {
+            XMode::Categorical | XMode::Temporal(_) => 60,
+            XMode::Numeric => 50,
+        })
         .y_label_area_size(70)
         .build_cartesian_2d(rx_min..rx_max, ry_min..ry_max)
         .map_err(draw_err)?;
 
-    // In categorical mode the x values are synthetic sequential indices
-    // assigned by `group_series` — the axis ticks need a formatter that
-    // translates the index back to the original string label, otherwise
-    // the rendered chart would show 0, 1, 2, ... where a reader expects
-    // dates or names.
-    if x_as_category {
-        let categories = collect_categories(&groups);
-        let raw_labels: Vec<String> = categories.iter().map(|(_, l)| l.clone()).collect();
-        let labels = shorten_labels(&raw_labels, opts.width);
-        chart
-            .configure_mesh()
-            .x_desc(x_col)
-            .y_desc(y_col)
-            .x_labels(categories.len().min(20))
-            .x_label_formatter(&|v| {
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "axis tick value originated as an integer index into `labels`; the subsequent `usize::try_from` + length check make out-of-range ticks render as the empty-string branch"
-                )]
-                let idx = v.round() as isize;
-                usize::try_from(idx)
-                    .ok()
-                    .and_then(|i| labels.get(i).cloned())
-                    .unwrap_or_default()
-            })
-            .draw()
-            .map_err(draw_err)?;
-    } else {
-        chart
-            .configure_mesh()
-            .x_desc(x_col)
-            .y_desc(y_col)
-            .draw()
-            .map_err(draw_err)?;
+    // Configure the x-axis ticks per mode:
+    // - Categorical: tick positions are synthetic indices; the formatter
+    //   maps each back to the original string label.
+    // - Temporal: tick positions are real Unix epoch seconds (proportional
+    //   to wall-clock time); the formatter renders each via chrono in a
+    //   format matching the input kind (DATE / TIMESTAMP / TIMESTAMPTZ).
+    // - Numeric: pass-through; plotters' default float formatter is fine.
+    match x_mode {
+        XMode::Categorical => {
+            let categories = collect_categories(&groups);
+            let raw_labels: Vec<String> = categories.iter().map(|(_, l)| l.clone()).collect();
+            let labels = strip_shared_tz_suffix(&raw_labels);
+            let tick_count = auto_tick_count(&labels, opts.width);
+            chart
+                .configure_mesh()
+                .x_desc(x_col)
+                .y_desc(y_col)
+                .x_labels(tick_count)
+                .x_label_formatter(&|v| {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "axis tick value originated as an integer index into `labels`; the subsequent `usize::try_from` + length check make out-of-range ticks render as the empty-string branch"
+                    )]
+                    let idx = v.round() as isize;
+                    usize::try_from(idx)
+                        .ok()
+                        .and_then(|i| labels.get(i).cloned())
+                        .unwrap_or_default()
+                })
+                .draw()
+                .map_err(draw_err)?;
+        }
+        XMode::Temporal(kind) => {
+            // Sample one rendered tick label to size the per-tick budget.
+            // DATE → 10 chars, TIMESTAMP → 19, TIMESTAMPTZ → 25 (with
+            // `+HH:MM`). Floor at 10 so a degenerate sample still gets
+            // a reasonable per-label budget.
+            let sample = format_temporal_tick(rx_min, kind);
+            let sample_chars = sample.chars().count().max(10);
+            let tick_count = tick_count_for_label_width(sample_chars, opts.width);
+            chart
+                .configure_mesh()
+                .x_desc(x_col)
+                .y_desc(y_col)
+                .x_labels(tick_count)
+                .x_label_formatter(&|v| format_temporal_tick(*v, kind))
+                .draw()
+                .map_err(draw_err)?;
+        }
+        XMode::Numeric => {
+            chart
+                .configure_mesh()
+                .x_desc(x_col)
+                .y_desc(y_col)
+                .draw()
+                .map_err(draw_err)?;
+        }
     }
 
     let mut total_plotted = 0usize;
@@ -1289,4 +1511,256 @@ where
 
     root.present().map_err(draw_err)?;
     Ok(values.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(strs: &[&str]) -> Vec<String> {
+        strs.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn strip_shared_tz_suffix_drops_uniform_offset() {
+        let labels = s(&[
+            "2026-05-01 08:00:00+00:00",
+            "2026-05-02 06:15:00+00:00",
+            "2026-05-03 18:30:00+00:00",
+        ]);
+        let stripped = strip_shared_tz_suffix(&labels);
+        assert_eq!(stripped, s(&[
+            "2026-05-01 08:00:00",
+            "2026-05-02 06:15:00",
+            "2026-05-03 18:30:00",
+        ]));
+    }
+
+    #[test]
+    fn strip_shared_tz_suffix_handles_non_utc_offset() {
+        let labels = s(&[
+            "2026-05-01 08:00:00+05:30",
+            "2026-05-02 06:15:00+05:30",
+        ]);
+        let stripped = strip_shared_tz_suffix(&labels);
+        assert_eq!(stripped, s(&[
+            "2026-05-01 08:00:00",
+            "2026-05-02 06:15:00",
+        ]));
+    }
+
+    #[test]
+    fn strip_shared_tz_suffix_preserves_when_offsets_differ() {
+        let labels = s(&[
+            "2026-05-01 08:00:00+00:00",
+            "2026-05-02 06:15:00+05:30",
+        ]);
+        let stripped = strip_shared_tz_suffix(&labels);
+        assert_eq!(stripped, labels, "differing offsets must not be stripped");
+    }
+
+    #[test]
+    fn strip_shared_tz_suffix_preserves_plain_dates() {
+        let labels = s(&["2026-05-01", "2026-05-02", "2026-05-03"]);
+        let stripped = strip_shared_tz_suffix(&labels);
+        assert_eq!(stripped, labels, "DATE strings have no suffix to strip");
+    }
+
+    #[test]
+    fn strip_shared_tz_suffix_passes_through_one_or_zero() {
+        assert_eq!(strip_shared_tz_suffix(&[]), Vec::<String>::new());
+        let one = s(&["2026-05-01 08:00:00+00:00"]);
+        assert_eq!(strip_shared_tz_suffix(&one), one);
+    }
+
+    #[test]
+    fn auto_tick_count_returns_all_when_labels_fit() {
+        // 5 short labels at width 800 — all fit comfortably.
+        let labels = s(&["A", "B", "C", "D", "E"]);
+        assert_eq!(auto_tick_count(&labels, 800), 5);
+    }
+
+    #[test]
+    fn auto_tick_count_thins_long_timestamp_series() {
+        // 90 points like "2026-01-01 13:00:00" (19 chars).
+        // per_label_px = 19*7 + 10 = 143; fits = 800/143 = 5.
+        // The fix's contract: the count plotters is told MUST be ≥ 2
+        // (so the axis stays informative) and ≤ labels.len(); for a
+        // 19-char label at 800px the heuristic should land in the
+        // 4..=8 band — comfortably small enough that no two adjacent
+        // ticks overlap.
+        let labels: Vec<String> = (0..90)
+            .map(|i| format!("2026-01-{:02} {:02}:00:00", (i / 24) + 1, i % 24))
+            .collect();
+        let count = auto_tick_count(&labels, 800);
+        assert!(
+            (4..=8).contains(&count),
+            "expected 4..=8 ticks for 90 long labels at 800px, got {count}"
+        );
+        assert!(count >= 2, "must always show at least 2 ticks");
+        assert!(count <= labels.len(), "must never exceed label count");
+    }
+
+    #[test]
+    fn auto_tick_count_clamps_to_at_least_two() {
+        // Hypothetical: extremely wide labels at narrow chart width.
+        let labels = s(&[
+            "x".repeat(200).as_str(),
+            "y".repeat(200).as_str(),
+            "z".repeat(200).as_str(),
+        ]);
+        assert!(auto_tick_count(&labels, 100) >= 2);
+    }
+
+    #[test]
+    fn auto_tick_count_handles_one_or_zero_labels() {
+        assert_eq!(auto_tick_count(&[], 800), 0);
+        let one = s(&["only"]);
+        assert_eq!(auto_tick_count(&one, 800), 1);
+    }
+
+    #[test]
+    fn auto_tick_count_caps_at_label_count() {
+        // Tiny labels at huge width — heuristic would say "many", but
+        // we should never exceed the actual label count.
+        let labels = s(&["A", "B", "C"]);
+        assert_eq!(auto_tick_count(&labels, 10_000), 3);
+    }
+
+    #[test]
+    fn tick_count_for_label_width_does_not_clamp_to_label_count() {
+        // The width-only helper has no label-count input, so a 19-char
+        // estimate at 800px must compute fits=5 directly. Regression
+        // guard against the bug where an over-eager `min(labels.len())`
+        // collapsed the temporal-mode tick budget to 2.
+        // 19 chars * 7 + 10 = 143px → 800/143 = 5, 1400/143 = 9.
+        assert_eq!(tick_count_for_label_width(19, 800), 5);
+        assert_eq!(tick_count_for_label_width(19, 1400), 9);
+        // 10 chars * 7 + 10 = 80px → 800/80 = 10. DATE-only fits more.
+        assert_eq!(tick_count_for_label_width(10, 800), 10);
+    }
+
+    #[test]
+    fn tick_count_for_label_width_clamps_to_at_least_two() {
+        assert_eq!(tick_count_for_label_width(200, 100), 2);
+    }
+
+    #[test]
+    fn parse_temporal_recognizes_date() {
+        let (kind, secs) = parse_temporal("2026-05-01").expect("DATE should parse");
+        assert_eq!(kind, TemporalKind::Date);
+        // Sanity: well after the epoch.
+        assert!(secs > 1.7e9);
+    }
+
+    #[test]
+    fn parse_temporal_recognizes_timestamp() {
+        let (kind, secs1) =
+            parse_temporal("2026-05-01 08:00:00").expect("TIMESTAMP should parse");
+        assert_eq!(kind, TemporalKind::DateTime);
+        let (_, secs2) =
+            parse_temporal("2026-05-01 12:30:00").expect("TIMESTAMP should parse");
+        // Same date, 4.5 hours apart.
+        let delta = secs2 - secs1;
+        assert!(
+            (delta - 16_200.0).abs() < 1.0,
+            "expected 16200s gap, got {delta}"
+        );
+    }
+
+    #[test]
+    fn parse_temporal_recognizes_timestamptz_and_captures_offset() {
+        let (kind, _) =
+            parse_temporal("2026-05-01 08:00:00+05:30").expect("TIMESTAMPTZ should parse");
+        match kind {
+            TemporalKind::DateTimeTz(off) => assert_eq!(off, 5 * 3600 + 30 * 60),
+            other => panic!("expected DateTimeTz, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_temporal_recognizes_t_separator() {
+        let (kind, _) =
+            parse_temporal("2026-05-01T08:00:00+00:00").expect("ISO T-form should parse");
+        assert!(matches!(kind, TemporalKind::DateTimeTz(0)));
+    }
+
+    #[test]
+    fn parse_temporal_rejects_non_temporal_strings() {
+        assert!(parse_temporal("alpha").is_none());
+        assert!(parse_temporal("").is_none());
+        assert!(parse_temporal("2026").is_none());
+        // Numeric strings are NOT temporal — caller should treat as numeric.
+        assert!(parse_temporal("42").is_none());
+    }
+
+    #[test]
+    fn format_temporal_tick_round_trips_date() {
+        let (_, secs) = parse_temporal("2026-05-01").unwrap();
+        assert_eq!(format_temporal_tick(secs, TemporalKind::Date), "2026-05-01");
+    }
+
+    #[test]
+    fn format_temporal_tick_round_trips_timestamp() {
+        let (_, secs) = parse_temporal("2026-05-01 08:30:00").unwrap();
+        assert_eq!(
+            format_temporal_tick(secs, TemporalKind::DateTime),
+            "2026-05-01 08:30:00"
+        );
+    }
+
+    #[test]
+    fn format_temporal_tick_preserves_offset_for_timestamptz() {
+        let (kind, secs) = parse_temporal("2026-05-01 08:30:00+05:30").unwrap();
+        assert_eq!(
+            format_temporal_tick(secs, kind),
+            "2026-05-01 08:30:00+05:30"
+        );
+    }
+
+    #[test]
+    fn format_temporal_tick_handles_nan() {
+        // Plotters can theoretically pass NaN/infinity for axis ticks
+        // when the range is degenerate. We must not panic.
+        assert_eq!(format_temporal_tick(f64::NAN, TemporalKind::Date), "");
+        assert_eq!(
+            format_temporal_tick(f64::INFINITY, TemporalKind::DateTime),
+            ""
+        );
+    }
+
+    #[test]
+    fn detect_line_x_mode_picks_temporal_for_dates() {
+        let rows = vec![serde_json::json!({"ts": "2026-05-01"})];
+        let mode = detect_line_x_mode(&rows, "ts");
+        assert!(matches!(mode, XMode::Temporal(TemporalKind::Date)));
+    }
+
+    #[test]
+    fn detect_line_x_mode_picks_temporal_for_timestamps() {
+        let rows = vec![serde_json::json!({"ts": "2026-05-01 08:00:00"})];
+        let mode = detect_line_x_mode(&rows, "ts");
+        assert!(matches!(mode, XMode::Temporal(TemporalKind::DateTime)));
+    }
+
+    #[test]
+    fn detect_line_x_mode_picks_temporal_for_timestamptz() {
+        let rows = vec![serde_json::json!({"ts": "2026-05-01 08:00:00+00:00"})];
+        let mode = detect_line_x_mode(&rows, "ts");
+        assert!(matches!(mode, XMode::Temporal(TemporalKind::DateTimeTz(0))));
+    }
+
+    #[test]
+    fn detect_line_x_mode_falls_back_to_categorical_for_text() {
+        let rows = vec![serde_json::json!({"x": "alpha"})];
+        let mode = detect_line_x_mode(&rows, "x");
+        assert!(matches!(mode, XMode::Categorical));
+    }
+
+    #[test]
+    fn detect_line_x_mode_picks_numeric_for_numbers() {
+        let rows = vec![serde_json::json!({"x": 42.0})];
+        let mode = detect_line_x_mode(&rows, "x");
+        assert!(matches!(mode, XMode::Numeric));
+    }
 }

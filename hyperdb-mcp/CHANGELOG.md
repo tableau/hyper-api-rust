@@ -143,6 +143,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Chart x-axis tick label thinning.** Long categorical line/scatter
+  charts (e.g. a 90-point hourly TIMESTAMP series) used to render with
+  only ONE visible x-axis label. The old logic blanked individual
+  labels at non-step indices, but `plotters` picks its own tick
+  *positions* on the float axis and rounds them to integer indices —
+  so almost none of the chosen ticks landed on a kept index, and the
+  formatter returned empty strings for the rest. The chart layer now
+  computes a target tick count from chart width and label sizes and
+  passes that count to `plotters` via `.x_labels(N)`; every drawn
+  tick carries its real label. Same `+00:00` suffix stripping for
+  shared TIMESTAMPTZ offsets is preserved (now isolated in
+  `strip_shared_tz_suffix`).
+- **Line / scatter charts over `DATE`, `TIMESTAMP`, and `TIMESTAMPTZ`
+  columns now use a proportional time axis** instead of the previous
+  categorical-with-evenly-spaced-ticks behavior. Real-world time gaps
+  between data points are now reflected in the chart's x-axis: a
+  series at `2026-05-01 08:00`, `2026-05-01 12:30`, `2026-05-02 06:15`
+  shows the 4.5-hour and 17.75-hour gaps proportionally instead of
+  flattening every interval to the same width. Tick labels are
+  formatted via `chrono` in a form that matches the input kind:
+  `%Y-%m-%d` for DATE, `%Y-%m-%d %H:%M:%S` for TIMESTAMP, and
+  `%Y-%m-%d %H:%M:%S%:z` for TIMESTAMPTZ (the offset captured from the
+  first row, so a uniformly-`+05:30` series reports IST throughout).
+  Set `x_as_category: true` to opt out and force the previous
+  categorical layout (e.g. for charts where evenly-spaced bins are
+  more readable than proportional gaps). TEXT x columns continue to
+  render categorically as before. Bar charts are unaffected — they
+  remain categorical regardless of x type, which matches reader
+  expectations for grouped data.
 - **Watcher recovery after hyperd restart.** The watcher's connection
   pool now auto-rebuilds when a per-file ingest hits a connection-lost
   error (typically after the daemon restarts hyperd). Each ingest gets
