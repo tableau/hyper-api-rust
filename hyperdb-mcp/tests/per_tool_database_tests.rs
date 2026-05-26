@@ -604,6 +604,7 @@ fn upsert_stub_in_routes_to_user_attached_db() {
         Some(42),
         true,
         Some("user_db"),
+        None,
     )
     .unwrap();
 
@@ -666,6 +667,7 @@ fn get_in_reads_from_user_attached_db_catalog() {
         Some(7),
         true,
         Some("user_db"),
+        None,
     )
     .unwrap();
 
@@ -773,6 +775,7 @@ fn set_metadata_in_routes_to_user_attached_db() {
         Some(0),
         true,
         Some("user_db"),
+        None,
     )
     .unwrap();
 
@@ -841,6 +844,7 @@ fn set_metadata_in_missing_row_names_target_database_in_error() {
         None,
         Some(0),
         true,
+        None,
         None,
     )
     .unwrap();
@@ -999,6 +1003,7 @@ fn qualified_catalog_in_uses_canonical_alias_after_attach() {
         Some(0),
         true,
         Some("User_DB"),
+        None,
     )
     .unwrap();
     let rows = engine
@@ -1056,6 +1061,7 @@ fn execute_drop_table_in_user_attached_reconciles_that_dbs_catalog() {
         Some(0),
         true,
         Some("user_db"),
+        None,
     )
     .unwrap();
 
