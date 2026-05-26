@@ -802,7 +802,7 @@ impl TestDaemon {
         // hyperd is slow to start, the bare "TestDaemon did not start"
         // assertion fires before the daemon thread can return its
         // actual error — masking the real cause behind a generic
-        // timeout. 60s gives the inner timeout room to surface via the
+        // timeout. 90s gives the inner timeout room to surface via the
         // `daemon_handle.is_finished()` branch below.
         let start = Instant::now();
         loop {
@@ -824,8 +824,8 @@ impl TestDaemon {
                 panic!("TestDaemon failed to start: {msg}");
             }
             assert!(
-                start.elapsed() <= Duration::from_secs(60),
-                "TestDaemon did not start within 60 seconds (daemon thread still running, no discovery file written)"
+                start.elapsed() <= Duration::from_secs(90),
+                "TestDaemon did not start within 90 seconds (daemon thread still running, no discovery file written)"
             );
             std::thread::sleep(Duration::from_millis(200));
         }
