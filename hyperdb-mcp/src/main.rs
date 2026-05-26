@@ -173,7 +173,7 @@ async fn run_daemon_mode(
 
     tracing_subscriber::registry()
         .with(filter)
-        .with(fmt::layer().with_writer(std::io::stderr))
+        .with(fmt::layer().with_writer(std::io::stderr).with_ansi(false))
         .with(fmt::layer().with_writer(file_writer).with_ansi(false))
         .init();
 
@@ -210,7 +210,7 @@ async fn run_mcp_mode(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     tracing_subscriber::registry()
         .with(filter)
-        .with(fmt::layer().with_writer(std::io::stderr))
+        .with(fmt::layer().with_writer(std::io::stderr).with_ansi(false))
         .with(fmt::layer().with_writer(file_writer).with_ansi(false))
         .init();
 

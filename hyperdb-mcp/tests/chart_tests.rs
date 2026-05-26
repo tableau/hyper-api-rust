@@ -107,13 +107,14 @@ fn line_chart_categorical_x() {
     let result = render_chart(&rows, &opts).unwrap();
     assert_eq!(result.rows_plotted, 5);
     assert_eq!(result.mime_type, "image/png");
-    // Without x_as_category this would fail the numeric-parse check.
+    // Without explicit x_as_category, auto-detection kicks in and
+    // recognizes the string x column as categorical.
     let without_category = ChartOptions {
         x_as_category: None,
         ..opts
     };
-    let err = render_chart(&rows, &without_category).unwrap_err();
-    assert!(err.message.contains("not numeric"));
+    let result2 = render_chart(&rows, &without_category).unwrap();
+    assert_eq!(result2.rows_plotted, 5);
 }
 
 /// Scatter chart with no series column renders every row as one series.
@@ -538,4 +539,96 @@ fn render_and_write_produces_valid_png_on_disk() {
 
     let on_disk = std::fs::read(&path).unwrap();
     assert!(on_disk.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]));
+}
+
+/// Line chart with TIMESTAMPTZ-style labels auto-detects categorical mode
+/// and renders without error. Labels with shared +00:00 suffix get shortened.
+#[test]
+fn line_chart_timestamptz_auto_categorical_and_label_shortening() {
+    let rows = vec![
+        json!({"ts": "2026-05-01 08:00:00+00:00", "value": 100}),
+        json!({"ts": "2026-05-01 12:30:00+00:00", "value": 150}),
+        json!({"ts": "2026-05-02 06:15:00+00:00", "value": 200}),
+        json!({"ts": "2026-05-02 22:45:00+00:00", "value": 180}),
+        json!({"ts": "2026-05-03 10:00:00+00:00", "value": 220}),
+        json!({"ts": "2026-05-03 18:30:00+00:00", "value": 190}),
+    ];
+    let opts = ChartOptions {
+        chart_type: ChartType::Line,
+        x_column: Some("ts".into()),
+        y_column: Some("value".into()),
+        // x_as_category deliberately left as None to test auto-detection
+        ..ChartOptions::default()
+    };
+    let result = render_chart(&rows, &opts).unwrap();
+    assert_eq!(result.rows_plotted, 6);
+}
+
+/// Many TIMESTAMPTZ labels auto-thin to avoid overlap.
+#[test]
+fn line_chart_many_timestamps_auto_thins() {
+    let rows: Vec<_> = (0..30)
+        .map(|i| {
+            json!({
+                "ts": format!("2026-05-{:02} 12:00:00+00:00", (i % 28) + 1),
+                "value": i * 10
+            })
+        })
+        .collect();
+    let opts = ChartOptions {
+        chart_type: ChartType::Line,
+        x_column: Some("ts".into()),
+        y_column: Some("value".into()),
+        ..ChartOptions::default()
+    };
+    let result = render_chart(&rows, &opts).unwrap();
+    assert_eq!(result.rows_plotted, 30);
+}
+
+/// Regression: a 90-point hourly TIMESTAMP series used to render with
+/// only ONE visible x-axis label because the old `shorten_labels`
+/// blanked non-step indices and `plotters` picked tick positions that
+/// rarely landed on a kept index. The fix tells `plotters` how many
+/// ticks to draw up front, so every tick position carries a real label.
+///
+/// Uses SVG mode so we can inspect the rendered text content directly.
+#[test]
+fn line_chart_long_timestamp_series_renders_multiple_visible_labels() {
+    let rows: Vec<_> = (0..90)
+        .map(|i| {
+            json!({
+                "ts": format!("2026-01-{:02} {:02}:00:00", (i / 24) + 1, i % 24),
+                "value": i
+            })
+        })
+        .collect();
+    let opts = ChartOptions {
+        chart_type: ChartType::Line,
+        format: ChartFormat::Svg,
+        x_column: Some("ts".into()),
+        y_column: Some("value".into()),
+        width: 800,
+        height: 480,
+        ..ChartOptions::default()
+    };
+    let result = render_chart(&rows, &opts).unwrap();
+    assert_eq!(result.rows_plotted, 90);
+    let svg = String::from_utf8(result.bytes).expect("SVG must be UTF-8");
+    // Each visible x-axis tick label is rendered as an SVG <text>
+    // element containing the literal label string. Every label in this
+    // series starts with "2026-01-", so counting that prefix gives the
+    // number of *visible* x-axis labels (the y-axis labels are numeric
+    // and won't match).
+    let visible_labels = svg.matches("2026-01-").count();
+    assert!(
+        visible_labels >= 3,
+        "expected >= 3 visible x-axis labels for a 90-point series, got {visible_labels} \
+         (regression: pre-fix value was 1)"
+    );
+    // Also bound the upper end — too many would mean labels overlap;
+    // 800 / (19chars * 7px + 10px) ≈ 5 is the heuristic target.
+    assert!(
+        visible_labels <= 12,
+        "expected <= 12 visible labels (no overlap on 800px wide chart), got {visible_labels}"
+    );
 }

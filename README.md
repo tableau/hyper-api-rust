@@ -10,11 +10,11 @@ A **pure-Rust** implementation of the Hyper database API, using the PostgreSQL
 wire protocol with Hyper-specific extensions. Create, read, and manipulate Hyper
 database files (`.hyper`) without any C library dependencies.
 
-> **Project Status — 0.1.x, AI-Engineered**
+> **Project Status — 0.2.x, AI-Engineered**
 >
 > This crate was vibe-engineered with heavy use of AI coding assistants. The
-> **0.1.x** line may still undergo large breaking changes; the public API
-> won't settle until the 0.2.0 release.
+> **0.2.x** line may still undergo large breaking changes; the public API
+> won't settle until the 1.0.0 release.
 >
 > Contributors and reviewers should, at a minimum, run an **AI code reviewer**
 > over any changes, following the conventions, layering rules, and patterns

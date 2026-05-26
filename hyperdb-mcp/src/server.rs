@@ -441,11 +441,11 @@ pub struct ChartParams {
     pub height: Option<u32>,
     /// Number of bins for histograms (default 20)
     pub bins: Option<u32>,
-    /// Treat the x column as categorical rather than numeric. Set to `true`
-    /// when plotting a `line` or `scatter` against a `DATE`, `TIMESTAMP`,
-    /// enum, or any other non-numeric x column; otherwise the chart will
-    /// reject the query with "column is missing or not numeric". Bar
-    /// charts are always categorical regardless of this flag.
+    /// Treat the x column as categorical rather than numeric. Auto-detected
+    /// from the first row's x value for line/scatter charts: DATE, TIMESTAMP,
+    /// TEXT, and other non-numeric types flip to categorical automatically.
+    /// Set explicitly to override auto-detection. Bar charts are always
+    /// categorical regardless of this flag.
     pub x_as_category: Option<bool>,
     /// Fix the x-axis range as [min, max]. Omit to auto-scale. Useful when
     /// comparing multiple charts at a consistent scale (e.g. [0, 1500] for
@@ -2299,7 +2299,7 @@ impl HyperMcpServer {
 
     /// Render a chart (PNG or SVG) from a SQL query.
     #[tool(
-        description = "Render a chart (bar, line, scatter, or histogram) from a SQL query. Writes the image to disk by default and returns a short stats blob with the path — use `Read(path)` to display it (this keeps the MCP transcript small). Set `inline=true` to also receive the PNG/SVG bytes inline in the tool result; combine with `output_path` to get both.\n\n- `output_path`: explicit destination file path. Parent directory is created automatically. If omitted, a file is auto-generated under the system temp dir as `hyperdb-charts/chart-<ts>-<pid>-<n>.<ext>`.\n- `inline`: when true, return the image bytes inline. Without `output_path`, suppresses the disk write entirely. With `output_path`, writes to disk AND returns inline. Defaults to false.\n- `format`: \"png\" (default) or \"svg\". Auto-derived from `output_path` extension when omitted. A mismatch between `format` and the path extension returns `INVALID_ARGUMENT`.\n- `overwrite`: default true. Set false to refuse overwriting an existing file (returns `PERMISSION_DENIED`).\n- `x_range` / `y_range`: fix axis extents across multiple charts (e.g. x_range=[0,1500], y_range=[0,1]).\n- `color_map`: stable per-series hex colors (e.g. {\"India\":\"#e41a1c\",\"China\":\"#ff7f0e\"}).\n- `label_points=true`: annotate each point with its series name instead of showing a legend — best when each series has exactly one point."
+        description = "Render a chart (bar, line, scatter, or histogram) from a SQL query. Writes the image to disk by default and returns a short stats blob with the path — use `Read(path)` to display it (this keeps the MCP transcript small). Set `inline=true` to also receive the PNG/SVG bytes inline in the tool result; combine with `output_path` to get both.\n\n**Data shape:** The query must return long-format data with one numeric `y` column. For multi-series charts, use a `series` column to split by category. If your data is wide-format (multiple value columns), reshape it with `UNION ALL` into (label, series, value) tuples before charting.\n\n**DATE/TIMESTAMP x-axis:** Line and scatter charts auto-detect non-numeric x columns. DATE, TIMESTAMP, and TIMESTAMPTZ values render with a **proportional time axis** — gaps between data points reflect real wall-clock time (4.5 h gap and 17 h gap don't look the same). Tick labels are formatted in the input kind: `%Y-%m-%d` for DATE, `%Y-%m-%d %H:%M:%S` for TIMESTAMP, with the originating timezone offset preserved for TIMESTAMPTZ. TEXT x columns fall back to evenly-spaced categorical mode. Set `x_as_category: true` to force categorical layout on temporal data (useful when even spacing reads better than proportional gaps).\n\n- `output_path`: explicit destination file path. Parent directory is created automatically (no need to pre-create it). If omitted, a file is auto-generated under the system temp dir as `hyperdb-charts/chart-<ts>-<pid>-<n>.<ext>`.\n- `inline`: when true, return the image bytes inline. Without `output_path`, suppresses the disk write entirely. With `output_path`, writes to disk AND returns inline. Defaults to false.\n- `format`: \"png\" (default) or \"svg\". Auto-derived from `output_path` extension when omitted. A mismatch between `format` and the path extension returns `INVALID_ARGUMENT`.\n- `overwrite`: default true. Set false to refuse overwriting an existing file (returns `PERMISSION_DENIED`).\n- `x_range` / `y_range`: fix axis extents across multiple charts (e.g. x_range=[0,1500], y_range=[0,1]).\n- `color_map`: stable per-series hex colors (e.g. {\"India\":\"#e41a1c\",\"China\":\"#ff7f0e\"}).\n- `label_points=true`: annotate each point with its series name instead of showing a legend — best when each series has exactly one point."
     )]
     fn chart(
         &self,
