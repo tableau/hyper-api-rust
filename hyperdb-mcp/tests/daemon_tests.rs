@@ -796,6 +796,14 @@ impl TestDaemon {
         // Wait for daemon to become ready. CI runners (especially macOS)
         // can be significantly slower than local dev — hyperd startup
         // alone may take 10+ seconds under load.
+        //
+        // The outer timeout MUST exceed `HyperProcess::new`'s own 30s
+        // wait for the hyperd-callback connection. Otherwise, when
+        // hyperd is slow to start, the bare "TestDaemon did not start"
+        // assertion fires before the daemon thread can return its
+        // actual error — masking the real cause behind a generic
+        // timeout. 60s gives the inner timeout room to surface via the
+        // `daemon_handle.is_finished()` branch below.
         let start = Instant::now();
         loop {
             if let Some(info) = discovery::discover() {
@@ -806,7 +814,7 @@ impl TestDaemon {
                 };
             }
             // Fail fast if the daemon thread has already exited (bind error,
-            // spawn error, etc.). Avoids the unhelpful 30s-timeout panic.
+            // spawn error, etc.). Avoids the unhelpful generic-timeout panic.
             if daemon_handle.is_finished() {
                 let msg = match daemon_handle.join() {
                     Ok(Ok(())) => "daemon thread exited cleanly without writing discovery".into(),
@@ -816,8 +824,8 @@ impl TestDaemon {
                 panic!("TestDaemon failed to start: {msg}");
             }
             assert!(
-                start.elapsed() <= Duration::from_secs(30),
-                "TestDaemon did not start within 30 seconds"
+                start.elapsed() <= Duration::from_secs(60),
+                "TestDaemon did not start within 60 seconds (daemon thread still running, no discovery file written)"
             );
             std::thread::sleep(Duration::from_millis(200));
         }
