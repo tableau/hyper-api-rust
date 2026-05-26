@@ -34,10 +34,10 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     AnnotateAble, CallToolResult, Content, GetPromptRequestParams, GetPromptResult, Implementation,
-    ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
-    PromptMessage, PromptMessageRole, RawResource, RawResourceTemplate, ReadResourceRequestParams,
-    ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo, SubscribeRequestParams,
-    UnsubscribeRequestParams,
+    InitializeRequestParams, InitializeResult, ListPromptsResult, ListResourceTemplatesResult,
+    ListResourcesResult, PaginatedRequestParams, PromptMessage, PromptMessageRole, RawResource,
+    RawResourceTemplate, ReadResourceRequestParams, ReadResourceResult, ResourceContents,
+    ServerCapabilities, ServerInfo, SubscribeRequestParams, UnsubscribeRequestParams,
 };
 use rmcp::service::RequestContext;
 use rmcp::{
@@ -827,6 +827,10 @@ pub struct HyperMcpServer {
     no_daemon: bool,
     /// Last time a heartbeat was sent to the daemon (debounced to avoid per-call TCP overhead).
     last_heartbeat: std::sync::Mutex<std::time::Instant>,
+    /// MCP client name from the `initialize` handshake (e.g. "Claude Code",
+    /// "cursor-mcp-client"). Populated once per session; used for catalog
+    /// provenance tracking (`created_by` / `last_modified_by`).
+    client_name: std::sync::Mutex<Option<String>>,
     // Under rmcp 1.x the router fields are constructed for downstream
     // macro-generated dispatch but not read through a direct field access
     // that the compiler can see. Keep them; the `#[tool_router]` /
@@ -899,6 +903,7 @@ impl HyperMcpServer {
             read_only,
             no_daemon,
             last_heartbeat: std::sync::Mutex::new(std::time::Instant::now()),
+            client_name: std::sync::Mutex::new(None),
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
         }
@@ -940,6 +945,12 @@ impl HyperMcpServer {
     /// created / deleted, watcher ingest of a brand-new table.
     pub(crate) fn notify_resource_list_changed(&self) {
         self.subscriptions.notify_list_changed();
+    }
+
+    /// The MCP client name from the `initialize` handshake, or `None` if
+    /// the handshake hasn't completed yet. Used for catalog provenance.
+    fn client_name(&self) -> Option<String> {
+        self.client_name.lock().ok().and_then(|g| g.clone())
     }
 
     /// Return a clone of the engine Arc so background tasks (watchers) can
@@ -1129,10 +1140,6 @@ impl HyperMcpServer {
     /// their own per-DB catalog. Read-only attachments are rejected
     /// upstream by `resolve_db(require_writable=true)` so this helper
     /// never sees them.
-    #[expect(
-        clippy::unused_self,
-        reason = "&self required for method-call dispatch; body uses only engine + params"
-    )]
     fn after_ingest_catalog_update(
         &self,
         engine: &Engine,
@@ -1150,6 +1157,7 @@ impl HyperMcpServer {
             row_count,
             true,
             target_db,
+            self.client_name().as_deref(),
         ) {
             tracing::warn!(
                 table = %table_name,
@@ -3837,6 +3845,25 @@ Full SQL reference: https://developer.salesforce.com/docs/data/data-cloud-query-
             .enable_resources_list_changed()
             .build();
         info
+    }
+
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, rmcp::ErrorData> {
+        let name = &request.client_info.name;
+        let version = &request.client_info.version;
+        let label = if version.is_empty() {
+            name.clone()
+        } else {
+            format!("{name} {version}")
+        };
+        if let Ok(mut guard) = self.client_name.lock() {
+            *guard = Some(label);
+        }
+        context.peer.set_peer_info(request);
+        Ok(self.get_info())
     }
 
     /// Handle a `resources/subscribe` request by recording the calling
