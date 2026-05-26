@@ -600,6 +600,89 @@ fn as_string(v: &Value) -> String {
     }
 }
 
+/// Shorten categorical tick labels for display. Two passes:
+///
+/// 1. **Strip shared timezone offset** — if every label ends with the
+///    same `+HH:MM` or `+00:00` (common for TIMESTAMPTZ), drop that
+///    suffix since it adds no information.
+/// 2. **Auto-thin** — if there are more labels than can fit without
+///    overlap (estimated at `chart_width / (avg_char_count * 7px)`),
+///    keep only every Nth label and blank the rest.
+fn shorten_labels(labels: &[String], chart_width: u32) -> Vec<String> {
+    if labels.is_empty() {
+        return Vec::new();
+    }
+    // Pass 1: strip shared timezone suffix (e.g. "+00:00", "+05:30")
+    let stripped: Vec<String> = if labels.len() > 1 {
+        let suffix = shared_tz_suffix(labels);
+        if let Some(ref sfx) = suffix {
+            labels
+                .iter()
+                .map(|l| l.strip_suffix(sfx.as_str()).unwrap_or(l).trim().to_string())
+                .collect()
+        } else {
+            labels.to_vec()
+        }
+    } else {
+        labels.to_vec()
+    };
+
+    // Pass 2: auto-thin if labels would overlap
+    let max_len = stripped.iter().map(String::len).max().unwrap_or(1);
+    let char_px = 7_u32;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "label length is bounded by real-world string sizes (< 200 chars)"
+    )]
+    let label_px = (max_len as u32) * char_px + 10;
+    let fits = (chart_width / label_px.max(1)) as usize;
+    if fits >= stripped.len() || stripped.len() <= 2 {
+        return stripped;
+    }
+    // Show every Nth label, always including first and last
+    let step = (stripped.len() + fits - 1) / fits.max(1);
+    stripped
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            if i == 0 || i == stripped.len() - 1 || i % step == 0 {
+                l.clone()
+            } else {
+                String::new()
+            }
+        })
+        .collect()
+}
+
+/// If all labels share a trailing timezone offset pattern like `+00:00`
+/// or `-05:30`, return that suffix. Returns `None` if labels differ or
+/// have no offset.
+fn shared_tz_suffix(labels: &[String]) -> Option<String> {
+    let first = labels.first()?;
+    // Match pattern: space or 'T' followed by time, then +/-HH:MM at the end
+    let offset_start = first.rfind('+').or_else(|| {
+        // Careful: don't match the '-' in "2026-05-01"
+        let last_minus = first.rfind('-')?;
+        // Only if it's after a ':' (i.e. part of time, not date)
+        if first[..last_minus].ends_with(|c: char| c.is_ascii_digit()) && last_minus > 10 {
+            Some(last_minus)
+        } else {
+            None
+        }
+    })?;
+    let suffix = &first[offset_start..];
+    // Must look like +HH:MM or -HH:MM (6 chars)
+    if suffix.len() != 6 {
+        return None;
+    }
+    // Verify all labels share this suffix
+    if labels.iter().all(|l| l.ends_with(suffix)) {
+        Some(suffix.to_string())
+    } else {
+        None
+    }
+}
+
 /// Collect distinct x values and their original string labels from a
 /// [`SeriesMap`], in ascending x-value order.
 ///
@@ -780,16 +863,12 @@ where
         .build_cartesian_2d(x_min..x_max, (y_min - y_pad)..(y_max + y_pad))
         .map_err(draw_err)?;
 
-    let labels: Vec<String> = categories.iter().map(|(_, l)| l.clone()).collect();
+    let raw_labels: Vec<String> = categories.iter().map(|(_, l)| l.clone()).collect();
+    let labels = shorten_labels(&raw_labels, opts.width);
     chart
         .configure_mesh()
         .x_labels(categories.len().min(20))
         .x_label_formatter(&|v| {
-            // Plotters passes us category-index floats that `collect_categories`
-            // generated from `0..labels.len()`; the round-trip stays within
-            // `isize` range. Clamp negative values to the out-of-range branch
-            // and rely on `usize::try_from` to surface any stray negative tick
-            // as an empty label rather than wrapping.
             #[expect(
                 clippy::cast_possible_truncation,
                 reason = "axis tick value originated as an integer index into `labels`; the subsequent `usize::try_from` + length check make out-of-range ticks render as the empty-string branch"
@@ -921,7 +1000,8 @@ where
     // dates or names.
     if x_as_category {
         let categories = collect_categories(&groups);
-        let labels: Vec<String> = categories.iter().map(|(_, l)| l.clone()).collect();
+        let raw_labels: Vec<String> = categories.iter().map(|(_, l)| l.clone()).collect();
+        let labels = shorten_labels(&raw_labels, opts.width);
         chart
             .configure_mesh()
             .x_desc(x_col)

@@ -540,3 +540,47 @@ fn render_and_write_produces_valid_png_on_disk() {
     let on_disk = std::fs::read(&path).unwrap();
     assert!(on_disk.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]));
 }
+
+/// Line chart with TIMESTAMPTZ-style labels auto-detects categorical mode
+/// and renders without error. Labels with shared +00:00 suffix get shortened.
+#[test]
+fn line_chart_timestamptz_auto_categorical_and_label_shortening() {
+    let rows = vec![
+        json!({"ts": "2026-05-01 08:00:00+00:00", "value": 100}),
+        json!({"ts": "2026-05-01 12:30:00+00:00", "value": 150}),
+        json!({"ts": "2026-05-02 06:15:00+00:00", "value": 200}),
+        json!({"ts": "2026-05-02 22:45:00+00:00", "value": 180}),
+        json!({"ts": "2026-05-03 10:00:00+00:00", "value": 220}),
+        json!({"ts": "2026-05-03 18:30:00+00:00", "value": 190}),
+    ];
+    let opts = ChartOptions {
+        chart_type: ChartType::Line,
+        x_column: Some("ts".into()),
+        y_column: Some("value".into()),
+        // x_as_category deliberately left as None to test auto-detection
+        ..ChartOptions::default()
+    };
+    let result = render_chart(&rows, &opts).unwrap();
+    assert_eq!(result.rows_plotted, 6);
+}
+
+/// Many TIMESTAMPTZ labels auto-thin to avoid overlap.
+#[test]
+fn line_chart_many_timestamps_auto_thins() {
+    let rows: Vec<_> = (0..30)
+        .map(|i| {
+            json!({
+                "ts": format!("2026-05-{:02} 12:00:00+00:00", (i % 28) + 1),
+                "value": i * 10
+            })
+        })
+        .collect();
+    let opts = ChartOptions {
+        chart_type: ChartType::Line,
+        x_column: Some("ts".into()),
+        y_column: Some("value".into()),
+        ..ChartOptions::default()
+    };
+    let result = render_chart(&rows, &opts).unwrap();
+    assert_eq!(result.rows_plotted, 30);
+}
