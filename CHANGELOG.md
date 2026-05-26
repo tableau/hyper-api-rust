@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.2.0](https://github.com/tableau/hyper-api-rust/compare/v0.1.3...v0.2.0) (2026-05-26)
+
+
+### Features
+
+* **mcp:** ephemeral-primary + persistent-attached two-database model ([#29](https://github.com/tableau/hyper-api-rust/issues/29)) ([025ffa7](https://github.com/tableau/hyper-api-rust/commit/025ffa71bd894fa1763e89b7399e4e97e6ac6d25))
+* **mcp:** finish persistent — remove all v1 limitations + per-database catalog ([#32](https://github.com/tableau/hyper-api-rust/issues/32)) ([b420532](https://github.com/tableau/hyper-api-rust/commit/b42053253a282a93e128c7035f4d25b0bc8971b3))
+* **mcp:** per-tool database parameter and persist shorthand ([#31](https://github.com/tableau/hyper-api-rust/issues/31)) ([37336c8](https://github.com/tableau/hyper-api-rust/commit/37336c8791f8cdde1a14054636a09676527944fc))
+* single-instance daemon for shared hyperd across MCP clients ([#26](https://github.com/tableau/hyper-api-rust/issues/26)) ([e2c6204](https://github.com/tableau/hyper-api-rust/commit/e2c6204ee22970d853d478e7679b6963e31bbc66))
+
+
+### Bug Fixes
+
+* chart time-axis rendering, auto-detection, and MCP ergonomic fixes ([#39](https://github.com/tableau/hyper-api-rust/issues/39)) ([e6d14d3](https://github.com/tableau/hyper-api-rust/commit/e6d14d33db02a26500b79ab207bd871a471ef4fa))
+* **ci:** add release-please version markers to hyperdb-mcp ([#41](https://github.com/tableau/hyper-api-rust/issues/41)) ([f566bc7](https://github.com/tableau/hyper-api-rust/commit/f566bc7a73d9dfc438f427026c785a9684072ddd))
+* **ci:** add release-please version markers to hyperdb-mcp dependency ([f566bc7](https://github.com/tableau/hyper-api-rust/commit/f566bc7a73d9dfc438f427026c785a9684072ddd))
+* **ci:** resolve daemon test interference on macOS/Windows and disable release-please ([#28](https://github.com/tableau/hyper-api-rust/issues/28)) ([51fc9fe](https://github.com/tableau/hyper-api-rust/commit/51fc9fed17cdc6835dd15be7c1122a38aa422cdc))
+* **mcp:** cross-process catalog write safety via optimistic concurrency ([#38](https://github.com/tableau/hyper-api-rust/issues/38)) ([54e3f18](https://github.com/tableau/hyper-api-rust/commit/54e3f18ebc4d79eb09df4d0663011ae49013ca17))
+* **mcp:** finish-persistent follow-ups — alias canonicalization, execute reconcile, e2e harness ([#33](https://github.com/tableau/hyper-api-rust/issues/33)) ([242be20](https://github.com/tableau/hyper-api-rust/commit/242be20680411d89ace701bf44b9c090a0c8f4c8))
+* **tests:** relax timing assertion and increase daemon startup timeout ([#30](https://github.com/tableau/hyper-api-rust/issues/30)) ([56a19d1](https://github.com/tableau/hyper-api-rust/commit/56a19d126212fe3b53adfb3d7770b9cfce451b37))
+
 ## [0.1.3](https://github.com/tableau/hyper-api-rust/compare/v0.1.2...v0.1.3) (2026-05-18)
 
 
