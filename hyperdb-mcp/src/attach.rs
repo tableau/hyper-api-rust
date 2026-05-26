@@ -727,6 +727,14 @@ pub fn validate_output_path(path: &str, kind: &str) -> Result<PathBuf, McpError>
             format!("{kind} path '{path}' has no file-name component"),
         )
     })?;
+    if !parent.exists() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            McpError::new(
+                ErrorCode::InternalError,
+                format!("Failed to create parent directory for {kind} path '{path}': {e}"),
+            )
+        })?;
+    }
     let canonical_parent = std::fs::canonicalize(parent).map_err(|e| {
         McpError::new(
             ErrorCode::FileNotFound,
@@ -924,14 +932,19 @@ mod tests {
     }
 
     #[test]
-    fn validate_output_path_rejects_missing_parent() {
-        // Build a platform-portable absolute path with a missing parent.
-        // Hardcoded "/definitely/..." paths are not absolute on Windows.
-        let missing_parent = std::env::temp_dir()
-            .join("hyper_mcp_validate_output_missing_parent_99999")
-            .join("out.csv");
-        let err = validate_output_path(missing_parent.to_str().unwrap(), "export").unwrap_err();
-        assert_eq!(err.code, ErrorCode::FileNotFound);
+    fn validate_output_path_creates_missing_parent() {
+        let parent = std::env::temp_dir().join("hyper_mcp_validate_output_missing_parent_99999");
+        // Clean up from any prior run.
+        let _ = std::fs::remove_dir_all(&parent);
+        assert!(!parent.exists());
+
+        let target = parent.join("out.csv");
+        let canonical =
+            validate_output_path(target.to_str().unwrap(), "export").expect("should create parent");
+        assert!(canonical.is_absolute());
+        assert!(parent.exists(), "parent directory should have been created");
+        // Clean up.
+        let _ = std::fs::remove_dir_all(&parent);
     }
 
     #[test]
