@@ -10,17 +10,31 @@ Built on the pure-Rust [`hyperdb-api`](../hyperdb-api/) crate for maximum perfor
 
 LLMs are powerful at reasoning but cannot natively crunch millions of rows. This plugin bridges that gap: another MCP tool produces data, the LLM passes it to `hyperdb-mcp`, Hyper ingests it and makes it SQL-queryable, the LLM runs analytical SQL, and results come back as JSON. Optionally export to CSV, Parquet, Apache Iceberg, Arrow IPC, or `.hyper` (opens directly in **Tableau Desktop**).
 
+### Queryable Memory for AI
+
+Unlike flat-text memory systems that store blobs and retrieve by similarity search, HyperDB gives LLMs **structured, queryable long-term memory**. The persistent database survives across sessions — anything the LLM stores there can be JOINed, filtered, aggregated, and reasoned over with full SQL in any future conversation.
+
+This means an LLM can:
+- **Accumulate knowledge over time** — store reference tables, project decisions, user preferences, learned facts
+- **Cross-reference across sessions** — JOIN today's analysis against historical data from last week
+- **Answer complex recall questions** — "Which projects had budget overruns in Q1?" is a SQL query, not a fuzzy text search
+- **Build on prior work** — load yesterday's cleaned dataset and extend it without re-processing from scratch
+- **Maintain structured context** — store relationship graphs, timelines, or decision logs as proper tables with typed columns
+
+The ephemeral database is scratch space (think: a whiteboard). The persistent database is long-term memory (think: a filing cabinet you can query). Multiple AI clients sharing the same daemon see the same persistent data — so Claude Code, Cursor, and VS Code Copilot can all read from and contribute to the same knowledge base.
+
 ---
 
 ## Features
 
 - **Zero setup** — `HyperProcess` auto-starts the Hyper server
 - **Shared `hyperd` daemon** — one Hyper process per user, shared across all MCP clients (Claude Code, Cursor, VS Code, etc.) for reduced memory overhead and concurrent access to the same persistent databases
+- **Queryable long-term memory** — persistent database survives across sessions; LLMs can store, recall, JOIN, and aggregate structured knowledge over time — not just retrieve text blobs, but reason over them with SQL
 - **Any data in** — JSON, CSV, Parquet, Arrow IPC, Apache Iceberg; schema inferred or exact
 - **SQL at scale** — thousands to billions of rows
 - **Data out** — export to CSV, Parquet, Apache Iceberg, Arrow IPC, or `.hyper` (Tableau Desktop-ready)
 - **One-shot queries** — `query_file("/tmp/sales.csv", "SELECT ...")` — single call, zero management
-- **Persistent workspace** — load multiple tables, JOIN across them, persist across sessions
+- **Cross-session continuity** — load multiple tables, JOIN across them, persist across sessions; pick up exactly where you left off
 - **Read-only safe mode** — `--read-only` flag for safe deployment
 - **Schema resources** — auto-discover table schemas via `resources/list`
 - **Guided prompts** — `analyze-table`, `compare-tables`, `data-quality`, `suggest-queries`
@@ -163,7 +177,7 @@ Any tool that supports the MCP stdio transport can use this server. Point it at 
 
 ## Operating Modes
 
-Each session has **two databases**: an ephemeral primary (always created fresh per session, deleted on exit) and a persistent attachment (stored at the platform-default location or a path you supply). Unqualified SQL targets the ephemeral primary; the persistent attachment is reachable as the `"persistent"` alias and survives across sessions.
+Each session has **two databases**: an ephemeral primary (scratch space — always created fresh per session, deleted on exit) and a persistent database (queryable long-term memory — stored at the platform-default location or a path you supply, survives indefinitely). Unqualified SQL targets the ephemeral primary; the persistent database is reachable as the `"persistent"` alias.
 
 ### Hyper engine
 
@@ -186,7 +200,7 @@ The shared daemon is the bigger win for users running multiple AI clients (Claud
 
 ### Working with both databases
 
-Tool calls default to the ephemeral primary — that's the LLM's scratch space for exploratory work. There are two ways to reach the persistent attachment:
+Tool calls default to the ephemeral primary — that's the LLM's scratch space for exploratory work that doesn't need to outlive the session. To store data in long-term memory (the persistent database), there are two ways to reach it:
 
 **1. Per-tool `database` parameter** (preferred for ergonomic LLM workflows):
 

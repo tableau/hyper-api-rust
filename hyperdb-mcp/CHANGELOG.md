@@ -131,6 +131,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   immediately after `CREATE TABLE IF NOT EXISTS`. `detach_database`
   clears the alias's entry so a re-attach to a different file isn't
   served stale.
+- **Cross-process catalog write safety via optimistic concurrency.**
+  `upsert_stub_in` now uses UPDATE-then-conditional-INSERT instead
+  of DELETE+INSERT in a transaction. Each statement is individually
+  atomic at the `hyperd` level, so multiple MCP server processes
+  sharing the same persistent database via the daemon can no longer
+  produce duplicate `_table_catalog` rows from concurrent ingests.
+  The UPDATE path also eliminates one round-trip (the pre-read of the
+  existing row to preserve prose fields — UPDATE preserves them
+  implicitly by only touching mechanical columns).
 
 ### Fixed
 
