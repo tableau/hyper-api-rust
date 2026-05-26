@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/tableau/hyper-api-rust/compare/v0.2.0...v0.2.1) (2026-05-26)
+
+
+### Bug Fixes
+
+* **build:** add make targets for API-only build and test ([#44](https://github.com/tableau/hyper-api-rust/issues/44)) ([7f81ead](https://github.com/tableau/hyper-api-rust/commit/7f81eadd690bdd09fe04a9ec2f819fbc0e041004))
+
 ## [0.2.0](https://github.com/tableau/hyper-api-rust/compare/v0.1.3...v0.2.0) (2026-05-26)
 
 

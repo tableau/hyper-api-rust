@@ -30,11 +30,11 @@
     "tsx": "^4.22.0"
   },
   "optionalDependencies": {
-    "hyperdb-api-node-darwin-arm64": "0.2.0",
-    "hyperdb-api-node-linux-arm64-gnu": "0.2.0",
-    "hyperdb-api-node-linux-x64-gnu": "0.2.0",
-    "hyperdb-api-node-linux-x64-musl": "0.2.0",
-    "hyperdb-api-node-win32-x64-msvc": "0.2.0"
+    "hyperdb-api-node-darwin-arm64": "0.2.1",
+    "hyperdb-api-node-linux-arm64-gnu": "0.2.1",
+    "hyperdb-api-node-linux-x64-gnu": "0.2.1",
+    "hyperdb-api-node-linux-x64-musl": "0.2.1",
+    "hyperdb-api-node-win32-x64-msvc": "0.2.1"
   },
   "keywords": [
     "hyper",

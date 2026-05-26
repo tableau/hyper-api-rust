@@ -6,9 +6,9 @@
     "hyperdb-mcp": "bin.js"
   },
   "optionalDependencies": {
-    "hyperdb-mcp-darwin-arm64": "0.2.0",
-    "hyperdb-mcp-linux-x64-gnu": "0.2.0",
-    "hyperdb-mcp-win32-x64-msvc": "0.2.0"
+    "hyperdb-mcp-darwin-arm64": "0.2.1",
+    "hyperdb-mcp-linux-x64-gnu": "0.2.1",
+    "hyperdb-mcp-win32-x64-msvc": "0.2.1"
   },
   "files": [
     "bin.js",
