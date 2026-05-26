@@ -27,23 +27,52 @@ or shell pipelines: it parses files faster, runs SQL natively, and keeps
 intermediate state in a workspace database the LLM can re-query without
 re-loading.
 
-## Workspace model
+## Workspace model — queryable memory
 
 Every session has TWO databases, plus optional user-attached ones:
 
 - **Ephemeral primary** (default destination). Created fresh per
-  session, deleted on exit. Unqualified SQL routes here. Use for
-  scratch work and intermediate transformations the user doesn't
-  need to keep.
-- **Persistent attachment** under alias `\"persistent\"`. Survives
-  across sessions at the platform-default path (or override via
-  `--persistent-db`). Use when the user wants the data to stick
-  around. Disabled when the server runs with `--ephemeral-only`.
+  session, deleted on exit. Unqualified SQL routes here. Use as
+  scratch space for exploratory work, intermediate transformations,
+  and one-off analysis the user doesn't need to keep.
+- **Persistent database** (alias `\"persistent\"`). Survives across
+  sessions — this is your **long-term structured memory**. Store
+  reference tables, accumulated results, user preferences, learned
+  facts, or any data you want to recall in future conversations.
+  Unlike flat-text memory, persistent data is **queryable**: you can
+  JOIN, filter, aggregate, and reason over it with SQL. Disabled
+  when the server runs with `--ephemeral-only`.
 - **User-attached writable databases** via `attach_database` with
   `writable: true`. Each lives in its own `.hyper` file under a
   user-chosen alias.
 
-Pick a destination in one of two ways:
+### Persistent as memory — when and how to use it
+
+Store data in persistent whenever:
+- The user says \"remember this\", \"save this\", \"keep this\"
+- You produce a useful reference table (lookups, configs, mappings)
+- You accumulate results across multiple conversations
+- You want to recall context in future sessions
+
+Retrieve from persistent whenever:
+- You need context from a prior session
+- The user asks \"what do we have?\" or \"show me what's saved\"
+- You want to JOIN current scratch work against historical data
+
+```
+// Save something for later
+load_data({ table: \"project_decisions\", data: \"[...]\", persist: true })
+
+// Recall it next session
+query({ sql: \"SELECT * FROM project_decisions\", database: \"persistent\" })
+
+// Cross-reference: join session scratch with persistent memory
+query({ sql: \"SELECT s.*, p.decision FROM scratch_analysis s \
+              JOIN \\\"persistent\\\".\\\"public\\\".\\\"project_decisions\\\" p \
+              ON s.topic = p.topic\" })
+```
+
+### Routing data to a destination
 
 - **`database` parameter** (preferred for tools that build their own
   SQL): `query`, `execute`, `load_data`, `load_file`, `load_files`,
