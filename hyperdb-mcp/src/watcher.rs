@@ -880,6 +880,7 @@ async fn process_ready_with_recovery(
                         Some(row_count_i64),
                         true,
                         target_db,
+                        None,
                     ) {
                         tracing::warn!(
                             table = %table,
