@@ -3,7 +3,7 @@
 
 //! Async connection to Hyper database.
 //!
-//! This module provides [`AsyncConnection`], the async version of [`Connection`](crate::Connection).
+//! This module provides [`AsyncConnection`] the async version of [`Connection`](crate::Connection).
 //! Use this when you're already in an async runtime (tokio).
 
 use std::any::Any;
