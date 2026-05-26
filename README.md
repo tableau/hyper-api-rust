@@ -13,7 +13,7 @@ database files (`.hyper`) without any C library dependencies.
 > **Project Status — 0.2.x, AI-Engineered**
 >
 > This crate was vibe-engineered with heavy use of AI coding assistants. The
-> **0.2.x** line will probably undergo large breaking changes; the public API
+> **0.2.x** line will probably undergo more large breaking changes; the public API
 > won't settle until the 1.0.0 release.
 >
 > Contributors and reviewers should, at a minimum, run an **AI code reviewer**
