@@ -3,10 +3,14 @@
 #
 # Usage:
 #   .\build.ps1 help             - Show help
-#   .\build.ps1 build            - Build debug binaries
-#   .\build.ps1 build-release    - Build release binaries
-#   .\build.ps1 test             - Run tests (debug mode)
-#   .\build.ps1 test-release     - Run tests (release mode)
+#   .\build.ps1 build            - Build debug binaries (API + MCP)
+#   .\build.ps1 build-api        - Build debug binaries (API only, no MCP/Node)
+#   .\build.ps1 build-release    - Build release binaries (API + MCP)
+#   .\build.ps1 build-api-release - Build release binaries (API only, no MCP/Node)
+#   .\build.ps1 test             - Run tests (debug, API + MCP)
+#   .\build.ps1 test-api         - Run tests (debug, API only, no MCP/Node)
+#   .\build.ps1 test-release     - Run tests (release, API + MCP)
+#   .\build.ps1 test-api-release - Run tests (release, API only, no MCP/Node)
 #   .\build.ps1 examples         - Run all examples
 #   .\build.ps1 doc              - Generate documentation
 #   .\build.ps1 download-hyperd  - Download hyperd into .hyperd\ (extra flags passed through)
@@ -45,6 +49,7 @@ if (-not $env:HYPERD_PATH) {
 # Windows contributors building via this script get the same coverage
 # (including the MCP server) as Unix contributors running `make`.
 $Crates = @("hyperdb-api-core", "hyperdb-api", "hyperdb-mcp")
+$ApiCrates = @("hyperdb-api-core", "hyperdb-api")
 
 # Crates documented by the `doc` target. Wider than $Crates because the
 # companion crates (hyperdb-api-salesforce, sea-query-hyperdb) ship user-facing
@@ -64,10 +69,14 @@ function Show-Help {
     Write-Host "Usage: .\build.ps1 <command>"
     Write-Host ""
     Write-Host "Commands:" -ForegroundColor Yellow
-    Write-Host "  build          - Build debug binaries"
-    Write-Host "  build-release  - Build release binaries"
-    Write-Host "  test           - Run tests (debug mode) with environment setup"
-    Write-Host "  test-release   - Run tests (release mode) with environment setup"
+    Write-Host "  build          - Build debug binaries (API + MCP)"
+    Write-Host "  build-api      - Build debug binaries (API only, no MCP/Node)"
+    Write-Host "  build-release  - Build release binaries (API + MCP)"
+    Write-Host "  build-api-release - Build release binaries (API only, no MCP/Node)"
+    Write-Host "  test           - Run tests (debug, API + MCP)"
+    Write-Host "  test-api       - Run tests (debug, API only, no MCP/Node)"
+    Write-Host "  test-release   - Run tests (release, API + MCP)"
+    Write-Host "  test-api-release - Run tests (release, API only, no MCP/Node)"
     Write-Host "  examples       - Run all examples via run_all_examples.ps1"
     Write-Host "  doc            - Generate documentation (only Hyper API crates)"
     Write-Host "  download-hyperd- Download hyperd into .hyperd\ (flags forwarded after command)"
@@ -128,9 +137,31 @@ function Build-Debug {
     Write-Host "Build succeeded!" -ForegroundColor Green
 }
 
+function Build-ApiDebug {
+    Write-Host "Building API debug binaries (no MCP/Node)..." -ForegroundColor Cyan
+    $PackageArgs = $ApiCrates | ForEach-Object { "-p", $_ }
+    & cargo build @PackageArgs
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Build failed!" -ForegroundColor Red
+        exit $LASTEXITCODE
+    }
+    Write-Host "Build succeeded!" -ForegroundColor Green
+}
+
 function Build-Release {
     Write-Host "Building release binaries..." -ForegroundColor Cyan
     $PackageArgs = $Crates | ForEach-Object { "-p", $_ }
+    & cargo build --release @PackageArgs
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Build failed!" -ForegroundColor Red
+        exit $LASTEXITCODE
+    }
+    Write-Host "Build succeeded!" -ForegroundColor Green
+}
+
+function Build-ApiRelease {
+    Write-Host "Building API release binaries (no MCP/Node)..." -ForegroundColor Cyan
+    $PackageArgs = $ApiCrates | ForEach-Object { "-p", $_ }
     & cargo build --release @PackageArgs
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Build failed!" -ForegroundColor Red
@@ -203,12 +234,32 @@ function Run-Tests {
     Write-Host "Tests passed!" -ForegroundColor Green
 }
 
+function Run-TestsApi {
+    Write-Host "Environment:" -ForegroundColor Yellow
+    Write-Host "  HYPERD_PATH=$env:HYPERD_PATH"
+    Write-Host ""
+
+    $PackageArgs = $ApiCrates | ForEach-Object { "-p", $_ }
+    Invoke-CargoTest -ProfileArgs @() -PackageArgs $PackageArgs
+    Write-Host "Tests passed!" -ForegroundColor Green
+}
+
 function Run-TestsRelease {
     Write-Host "Environment:" -ForegroundColor Yellow
     Write-Host "  HYPERD_PATH=$env:HYPERD_PATH"
     Write-Host ""
 
     $PackageArgs = $Crates | ForEach-Object { "-p", $_ }
+    Invoke-CargoTest -ProfileArgs @("--release") -PackageArgs $PackageArgs
+    Write-Host "Tests passed!" -ForegroundColor Green
+}
+
+function Run-TestsApiRelease {
+    Write-Host "Environment:" -ForegroundColor Yellow
+    Write-Host "  HYPERD_PATH=$env:HYPERD_PATH"
+    Write-Host ""
+
+    $PackageArgs = $ApiCrates | ForEach-Object { "-p", $_ }
     Invoke-CargoTest -ProfileArgs @("--release") -PackageArgs $PackageArgs
     Write-Host "Tests passed!" -ForegroundColor Green
 }
@@ -308,7 +359,7 @@ function Clean-All {
 
 # Commands that need a working hyperd. If none is on disk at the
 # configured HYPERD_PATH, run the downloader before the command itself.
-$NeedsHyperd = @("build", "build-release", "test", "test-release", "examples", "doc")
+$NeedsHyperd = @("build", "build-api", "build-release", "build-api-release", "test", "test-api", "test-release", "test-api-release", "examples", "doc")
 if ($NeedsHyperd -contains $Command.ToLower() -and -not (Test-Path $env:HYPERD_PATH)) {
     Write-Host "hyperd not found; running download-hyperd first..." -ForegroundColor Cyan
     $BootstrapArgs = @("run", "--release", "-p", "hyperdb-bootstrap", "--bin", "hyperdb-bootstrap", "--", "download")
@@ -327,14 +378,26 @@ switch ($Command.ToLower()) {
     "build" {
         Build-Debug
     }
+    "build-api" {
+        Build-ApiDebug
+    }
     "build-release" {
         Build-Release
+    }
+    "build-api-release" {
+        Build-ApiRelease
     }
     "test" {
         Run-Tests
     }
+    "test-api" {
+        Run-TestsApi
+    }
     "test-release" {
         Run-TestsRelease
+    }
+    "test-api-release" {
+        Run-TestsApiRelease
     }
     "examples" {
         Run-Examples

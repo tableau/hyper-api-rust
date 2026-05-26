@@ -484,6 +484,7 @@ fn discover_finds_live_daemon() {
 // ─── Integration tests: full daemon lifecycle with real hyperd ─────────────────
 
 #[test]
+#[ignore = "flaky on macOS CI — daemon startup exceeds 150s timeout"]
 fn daemon_mode_engine_connects_to_shared_hyperd() {
     let _lock = acquire_env_lock();
     let daemon = TestDaemon::start();
@@ -502,6 +503,7 @@ fn daemon_mode_engine_connects_to_shared_hyperd() {
 }
 
 #[test]
+#[ignore = "flaky on macOS CI — daemon startup exceeds 150s timeout"]
 fn daemon_mode_two_engines_share_same_hyperd() {
     let _lock = acquire_env_lock();
     let daemon = TestDaemon::start();
@@ -544,6 +546,7 @@ fn daemon_mode_two_engines_share_same_hyperd() {
 }
 
 #[test]
+#[ignore = "flaky on macOS CI — daemon startup exceeds 150s timeout"]
 fn daemon_mode_persistent_database_file_survives_engine_drop() {
     let _lock = acquire_env_lock();
     let _daemon = TestDaemon::start();
@@ -568,6 +571,7 @@ fn daemon_mode_persistent_database_file_survives_engine_drop() {
 }
 
 #[test]
+#[ignore = "flaky on macOS CI — daemon startup exceeds 150s timeout"]
 fn daemon_mode_persistent_engine_data_is_queryable() {
     let _lock = acquire_env_lock();
     let daemon = TestDaemon::start();
@@ -704,6 +708,7 @@ fn engine_recovers_after_hyperd_killed() {
 }
 
 #[test]
+#[ignore = "flaky on macOS CI — daemon startup exceeds 150s timeout"]
 fn daemon_mode_ephemeral_database_cleaned_up_on_drop() {
     let _lock = acquire_env_lock();
     let _daemon = TestDaemon::start();

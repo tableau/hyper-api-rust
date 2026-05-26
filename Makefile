@@ -1,4 +1,4 @@
-.PHONY: clean clean-test-files clean-doc build test test-release doc examples download-hyperd verify-hyperd-pin npm-pack
+.PHONY: clean clean-test-files clean-doc build build-api build-release build-api-release test test-api test-release test-api-release doc examples download-hyperd verify-hyperd-pin npm-pack
 
 # Environment variables for runtime
 # HYPERD_PATH points to the Hyper server executable.
@@ -26,7 +26,7 @@ endif
 # here (help, clean*, download-hyperd itself, verify-hyperd-pin) stay
 # free of the dependency.
 ifdef NEED_AUTO_DOWNLOAD
-build build-release test test-release test-redirect examples doc: download-hyperd
+build build-api build-release build-api-release test test-api test-release test-api-release test-redirect examples doc: download-hyperd
 endif
 
 # Show help
@@ -34,10 +34,14 @@ help:
 	@echo "Rust Hyper API Makefile"
 	@echo ""
 	@echo "Targets:"
-	@echo "  build          - Build debug binaries"
-	@echo "  build-release  - Build release binaries"
-	@echo "  test           - Run tests (debug mode) with environment setup"
-	@echo "  test-release   - Run tests (release mode) with environment setup"
+	@echo "  build          - Build debug binaries (API + MCP)"
+	@echo "  build-api      - Build debug binaries (API only, no MCP/Node)"
+	@echo "  build-release  - Build release binaries (API + MCP)"
+	@echo "  build-api-release - Build release binaries (API only, no MCP/Node)"
+	@echo "  test           - Run tests (debug, API + MCP)"
+	@echo "  test-api       - Run tests (debug, API only, no MCP/Node)"
+	@echo "  test-release   - Run tests (release, API + MCP)"
+	@echo "  test-api-release - Run tests (release, API only, no MCP/Node)"
 	@echo "  examples       - Run all examples via run_all_examples.sh"
 	@echo "  doc            - Generate documentation (only Hyper API crates)"
 	@echo "  npm-pack       - Build npm packages locally (.tgz files for sharing)"
@@ -81,9 +85,17 @@ clean-doc:
 build:
 	cargo build -p hyperdb-api-core -p hyperdb-api -p hyperdb-mcp
 
+# Build (debug) - Hyper API library stack only (no MCP/Node)
+build-api:
+	cargo build -p hyperdb-api-core -p hyperdb-api
+
 # Build (release) - Hyper API library stack + MCP server
 build-release:
 	cargo build --release -p hyperdb-api-core -p hyperdb-api -p hyperdb-mcp
+
+# Build (release) - Hyper API library stack only (no MCP/Node)
+build-api-release:
+	cargo build --release -p hyperdb-api-core -p hyperdb-api
 
 # Run tests (debug) with proper environment
 test:
@@ -92,12 +104,26 @@ test:
 	@echo ""
 	cargo test -p hyperdb-api-core -p hyperdb-api -p hyperdb-mcp
 
+# Run tests (debug) - API only (no MCP/Node)
+test-api:
+	@echo "Environment:"
+	@echo "  HYPERD_PATH=$(HYPERD_PATH)"
+	@echo ""
+	cargo test -p hyperdb-api-core -p hyperdb-api
+
 # Run tests (release) with proper environment
 test-release:
 	@echo "Environment:"
 	@echo "  HYPERD_PATH=$(HYPERD_PATH)"
 	@echo ""
 	cargo test --release -p hyperdb-api-core -p hyperdb-api -p hyperdb-mcp
+
+# Run tests (release) - API only (no MCP/Node)
+test-api-release:
+	@echo "Environment:"
+	@echo "  HYPERD_PATH=$(HYPERD_PATH)"
+	@echo ""
+	cargo test --release -p hyperdb-api-core -p hyperdb-api
 
 # Run tests with redirect feature enabled
 test-redirect:

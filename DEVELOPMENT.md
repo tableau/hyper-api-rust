@@ -445,10 +445,14 @@ in companion crates:
 The `Makefile` automatically sets up all required environment variables:
 
 ```bash
-make build              # Debug build
-make build-release      # Release build
-make test               # Run tests (auto-sets HYPERD_PATH)
-make test-release       # Run tests (release)
+make build              # Debug build (API + MCP)
+make build-api          # Debug build (API only, no MCP/Node)
+make build-release      # Release build (API + MCP)
+make build-api-release  # Release build (API only, no MCP/Node)
+make test               # Run tests (debug, API + MCP)
+make test-api           # Run tests (debug, API only, no MCP/Node)
+make test-release       # Run tests (release, API + MCP)
+make test-api-release   # Run tests (release, API only, no MCP/Node)
 make examples           # Run all examples
 make doc                # Generate documentation
 make clean              # Remove build artifacts and test files
@@ -470,9 +474,14 @@ cargo test -p hyperdb-api
 
 ```powershell
 .\build.ps1 help            # Show available commands
-.\build.ps1 build           # Debug build
-.\build.ps1 build-release   # Release build
-.\build.ps1 test            # Run tests (auto-sets HYPERD_PATH)
+.\build.ps1 build           # Debug build (API + MCP)
+.\build.ps1 build-api       # Debug build (API only, no MCP/Node)
+.\build.ps1 build-release   # Release build (API + MCP)
+.\build.ps1 build-api-release # Release build (API only, no MCP/Node)
+.\build.ps1 test            # Run tests (debug, API + MCP)
+.\build.ps1 test-api        # Run tests (debug, API only, no MCP/Node)
+.\build.ps1 test-release    # Run tests (release, API + MCP)
+.\build.ps1 test-api-release # Run tests (release, API only, no MCP/Node)
 .\build.ps1 examples        # Run all examples
 .\build.ps1 doc             # Generate and open documentation
 .\build.ps1 clean           # Remove build artifacts and test files
@@ -519,9 +528,12 @@ cargo build --release
 
 | Task | Linux/macOS | Windows |
 |------|-------------|---------|
-| Build debug | `make build` | `.\build.ps1 build` |
-| Build release | `make build-release` | `.\build.ps1 build-release` |
-| Run tests | `make test` | `.\build.ps1 test` |
+| Build debug (all) | `make build` | `.\build.ps1 build` |
+| Build debug (API only) | `make build-api` | `.\build.ps1 build-api` |
+| Build release (all) | `make build-release` | `.\build.ps1 build-release` |
+| Build release (API only) | `make build-api-release` | `.\build.ps1 build-api-release` |
+| Run tests (all) | `make test` | `.\build.ps1 test` |
+| Run tests (API only) | `make test-api` | `.\build.ps1 test-api` |
 | Run examples | `./run_all_examples.sh` | `.\run_all_examples.ps1` |
 | Generate docs | `make doc` | `.\build.ps1 doc` |
 | Clean | `make clean` | `.\build.ps1 clean` |
