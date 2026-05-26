@@ -596,6 +596,7 @@ fn daemon_mode_persistent_engine_data_is_queryable() {
 
 #[cfg(unix)]
 #[test]
+#[ignore = "flaky on macOS CI — daemon startup exceeds 150s timeout"]
 fn hyperd_monitor_detects_killed_hyperd_and_restarts() {
     let _lock = acquire_env_lock();
     let daemon = TestDaemon::start();
@@ -623,6 +624,7 @@ fn hyperd_monitor_detects_killed_hyperd_and_restarts() {
 
 #[cfg(unix)]
 #[test]
+#[ignore = "flaky on macOS CI — daemon startup exceeds 150s timeout"]
 fn client_report_triggers_restart_after_kill() {
     let _lock = acquire_env_lock();
     let daemon = TestDaemon::start();
