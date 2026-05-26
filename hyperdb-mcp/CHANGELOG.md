@@ -146,7 +146,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   stranded in `"foo"."public"."_table_catalog"` indefinitely (bootstrap
   reconcile and the post-execute reconcile both walked persistent
   only). `after_execute_catalog_update` now reconciles persistent
-  first and then the user-attached target if non-persistent.
+  first and then the user-attached target if non-persistent. Gated on
+  `is_structural_sql` (CREATE / DROP / ALTER / TRUNCATE / RENAME) so
+  per-row `INSERT` / `UPDATE` / `DELETE` no longer triggers a
+  workspace-wide catalog scan on every call.
+- **`copy_query.target_database` now canonicalizes mixed-case aliases.**
+  Pre-fix, `attach_database(alias="My_DB")` (which the registry stores
+  as `"my_db"` after the alias-canonicalization change) followed by
+  `copy_query(target_database="My_DB")` rendered SQL referring to
+  `"My_DB"` and Hyper rejected it with "database does not exist"
+  (Hyper is case-sensitive on quoted identifiers). The tool now
+  lowercases `target_database` after the `LOCAL_ALIAS` filter so the
+  registry lookup AND the qualified-SQL build path agree on the
+  canonical lowercase form.
 
 ## [0.1.1] - 2026-05-13
 

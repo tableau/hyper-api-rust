@@ -39,7 +39,10 @@ struct TestHarness {
     /// Persistent workspace path — kept alive via the temp dir.
     /// Held by the harness so individual tests can read it back if a
     /// scenario ever needs to inspect the on-disk file directly.
-    #[expect(dead_code, reason = "kept for future tests that inspect the on-disk persistent file")]
+    #[expect(
+        dead_code,
+        reason = "kept for future tests that inspect the on-disk persistent file"
+    )]
     persistent_path: PathBuf,
     _temp_dir: Arc<TempDir>,
 }
@@ -634,6 +637,71 @@ async fn tool_detach_database_rejects_when_watcher_active() -> TestResult {
         serde_json::json!({ "path": canon.to_string_lossy() }),
     )
     .await?;
+
+    h.shutdown().await
+}
+
+/// Regression test for the final-sweep CRITICAL: `copy_query` did not
+/// canonicalize `target_database`, so attaching as `"My_DB"` (which
+/// the registry stores lowercased as `"my_db"`) and calling
+/// `copy_query(target_database="My_DB")` failed at SQL render time
+/// because Hyper is case-sensitive on quoted identifiers. The fix
+/// lowercases `target_database` after the LOCAL_ALIAS filter so both
+/// the registry lookup and `qualified_name` agree on the canonical
+/// form.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_copy_query_target_database_mixed_case_canonicalizes() -> TestResult {
+    let h = TestHarness::start(false, false).await?;
+    let attach_dir = TempDir::new()?;
+    let attached_file = attach_dir.path().join("dst.hyper");
+
+    let r = call_tool(
+        &h.client,
+        "attach_database",
+        serde_json::json!({
+            "alias": "My_DB",
+            "kind": "local_file",
+            "path": attached_file.to_string_lossy(),
+            "writable": true,
+            "on_missing": "create",
+        }),
+    )
+    .await?;
+    assert!(!is_error(&r), "attach failed: {:?}", first_text(&r));
+
+    // Use the user-typed mixed-case alias for the copy target. Pre-fix
+    // this would render `"My_DB"."public"."t"` and fail; post-fix the
+    // tool lowercases to match the canonical `"my_db"` form.
+    let r = call_tool(
+        &h.client,
+        "copy_query",
+        serde_json::json!({
+            "mode": "create",
+            "target_database": "My_DB",
+            "target_table": "t",
+            "sql": "SELECT 1 AS x, 'hi' AS y",
+        }),
+    )
+    .await?;
+    assert!(
+        !is_error(&r),
+        "copy_query with mixed-case target_database must succeed; got: {:?}",
+        first_text(&r)
+    );
+
+    let q = call_tool(
+        &h.client,
+        "query",
+        serde_json::json!({
+            "sql": "SELECT COUNT(*) AS n FROM \"my_db\".\"public\".\"t\""
+        }),
+    )
+    .await?;
+    let body = all_text(&q);
+    assert!(
+        body.contains("\"n\":1") || body.contains("\"n\": 1"),
+        "row must land in canonical lowercase database; got: {body}"
+    );
 
     h.shutdown().await
 }

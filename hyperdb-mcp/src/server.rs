@@ -1131,7 +1131,7 @@ impl HyperMcpServer {
     /// never sees them.
     #[expect(
         clippy::unused_self,
-        reason = "kept for symmetry with after_execute_catalog_update; both run inside with_engine"
+        reason = "&self required for method-call dispatch; body uses only engine + params"
     )]
     fn after_ingest_catalog_update(
         &self,
@@ -1171,7 +1171,7 @@ impl HyperMcpServer {
     /// persistent, and tools like `describe` would keep listing it).
     #[expect(
         clippy::unused_self,
-        reason = "kept for symmetry; runs inside with_engine"
+        reason = "&self required for method-call dispatch; body uses only engine + target_db"
     )]
     fn after_execute_catalog_update(&self, engine: &Engine, target_db: Option<&str>) {
         if let Err(e) = crate::table_catalog::reconcile_in(engine, None) {
@@ -2221,15 +2221,22 @@ impl HyperMcpServer {
             let timer = crate::stats::StatsTimer::start();
             let affected = engine.execute_command(&params.sql)?;
             let elapsed = timer.elapsed_ms();
-            // Reconcile before returning so clients see the updated
-            // catalog immediately (e.g. a subsequent `describe` picks up
-            // a freshly-CREATEd table's stub row, and DROPped tables
-            // disappear from the catalog). Threads `target_db` so a
-            // raw DDL against a user-attached alias also reconciles
-            // that DB's catalog (otherwise the dropped table's row
-            // stays stranded — bootstrap reconcile only walks
-            // persistent).
-            self.after_execute_catalog_update(engine, target_db.as_deref());
+            // Reconcile only when the statement could have changed the
+            // set of tables (CREATE / DROP / ALTER / TRUNCATE / RENAME).
+            // INSERT / UPDATE / DELETE can't add or remove tables, so
+            // running `reconcile_in` on every row-level execute would
+            // do `2N + 2` SQL round-trips of pure waste — and after
+            // M4's M-target fan-out, `4N + 4` for user-attached
+            // targets. Same gate as `notify_resource_list_changed`
+            // below; both fire on the same set of statements.
+            //
+            // Threads `target_db` so a structural DDL against a
+            // user-attached alias also reconciles that DB's catalog
+            // (otherwise the dropped table's row stays stranded —
+            // bootstrap reconcile only walks persistent).
+            if is_structural_sql(&params.sql) {
+                self.after_execute_catalog_update(engine, target_db.as_deref());
+            }
             Ok(json!({
                 "sql": Self::fmt_sql(&params.sql),
                 "affected_rows": affected,
@@ -3021,10 +3028,20 @@ impl HyperMcpServer {
         // `target_database = None` and `"local"` both map to the
         // primary workspace (unqualified target name). Anything else
         // must refer to an attached writable database.
-        let target_db = params
+        //
+        // Canonicalize to the registry's lowercase storage form before
+        // both the registry lookup AND the qualified-SQL build path
+        // (`perform_copy` → `qualified_name`). Hyper is case-sensitive
+        // on quoted identifiers; without canonicalization here, a user
+        // attaching as `"My_DB"` (which the registry stores as
+        // `"my_db"`) and calling `copy_query(target_database="My_DB")`
+        // would fail with "database does not exist" once SQL renders.
+        let target_db_owned = params
             .target_database
             .as_deref()
-            .filter(|s| !s.eq_ignore_ascii_case(LOCAL_ALIAS));
+            .filter(|s| !s.eq_ignore_ascii_case(LOCAL_ALIAS))
+            .map(str::to_ascii_lowercase);
+        let target_db = target_db_owned.as_deref();
         if let Some(alias) = target_db {
             match self.attachments.get(alias) {
                 None => {
