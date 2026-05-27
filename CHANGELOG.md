@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3](https://github.com/tableau/hyper-api-rust/compare/v0.2.2...v0.2.3) (2026-05-27)
+
+
+### Bug Fixes
+
+* **ci:** use exact-name match for required check-runs (no regex) ([#54](https://github.com/tableau/hyper-api-rust/issues/54)) ([fc13637](https://github.com/tableau/hyper-api-rust/commit/fc13637b0da39e98f0dc3da3034b23014ba6dc33))
+
 ## [0.2.2](https://github.com/tableau/hyper-api-rust/compare/v0.2.1...v0.2.2) (2026-05-27)
 
 
