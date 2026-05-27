@@ -1,6 +1,5 @@
 {
   "name": "hyperdb-mcp-darwin-x64",
-  "version": "0.1.2",
   "description": "HyperDB MCP server binary for macOS x64",
   "os": ["darwin"],
   "cpu": ["x64"],

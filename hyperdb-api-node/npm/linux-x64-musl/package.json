@@ -1,6 +1,5 @@
 {
   "name": "hyperdb-api-node-linux-x64-musl",
-  "version": "0.1.3",
   "os": [
     "linux"
   ],

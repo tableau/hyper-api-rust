@@ -1,6 +1,5 @@
 {
   "name": "hyperdb-api-node-darwin-x64",
-  "version": "0.1.2",
   "os": [
     "darwin"
   ],

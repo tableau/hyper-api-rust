@@ -1,14 +1,8 @@
 {
   "name": "hyperdb-mcp",
-  "version": "0.1.3",
   "description": "HyperDB MCP server — instant SQL analytics for LLM workflows",
   "bin": {
     "hyperdb-mcp": "bin.js"
-  },
-  "optionalDependencies": {
-    "hyperdb-mcp-darwin-arm64": "0.2.1",
-    "hyperdb-mcp-linux-x64-gnu": "0.2.1",
-    "hyperdb-mcp-win32-x64-msvc": "0.2.1"
   },
   "files": [
     "bin.js",
