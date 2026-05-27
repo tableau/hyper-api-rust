@@ -37,25 +37,36 @@ jobs:
       - name: Wait for CI to pass
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
           SHA=$(git rev-parse HEAD)
-          echo "Waiting for CI status on $SHA"
+          echo "Waiting for required CI check-runs on $SHA"
+          # GitHub Actions report results via check-runs, not the legacy
+          # commit-status API. Poll check-runs by name; ignore the
+          # verify-ci job from this workflow (it would self-reference).
           MAX_ATTEMPTS=30
           SLEEP_SECONDS=60
-          for i in $(seq 1 $MAX_ATTEMPTS); do
-            STATE=$(gh api "repos/${{ github.repository }}/commits/$SHA/status" --jq '.state')
-            echo "Attempt $i/$MAX_ATTEMPTS: state=$STATE"
-            if [[ "$STATE" == "success" ]]; then
-              echo "CI passed."
-              exit 0
-            elif [[ "$STATE" == "failure" || "$STATE" == "error" ]]; then
-              echo "::error::CI failed for $SHA (state: $STATE). Aborting publish."
+          REQUIRED='rustfmt|clippy|cargo-audit|cargo-deny|version consistency|publish dry-run|test \(ubuntu-latest\)|test \(macos-14\)|test \(windows-latest\)'
+          for i in $(seq 1 "$MAX_ATTEMPTS"); do
+            RUNS=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" \
+              --jq "[.check_runs[] | select(.name | test(\"$REQUIRED\"))]")
+            TOTAL=$(echo "$RUNS" | jq 'length')
+            COMPLETED=$(echo "$RUNS" | jq '[.[] | select(.status=="completed")] | length')
+            FAILED=$(echo "$RUNS" | jq '[.[] | select(.status=="completed" and (.conclusion!="success" and .conclusion!="skipped" and .conclusion!="neutral"))] | length')
+            echo "Attempt $i/$MAX_ATTEMPTS: total=$TOTAL completed=$COMPLETED failed=$FAILED"
+            if [[ "$FAILED" -gt 0 ]]; then
+              echo "::error::CI failed for $SHA. Failing check-runs:"
+              echo "$RUNS" | jq -r '.[] | select(.status=="completed" and (.conclusion!="success" and .conclusion!="skipped" and .conclusion!="neutral")) | "  - \(.name): \(.conclusion)"'
               exit 1
             fi
+            if [[ "$TOTAL" -gt 0 && "$COMPLETED" == "$TOTAL" ]]; then
+              echo "CI passed ($TOTAL required check-runs completed successfully)."
+              exit 0
+            fi
             echo "CI still pending, waiting ${SLEEP_SECONDS}s..."
-            sleep $SLEEP_SECONDS
+            sleep "$SLEEP_SECONDS"
           done
-          echo "::error::Timed out waiting for CI to pass ($SHA). State: $STATE"
+          echo "::error::Timed out waiting for CI to pass ($SHA)."
           exit 1
 
   build-npm:
