@@ -109,7 +109,16 @@ jobs:
           exit 1
 
       - name: Install system libraries
-        run: sudo apt-get update -q && sudo apt-get install -y protobuf-compiler
+        # `mold` is required because `.cargo/config.toml` pins
+        # `linker = "clang"` + `link-arg=-fuse-ld=mold` for
+        # `x86_64-unknown-linux-gnu`. The `publish` job below already
+        # installs it; the `verify` job missed it, which broke the
+        # v0.2.3 release.yml run with `clang: error: invalid linker
+        # name in argument '-fuse-ld=mold'` while the verify-step's
+        # `cargo run --release -p hyperdb-bootstrap -- verify`
+        # tried to compile build scripts. Keeping the package list
+        # in sync with the publish job below.
+        run: sudo apt-get update -q && sudo apt-get install -y mold protobuf-compiler
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
