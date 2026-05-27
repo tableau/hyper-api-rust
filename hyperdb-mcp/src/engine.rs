@@ -1706,21 +1706,48 @@ fn translate_table_missing(err: McpError, table_name: &str) -> McpError {
 /// rather than the sole security boundary.
 #[must_use]
 pub fn is_read_only_sql(sql: &str) -> bool {
+    matches!(classify_statement(sql), StatementKind::ReadOnly)
+}
+
+/// Coarse classification of a single SQL statement, comment-aware.
+///
+/// Used by the atomic-batch `execute` tool to enforce the rule "a batch
+/// must be either all-DDL singletons or all-DML; mixing the two aborts
+/// the transaction with SQLSTATE 0A000". The first-keyword heuristic
+/// matches what `is_read_only_sql` and the legacy `is_structural_sql`
+/// already trust elsewhere in the codebase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatementKind {
+    /// `SELECT` / `WITH` / `EXPLAIN` / `SHOW` / `VALUES`.
+    ReadOnly,
+    /// `CREATE` / `DROP` / `ALTER` / `TRUNCATE` / `RENAME` — Hyper auto-commits.
+    Ddl,
+    /// `INSERT` / `UPDATE` / `DELETE` / `COPY` / `MERGE` — transactional.
+    Dml,
+    /// Empty/comment-only input or an unrecognized first keyword. Treated
+    /// as opaque by the batch validator (passed through to Hyper).
+    Other,
+}
+
+#[must_use]
+pub fn classify_statement(sql: &str) -> StatementKind {
     let stripped = strip_leading_sql_comments(sql);
     let first_token: String = stripped
         .chars()
         .take_while(|c| c.is_alphabetic())
         .flat_map(char::to_uppercase)
         .collect();
-    matches!(
-        first_token.as_str(),
-        "SELECT" | "WITH" | "EXPLAIN" | "SHOW" | "VALUES"
-    )
+    match first_token.as_str() {
+        "SELECT" | "WITH" | "EXPLAIN" | "SHOW" | "VALUES" => StatementKind::ReadOnly,
+        "CREATE" | "DROP" | "ALTER" | "TRUNCATE" | "RENAME" => StatementKind::Ddl,
+        "INSERT" | "UPDATE" | "DELETE" | "COPY" | "MERGE" => StatementKind::Dml,
+        _ => StatementKind::Other,
+    }
 }
 
 /// Strips leading whitespace, line comments (`--`), and block comments (`/* */`)
 /// from SQL text. Handles nested block comments.
-fn strip_leading_sql_comments(sql: &str) -> &str {
+pub(crate) fn strip_leading_sql_comments(sql: &str) -> &str {
     let mut s = sql;
     loop {
         s = s.trim_start();
@@ -1766,6 +1793,183 @@ fn strip_leading_sql_comments(sql: &str) -> &str {
         }
     }
     s
+}
+
+/// Verifies that `sql` contains at most one SQL statement.
+///
+/// Hyper rejects multi-statement strings on the wire (SQLSTATE `0A000` /
+/// "Multi-part queries"); the atomic-batch `execute` tool catches this up
+/// front so each array element gets its own connection round-trip and any
+/// failure can name the offending statement.
+///
+/// Returns `Ok(())` when the input is empty, comment-only, a single
+/// statement (with or without a trailing semicolon), or a single statement
+/// followed by trailing whitespace/comments. Returns `Err(InvalidArgument)`
+/// when a non-comment, non-whitespace character follows the first
+/// un-quoted, un-commented `;`.
+///
+/// The scanner recognizes the same lexical structure Hyper does:
+/// `'…'` single-quoted string literals (with `''` doubled-quote escape),
+/// `E'…'` PostgreSQL-style escape strings (with `\'` and `''` escapes),
+/// `"…"` double-quoted identifiers (with `""` escape), `--` line comments,
+/// and `/* … */` block comments (nested).
+///
+/// PostgreSQL dollar-quoted strings (`$tag$ … $tag$`) are NOT recognized.
+/// Hyper is an analytical engine without stored procedures or triggers,
+/// so these are vanishingly rare in `execute` traffic; on the off chance
+/// a user passes one whose body contains a `;`, this scanner will
+/// misclassify it as multi-statement and the request will be rejected
+/// with a misleading message. Workaround: rewrite using standard `'…'`
+/// literals.
+pub(crate) fn first_statement_only(sql: &str) -> Result<(), McpError> {
+    #[derive(Clone, Copy)]
+    enum State {
+        Normal,
+        SingleQuoted,
+        EscapeString,
+        DoubleQuoted,
+        LineComment,
+        BlockComment(u32),
+    }
+
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    let mut state = State::Normal;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        match state {
+            State::Normal => match b {
+                // E-string prefix: E or e immediately followed by '. The
+                // identifier-boundary rule (PG spec) says no other letter/
+                // digit/underscore may precede the E — but we don't need
+                // strict identifier tracking here. Misidentifying the E
+                // in a longer identifier (e.g. `case` ending right before
+                // `'…'`) would pessimistically over-recognize an escape
+                // string; the only side-effect is treating `\'` as escaped,
+                // which is a superset of the standard rules. False
+                // positives don't break anything.
+                b'E' | b'e' if bytes.get(i + 1) == Some(&b'\'') => {
+                    state = State::EscapeString;
+                    i += 2;
+                }
+                b'\'' => {
+                    state = State::SingleQuoted;
+                    i += 1;
+                }
+                b'"' => {
+                    state = State::DoubleQuoted;
+                    i += 1;
+                }
+                b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                    state = State::LineComment;
+                    i += 2;
+                }
+                b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                    state = State::BlockComment(1);
+                    i += 2;
+                }
+                b';' => {
+                    i += 1;
+                    // Scan forward for any non-whitespace, non-comment content
+                    while i < bytes.len() {
+                        let c = bytes[i];
+                        if c.is_ascii_whitespace() {
+                            i += 1;
+                        } else if c == b'-' && bytes.get(i + 1) == Some(&b'-') {
+                            i += 2;
+                            while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
+                                i += 1;
+                            }
+                        } else if c == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                            i += 2;
+                            let mut depth = 1u32;
+                            while i < bytes.len() && depth > 0 {
+                                if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                                    depth += 1;
+                                    i += 2;
+                                } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                                    depth -= 1;
+                                    i += 2;
+                                } else {
+                                    i += 1;
+                                }
+                            }
+                        } else if c == b';' {
+                            // Empty statement after a semicolon is harmless;
+                            // skip it and keep scanning for real content.
+                            i += 1;
+                        } else {
+                            return Err(McpError::new(
+                                ErrorCode::InvalidArgument,
+                                "Each `sql[i]` must contain exactly one statement.",
+                            )
+                            .with_suggestion(
+                                "Split semicolon-separated statements into separate array elements: `sql: [\"stmt1\", \"stmt2\"]`. The whole array runs atomically inside a single transaction.",
+                            ));
+                        }
+                    }
+                    return Ok(());
+                }
+                _ => i += 1,
+            },
+            State::SingleQuoted => match b {
+                // Doubled '' inside a string literal is an escaped quote, not a terminator.
+                b'\'' if bytes.get(i + 1) == Some(&b'\'') => i += 2,
+                b'\'' => {
+                    state = State::Normal;
+                    i += 1;
+                }
+                _ => i += 1,
+            },
+            State::EscapeString => match b {
+                // E-strings honor both `\'` and `''` as escapes for an
+                // embedded apostrophe. The backslash also escapes the
+                // following byte (so `\\` is a literal backslash and
+                // `\;` keeps the semicolon literal — which is the whole
+                // reason this state exists).
+                b'\\' if bytes.get(i + 1).is_some() => i += 2,
+                b'\'' if bytes.get(i + 1) == Some(&b'\'') => i += 2,
+                b'\'' => {
+                    state = State::Normal;
+                    i += 1;
+                }
+                _ => i += 1,
+            },
+            State::DoubleQuoted => match b {
+                // Doubled "" inside an identifier is an escaped quote.
+                b'"' if bytes.get(i + 1) == Some(&b'"') => i += 2,
+                b'"' => {
+                    state = State::Normal;
+                    i += 1;
+                }
+                _ => i += 1,
+            },
+            State::LineComment => match b {
+                b'\n' | b'\r' => {
+                    state = State::Normal;
+                    i += 1;
+                }
+                _ => i += 1,
+            },
+            State::BlockComment(depth) => {
+                if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                    state = State::BlockComment(depth + 1);
+                    i += 2;
+                } else if b == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    state = if depth == 1 {
+                        State::Normal
+                    } else {
+                        State::BlockComment(depth - 1)
+                    };
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Drop for Engine {
@@ -1842,5 +2046,114 @@ fn home_dir() -> Option<PathBuf> {
         Some(combined)
     } else {
         std::env::var_os("HOME").map(PathBuf::from)
+    }
+}
+
+#[cfg(test)]
+mod statement_helper_tests {
+    use super::*;
+
+    #[test]
+    fn classify_statement_recognizes_each_kind() {
+        assert_eq!(classify_statement("SELECT 1"), StatementKind::ReadOnly);
+        assert_eq!(
+            classify_statement("with x as (..) select * from x"),
+            StatementKind::ReadOnly
+        );
+        assert_eq!(
+            classify_statement("CREATE TABLE t (i INT)"),
+            StatementKind::Ddl
+        );
+        assert_eq!(classify_statement("drop table t"), StatementKind::Ddl);
+        assert_eq!(
+            classify_statement("INSERT INTO t VALUES (1)"),
+            StatementKind::Dml
+        );
+        assert_eq!(classify_statement("update t set i = 2"), StatementKind::Dml);
+        assert_eq!(classify_statement("delete from t"), StatementKind::Dml);
+        assert_eq!(classify_statement("BEGIN"), StatementKind::Other);
+        assert_eq!(classify_statement(""), StatementKind::Other);
+    }
+
+    #[test]
+    fn classify_statement_strips_comments() {
+        assert_eq!(
+            classify_statement("/* harmless */ DROP TABLE t"),
+            StatementKind::Ddl
+        );
+        assert_eq!(
+            classify_statement("-- pretend to be readonly\nINSERT INTO t VALUES (1)"),
+            StatementKind::Dml
+        );
+    }
+
+    #[test]
+    fn first_statement_only_accepts_singletons() {
+        assert!(first_statement_only("SELECT 1").is_ok());
+        assert!(first_statement_only("INSERT INTO t VALUES (1)").is_ok());
+        assert!(first_statement_only("INSERT INTO t VALUES (1);").is_ok());
+        assert!(first_statement_only("INSERT INTO t VALUES (1) ;  ").is_ok());
+        assert!(first_statement_only("INSERT INTO t VALUES (1);;;  ").is_ok());
+        assert!(first_statement_only("").is_ok());
+        assert!(first_statement_only("   ").is_ok());
+    }
+
+    #[test]
+    fn first_statement_only_rejects_multi_statement() {
+        assert!(
+            first_statement_only("INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)").is_err()
+        );
+        assert!(first_statement_only("UPDATE t SET i = 1; UPDATE t SET i = 2").is_err());
+    }
+
+    #[test]
+    fn first_statement_only_tolerates_quoted_semicolons() {
+        // Single-quoted string literal containing a semicolon must NOT be
+        // treated as a statement terminator.
+        assert!(first_statement_only("INSERT INTO t (msg) VALUES ('a;b')").is_ok());
+        // Doubled '' inside a literal is an escaped quote.
+        assert!(first_statement_only("INSERT INTO t (msg) VALUES ('it''s; fine')").is_ok());
+        // Double-quoted identifier with semicolon.
+        assert!(first_statement_only("SELECT \"col;name\" FROM t").is_ok());
+    }
+
+    #[test]
+    fn first_statement_only_tolerates_escape_strings() {
+        // E-string with backslash-escaped semicolon.
+        assert!(first_statement_only(r"INSERT INTO t (msg) VALUES (E'a\;b')").is_ok());
+        // E-string with backslash-escaped quote.
+        assert!(first_statement_only(r"INSERT INTO t (msg) VALUES (E'it\'s ; fine')").is_ok());
+        // Lowercase e prefix should also be recognized.
+        assert!(first_statement_only(r"INSERT INTO t (msg) VALUES (e'a\;b')").is_ok());
+        // Hex byte literal — the form `hyperdb-api` emits for &[u8] params.
+        assert!(first_statement_only(r"INSERT INTO t (b) VALUES (E'\\x00ff;ee')").is_ok());
+    }
+
+    #[test]
+    fn first_statement_only_tolerates_trailing_comments() {
+        assert!(first_statement_only("INSERT INTO t VALUES (1); -- done").is_ok());
+        assert!(first_statement_only("INSERT INTO t VALUES (1); /* trailing */").is_ok());
+        // Block comment after semicolon, then real content → reject.
+        assert!(first_statement_only(
+            "INSERT INTO t VALUES (1); /* hi */ INSERT INTO t VALUES (2)"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn first_statement_only_handles_block_comments_with_semicolons() {
+        assert!(first_statement_only("/* cmt;cmt */ INSERT INTO t VALUES (1)").is_ok());
+        assert!(first_statement_only("INSERT INTO t /* mid;cmt */ VALUES (1)").is_ok());
+        // Nested block comments
+        assert!(first_statement_only(
+            "/* outer /* inner;inner */ outer */ INSERT INTO t VALUES (1)"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn first_statement_only_handles_line_comments_with_semicolons() {
+        assert!(first_statement_only("-- a; b\nINSERT INTO t VALUES (1)").is_ok());
+        assert!(first_statement_only("INSERT INTO t VALUES (1) -- trailing;\n").is_ok());
     }
 }

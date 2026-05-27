@@ -13,7 +13,9 @@
 
 use crate::attach::{self, AttachRegistry, AttachRequest, AttachSource, LOCAL_ALIAS};
 use crate::chart::{render_chart, ChartFormat, ChartOptions, ChartType};
-use crate::engine::{is_read_only_sql, Engine};
+use crate::engine::{
+    classify_statement, first_statement_only, is_read_only_sql, Engine, StatementKind,
+};
 use crate::error::{ErrorCode, McpError};
 use crate::export::{export_to_file, ExportOptions};
 use crate::ingest::{
@@ -384,8 +386,24 @@ pub struct QueryParams {
 /// Parameters for the mutating `execute` workspace tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ExecuteParams {
-    /// DDL/DML SQL statement (CREATE, INSERT, UPDATE, DELETE, DROP, ALTER, COPY, etc.)
-    pub sql: String,
+    /// One or more DDL/DML SQL statements (CREATE, INSERT, UPDATE, DELETE,
+    /// DROP, ALTER, COPY, etc.) to execute as an atomic batch.
+    ///
+    /// Pass a single-element array `["UPDATE …"]` for one statement, or
+    /// multiple elements for an atomic upsert / multi-table mutation.
+    /// Multi-element batches run inside a transaction — every statement
+    /// commits together or all roll back. Each element must be exactly
+    /// one statement (no embedded `;`-separated multi-statements).
+    ///
+    /// Restrictions enforced before any SQL hits the server:
+    /// - The array must be non-empty and no element may be empty/whitespace.
+    /// - No element may be read-only (use `query` for SELECT/WITH/EXPLAIN).
+    /// - DDL and DML cannot be mixed in one batch (Hyper aborts the
+    ///   transaction with SQLSTATE 0A000).
+    /// - Multi-element all-DDL batches are rejected because Hyper
+    ///   auto-commits CREATE/DROP/ALTER even inside a transaction —
+    ///   issue each DDL in its own `execute` call.
+    pub sql: Vec<String>,
     /// Target database alias for unqualified name resolution. Omit to
     /// run against the ephemeral primary. Pass `"persistent"` to write
     /// to the durable database (or a writable user-attached alias).
@@ -2200,9 +2218,9 @@ impl HyperMcpServer {
         }
     }
 
-    /// Execute a DDL or DML statement (CREATE, INSERT, UPDATE, DELETE, DROP, etc.).
+    /// Execute one or more DDL/DML statements as an atomic batch.
     #[tool(
-        description = "Execute a DDL/DML statement (CREATE TABLE, INSERT, UPDATE, DELETE, DROP, ALTER, COPY, etc.). Returns affected row count. Disabled in read-only mode."
+        description = "Execute one or more DDL/DML statements as an atomic batch. `sql` is an array of statements; pass `[\"SQL\"]` for a single statement or `[\"UPDATE …\", \"INSERT …\"]` for an atomic upsert. Multi-statement batches run inside a transaction — if any statement fails, all are rolled back. Mixing DDL with DML in one batch is rejected (Hyper aborts such transactions). Disabled in read-only mode."
     )]
     fn execute(
         &self,
@@ -2211,44 +2229,107 @@ impl HyperMcpServer {
         if let Err(e) = self.check_writable("execute") {
             return Self::err_content(e);
         }
-        let sql = params.sql.clone();
+        // Validation runs outside `with_engine` so a malformed batch
+        // doesn't tie up an engine handle. All checks short-circuit on
+        // the first failure with an InvalidArgument / SqlError carrying
+        // an LLM-actionable suggestion.
+        if let Err(e) = validate_execute_batch(&params.sql) {
+            return Self::err_content(e);
+        }
+        let any_structural = params
+            .sql
+            .iter()
+            .any(|s| matches!(classify_statement(s), StatementKind::Ddl));
         let result = self.with_engine(|engine| {
-            if is_read_only_sql(&params.sql) {
-                return Err(McpError::new(
-                    ErrorCode::SqlError,
-                    "The execute tool is for DDL/DML. Use the query tool for SELECT/WITH/EXPLAIN statements.",
-                ));
-            }
             // Optional database routing — temporarily redirect search_path.
             // require_writable=true ensures non-primary aliases must be writable.
+            // Held for the entire batch (and transaction, if multi-statement).
             let target_db = self.resolve_db(engine, params.database.as_deref(), None, true)?;
             let _search_guard = match target_db {
                 Some(ref alias) => Some(engine.scoped_search_path(alias)?),
                 None => None,
             };
-            let timer = crate::stats::StatsTimer::start();
-            let affected = engine.execute_command(&params.sql)?;
-            let elapsed = timer.elapsed_ms();
-            // Reconcile only when the statement could have changed the
-            // set of tables (CREATE / DROP / ALTER / TRUNCATE / RENAME).
-            // INSERT / UPDATE / DELETE can't add or remove tables, so
-            // running `reconcile_in` on every row-level execute would
-            // do `2N + 2` SQL round-trips of pure waste — and after
-            // M4's M-target fan-out, `4N + 4` for user-attached
-            // targets. Same gate as `notify_resource_list_changed`
-            // below; both fire on the same set of statements.
+            let total_timer = crate::stats::StatsTimer::start();
+            let (per_statement, operation): (Vec<Value>, &'static str) = if params.sql.len() == 1 {
+                // Singletons skip BEGIN/COMMIT — same auto-commit behavior
+                // as the pre-batch `execute` tool, and DDL singletons stay
+                // legal (Hyper auto-commits DDL anyway).
+                let stmt = &params.sql[0];
+                let t = crate::stats::StatsTimer::start();
+                let affected = engine.execute_command(stmt)?;
+                (
+                    vec![json!({
+                        "sql": Self::fmt_sql(stmt),
+                        "affected_rows": affected,
+                        "elapsed_ms": t.elapsed_ms(),
+                    })],
+                    "command",
+                )
+            } else {
+                let stmts = &params.sql;
+                let results = engine.execute_in_transaction(|engine| {
+                    let mut out = Vec::with_capacity(stmts.len());
+                    for (idx, stmt) in stmts.iter().enumerate() {
+                        let t = crate::stats::StatsTimer::start();
+                        let affected = engine.execute_command(stmt).map_err(|e| {
+                            // Preserve the original error's code AND its
+                            // suggestion (e.g. Hyper's "did you mean
+                            // <column>?") — append the rollback context
+                            // rather than replacing it.
+                            let rollback_note = format!(
+                                "Failing SQL: {sql}. All previous statements in this batch were rolled back.",
+                                sql = Self::fmt_sql(stmt)
+                            );
+                            let combined = match e.suggestion.as_deref() {
+                                Some(orig) => format!("{orig} | {rollback_note}"),
+                                None => rollback_note,
+                            };
+                            McpError::new(
+                                e.code,
+                                format!(
+                                    "statement {} of {} failed: {}",
+                                    idx + 1,
+                                    stmts.len(),
+                                    e.message
+                                ),
+                            )
+                            .with_suggestion(combined)
+                        })?;
+                        out.push(json!({
+                            "sql": Self::fmt_sql(stmt),
+                            "affected_rows": affected,
+                            "elapsed_ms": t.elapsed_ms(),
+                        }));
+                    }
+                    Ok(out)
+                })?;
+                (results, "transaction")
+            };
+            let elapsed = total_timer.elapsed_ms();
+            // Reconcile only when the batch contains a statement that
+            // could have changed the set of tables (CREATE / DROP /
+            // ALTER / TRUNCATE / RENAME). Pure DML can't add or remove
+            // tables, so running `reconcile_in` on every row-level
+            // execute would do `2N + 2` SQL round-trips of pure waste.
+            // Same gate as `notify_resource_list_changed` below; both
+            // fire on the same set of statements.
             //
             // Threads `target_db` so a structural DDL against a
             // user-attached alias also reconciles that DB's catalog
             // (otherwise the dropped table's row stays stranded —
             // bootstrap reconcile only walks persistent).
-            if is_structural_sql(&params.sql) {
+            if any_structural {
                 self.after_execute_catalog_update(engine, target_db.as_deref());
             }
+            let affected_total: u64 = per_statement
+                .iter()
+                .filter_map(|v| v.get("affected_rows").and_then(Value::as_u64))
+                .sum();
             Ok(json!({
-                "sql": Self::fmt_sql(&params.sql),
-                "affected_rows": affected,
-                "stats": { "operation": "command", "elapsed_ms": elapsed },
+                "statements": per_statement.len(),
+                "affected_rows": affected_total,
+                "per_statement": per_statement,
+                "stats": { "operation": operation, "elapsed_ms": elapsed },
             }))
         });
 
@@ -2259,7 +2340,7 @@ impl HyperMcpServer {
                 // nudge subscribers to refresh their resource catalog for
                 // CREATE / DROP style statements.
                 self.notify_workspace_changed();
-                if is_structural_sql(&sql) {
+                if any_structural {
                     self.notify_resource_list_changed();
                 }
                 Self::ok_content(val)
@@ -4166,26 +4247,90 @@ Full SQL reference: https://developer.salesforce.com/docs/data/data-cloud-query-
     }
 }
 
-/// Cheap heuristic: does the given SQL statement create, drop, rename, or
-/// otherwise change the shape of the resource catalog? Used by `execute` to
-/// decide whether it should fire `notifications/resources/list_changed` in
-/// addition to the usual per-URI updates.
+/// Validates an `execute` batch up front, before any SQL hits the server.
 ///
-/// Matches the first keyword (case-insensitive) after whitespace; treats
-/// `CREATE TABLE`, `DROP TABLE`, `ALTER TABLE`, `TRUNCATE TABLE`, and
-/// `RENAME TABLE` as structural. Plain INSERT / UPDATE / DELETE don't
-/// change the table catalog and so don't trigger `list_changed`.
-fn is_structural_sql(sql: &str) -> bool {
-    let trimmed = sql.trim_start();
-    let first: String = trimmed
-        .chars()
-        .take_while(|c| c.is_alphabetic())
-        .flat_map(char::to_uppercase)
-        .collect();
-    matches!(
-        first.as_str(),
-        "CREATE" | "DROP" | "ALTER" | "TRUNCATE" | "RENAME"
-    )
+/// Rules:
+/// 1. Non-empty array.
+/// 2. Each element non-empty and not comment-only after stripping comments.
+/// 3. Each element contains exactly one statement (uses `first_statement_only`).
+/// 4. No element is read-only (steer LLMs to the `query` tool).
+/// 5. No batch mixes DDL with DML — Hyper aborts mixed transactions with
+///    SQLSTATE `0A000`.
+/// 6. Multi-element all-DDL batches are rejected because Hyper auto-commits
+///    `CREATE` / `DROP` / `ALTER` even inside a transaction, so the
+///    "atomic" promise would be a lie.
+///
+/// Single-element batches and `Other`-classified statements (everything not
+/// in the explicit DDL/DML/read-only sets) are passed through untouched —
+/// Hyper itself is the final authority on syntax.
+fn validate_execute_batch(stmts: &[String]) -> Result<(), McpError> {
+    use crate::engine::strip_leading_sql_comments;
+
+    if stmts.is_empty() {
+        return Err(McpError::new(
+            ErrorCode::InvalidArgument,
+            "`sql` must be a non-empty array of SQL statements.",
+        )
+        .with_suggestion("Pass at least one statement: `sql: [\"INSERT INTO t VALUES (1)\"]`."));
+    }
+
+    let mut has_schema_change = false;
+    let mut has_data_mutation = false;
+
+    for (idx, stmt) in stmts.iter().enumerate() {
+        if strip_leading_sql_comments(stmt).trim().is_empty() {
+            return Err(McpError::new(
+                ErrorCode::InvalidArgument,
+                format!("`sql[{idx}]` is empty or contains only whitespace/comments."),
+            )
+            .with_suggestion("Remove the empty element or replace it with a real statement."));
+        }
+        first_statement_only(stmt).map_err(|e| {
+            McpError::new(e.code, format!("`sql[{idx}]`: {}", e.message)).with_suggestion(
+                e.suggestion.unwrap_or_else(|| {
+                    "Split semicolon-separated statements into separate array elements.".to_string()
+                }),
+            )
+        })?;
+        match classify_statement(stmt) {
+            StatementKind::ReadOnly => {
+                return Err(McpError::new(
+                    ErrorCode::SqlError,
+                    format!(
+                        "`sql[{idx}]` is a read-only statement; the `execute` tool is for DDL/DML."
+                    ),
+                )
+                .with_suggestion(
+                    "Use the `query` tool for SELECT/WITH/EXPLAIN/SHOW/VALUES. To read-then-write atomically, fold the read into the write (e.g. `UPDATE … FROM (SELECT …)` or `INSERT … SELECT …`).",
+                ));
+            }
+            StatementKind::Ddl => has_schema_change = true,
+            StatementKind::Dml => has_data_mutation = true,
+            StatementKind::Other => {}
+        }
+    }
+
+    if has_schema_change && has_data_mutation {
+        return Err(McpError::new(
+            ErrorCode::InvalidArgument,
+            "Cannot mix DDL (CREATE/DROP/ALTER/TRUNCATE/RENAME) with DML (INSERT/UPDATE/DELETE/COPY/MERGE) in one `execute` batch.",
+        )
+        .with_suggestion(
+            "Hyper aborts such transactions with SQLSTATE 0A000. Issue DDL in a separate `execute` call from DML — DDL singletons run as their own auto-commit unit.",
+        ));
+    }
+
+    if has_schema_change && stmts.len() > 1 {
+        return Err(McpError::new(
+            ErrorCode::InvalidArgument,
+            "Multi-statement DDL batches are not supported.",
+        )
+        .with_suggestion(
+            "Hyper auto-commits CREATE/DROP/ALTER even inside a transaction, so wrapping multiple DDL statements in one `execute` call cannot guarantee atomicity. Issue each DDL as its own single-element `execute` call.",
+        ));
+    }
+
+    Ok(())
 }
 
 /// Render a JSON cell value into a CSV string. Scalars are emitted in their
@@ -4435,4 +4580,87 @@ fn perform_copy(
         "row_count": row_count,
         "stats": { "operation": "copy_query", "elapsed_ms": elapsed_ms },
     }))
+}
+
+#[cfg(test)]
+mod validate_execute_batch_tests {
+    use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| (*x).to_string()).collect()
+    }
+
+    #[test]
+    fn rejects_empty_array() {
+        let err = validate_execute_batch(&[]).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn rejects_whitespace_only_element() {
+        let err = validate_execute_batch(&s(&["   "])).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert!(err.message.contains("sql[0]"));
+        let err = validate_execute_batch(&s(&["INSERT INTO t VALUES (1)", "/* */"])).unwrap_err();
+        assert!(err.message.contains("sql[1]"));
+    }
+
+    #[test]
+    fn rejects_inner_multi_statement() {
+        let err =
+            validate_execute_batch(&s(&["INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)"]))
+                .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert!(err.message.contains("exactly one statement"));
+    }
+
+    #[test]
+    fn rejects_read_only_element() {
+        let err =
+            validate_execute_batch(&s(&["INSERT INTO t VALUES (1)", "SELECT 1"])).unwrap_err();
+        assert_eq!(err.code, ErrorCode::SqlError);
+        assert!(err.message.contains("sql[1]"));
+    }
+
+    #[test]
+    fn rejects_ddl_dml_mix() {
+        let err =
+            validate_execute_batch(&s(&["CREATE TABLE x (i INT)", "INSERT INTO x VALUES (1)"]))
+                .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert!(err.message.contains("DDL"));
+    }
+
+    #[test]
+    fn rejects_multi_ddl() {
+        let err = validate_execute_batch(&s(&["CREATE TABLE a (i INT)", "CREATE TABLE b (j INT)"]))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert!(err.message.contains("Multi-statement DDL"));
+    }
+
+    #[test]
+    fn allows_single_ddl() {
+        validate_execute_batch(&s(&["CREATE TABLE a (i INT)"])).unwrap();
+    }
+
+    #[test]
+    fn allows_multi_dml() {
+        validate_execute_batch(&s(&[
+            "UPDATE settings SET value = 'x' WHERE key = 'k'",
+            "INSERT INTO settings (key, value) SELECT 'k', 'x' WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key = 'k')",
+        ]))
+        .unwrap();
+    }
+
+    #[test]
+    fn allows_other_kinds() {
+        // Non-classified statements (e.g. BEGIN as a singleton) pass through.
+        validate_execute_batch(&s(&["BEGIN"])).unwrap();
+    }
+
+    #[test]
+    fn allows_trailing_semicolon() {
+        validate_execute_batch(&s(&["INSERT INTO t VALUES (1);"])).unwrap();
+    }
 }
