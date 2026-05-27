@@ -151,6 +151,52 @@ jobs:
       - name: hyperdb-bootstrap tests
         run: cargo test -p hyperdb-bootstrap
 
+  node-bindings:
+    # Build the napi-rs Node.js bindings and run the smoke test on every
+    # PR. Without this, regressions in hyperdb-api-node (TS surface, napi
+    # glue, build script) only surface during npm-build-publish at release
+    # time and block the publish mid-flight. Linux-only is sufficient —
+    # cross-platform napi compatibility is exercised by the per-platform
+    # build matrix in npm-build-publish.yml when a release ships.
+    name: hyperdb-api-node (build + smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install system libraries
+        run: sudo apt-get update -q && sudo apt-get install -y libfontconfig1-dev mold protobuf-compiler
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          # Reuse the test job's Linux cache so the Cargo deps are warm
+          # when both jobs run on the same SHA.
+          cache-key: test-ubuntu-latest
+          # See fmt job for rationale.
+          rustflags: ""
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+      - name: Cache hyperd binary
+        id: hyperd-cache
+        uses: actions/cache@v5
+        with:
+          path: .hyperd
+          key: hyperd-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('hyperdb-bootstrap/hyperd-version.toml') }}
+      - name: Download hyperd
+        if: steps.hyperd-cache.outputs.cache-hit != 'true'
+        run: cargo run --release -p hyperdb-bootstrap --bin hyperdb-bootstrap -- download
+      - name: Build native addon (debug)
+        run: |
+          cd hyperdb-api-node
+          npm install --ignore-scripts
+          npm run build:debug
+      - name: Smoke test
+        env:
+          HYPERD_PATH: ${{ github.workspace }}/.hyperd/current
+        run: |
+          cd hyperdb-api-node
+          npm test
+
   publish-dry-run:
     # Catches Cargo.toml metadata regressions (missing license, bad
     # include paths, etc.) on the subset of crates that have no
