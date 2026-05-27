@@ -11,6 +11,24 @@ name: release-please
 # downstream CI and publish workflows. With GITHUB_TOKEN, GitHub
 # suppresses workflow triggers on events it creates (anti-recursion).
 #
+# After release-please opens or updates the release PR, a follow-up
+# step reconciles Cargo.lock against the bumped Cargo.toml and pushes
+# the lockfile commit onto the release-please branch. Without this,
+# the release tag points at a tree where Cargo.toml is at the new
+# version but Cargo.lock still pins the previous one; CI's
+# `cargo build --release` then silently rewrites the lockfile in-place
+# at build time, dirtying the worktree, and `build.rs` stamps a
+# `-dirty-<timestamp>` marker onto the released binary. Keeping the
+# lockfile in sync at release-PR time avoids that. (`build.rs` also
+# excludes Cargo.lock from its dirty check as a safety net.)
+#
+# A defense-in-depth sentinel verifies the lockfile diff only touches
+# workspace-member version rows. If a future cargo version touches
+# non-workspace rows (or bumps the lockfile format version), the
+# sentinel ABORTS the workflow and blocks the release; resolve by
+# either updating the sentinel or landing the dep bump on main first
+# as its own commit.
+#
 # Maintainers don't run anything by hand:
 #   1. Land conventional-commit PRs into main.
 #   2. Merge the release-please PR when ready to ship.
@@ -22,6 +40,12 @@ on:
     branches: [main]
   workflow_dispatch: {}
 
+# Serialize runs so the lockfile-sync push doesn't race a concurrent
+# `release-please` run pointed at the same release branch.
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
 permissions:
   contents: write
   pull-requests: write
@@ -32,7 +56,148 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: googleapis/release-please-action@v5
+        id: release
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
           token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+
+      # release-please-action@v5 calls manifest.createPullRequests()
+      # which routes through `createOrUpdatePullRequest` — the action
+      # emits its `pr` JSON output on BOTH first creation and any
+      # subsequent update from a later push to main. Verified by
+      # reading the action source.
+      #
+      # The `pr != ''` gate fires whenever there's a release PR after
+      # this run, so we get a re-sync opportunity each time release-
+      # please re-runs. If release-please force-pushes the release
+      # branch (it does — its bot commits get rewritten on each
+      # re-run) and clobbers our prior lockfile-sync commit, this
+      # follow-up step re-fires on the SAME run and re-pushes the
+      # synced lockfile. The eventually-merged release PR head is
+      # always lockfile-synced. The build.rs Cargo.lock pathspec
+      # exclusion is the safety net that protects the released
+      # binary even if a maintainer merges in a tiny window between
+      # release-please's force-push and our follow-up step landing.
+      - name: Checkout release-please branch
+        if: ${{ steps.release.outputs.pr != '' }}
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ fromJson(steps.release.outputs.pr).headBranchName }}
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        if: ${{ steps.release.outputs.pr != '' }}
+        with:
+          toolchain: stable
+          cache: false   # one-shot job; cache adds latency without benefit
+          rustflags: ""
+
+      # `cargo metadata --format-version=1` forces a lockfile
+      # reconciliation pass against the current Cargo.tomls. Empirically
+      # validated on this workspace: it flips exactly the 7 workspace-
+      # member version rows (hyperdb-api, hyperdb-api-core,
+      # hyperdb-api-node, hyperdb-api-salesforce, hyperdb-bootstrap,
+      # hyperdb-mcp, sea-query-hyperdb) and touches no external dep
+      # rows. The "Verify lockfile diff is workspace-only" sentinel
+      # below catches it if a future cargo version diverges.
+      #
+      # Why not `cargo generate-lockfile`: it does a full re-resolve
+      # and bumps unrelated transitive deps to their latest semver
+      # (verified: bumps `crypto-common`, `matchit`, et al. on this
+      # workspace, plus changes the lockfile format version). That's
+      # noisy in a release commit.
+      #
+      # Why not `cargo update --workspace [--offline]`: `--workspace`
+      # doesn't prevent external dep re-resolution from the cache,
+      # and `--offline` makes it brittle.
+      # NOTE: this step intentionally does NOT install protoc / system
+      # libs. `cargo metadata` only resolves the dependency graph — it
+      # does not compile build.rs or proc-macros. Do NOT extend this
+      # step to run `cargo build` / `cargo check` without first
+      # installing the system libraries used by the test/release
+      # workflows (libfontconfig1-dev, mold, protobuf-compiler).
+      - name: Sync Cargo.lock with bumped workspace versions
+        if: ${{ steps.release.outputs.pr != '' }}
+        run: cargo metadata --format-version=1 > /dev/null
+
+      # Sentinel: fail loudly if the lockfile diff touches anything
+      # other than workspace-member version rows. Two-layer check:
+      #   1. The lockfile format-version line (`version = N` at the
+      #      top, unquoted integer) must NOT change. Format bumps
+      #      come from full re-resolves like `cargo generate-lockfile`,
+      #      not from a metadata reconciliation pass — if we see one,
+      #      something has gone sideways.
+      #   2. Every changed `[[package]]` block's name must be a
+      #      workspace member, derived at runtime from `cargo metadata`
+      #      so a future workspace addition / rename / removal stays
+      #      automatically in sync (no separate hard-coded list to
+      #      maintain).
+      #
+      # Defense against a future cargo version that decides to bump
+      # transitive deps during what should be a workspace-only sync.
+      - name: Verify lockfile diff is workspace-only
+        if: ${{ steps.release.outputs.pr != '' }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- Cargo.lock; then
+            echo "Cargo.lock unchanged — nothing to verify."
+            exit 0
+          fi
+          # Layer 1: catch lockfile-format-version changes. The
+          # top-of-file `version = 4` line is unquoted; package
+          # versions are always quoted (`version = "0.2.1"`). A
+          # `^[+-]version = [0-9]+$` line in the diff is necessarily
+          # the format header.
+          if git diff -- Cargo.lock | grep -Eq '^[+-]version = [0-9]+$'; then
+            echo "::error::Cargo.lock format version changed — refusing to commit."
+            git diff -- Cargo.lock | head -10
+            exit 1
+          fi
+          # Layer 2: enumerate workspace members at runtime, then
+          # check each name appearing in the diff is in that set.
+          # `select(.source==null)` filters out registry packages.
+          WORKSPACE=$(cargo metadata --no-deps --format-version=1 \
+            | jq -r '.packages[] | select(.source==null) | .name' \
+            | sort -u)
+          CHANGED=$(git diff -U1 -- Cargo.lock \
+            | awk '/^ name = / { gsub(/"/, "", $3); name=$3 } /^[+-]version = / { print name }' \
+            | sort -u)
+          UNEXPECTED=""
+          for pkg in $CHANGED; do
+            case " $(echo $WORKSPACE | tr '\n' ' ') " in
+              *" $pkg "*) ;;
+              *) UNEXPECTED="$UNEXPECTED $pkg" ;;
+            esac
+          done
+          if [ -n "$UNEXPECTED" ]; then
+            echo "::error::Cargo.lock sync touched non-workspace packages:$UNEXPECTED"
+            git diff -- Cargo.lock | head -120
+            exit 1
+          fi
+          echo "Cargo.lock changes touched only workspace members:"
+          echo "$CHANGED"
+
+      - name: Commit Cargo.lock if changed
+        if: ${{ steps.release.outputs.pr != '' }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- Cargo.lock; then
+            echo "Cargo.lock already in sync — no commit needed."
+            exit 0
+          fi
+          # github-actions[bot] is the canonical identity for
+          # workflow-authored commits. Verified against this repo's
+          # log: prior release-please commits were authored under
+          # the user's PAT (no bot account exists), so we can't
+          # match the existing style automatically — github-actions[bot]
+          # is unambiguous and reads correctly in the PR history.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git commit -m "chore: sync Cargo.lock with bumped workspace versions"
+          # Explicit refspec — don't rely on actions/checkout's
+          # tracking branch staying the default in future versions.
+          git push origin "HEAD:${BRANCH}"
+        env:
+          BRANCH: ${{ fromJson(steps.release.outputs.pr).headBranchName }}
