@@ -19,10 +19,12 @@ name: release
 # "Latest release" on the repo home.
 #
 # Publishing is destructive — version numbers on crates.io are
-# permanent. This workflow re-runs the full test matrix before
-# touching crates.io, and publishes crates strictly in dependency
-# order with a small settle delay between each so the index is
-# consistent for downstream crates.
+# permanent. The verify job confirms CI already passed on the tagged
+# SHA via the check-runs API (rather than re-running the full test
+# matrix), then publishes crates strictly in dependency order with a
+# small settle delay between each so the index is consistent for
+# downstream crates. See npm-build-publish.yml for the same polling
+# pattern.
 
 on:
   release:
@@ -46,14 +48,57 @@ jobs:
     if: github.repository == 'tableau/hyper-api-rust'
     name: verify
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.inputs.tag || github.event.release.tag_name || github.ref }}
 
+      - name: Wait for CI to pass
+        # The full test matrix already ran on the merge commit before
+        # release-please tagged it. Re-running it here was ~20 minutes
+        # of redundant CI per release. Instead, poll the check-runs
+        # API for the tag's SHA and verify all required checks are
+        # green. Mirrors the verify-ci pattern in npm-build-publish.yml.
+        #
+        # Risk: a maintainer who runs workflow_dispatch with a tag on
+        # a SHA that never had CI would skip all test coverage. Guard
+        # against that by requiring TOTAL > 0 — if no required check
+        # ever ran on this SHA, abort.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          SHA=$(git rev-parse HEAD)
+          echo "Waiting for required CI check-runs on $SHA"
+          MAX_ATTEMPTS=30
+          SLEEP_SECONDS=60
+          REQUIRED='rustfmt|clippy|cargo-audit|cargo-deny|version consistency|publish dry-run|test \(ubuntu-latest\)|test \(macos-14\)|test \(windows-latest\)|hyperdb-api-node \(build \+ smoke\)'
+          for i in $(seq 1 "$MAX_ATTEMPTS"); do
+            RUNS=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" \
+              --jq "[.check_runs[] | select(.name | test(\"$REQUIRED\"))]")
+            TOTAL=$(echo "$RUNS" | jq 'length')
+            COMPLETED=$(echo "$RUNS" | jq '[.[] | select(.status=="completed")] | length')
+            FAILED=$(echo "$RUNS" | jq '[.[] | select(.status=="completed" and (.conclusion!="success" and .conclusion!="skipped" and .conclusion!="neutral"))] | length')
+            echo "Attempt $i/$MAX_ATTEMPTS: total=$TOTAL completed=$COMPLETED failed=$FAILED"
+            if [[ "$FAILED" -gt 0 ]]; then
+              echo "::error::CI failed for $SHA. Failing check-runs:"
+              echo "$RUNS" | jq -r '.[] | select(.status=="completed" and (.conclusion!="success" and .conclusion!="skipped" and .conclusion!="neutral")) | "  - \(.name): \(.conclusion)"'
+              exit 1
+            fi
+            if [[ "$TOTAL" -gt 0 && "$COMPLETED" == "$TOTAL" ]]; then
+              echo "CI passed ($TOTAL required check-runs completed successfully)."
+              exit 0
+            fi
+            echo "CI still pending, waiting ${SLEEP_SECONDS}s..."
+            sleep "$SLEEP_SECONDS"
+          done
+          echo "::error::Timed out waiting for CI to pass ($SHA)."
+          exit 1
+
       - name: Install system libraries
-        run: sudo apt-get update -q && sudo apt-get install -y libfontconfig1-dev mold protobuf-compiler
+        run: sudo apt-get update -q && sudo apt-get install -y protobuf-compiler
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -61,29 +106,10 @@ jobs:
           cache-key: release-verify
           rustflags: ""
 
-      - name: Cache hyperd binary
-        id: hyperd-cache
-        uses: actions/cache@v5
-        with:
-          path: .hyperd
-          key: hyperd-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('hyperdb-bootstrap/hyperd-version.toml') }}
-
-      - name: Download hyperd
-        if: steps.hyperd-cache.outputs.cache-hit != 'true'
-        run: cargo run --release -p hyperdb-bootstrap --bin hyperdb-bootstrap -- download
-
-      - name: Workspace tests
-        env:
-          HYPERD_PATH: ${{ github.workspace }}/.hyperd/current
-        run: |
-          cargo test --workspace \
-            --exclude hyperdb-api-node \
-            --exclude hyperdb-bootstrap
-
-      - name: hyperdb-bootstrap tests
-        run: cargo test -p hyperdb-bootstrap
-
       - name: Verify pinned hyperd release URLs still resolve
+        # Standalone safety check: HEAD each platform's pinned hyperd
+        # download URL right before publishing, in case Tableau rotated
+        # something between merge time and tag time. Cheap (~1 min).
         run: cargo run --release -p hyperdb-bootstrap --bin hyperdb-bootstrap -- verify
 
   publish:
