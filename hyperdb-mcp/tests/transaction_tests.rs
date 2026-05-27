@@ -186,6 +186,114 @@ fn successful_replace_commits_atomically() {
     assert_eq!(rows[0]["cnt"].as_i64().unwrap(), 0);
 }
 
+/// The canonical upsert pattern (UPDATE + INSERT WHERE NOT EXISTS) wrapped
+/// in a transaction. When the row exists, the UPDATE applies; when it
+/// doesn't, the INSERT fires. Both statements commit atomically.
+///
+/// This is the use case that motivated the `execute` tool's array shape:
+/// Hyper has no `ON CONFLICT`, so users build upserts as two SQL
+/// statements that must run atomically. Here we exercise the same shape
+/// at the engine level — the MCP handler is a thin wrapper around this.
+#[test]
+fn batched_upsert_inserts_when_row_missing() {
+    let te = TestEngine::new_ephemeral();
+    te.engine
+        .execute_command("CREATE TABLE settings (key TEXT NOT NULL, value TEXT NOT NULL)")
+        .unwrap();
+
+    te.engine
+        .execute_in_transaction(|engine| {
+            engine.execute_command("UPDATE settings SET value = 'dark' WHERE key = 'theme'")?;
+            engine.execute_command(
+                "INSERT INTO settings (key, value) SELECT 'theme', 'dark' \
+                 WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key = 'theme')",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let rows = query_resilient(&te.engine, "SELECT value FROM settings WHERE key = 'theme'");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["value"].as_str().unwrap(), "dark");
+}
+
+#[test]
+fn batched_upsert_updates_when_row_exists() {
+    let te = TestEngine::new_ephemeral();
+    te.engine
+        .execute_command("CREATE TABLE settings (key TEXT NOT NULL, value TEXT NOT NULL)")
+        .unwrap();
+    te.engine
+        .execute_command("INSERT INTO settings (key, value) VALUES ('theme', 'light')")
+        .unwrap();
+
+    te.engine
+        .execute_in_transaction(|engine| {
+            engine.execute_command("UPDATE settings SET value = 'dark' WHERE key = 'theme'")?;
+            engine.execute_command(
+                "INSERT INTO settings (key, value) SELECT 'theme', 'dark' \
+                 WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key = 'theme')",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let rows = query_resilient(
+        &te.engine,
+        "SELECT COUNT(*) as cnt FROM settings WHERE key = 'theme'",
+    );
+    // Exactly one row, not two — UPDATE applied, INSERT's WHERE NOT EXISTS
+    // suppressed it.
+    assert_eq!(rows[0]["cnt"].as_i64().unwrap(), 1);
+
+    let rows = query_resilient(&te.engine, "SELECT value FROM settings WHERE key = 'theme'");
+    assert_eq!(rows[0]["value"].as_str().unwrap(), "dark");
+}
+
+/// Mid-batch failure rolls back ALL prior statements in the transaction.
+/// Without atomicity, the first INSERT would be visible after the second
+/// one fails — leaving the table in a state the user never asked for.
+#[test]
+fn batched_multi_table_mutation_rolls_back_on_second_failure() {
+    let te = TestEngine::new_ephemeral();
+    te.engine
+        .execute_command("CREATE TABLE orders (id INT NOT NULL, customer_id INT)")
+        .unwrap();
+    te.engine
+        .execute_command("CREATE TABLE customers (id INT NOT NULL, total_orders INT NOT NULL)")
+        .unwrap();
+    te.engine
+        .execute_command("INSERT INTO customers VALUES (42, 0)")
+        .unwrap();
+
+    use hyperdb_mcp::error::McpError;
+    let result: Result<(), McpError> = te.engine.execute_in_transaction(|engine| {
+        engine.execute_command("INSERT INTO orders (id, customer_id) VALUES (1001, 42)")?;
+        // This second statement violates NOT NULL on `id` because we
+        // omit it — the entire batch must roll back.
+        engine.execute_command("INSERT INTO orders (customer_id) VALUES (42)")?;
+        engine.execute_command(
+            "UPDATE customers SET total_orders = total_orders + 2 WHERE id = 42",
+        )?;
+        Ok(())
+    });
+    assert!(result.is_err(), "batch should fail on NOT NULL violation");
+
+    // The first INSERT must have been rolled back.
+    let rows = query_resilient(&te.engine, "SELECT COUNT(*) as cnt FROM orders");
+    assert_eq!(
+        rows[0]["cnt"].as_i64().unwrap(),
+        0,
+        "first INSERT must have rolled back — atomicity violated"
+    );
+    // The customers table must not have been touched either.
+    let rows = query_resilient(
+        &te.engine,
+        "SELECT total_orders FROM customers WHERE id = 42",
+    );
+    assert_eq!(rows[0]["total_orders"].as_i64().unwrap(), 0);
+}
+
 /// Replace-mode ingest with a mid-flight INSERT failure leaves the new
 /// (empty) table behind, not partial rows.
 ///
