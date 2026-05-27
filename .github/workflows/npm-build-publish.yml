@@ -46,10 +46,21 @@ jobs:
           # verify-ci job from this workflow (it would self-reference).
           MAX_ATTEMPTS=30
           SLEEP_SECONDS=60
-          REQUIRED='rustfmt|clippy|cargo-audit|cargo-deny|version consistency|publish dry-run|test \(ubuntu-latest\)|test \(macos-14\)|test \(windows-latest\)|hyperdb-api-node \(build \+ smoke\)'
+          # Exact-name membership against the canonical check-run list.
+          # We previously used a regex via `test()` here, but the names
+          # contain `(` and `+` which both have regex meaning — escaping
+          # them through bash → jq → Oniguruma was fragile and broke
+          # silently on the v0.2.2 release. Exact-string match avoids
+          # the whole class of regex-escaping bugs.
+          REQUIRED_JSON='[
+            "rustfmt","clippy","cargo-audit","cargo-deny",
+            "version consistency","publish dry-run",
+            "test (ubuntu-latest)","test (macos-14)","test (windows-latest)",
+            "hyperdb-api-node (build + smoke)"
+          ]'
           for i in $(seq 1 "$MAX_ATTEMPTS"); do
             RUNS=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" \
-              --jq "[.check_runs[] | select(.name | test(\"$REQUIRED\"))]")
+              --jq "[.check_runs[] | select(.name as \$n | $REQUIRED_JSON | index(\$n))]")
             TOTAL=$(echo "$RUNS" | jq 'length')
             COMPLETED=$(echo "$RUNS" | jq '[.[] | select(.status=="completed")] | length')
             FAILED=$(echo "$RUNS" | jq '[.[] | select(.status=="completed" and (.conclusion!="success" and .conclusion!="skipped" and .conclusion!="neutral"))] | length')
