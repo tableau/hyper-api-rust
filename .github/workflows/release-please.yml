@@ -79,11 +79,35 @@ jobs:
       # exclusion is the safety net that protects the released
       # binary even if a maintainer merges in a tiny window between
       # release-please's force-push and our follow-up step landing.
+      # Extract the release-please branch name into its own step
+      # output. We can't reference `fromJson(steps.release.outputs.pr)`
+      # directly in `ref:` / `env:` further down, because GitHub
+      # Actions evaluates every `${{ }}` expression in the workflow
+      # at job-load time — even on steps gated by `if:` that won't
+      # run. When `pr` is empty (no release PR this run),
+      # `fromJson('')` errors with "Error reading JToken from
+      # JsonReader." Wrapping the parse in a `run:` block keeps it
+      # inside the `if`-gate.
+      - name: Resolve release-please branch name
+        id: branch
+        if: ${{ steps.release.outputs.pr != '' }}
+        env:
+          PR_JSON: ${{ steps.release.outputs.pr }}
+        run: |
+          set -euo pipefail
+          BRANCH=$(printf '%s' "$PR_JSON" | jq -r '.headBranchName')
+          if [ -z "$BRANCH" ] || [ "$BRANCH" = "null" ]; then
+            echo "::error::Could not extract headBranchName from release-please output"
+            printf '%s\n' "$PR_JSON" | head -5
+            exit 1
+          fi
+          echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
+
       - name: Checkout release-please branch
         if: ${{ steps.release.outputs.pr != '' }}
         uses: actions/checkout@v6
         with:
-          ref: ${{ fromJson(steps.release.outputs.pr).headBranchName }}
+          ref: ${{ steps.branch.outputs.name }}
           token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -200,4 +224,4 @@ jobs:
           # tracking branch staying the default in future versions.
           git push origin "HEAD:${BRANCH}"
         env:
-          BRANCH: ${{ fromJson(steps.release.outputs.pr).headBranchName }}
+          BRANCH: ${{ steps.branch.outputs.name }}
