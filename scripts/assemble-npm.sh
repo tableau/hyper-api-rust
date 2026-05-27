@@ -6,6 +6,17 @@
 # Copies the release-built hyperdb-mcp binary and hyperd into the npm
 # platform directories, then runs `npm pack` to produce .tgz files.
 #
+# The platform/umbrella package.json files do NOT carry a `version`
+# field in source — npm-build-publish.yml injects it at publish time
+# from the git tag. This script mirrors that behavior locally by
+# deriving VERSION from the workspace Cargo.toml and writing it (plus
+# the umbrella optionalDependencies pins) via `npm pkg set`.
+#
+# IMPORTANT: this mutates the working tree (writes `version` and
+# `optionalDependencies` into the source package.json files). Discard
+# with `git restore hyperdb-mcp/npm hyperdb-api-node/npm hyperdb-api-node/package.json`
+# when you're done.
+#
 # Prerequisites:
 #   - `make build-release` (or `cargo build --release -p hyperdb-mcp -p hyperdb-api-node`)
 #   - `make download-hyperd` (hyperd available at .hyperd/current/)
@@ -34,8 +45,27 @@ case "$(uname -s)-$(uname -m)" in
     ;;
 esac
 
+# Derive VERSION from the workspace Cargo.toml so platform / umbrella
+# package.json files can be stamped before `npm pack`. Match the same
+# field release-please patches: [workspace.package].version.
+VERSION=$(awk '
+  /^\[workspace\.package\]/ { in_section = 1; next }
+  /^\[/ { in_section = 0 }
+  in_section && /^version[[:space:]]*=/ {
+    gsub(/[[:space:]"]/, "", $0)
+    sub(/^version=/, "", $0)
+    print
+    exit
+  }
+' "${ROOT}/Cargo.toml")
+if [[ -z "${VERSION}" ]]; then
+  echo "ERROR: could not derive VERSION from ${ROOT}/Cargo.toml" >&2
+  exit 1
+fi
+
 echo "Platform: ${PLATFORM}"
 echo "hyperd dir: ${HYPERD_DIR}"
+echo "Version:   ${VERSION}"
 
 # Verify prerequisites
 if [[ ! -f "${ROOT}/target/release/hyperdb-mcp${EXE}" ]]; then
@@ -60,14 +90,23 @@ chmod +x "${MCP_DEST}/hyperdb-mcp${EXE}" "${MCP_DEST}/${HYPERD_BIN}" 2>/dev/null
 echo "Contents:"
 ls -lh "${MCP_DEST}/"
 
-# Pack platform package
+# Inject version into platform package, then pack
 echo ""
 echo "Packing hyperdb-mcp-${PLATFORM}..."
-(cd "${MCP_DEST}" && npm pack --quiet)
+(cd "${MCP_DEST}" && npm pkg set "version=${VERSION}" && npm pack --quiet)
 
-# Pack main package
+# Inject version + optionalDependencies into the umbrella, then pack.
+# Pin all 3 published platforms (must stay in sync with the publish
+# loop in npm-build-publish.yml).
 echo "Packing hyperdb-mcp (main)..."
-(cd "${ROOT}/hyperdb-mcp/npm" && npm pack --quiet)
+(
+  cd "${ROOT}/hyperdb-mcp/npm"
+  npm pkg set "version=${VERSION}"
+  for p in darwin-arm64 linux-x64-gnu win32-x64-msvc; do
+    npm pkg set "optionalDependencies.hyperdb-mcp-$p=${VERSION}"
+  done
+  npm pack --quiet
+)
 
 # --- hyperdb-api-node ---
 NODE_DEST="${ROOT}/hyperdb-api-node/npm/${PLATFORM}"
@@ -99,7 +138,18 @@ if [[ -f "${NODE_LIB}" ]]; then
 
   echo ""
   echo "Packing hyperdb-api-node-${PLATFORM}..."
-  (cd "${NODE_DEST}" && npm pack --quiet)
+  (cd "${NODE_DEST}" && npm pkg set "version=${VERSION}" && npm pack --quiet)
+
+  # Inject version + optionalDependencies into the api-node umbrella, then pack.
+  echo "Packing hyperdb-api-node (main)..."
+  (
+    cd "${ROOT}/hyperdb-api-node"
+    npm pkg set "version=${VERSION}"
+    for p in darwin-arm64 linux-arm64-gnu linux-x64-gnu linux-x64-musl win32-x64-msvc; do
+      npm pkg set "optionalDependencies.hyperdb-api-node-$p=${VERSION}"
+    done
+    npm pack --quiet
+  )
 else
   echo ""
   echo "Skipping hyperdb-api-node (native addon not built for this platform)."
@@ -110,7 +160,10 @@ echo ""
 echo "=== Done ==="
 echo ""
 echo "To install locally:"
-echo "  npm install ${MCP_DEST}/hyperdb-mcp-${PLATFORM}-0.1.0.tgz ${ROOT}/hyperdb-mcp/npm/hyperdb-mcp-0.1.0.tgz"
+echo "  npm install ${MCP_DEST}/hyperdb-mcp-${PLATFORM}-${VERSION}.tgz ${ROOT}/hyperdb-mcp/npm/hyperdb-mcp-${VERSION}.tgz"
 echo ""
 echo "Or test directly:"
 echo "  node ${ROOT}/hyperdb-mcp/npm/bin.js"
+echo ""
+echo "Tip: discard the in-source package.json edits when finished:"
+echo "  git restore hyperdb-mcp/npm hyperdb-api-node/npm hyperdb-api-node/package.json"

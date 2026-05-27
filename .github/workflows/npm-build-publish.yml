@@ -46,7 +46,7 @@ jobs:
           # verify-ci job from this workflow (it would self-reference).
           MAX_ATTEMPTS=30
           SLEEP_SECONDS=60
-          REQUIRED='rustfmt|clippy|cargo-audit|cargo-deny|version consistency|publish dry-run|test \(ubuntu-latest\)|test \(macos-14\)|test \(windows-latest\)'
+          REQUIRED='rustfmt|clippy|cargo-audit|cargo-deny|version consistency|publish dry-run|test \(ubuntu-latest\)|test \(macos-14\)|test \(windows-latest\)|hyperdb-api-node \(build \+ smoke\)'
           for i in $(seq 1 "$MAX_ATTEMPTS"); do
             RUNS=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" \
               --jq "[.check_runs[] | select(.name | test(\"$REQUIRED\"))]")
@@ -288,26 +288,82 @@ jobs:
       - name: Copy README into hyperdb-mcp npm publish directory
         run: cp hyperdb-mcp/README.md hyperdb-mcp/npm/README.md
 
-      - name: Determine npm dist-tag
-        id: dist-tag
+      - name: Resolve version and dist-tag from event
+        id: version
+        # Source-of-truth: the git tag that triggered the workflow.
+        # release events carry it in github.event.release.tag_name;
+        # workflow_dispatch carries it in inputs.tag. Neither path
+        # reads from package.json, so the platform/umbrella package
+        # files don't need to track the version in source control.
+        env:
+          RAW_VERSION: ${{ github.event.inputs.tag || github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          VERSION=$(node -p "require('./hyperdb-mcp/npm/package.json').version")
-          if [[ "$VERSION" == *-rc.* ]]; then
-            echo "tag=rc" >> "$GITHUB_OUTPUT"
-          elif [[ "$VERSION" == *-alpha.* ]]; then
-            echo "tag=alpha" >> "$GITHUB_OUTPUT"
-          elif [[ "$VERSION" == *-beta.* ]]; then
-            echo "tag=beta" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          if [[ -z "${RAW_VERSION:-}" ]]; then
+            echo "::error::No tag/version available; refusing to publish."
+            exit 1
           fi
-          echo "Publishing with dist-tag: $(grep tag "$GITHUB_OUTPUT" | tail -1)"
+          VERSION="${RAW_VERSION#v}"
+          # Defense in depth: tags from workflow_dispatch are user-supplied.
+          # Enforce strict vX.Y.Z / vX.Y.Z-rc.N shape before the value
+          # flows into npm pkg set / npm publish commands.
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(rc|alpha|beta)\.[0-9]+)?$ ]]; then
+            echo "::error::Invalid version: $VERSION (expected X.Y.Z or X.Y.Z-rc.N)"
+            exit 1
+          fi
+          case "$VERSION" in
+            *-rc.*)    TAG=rc ;;
+            *-alpha.*) TAG=alpha ;;
+            *-beta.*)  TAG=beta ;;
+            *)         TAG=latest ;;
+          esac
+          {
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved version=$VERSION dist-tag=$TAG"
+
+      - name: Inject version into all npm package.json files
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        # The platform and umbrella package.json files are stripped of
+        # `version` and `optionalDependencies` in source. We materialize
+        # them here from the tag-derived $VERSION just before publish.
+        # Keep MCP_PLATFORMS / NODE_PLATFORMS in sync with the publish
+        # loops below and the build-npm matrix above.
+        run: |
+          set -euo pipefail
+          MCP_PLATFORMS=(darwin-arm64 linux-x64-gnu win32-x64-msvc)
+          NODE_PLATFORMS=(darwin-arm64 linux-arm64-gnu linux-x64-gnu linux-x64-musl win32-x64-msvc)
+
+          for p in "${MCP_PLATFORMS[@]}"; do
+            (cd "hyperdb-mcp/npm/$p" && npm pkg set "version=$VERSION")
+          done
+          for p in "${NODE_PLATFORMS[@]}"; do
+            (cd "hyperdb-api-node/npm/$p" && npm pkg set "version=$VERSION")
+          done
+
+          # Umbrellas: own version + every optionalDependency exact-pinned
+          # to ==VERSION so installs resolve to the matching platform tarball.
+          (
+            cd hyperdb-mcp/npm
+            npm pkg set "version=$VERSION"
+            for p in "${MCP_PLATFORMS[@]}"; do
+              npm pkg set "optionalDependencies.hyperdb-mcp-$p=$VERSION"
+            done
+          )
+          (
+            cd hyperdb-api-node
+            npm pkg set "version=$VERSION"
+            for p in "${NODE_PLATFORMS[@]}"; do
+              npm pkg set "optionalDependencies.hyperdb-api-node-$p=$VERSION"
+            done
+          )
 
       - name: Publish hyperdb-mcp platform packages
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_TAG: ${{ steps.dist-tag.outputs.tag }}
+          NPM_TAG: ${{ steps.version.outputs.tag }}
         run: |
           set -euo pipefail
           for dir in hyperdb-mcp/npm/darwin-arm64 hyperdb-mcp/npm/linux-x64-gnu hyperdb-mcp/npm/win32-x64-msvc; do
@@ -321,7 +377,7 @@ jobs:
       - name: Publish hyperdb-mcp main package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_TAG: ${{ steps.dist-tag.outputs.tag }}
+          NPM_TAG: ${{ steps.version.outputs.tag }}
         run: |
           cd hyperdb-mcp/npm
           npm publish --access public --tag "$NPM_TAG"
@@ -329,7 +385,7 @@ jobs:
       - name: Publish hyperdb-api-node platform packages
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_TAG: ${{ steps.dist-tag.outputs.tag }}
+          NPM_TAG: ${{ steps.version.outputs.tag }}
         run: |
           set -euo pipefail
           for dir in hyperdb-api-node/npm/darwin-arm64 hyperdb-api-node/npm/linux-x64-gnu hyperdb-api-node/npm/win32-x64-msvc; do
@@ -343,7 +399,7 @@ jobs:
       - name: Publish hyperdb-api-node main package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_TAG: ${{ steps.dist-tag.outputs.tag }}
+          NPM_TAG: ${{ steps.version.outputs.tag }}
         # --ignore-scripts skips the prepublishOnly hook (`napi prepublish`),
         # which would try to re-orchestrate the platform packages our CI
         # has already built and published independently.
