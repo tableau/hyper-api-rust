@@ -1724,6 +1724,11 @@ pub enum StatementKind {
     Ddl,
     /// `INSERT` / `UPDATE` / `DELETE` / `COPY` / `MERGE` — transactional.
     Dml,
+    /// `BEGIN` / `START` / `COMMIT` / `END` / `ROLLBACK` / `ABORT` /
+    /// `SAVEPOINT` / `RELEASE`. Rejected inside a batch because the
+    /// `execute` tool already manages the transaction; an explicit
+    /// COMMIT mid-batch would defeat atomicity.
+    TransactionControl,
     /// Empty/comment-only input or an unrecognized first keyword. Treated
     /// as opaque by the batch validator (passed through to Hyper).
     Other,
@@ -1741,6 +1746,9 @@ pub fn classify_statement(sql: &str) -> StatementKind {
         "SELECT" | "WITH" | "EXPLAIN" | "SHOW" | "VALUES" => StatementKind::ReadOnly,
         "CREATE" | "DROP" | "ALTER" | "TRUNCATE" | "RENAME" => StatementKind::Ddl,
         "INSERT" | "UPDATE" | "DELETE" | "COPY" | "MERGE" => StatementKind::Dml,
+        "BEGIN" | "START" | "COMMIT" | "END" | "ROLLBACK" | "ABORT" | "SAVEPOINT" | "RELEASE" => {
+            StatementKind::TransactionControl
+        }
         _ => StatementKind::Other,
     }
 }
@@ -2071,8 +2079,30 @@ mod statement_helper_tests {
         );
         assert_eq!(classify_statement("update t set i = 2"), StatementKind::Dml);
         assert_eq!(classify_statement("delete from t"), StatementKind::Dml);
-        assert_eq!(classify_statement("BEGIN"), StatementKind::Other);
         assert_eq!(classify_statement(""), StatementKind::Other);
+    }
+
+    #[test]
+    fn classify_statement_recognizes_transaction_control() {
+        for kw in [
+            "BEGIN",
+            "Begin transaction",
+            "START TRANSACTION",
+            "COMMIT",
+            "Commit work",
+            "END",
+            "ROLLBACK",
+            "Rollback to savepoint sp1",
+            "ABORT",
+            "SAVEPOINT sp1",
+            "RELEASE SAVEPOINT sp1",
+        ] {
+            assert_eq!(
+                classify_statement(kw),
+                StatementKind::TransactionControl,
+                "expected TransactionControl for `{kw}`"
+            );
+        }
     }
 
     #[test]

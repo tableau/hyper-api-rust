@@ -393,6 +393,7 @@ Validation rules enforced before any SQL hits the server:
 - No element may be read-only — use `query` for SELECT/WITH/EXPLAIN.
 - DDL and DML cannot be mixed in one batch (Hyper aborts mixed transactions with SQLSTATE 0A000).
 - Multi-element all-DDL batches are rejected because Hyper auto-commits CREATE/DROP/ALTER even inside a transaction; issue each DDL in its own `execute` call.
+- Explicit transaction-control statements (`BEGIN` / `COMMIT` / `ROLLBACK` / `SAVEPOINT`) in batch elements are rejected — the tool manages the transaction for you, and a user-issued COMMIT mid-batch would defeat atomicity.
 
 #### `describe`
 

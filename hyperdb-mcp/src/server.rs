@@ -4304,6 +4304,24 @@ fn validate_execute_batch(stmts: &[String]) -> Result<(), McpError> {
                     "Use the `query` tool for SELECT/WITH/EXPLAIN/SHOW/VALUES. To read-then-write atomically, fold the read into the write (e.g. `UPDATE … FROM (SELECT …)` or `INSERT … SELECT …`).",
                 ));
             }
+            StatementKind::TransactionControl => {
+                // Explicit BEGIN / COMMIT / ROLLBACK / SAVEPOINT inside a
+                // batch element would defeat atomicity: the `execute`
+                // tool already opens its own transaction around multi-
+                // element batches, and a user-issued COMMIT mid-batch
+                // would commit early. Reject up front with an
+                // actionable message rather than silently breaking the
+                // contract.
+                return Err(McpError::new(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "`sql[{idx}]` is a transaction-control statement (BEGIN / COMMIT / ROLLBACK / SAVEPOINT); these are not allowed in `execute` batches."
+                    ),
+                )
+                .with_suggestion(
+                    "The `execute` tool manages the transaction for you — multi-element arrays already run inside BEGIN/COMMIT. Just pass the DML statements you want to run atomically.",
+                ));
+            }
             StatementKind::Ddl => has_schema_change = true,
             StatementKind::Dml => has_data_mutation = true,
             StatementKind::Other => {}
@@ -4623,6 +4641,39 @@ mod validate_execute_batch_tests {
     }
 
     #[test]
+    fn rejects_transaction_control_in_batch() {
+        // The wrapper manages the transaction; a user-issued COMMIT
+        // mid-batch would commit early and break atomicity.
+        for sql in [
+            "BEGIN",
+            "COMMIT",
+            "ROLLBACK",
+            "SAVEPOINT sp1",
+            "START TRANSACTION",
+            "END",
+            "RELEASE SAVEPOINT sp1",
+        ] {
+            let err = validate_execute_batch(&s(&["INSERT INTO t VALUES (1)", sql])).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidArgument, "for `{sql}`");
+            assert!(
+                err.message.contains("transaction-control"),
+                "for `{sql}`: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_transaction_control_singleton() {
+        // Even a one-element BEGIN-only call is rejected — there's no
+        // statement following it that could benefit, and the BEGIN
+        // would leave the connection in an open-transaction state for
+        // the next caller to inherit.
+        let err = validate_execute_batch(&s(&["BEGIN"])).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    #[test]
     fn rejects_ddl_dml_mix() {
         let err =
             validate_execute_batch(&s(&["CREATE TABLE x (i INT)", "INSERT INTO x VALUES (1)"]))
@@ -4655,8 +4706,10 @@ mod validate_execute_batch_tests {
 
     #[test]
     fn allows_other_kinds() {
-        // Non-classified statements (e.g. BEGIN as a singleton) pass through.
-        validate_execute_batch(&s(&["BEGIN"])).unwrap();
+        // Non-classified statements (e.g. SET, ATTACH) pass through.
+        // Transaction-control keywords are NOT in this group — see
+        // `rejects_transaction_control_*` tests.
+        validate_execute_batch(&s(&["SET schema_search_path = 'mydb'"])).unwrap();
     }
 
     #[test]
