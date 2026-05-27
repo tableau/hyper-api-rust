@@ -323,23 +323,50 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "Resolved version=$VERSION dist-tag=$TAG"
 
+      - name: Verify tag matches workspace Cargo.toml version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        # Defense against a tag that doesn't match what `cargo publish`
+        # will publish in release.yml. If they diverge, npm and crates.io
+        # would ship at different versions. Match the same field
+        # release-please patches: [workspace.package].version.
+        run: |
+          set -euo pipefail
+          CARGO_VERSION=$(awk '
+            /^\[workspace\.package\]/ { in_section = 1; next }
+            /^\[/ { in_section = 0 }
+            in_section && /^version[[:space:]]*=/ {
+              gsub(/[[:space:]"]/, "", $0)
+              sub(/^version=/, "", $0)
+              print
+              exit
+            }
+          ' Cargo.toml)
+          if [[ "$VERSION" != "$CARGO_VERSION" ]]; then
+            echo "::error::Tag version ($VERSION) does not match Cargo.toml workspace version ($CARGO_VERSION). Refusing to publish to avoid registry skew between npm and crates.io."
+            exit 1
+          fi
+
       - name: Inject version into all npm package.json files
         env:
           VERSION: ${{ steps.version.outputs.version }}
         # The platform and umbrella package.json files are stripped of
         # `version` and `optionalDependencies` in source. We materialize
         # them here from the tag-derived $VERSION just before publish.
-        # Keep MCP_PLATFORMS / NODE_PLATFORMS in sync with the publish
-        # loops below and the build-npm matrix above.
+        #
+        # PLATFORMS is the SINGLE source of truth for which platforms
+        # ship. It must match (a) the build-npm matrix above, (b) the
+        # publish loops below, and (c) the `napi.targets` array in
+        # hyperdb-api-node/package.json. hyperdb-mcp and hyperdb-api-node
+        # currently ship the same 3 platforms; if that ever diverges,
+        # split into MCP_PLATFORMS / NODE_PLATFORMS arrays here AND
+        # below in the publish steps.
         run: |
           set -euo pipefail
-          MCP_PLATFORMS=(darwin-arm64 linux-x64-gnu win32-x64-msvc)
-          NODE_PLATFORMS=(darwin-arm64 linux-arm64-gnu linux-x64-gnu linux-x64-musl win32-x64-msvc)
+          PLATFORMS=(darwin-arm64 linux-x64-gnu win32-x64-msvc)
 
-          for p in "${MCP_PLATFORMS[@]}"; do
+          for p in "${PLATFORMS[@]}"; do
             (cd "hyperdb-mcp/npm/$p" && npm pkg set "version=$VERSION")
-          done
-          for p in "${NODE_PLATFORMS[@]}"; do
             (cd "hyperdb-api-node/npm/$p" && npm pkg set "version=$VERSION")
           done
 
@@ -348,14 +375,14 @@ jobs:
           (
             cd hyperdb-mcp/npm
             npm pkg set "version=$VERSION"
-            for p in "${MCP_PLATFORMS[@]}"; do
+            for p in "${PLATFORMS[@]}"; do
               npm pkg set "optionalDependencies.hyperdb-mcp-$p=$VERSION"
             done
           )
           (
             cd hyperdb-api-node
             npm pkg set "version=$VERSION"
-            for p in "${NODE_PLATFORMS[@]}"; do
+            for p in "${PLATFORMS[@]}"; do
               npm pkg set "optionalDependencies.hyperdb-api-node-$p=$VERSION"
             done
           )

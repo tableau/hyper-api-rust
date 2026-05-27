@@ -12,10 +12,11 @@
 # deriving VERSION from the workspace Cargo.toml and writing it (plus
 # the umbrella optionalDependencies pins) via `npm pkg set`.
 #
-# IMPORTANT: this mutates the working tree (writes `version` and
-# `optionalDependencies` into the source package.json files). Discard
-# with `git restore hyperdb-mcp/npm hyperdb-api-node/npm hyperdb-api-node/package.json`
-# when you're done.
+# During the run, this temporarily writes `version` and
+# `optionalDependencies` into the in-source package.json files so
+# `npm pack` produces installable tarballs. An EXIT trap reverts
+# those edits on success, failure, or Ctrl-C — see
+# `restore_package_jsons` below.
 #
 # Prerequisites:
 #   - `make build-release` (or `cargo build --release -p hyperdb-mcp -p hyperdb-api-node`)
@@ -32,6 +33,21 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HYPERD_DIR="${ROOT}/.hyperd/current"
+
+# The script writes `version` and `optionalDependencies` into the
+# in-source package.json files so `npm pack` produces installable
+# tarballs. Always revert those edits on exit (success, failure, or
+# Ctrl-C) so a contributor can never accidentally `git add -A` the
+# mutated files and re-introduce the in-source `version` field that
+# this codebase is deliberately keeping out of git.
+restore_package_jsons() {
+  (cd "${ROOT}" && git restore \
+    hyperdb-mcp/npm/package.json \
+    hyperdb-mcp/npm/*/package.json \
+    hyperdb-api-node/package.json \
+    hyperdb-api-node/npm/*/package.json 2>/dev/null) || true
+}
+trap restore_package_jsons EXIT
 
 # Detect platform
 case "$(uname -s)-$(uname -m)" in
@@ -164,6 +180,3 @@ echo "  npm install ${MCP_DEST}/hyperdb-mcp-${PLATFORM}-${VERSION}.tgz ${ROOT}/h
 echo ""
 echo "Or test directly:"
 echo "  node ${ROOT}/hyperdb-mcp/npm/bin.js"
-echo ""
-echo "Tip: discard the in-source package.json edits when finished:"
-echo "  git restore hyperdb-mcp/npm hyperdb-api-node/npm hyperdb-api-node/package.json"

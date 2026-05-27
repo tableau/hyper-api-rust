@@ -274,3 +274,41 @@ jobs:
             echo "::error::version.txt ($TXT_VERSION) does not match Cargo.toml workspace version ($CARGO_VERSION)"
             exit 1
           fi
+
+      - name: Check npm package.json files have no in-source version
+        # The platform and umbrella npm package.json files have their
+        # `version` field stripped from source — npm-build-publish.yml
+        # injects it at publish time from the git tag. This guard
+        # catches anyone (or any tool) re-introducing a `version` field
+        # and reviving the original "platform versions stuck at 0.1.3"
+        # bug. assemble-npm.sh writes versions transiently with a
+        # restore-on-EXIT trap, so a clean checkout never has them.
+        run: |
+          set -euo pipefail
+          FILES=(
+            hyperdb-mcp/npm/package.json
+            hyperdb-mcp/npm/darwin-arm64/package.json
+            hyperdb-mcp/npm/darwin-x64/package.json
+            hyperdb-mcp/npm/linux-x64-gnu/package.json
+            hyperdb-mcp/npm/win32-x64-msvc/package.json
+            hyperdb-api-node/package.json
+            hyperdb-api-node/npm/darwin-arm64/package.json
+            hyperdb-api-node/npm/darwin-x64/package.json
+            hyperdb-api-node/npm/linux-arm64-gnu/package.json
+            hyperdb-api-node/npm/linux-x64-gnu/package.json
+            hyperdb-api-node/npm/linux-x64-musl/package.json
+            hyperdb-api-node/npm/win32-x64-msvc/package.json
+          )
+          OFFENDERS=()
+          for f in "${FILES[@]}"; do
+            if node -e "process.exit(JSON.parse(require('fs').readFileSync('$f', 'utf8')).version === undefined ? 0 : 1)"; then
+              :
+            else
+              OFFENDERS+=("$f")
+            fi
+          done
+          if (( ${#OFFENDERS[@]} > 0 )); then
+            echo "::error::The following npm package.json files have a 'version' field, which must not be tracked in source (it's injected at publish time by npm-build-publish.yml):"
+            printf '  - %s\n' "${OFFENDERS[@]}"
+            exit 1
+          fi
