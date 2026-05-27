@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.2](https://github.com/tableau/hyper-api-rust/compare/v0.2.1...v0.2.2) (2026-05-27)
+
+
+### Bug Fixes
+
+* **ci:** defer fromJson(release.outputs.pr) into a run block ([#51](https://github.com/tableau/hyper-api-rust/issues/51)) ([dd78df9](https://github.com/tableau/hyper-api-rust/commit/dd78df978eaf244617e83ba2d8d71b680ad52876))
+* clean version stamps on release builds (no -dirty markers) ([#50](https://github.com/tableau/hyper-api-rust/issues/50)) ([5962a4e](https://github.com/tableau/hyper-api-rust/commit/5962a4e3df3ff16ac29cb660d96f22907b9374a5))
+
 ## [0.2.1](https://github.com/tableau/hyper-api-rust/compare/v0.2.0...v0.2.1) (2026-05-26)
 
 
