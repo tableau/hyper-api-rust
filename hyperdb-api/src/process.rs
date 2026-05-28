@@ -341,16 +341,16 @@ impl HyperProcess {
         // Create callback listener on ephemeral port
         // This is the "dead man's switch" - when this connection is closed, Hyper shuts down
         let callback_listener = TcpListener::bind("127.0.0.1:0")
-            .map_err(|e| Error::internal(format!("Failed to create callback listener: {e}")))?;
+            .map_err(|e| Error::connection_with_io("Failed to create callback listener", e))?;
 
         let callback_port = callback_listener
             .local_addr()
-            .map_err(|e| Error::internal(format!("Failed to get callback port: {e}")))?
+            .map_err(|e| Error::connection_with_io("Failed to get callback port", e))?
             .port();
 
         // Set a timeout for accepting the callback connection
         callback_listener.set_nonblocking(false).map_err(|e| {
-            Error::internal(format!("Failed to set callback listener to blocking: {e}"))
+            Error::connection_with_io("Failed to set callback listener to blocking", e)
         })?;
 
         // Check if user wants to disable default parameters
@@ -384,7 +384,7 @@ impl HyperProcess {
                 // Create a temp directory for the socket
                 let temp_dir = std::env::temp_dir().join(format!("hyper-{}", std::process::id()));
                 std::fs::create_dir_all(&temp_dir).map_err(|e| {
-                    Error::internal(format!("Failed to create socket directory: {e}"))
+                    Error::connection_with_io("Failed to create socket directory", e)
                 })?;
                 temp_dir
             };
@@ -610,11 +610,10 @@ impl HyperProcess {
 
         // Start the process
         let child = cmd.spawn().map_err(|e| {
-            Error::internal(format!(
-                "Failed to start Hyper server at {}: {}",
-                hyperd_path.display(),
-                e
-            ))
+            Error::connection_with_io(
+                format!("Failed to start Hyper server at {}", hyperd_path.display()),
+                e,
+            )
         })?;
 
         // Wait for Hyper to connect back to our callback listener
@@ -727,16 +726,17 @@ impl HyperProcess {
                     thread::sleep(Duration::from_millis(50));
                 }
                 Err(e) => {
-                    return Err(Error::internal(format!(
-                        "Failed to accept callback connection: {e}"
-                    )));
+                    return Err(Error::connection_with_io(
+                        "Failed to accept callback connection",
+                        e,
+                    ));
                 }
             }
         };
 
         // Set stream back to blocking for reading
         stream.set_nonblocking(false).map_err(|e| {
-            Error::internal(format!("Failed to set callback stream to blocking: {e}"))
+            Error::connection_with_io("Failed to set callback stream to blocking", e)
         })?;
 
         // Set read timeout
@@ -746,7 +746,7 @@ impl HyperProcess {
         // Protocol: [1 byte length][N bytes descriptor string]
         let mut len_buf = [0u8; 1];
         stream.read_exact(&mut len_buf).map_err(|e| {
-            Error::internal(format!("Failed to read endpoint length from Hyper: {e}"))
+            Error::connection_with_io("Failed to read endpoint length from Hyper", e)
         })?;
 
         let len = len_buf[0] as usize;
@@ -756,9 +756,7 @@ impl HyperProcess {
 
         let mut descriptor_buf = vec![0u8; len];
         stream.read_exact(&mut descriptor_buf).map_err(|e| {
-            Error::internal(format!(
-                "Failed to read endpoint descriptor from Hyper: {e}"
-            ))
+            Error::connection_with_io("Failed to read endpoint descriptor from Hyper", e)
         })?;
 
         let descriptor = String::from_utf8(descriptor_buf)
@@ -1101,13 +1099,13 @@ impl HyperProcess {
                                 // Then force kill
                                 let _ = child.kill();
                                 break child.wait().map_err(|e| {
-                                    Error::internal(format!("Failed to wait for hyperd: {e}"))
+                                    Error::connection_with_io("Failed to wait for hyperd", e)
                                 });
                             }
                             thread::sleep(Duration::from_millis(100));
                         }
                         Err(e) => {
-                            break Err(Error::internal(format!("Failed to wait for hyperd: {e}")))
+                            break Err(Error::connection_with_io("Failed to wait for hyperd", e))
                         }
                     }
                 }
@@ -1115,7 +1113,7 @@ impl HyperProcess {
                 // Wait indefinitely
                 child
                     .wait()
-                    .map_err(|e| Error::internal(format!("Failed to wait for hyperd: {e}")))
+                    .map_err(|e| Error::connection_with_io("Failed to wait for hyperd", e))
             };
 
             wait_result?;
