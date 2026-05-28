@@ -243,6 +243,126 @@ The MCP server's `Engine::execute_in_transaction` helper takes `&self` and so ca
 
 ---
 
+## #61 + #62 — FromRow modernization
+
+The `FromRow` trait was redesigned around a new [`RowAccessor`] type and a new [`#[derive(FromRow)]`][derive] proc-macro. The blanket tuple impls (1/2/3/4-tuple) were deleted; hand-written impls have a new signature.
+
+[`RowAccessor`]: https://docs.rs/hyperdb-api/latest/hyperdb_api/struct.RowAccessor.html
+[derive]: https://docs.rs/hyperdb-api/latest/hyperdb_api/derive.FromRow.html
+
+### What's changed
+
+| Surface | Before (v0.2.x) | After (v0.3.0) |
+| ------- | --------------- | -------------- |
+| `FromRow::from_row` signature | `fn from_row(row: &Row) -> Result<Self>` | `fn from_row(row: RowAccessor<'_>) -> Result<Self>` |
+| Blanket tuple impls | `(Option<A>,)` … `(Option<A>, Option<B>, Option<C>, Option<D>)` | **Deleted.** Define a struct with `#[derive(FromRow)]` instead. |
+| Derive macro | did not exist | `#[derive(FromRow)]` from the new `hyperdb-api-derive` crate (re-exported by `hyperdb-api`) |
+| Name-based access on a single row | did not exist | `Row::get_by_name<T>(name)` |
+| Cached column-name → index lookup | did not exist | `RowAccessor` carries one; built once per query in `fetch_*_as` |
+
+### What's new
+
+- **`#[derive(FromRow)]`** generates the `impl FromRow` for you. Field names match column names by default; `#[hyperdb(rename = "...")]` on a field overrides. `Option<T>` fields use `get_opt` (NULL → `None`); other fields use `get` (NULL → error).
+
+  ```rust
+  use hyperdb_api::FromRow;
+
+  #[derive(FromRow)]
+  struct User {
+      id: i32,
+      name: String,
+      #[hyperdb(rename = "email_address")]
+      email: Option<String>,
+  }
+  ```
+
+- **`RowAccessor<'a>`** is the parameter type of the new `FromRow::from_row`. It exposes:
+  - `get<T>(name: &str) -> Result<T>` — required field; missing/NULL/type-mismatch return `Error::Column`.
+  - `get_opt<T>(name: &str) -> Result<Option<T>>` — optional field; NULL becomes `None`.
+  - `position<T>(idx: usize) -> Result<T>` — positional escape hatch.
+  - `row()` — access to the underlying `Row` for callers that need other methods.
+
+- **`Row::get_by_name<T>(name)`** does the same name-based lookup but on a single `Row` (no cached lookup map). Convenient for hand-coded paths that don't go through `FromRow`. Doc warns that it's a linear scan; recommends `#[derive(FromRow)]` or `fetch_*_as` for hot paths.
+
+### Migration recipes
+
+#### Hand-written `FromRow` impl
+
+```rust
+// Before
+impl FromRow for User {
+    fn from_row(row: &Row) -> Result<Self> {
+        Ok(User {
+            id: row.get::<i32>(0).ok_or_else(|| Error::conversion("NULL id"))?,
+            name: row.get::<String>(1).unwrap_or_default(),
+        })
+    }
+}
+
+// After
+impl FromRow for User {
+    fn from_row(row: RowAccessor<'_>) -> Result<Self> {
+        Ok(User {
+            id: row.get("id")?,
+            name: row.get_opt("name")?.unwrap_or_default(),
+        })
+    }
+}
+```
+
+The new shape is shorter, more readable, and decouples your code from column position — reordering `SELECT` columns no longer breaks your impl.
+
+#### Tuple destructuring (deleted)
+
+```rust
+// Before — blanket tuple impl
+let row = conn.fetch_one("SELECT id, name FROM users")?;
+let (id, name): (Option<i32>, Option<String>) = FromRow::from_row(&row)?;
+
+// After — define a struct
+#[derive(FromRow)]
+struct User { id: Option<i32>, name: Option<String> }
+let user: User = conn.fetch_one_as("SELECT id, name FROM users")?;
+```
+
+Or, if you really want positional access without a struct, use `Row::get(idx)` directly:
+
+```rust
+let row = conn.fetch_one("SELECT id, name FROM users")?;
+let id: Option<i32> = row.get(0);
+let name: Option<String> = row.get(1);
+```
+
+#### Direct `T::from_row(&row)` calls
+
+If you previously called `T::from_row(&row)` directly (outside `fetch_*_as`), the new signature requires a `RowAccessor`. Easiest migration: use `fetch_one_as` / `fetch_all_as` instead, which build the cached lookup for you.
+
+If you must construct a `RowAccessor` yourself (e.g. processing rows from a custom source), the constructor is `pub(crate)`. File an issue if you need this surfaced — current direction is to keep `RowAccessor` construction internal so the cache lifetime stays tied to `fetch_*_as`.
+
+### Errors
+
+The derive and `RowAccessor` accessors return `Error::Column { name, kind }` for column-access failures, where `ColumnErrorKind` is one of:
+
+- `Missing` — column with that name not in the result schema
+- `Null` — required field, but the cell is SQL `NULL`
+- `TypeMismatch { expected, actual }` — the cell value couldn't be decoded as `T`
+
+`Error::ColumnIndexOutOfBounds { idx, column_count }` is returned by `RowAccessor::position` when `idx` is out of range.
+
+These variants were shipped in `#70` so this PR doesn't re-break the error type.
+
+### Performance note
+
+`fetch_*_as` builds a `HashMap<&str, usize>` once per query (O(N) in the column count). Each row's `RowAccessor::get(name)` then runs a single hash lookup followed by typed access — O(1) per field per row. This is strictly better than the previous behavior, where a hand-written impl using `try_get(idx, name)` had to know column positions hard-coded.
+
+For one-off named access on a `Row` outside `fetch_*_as`, `Row::get_by_name` is a linear scan over `ResultSchema::column_index`. For hot paths (many rows × many fields), prefer `#[derive(FromRow)]`.
+
+### `hyperdb-api-derive` crate
+
+The proc-macro lives in a new `hyperdb-api-derive` workspace crate (Rust requires proc-macro code to live in its own `proc-macro = true` crate). It's re-exported from `hyperdb-api`, so callers don't need a direct dependency — same pattern as serde / thiserror. **Don't add `hyperdb-api-derive` to your `Cargo.toml`**; just `use hyperdb_api::FromRow;`.
+
+---
+
 ## #70 (continued) — Ergonomic constructors across all workspace error types
 
 The same ergonomic-constructor pattern was applied to every error type in the workspace that user code might construct, so call sites no longer need `.to_string()` ceremony for string-literal arguments.

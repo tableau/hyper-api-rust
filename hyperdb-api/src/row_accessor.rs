@@ -28,7 +28,7 @@ use crate::result::{Row, RowValue};
 /// A view over a [`Row`] that supports name-based access via a
 /// pre-resolved column-name → index lookup table.
 ///
-/// `RowAccessor` is the parameter type of [`FromRow::from_row`]; it
+/// `RowAccessor` is the parameter type of [`crate::FromRow::from_row`]; it
 /// borrows the row and a shared lookup map built once per query in
 /// [`fetch_one_as`](crate::Connection::fetch_one_as) /
 /// [`fetch_all_as`](crate::Connection::fetch_all_as).
