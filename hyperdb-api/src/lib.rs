@@ -16,8 +16,9 @@
 //! - `hyperdb-api` — High-level API (this crate)
 //!
 //! Optional companion crates:
-//! - `sea-query-hyper` — `HyperDB` SQL dialect backend for `sea-query`
+//! - `sea-query-hyperdb` — `HyperDB` SQL dialect backend for `sea-query`
 //! - `hyperdb-api-salesforce` — Salesforce Data Cloud OAuth authentication
+//! - `hyperdb-api-derive` — Proc-macro `#[derive(FromRow)]` (re-exported by this crate)
 //!
 //! # Quick Start
 //!
