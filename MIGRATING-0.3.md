@@ -26,7 +26,7 @@ The public `hyperdb_api::Error` type was redesigned into a flat enum per the [Mi
 ```rust
 pub enum Error {
     // Connection / transport
-    Connection { message: String, source: Option<std::io::Error> },
+    Connection { message: String, source: Option<std::io::Error>, sqlstate: Option<String> },
     Authentication(String),
     Tls(String),
 
@@ -38,9 +38,9 @@ pub enum Error {
     Io(std::io::Error),
 
     // Lifecycle
-    Closed(String),
+    Closed { message: String, sqlstate: Option<String> },
     Timeout(String),
-    Cancelled(String),
+    Cancelled { message: String, sqlstate: Option<String> },
 
     // Type / value
     Conversion(String),
@@ -105,9 +105,11 @@ Pattern-matching uses the PascalCase variant names (e.g. `Error::Conversion(msg)
 
 ### Behavioral note: SQLSTATE on non-server errors
 
-`Error::sqlstate()` now returns `Some(...)` only for [`Error::Server`]. Previously it could return `Some` for any wrapped `client::Error` whose internal type carried a SQLSTATE code, including some `Cancelled`, `Closed`, and `Connection` paths that arrived from the server with codes like `57014` (`query_canceled`), `57P03` (`cannot_connect_now`), or `08*` connection-class codes.
+> **Updated by Follow-up C below.** v0.3.0 ships with structured SQLSTATE on `Server`, `Connection`, `Closed`, and `Cancelled`. Use `Error::sqlstate()` on any of these variants to retrieve the code; or destructure the variant directly to read it.
 
-After v0.3.0 those SQLSTATE codes are folded into the variant's message string (still visible to humans via `Display`) but are not surfaced by `Error::sqlstate()`. If you branch on those codes, parse them out of the message string or open a follow-up issue requesting structured SQLSTATE on `Connection`/`Closed`/`Cancelled`/`Timeout` variants.
+`Error::sqlstate()` returns `Some(...)` for [`Error::Server`] (Query-class codes), [`Error::Connection`] (typically `08*`), [`Error::Closed`] (typically `57P0*` shutdown codes), and [`Error::Cancelled`] (typically `57014` `query_canceled`) when the underlying server provided a code. Other variants always return `None`.
+
+If you have callers that previously parsed SQLSTATE out of the message string for `Cancelled` / `Closed` / `Connection`, switch them to destructuring or `Error::sqlstate()` — see the Follow-up C section below for recipes.
 
 ### Migration recipes
 
@@ -372,6 +374,80 @@ For one-off named access on a `Row` outside `fetch_*_as`, `Row::get_by_name` is 
 ### `hyperdb-api-derive` crate
 
 The proc-macro lives in a new `hyperdb-api-derive` workspace crate (Rust requires proc-macro code to live in its own `proc-macro = true` crate). It's re-exported from `hyperdb-api`, so callers don't need a direct dependency — same pattern as serde / thiserror. **Don't add `hyperdb-api-derive` to your `Cargo.toml`**; just `use hyperdb_api::FromRow;`.
+
+---
+
+## Follow-up C — Structured SQLSTATE on `Cancelled` / `Closed` / `Connection`
+
+Reverses the v0.3.0 "non-Server SQLSTATE drops to message" caveat. SQLSTATE codes that arrive via cancellation (`57014`), connection-class (`08*`), or close-class wire errors (`57P01` admin shutdown, `57P02` crash shutdown) are now exposed structurally via the variant's `sqlstate` field, and `Error::sqlstate()` returns them too — no more parsing the message string.
+
+### Variant shape changes
+
+```rust
+// Before
+Error::Cancelled(String)
+Error::Closed(String)
+Error::Connection { message: String, source: Option<std::io::Error> }
+
+// After
+Error::Cancelled { message: String, sqlstate: Option<String> }
+Error::Closed    { message: String, sqlstate: Option<String> }
+Error::Connection { message: String, source: Option<std::io::Error>, sqlstate: Option<String> }
+```
+
+`Error::Cancelled` and `Error::Closed` are now struct variants instead of tuple variants. Match arms that destructured them as tuples must switch to struct-pattern syntax.
+
+### Migration recipes
+
+**Pattern-match for the message** — before:
+
+```rust
+match err {
+    Error::Cancelled(msg) => log::warn!("cancelled: {msg}"),
+    Error::Closed(msg) => log::warn!("closed: {msg}"),
+    other => return Err(other),
+}
+```
+
+after:
+
+```rust
+match err {
+    Error::Cancelled { message, sqlstate } => log::warn!("cancelled: {message} ({sqlstate:?})"),
+    Error::Closed { message, sqlstate } => log::warn!("closed: {message} ({sqlstate:?})"),
+    other => return Err(other),
+}
+```
+
+If you only need the message, use `..` to elide other fields: `Error::Cancelled { message, .. }`.
+
+**Read SQLSTATE structurally** — new in Follow-up C:
+
+```rust
+if let Error::Cancelled { sqlstate: Some(code), .. } = &err {
+    if code == "57014" { /* user cancellation, distinct from timeout */ }
+}
+
+// Or via the helper:
+match err.sqlstate() {
+    Some("08006") => /* connection failure */,
+    Some("57014") => /* query_canceled */,
+    Some("57P01") => /* admin shutdown */,
+    _ => {}
+}
+```
+
+### Constructors
+
+The existing `Error::cancelled(msg)`, `Error::closed(msg)`, and `Error::connection(msg)` keep working — they default `sqlstate: None`. Three new constructors carry SQLSTATE:
+
+```rust
+Error::cancelled_with_sqlstate(message, sqlstate);  // both impl Into<String>
+Error::closed_with_sqlstate(message, sqlstate);
+Error::connection_with_sqlstate(message, sqlstate);
+```
+
+`Error::connection_with_io(message, io_err)` is unchanged — it still defaults `sqlstate: None`. If you have an `io::Error` cause *and* a SQLSTATE, construct via the struct-expression form (forward-compatibility caveat: future field additions may break it; prefer adding a constructor if this combination becomes common).
 
 ---
 
