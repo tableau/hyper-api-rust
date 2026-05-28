@@ -211,9 +211,9 @@ impl From<hyperdb_api::Error> for McpError {
             // so the engine recycles. is_connection_lost above already
             // catches most of these via message; this is a fallback.
             hyperdb_api::Error::Connection { .. }
-            | hyperdb_api::Error::Closed(_)
+            | hyperdb_api::Error::Closed { .. }
             | hyperdb_api::Error::Timeout(_)
-            | hyperdb_api::Error::Cancelled(_) => McpError::new(ErrorCode::ConnectionLost, msg),
+            | hyperdb_api::Error::Cancelled { .. } => McpError::new(ErrorCode::ConnectionLost, msg),
 
             _ => McpError::new(ErrorCode::InternalError, msg),
         }

@@ -42,16 +42,24 @@ pub enum Error {
     /// I/O). Carries the underlying [`std::io::Error`] when one is
     /// available; the type is erased at the wire-protocol boundary in
     /// `hyperdb-api-core`, so `source` is `None` for errors that
-    /// originated there.
+    /// originated there. `sqlstate` is set when the server provided a
+    /// connection-class SQLSTATE (e.g. `08001`, `08006`, `57P03`).
     ///
-    /// Construct via [`Self::connection`] or [`Self::connection_with_io`].
-    #[error("connection error: {message}")]
+    /// Construct via [`Self::connection`], [`Self::connection_with_io`],
+    /// or [`Self::connection_with_sqlstate`].
+    #[error(
+        "connection error{}: {message}",
+        sqlstate.as_ref().map(|s| format!(" ({s})")).unwrap_or_default(),
+    )]
     Connection {
         /// Human-readable description.
         message: String,
         /// Underlying I/O error, if available.
         #[source]
         source: Option<std::io::Error>,
+        /// `PostgreSQL` SQLSTATE code, if the server provided one
+        /// (typically `08*` connection-class codes).
+        sqlstate: Option<String>,
     },
 
     /// Authentication failed.
@@ -97,17 +105,38 @@ pub enum Error {
     Io(#[from] std::io::Error),
 
     // ---- Lifecycle -----------------------------------------------------
-    /// Operation attempted on a closed connection.
-    #[error("connection closed: {0}")]
-    Closed(String),
+    /// Operation attempted on a closed connection. `sqlstate` is set
+    /// when the server provided one (typically `57P01` admin shutdown
+    /// or `57P02` crash shutdown). Construct via [`Self::closed`] or
+    /// [`Self::closed_with_sqlstate`].
+    #[error(
+        "connection closed{}: {message}",
+        sqlstate.as_ref().map(|s| format!(" ({s})")).unwrap_or_default(),
+    )]
+    Closed {
+        /// Human-readable description.
+        message: String,
+        /// `PostgreSQL` SQLSTATE code, if the server provided one.
+        sqlstate: Option<String>,
+    },
 
     /// Operation timed out.
     #[error("operation timed out: {0}")]
     Timeout(String),
 
-    /// Operation was cancelled.
-    #[error("operation cancelled: {0}")]
-    Cancelled(String),
+    /// Operation was cancelled. `sqlstate` is set when the server
+    /// provided one (typically `57014` `query_canceled`). Construct via
+    /// [`Self::cancelled`] or [`Self::cancelled_with_sqlstate`].
+    #[error(
+        "operation cancelled{}: {message}",
+        sqlstate.as_ref().map(|s| format!(" ({s})")).unwrap_or_default(),
+    )]
+    Cancelled {
+        /// Human-readable description.
+        message: String,
+        /// `PostgreSQL` SQLSTATE code, if the server provided one.
+        sqlstate: Option<String>,
+    },
 
     // ---- Type / value --------------------------------------------------
     /// Type or value conversion failed (out-of-range numeric, malformed
@@ -144,6 +173,15 @@ pub enum Error {
     #[error("already exists: {0}")]
     AlreadyExists(String),
 
+    /// Caller-API misuse: a method was called in an invalid sequence
+    /// or combination (e.g. mixing two mutually exclusive insertion
+    /// modes on a single inserter, calling a method after the resource
+    /// has been finalized). Distinct from [`Self::Internal`], which is
+    /// reserved for true library invariant violations the caller could
+    /// not have triggered. Construct via [`Self::invalid_operation`].
+    #[error("invalid operation: {0}")]
+    InvalidOperation(String),
+
     // ---- Column / row mapping ------------------------------------------
     /// Structured error for named-column access in row decoding. Used
     /// by `FromRow` impls and `Row::try_get` / `Row::get_by_name` to
@@ -169,13 +207,15 @@ pub enum Error {
     },
 
     // ---- Internal ------------------------------------------------------
-    /// Internal invariant violation. Used as a default for state
-    /// assertions that should be unreachable in correct callers;
-    /// callers generally cannot recover beyond logging and bailing.
+    /// Internal invariant violation — a state the library believes
+    /// should be unreachable. Callers cannot trigger this from the
+    /// public API in well-formed code; reaching it indicates a bug
+    /// inside `hyperdb-api`. Recovery is generally impossible beyond
+    /// logging and bailing.
     ///
-    /// Construction of this variant should be rare — every site is a
-    /// candidate for either a more specific variant or removal once
-    /// the assertion is proven unreachable.
+    /// For caller-API misuse (e.g. mixing two mutually exclusive
+    /// methods, using a finalized resource), prefer
+    /// [`Self::InvalidOperation`].
     ///
     /// Construct via [`Self::internal`].
     #[error("internal error: {message}")]
@@ -218,12 +258,14 @@ impl Error {
     }
 
     /// Constructs an [`Self::Connection`] error with no underlying I/O
-    /// source. Prefer this over struct-expression syntax to remain
-    /// source-compatible if new fields are added in a minor release.
+    /// source and no SQLSTATE. Prefer this over struct-expression
+    /// syntax to remain source-compatible if new fields are added in a
+    /// minor release.
     pub fn connection(message: impl Into<String>) -> Self {
         Error::Connection {
             message: message.into(),
             source: None,
+            sqlstate: None,
         }
     }
 
@@ -235,6 +277,20 @@ impl Error {
         Error::Connection {
             message: message.into(),
             source: Some(source),
+            sqlstate: None,
+        }
+    }
+
+    /// Constructs an [`Self::Connection`] error carrying a SQLSTATE
+    /// code (typically `08*` connection-class) and no I/O source.
+    pub fn connection_with_sqlstate(
+        message: impl Into<String>,
+        sqlstate: impl Into<String>,
+    ) -> Self {
+        Error::Connection {
+            message: message.into(),
+            source: None,
+            sqlstate: Some(sqlstate.into()),
         }
     }
 
@@ -293,9 +349,21 @@ impl Error {
         Error::Protocol(message.into())
     }
 
-    /// Constructs an [`Self::Closed`] error.
+    /// Constructs an [`Self::Closed`] error with no SQLSTATE.
     pub fn closed(message: impl Into<String>) -> Self {
-        Error::Closed(message.into())
+        Error::Closed {
+            message: message.into(),
+            sqlstate: None,
+        }
+    }
+
+    /// Constructs an [`Self::Closed`] error carrying a SQLSTATE code
+    /// (typically `57P01` admin shutdown or `57P02` crash shutdown).
+    pub fn closed_with_sqlstate(message: impl Into<String>, sqlstate: impl Into<String>) -> Self {
+        Error::Closed {
+            message: message.into(),
+            sqlstate: Some(sqlstate.into()),
+        }
     }
 
     /// Constructs an [`Self::Timeout`] error.
@@ -303,9 +371,24 @@ impl Error {
         Error::Timeout(message.into())
     }
 
-    /// Constructs an [`Self::Cancelled`] error.
+    /// Constructs an [`Self::Cancelled`] error with no SQLSTATE.
     pub fn cancelled(message: impl Into<String>) -> Self {
-        Error::Cancelled(message.into())
+        Error::Cancelled {
+            message: message.into(),
+            sqlstate: None,
+        }
+    }
+
+    /// Constructs an [`Self::Cancelled`] error carrying a SQLSTATE
+    /// code (typically `57014` `query_canceled`).
+    pub fn cancelled_with_sqlstate(
+        message: impl Into<String>,
+        sqlstate: impl Into<String>,
+    ) -> Self {
+        Error::Cancelled {
+            message: message.into(),
+            sqlstate: Some(sqlstate.into()),
+        }
     }
 
     /// Constructs an [`Self::Conversion`] error.
@@ -343,6 +426,11 @@ impl Error {
         Error::AlreadyExists(message.into())
     }
 
+    /// Constructs an [`Self::InvalidOperation`] error.
+    pub fn invalid_operation(message: impl Into<String>) -> Self {
+        Error::InvalidOperation(message.into())
+    }
+
     /// Returns the error message in human-readable form. Equivalent to
     /// `self.to_string()`.
     #[must_use]
@@ -350,8 +438,14 @@ impl Error {
         self.to_string()
     }
 
-    /// Returns the `PostgreSQL` SQLSTATE code if this is a
-    /// [`Self::Server`] error that carries one, otherwise `None`.
+    /// Returns the `PostgreSQL` SQLSTATE code if this error carries
+    /// one, otherwise `None`.
+    ///
+    /// Returns `Some(...)` for [`Self::Server`] (Query-class codes),
+    /// [`Self::Connection`] (typically `08*`), [`Self::Closed`]
+    /// (typically `57P0*` shutdown codes), and [`Self::Cancelled`]
+    /// (typically `57014` `query_canceled`) when the underlying server
+    /// provided a code.
     ///
     /// SQLSTATE codes are 5-character strings — see the [`PostgreSQL`
     /// errcodes appendix][1].
@@ -360,7 +454,10 @@ impl Error {
     #[must_use]
     pub fn sqlstate(&self) -> Option<&str> {
         match self {
-            Error::Server { sqlstate, .. } => sqlstate.as_deref(),
+            Error::Server { sqlstate, .. }
+            | Error::Connection { sqlstate, .. }
+            | Error::Closed { sqlstate, .. }
+            | Error::Cancelled { sqlstate, .. } => sqlstate.as_deref(),
             _ => None,
         }
     }
@@ -381,11 +478,12 @@ impl Error {
 // "DETAIL: ..." and "HINT: ..." lines from those fields, so using
 // `chain` would duplicate the detail text.
 //
-// SQLSTATE: `client::Error::sqlstate()` may return `Some` for non-Query
-// kinds (e.g. SQLSTATE 57014 query_canceled comes back as Cancelled).
-// The flat enum only carries `sqlstate` on `Server`, so SQLSTATE codes
-// from non-Query kinds are folded into the message via `chain` rather
-// than surfaced via `Error::sqlstate()`. Documented in MIGRATING-0.3.
+// SQLSTATE: `client::Error::sqlstate()` may return `Some` for any
+// kind. After Follow-up C, the flat enum carries `sqlstate` on
+// `Server`, `Connection`, `Closed`, and `Cancelled` so callers can
+// match on it programmatically (e.g. SQLSTATE 57014 `query_canceled`
+// arrives via Cancelled and is now exposed structurally). Other
+// variants still drop SQLSTATE — folded into the message via `chain`.
 impl From<hyperdb_api_core::client::Error> for Error {
     fn from(err: hyperdb_api_core::client::Error) -> Self {
         use hyperdb_api_core::client::ErrorKind as CoreKind;
@@ -401,6 +499,7 @@ impl From<hyperdb_api_core::client::Error> for Error {
             CoreKind::Connection => Error::Connection {
                 message: chain,
                 source: None,
+                sqlstate,
             },
             CoreKind::Authentication => Error::Authentication(chain),
             // Use unchained `message` here: detail/hint are passed as
@@ -419,11 +518,18 @@ impl From<hyperdb_api_core::client::Error> for Error {
             CoreKind::Io => Error::Connection {
                 message: chain,
                 source: None,
+                sqlstate,
             },
             CoreKind::Config => Error::Config(chain),
             CoreKind::Timeout => Error::Timeout(chain),
-            CoreKind::Cancelled => Error::Cancelled(chain),
-            CoreKind::Closed => Error::Closed(chain),
+            CoreKind::Cancelled => Error::Cancelled {
+                message: chain,
+                sqlstate,
+            },
+            CoreKind::Closed => Error::Closed {
+                message: chain,
+                sqlstate,
+            },
             CoreKind::Conversion => Error::Conversion(chain),
             CoreKind::FeatureNotSupported => Error::FeatureNotSupported(chain),
             CoreKind::Other => Error::Internal { message: chain },
@@ -533,14 +639,23 @@ mod tests {
     }
 
     #[test]
-    fn sqlstate_returns_some_only_for_server() {
+    fn sqlstate_returns_some_for_server_connection_closed_cancelled() {
+        // Server still surfaces SQLSTATE.
         let server = Error::server(Some("42P04".to_string()), "db exists", None, None);
         assert_eq!(server.sqlstate(), Some("42P04"));
 
-        // Non-Server variants must return None even if the SQLSTATE
-        // would have been present in the underlying client::Error.
-        // Documented behavior: only Server-variant SQLSTATEs surface
-        // through Error::sqlstate() in the flat enum.
+        // Connection / Closed / Cancelled now surface SQLSTATE
+        // structurally (Follow-up C).
+        let conn = Error::connection_with_sqlstate("connect failed", "08006");
+        assert_eq!(conn.sqlstate(), Some("08006"));
+
+        let closed = Error::closed_with_sqlstate("admin shutdown", "57P01");
+        assert_eq!(closed.sqlstate(), Some("57P01"));
+
+        let cancelled = Error::cancelled_with_sqlstate("user cancel", "57014");
+        assert_eq!(cancelled.sqlstate(), Some("57014"));
+
+        // Variants without sqlstate field return None.
         assert_eq!(Error::Conversion("...".into()).sqlstate(), None);
         assert_eq!(
             Error::Internal {
@@ -549,7 +664,9 @@ mod tests {
             .sqlstate(),
             None
         );
-        assert_eq!(Error::Cancelled("...".into()).sqlstate(), None);
+
+        // Cancelled with no SQLSTATE returns None too.
+        assert_eq!(Error::cancelled("user cancel").sqlstate(), None);
     }
 
     #[test]
@@ -605,5 +722,15 @@ mod tests {
     fn internal_constructor_round_trip() {
         let err = Error::internal("invariant violated");
         assert_eq!(err.to_string(), "internal error: invariant violated");
+    }
+
+    #[test]
+    fn invalid_operation_constructor_round_trip() {
+        let err = Error::invalid_operation("cannot mix insert_data with insert_batch");
+        assert_eq!(
+            err.to_string(),
+            "invalid operation: cannot mix insert_data with insert_batch"
+        );
+        assert!(matches!(err, Error::InvalidOperation(_)));
     }
 }
