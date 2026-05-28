@@ -66,7 +66,8 @@ struct Aggregate {
 
 The derive emits a straightforward mapping. If you need transformation
 in the mapping — parsing a string column into a Rust enum, splitting a
-single column into multiple fields, etc. — write the impl directly:
+single column into multiple fields, defaulting NULLs to a non-`Option`
+value, etc. — write the impl directly:
 
 ```rust
 impl FromRow for User {
@@ -85,6 +86,44 @@ In a hand-written impl, the string passed to `row.get(...)` /
 needed, since you're spelling the column out yourself. Your `SELECT`
 just needs to actually return that column (use `AS full_name` if the
 underlying table column has a different name).
+
+### `RowAccessor` accessor cheat sheet
+
+`RowAccessor` exposes four accessors. Pick by access mode (name vs.
+index) and required vs. optional. Indices are **zero-based**.
+
+| | Required (`T`) | Optional (`Option<T>`) |
+|---|---|---|
+| **By name** | `row.get(name)?` | `row.get_opt(name)?` |
+| **By index** | `row.position(idx)?` | `row.position_opt(idx)?` |
+
+NULL handling differs between the two columns of the table:
+
+- **`get` / `position`** — NULL errors with `Error::Column { kind: Null, .. }`.
+  Use these for required fields where NULL is a problem.
+- **`get_opt` / `position_opt`** — NULL becomes `Ok(None)`. Use these for
+  fields whose Rust type is `Option<T>`.
+
+The Rust field type and the accessor must agree: `position` returns
+`Result<T>`, `position_opt` returns `Result<Option<T>>`. Mixing them
+across types is a compile error, not a runtime mismatch:
+
+```rust
+// ✅ field type matches accessor return
+let email: Option<String> = row.position_opt(2)?;
+let id:    i32            = row.position(0)?;
+
+// ❌ compile errors
+let email: Option<String> = row.position(2)?;     // returns T, not Option<T>
+let id:    i32            = row.position_opt(0)?; // returns Option<T>
+```
+
+If you want to silently default a NULL on a non-`Option` field, opt in
+explicitly:
+
+```rust
+name: row.position_opt(1)?.unwrap_or_default(),   // NULL → ""
+```
 
 See the [`hyperdb-api` docs](https://docs.rs/hyperdb-api) for full usage.
 
