@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.0.0](https://github.com/tableau/hyper-api-rust/compare/v0.2.3...v1.0.0) (2026-05-28)
+
+
+### ⚠ BREAKING CHANGES
+
+* v0.3.0 reshapes the public hyperdb_api::Error enum into a flat canonical structure (no Box<dyn StdError> cause channel, no kind() method, no Other catch-all variant), and its constructor surface (Error::new and Error::with_cause are deleted in favor of domain-specific snake_case constructors). It also changes the FromRow trait signature from fn from_row(row: &Row) to fn from_row(row: RowAccessor<'_>), deletes the blanket 1/2/3/4-tuple FromRow impls, deprecates Connection::begin_transaction/commit/rollback (use the RAII guard at Connection::transaction() instead), introduces a new Error::InvalidOperation variant, and changes Error::Cancelled and Error::Closed from tuple to struct variants carrying structured sqlstate. Every variant has a snake_case constructor; the FromRow derive lives in a re-exported hyperdb-api-derive crate. See MIGRATING-0.3.md for migration recipes.
+
+### Features
+
+* stabilize v0.3.0 public API bundle ([#77](https://github.com/tableau/hyper-api-rust/issues/77)) ([ac39b2c](https://github.com/tableau/hyper-api-rust/commit/ac39b2cc0ef77ecfbe3abcff965c985635e10fdf))
+
 ## [0.2.3](https://github.com/tableau/hyper-api-rust/compare/v0.2.2...v0.2.3) (2026-05-27)
 
 
