@@ -234,7 +234,7 @@ impl ConnectionBuilder {
         let mut config: Config = self
             .endpoint
             .parse()
-            .map_err(|e| Error::new(format!("invalid endpoint: {e}")))?;
+            .map_err(|e| Error::config(format!("invalid endpoint: {e}")))?;
 
         if let Some(user) = &self.user {
             config = config.with_user(user);
@@ -279,11 +279,11 @@ impl ConnectionBuilder {
         let socket_path = if self.endpoint.starts_with("tab.domain://") {
             // Format: tab.domain://<dir>/domain/<name>
             let endpoint = ConnectionEndpoint::parse(&self.endpoint)
-                .map_err(|e| Error::new(format!("invalid Unix socket endpoint: {e}")))?;
+                .map_err(|e| Error::config(format!("invalid Unix socket endpoint: {e}")))?;
             match endpoint {
                 ConnectionEndpoint::DomainSocket { directory, name } => directory.join(&name),
                 ConnectionEndpoint::Tcp { .. } => {
-                    return Err(Error::new("expected Unix domain socket endpoint"))
+                    return Err(Error::config("expected Unix domain socket endpoint"))
                 }
             }
         } else {
@@ -329,12 +329,12 @@ impl ConnectionBuilder {
         let pipe_path = if self.endpoint.starts_with("tab.pipe://") {
             // Format: tab.pipe://<host>/pipe/<name>
             let endpoint = ConnectionEndpoint::parse(&self.endpoint)
-                .map_err(|e| Error::new(format!("invalid named pipe endpoint: {e}")))?;
+                .map_err(|e| Error::config(format!("invalid named pipe endpoint: {e}")))?;
             match endpoint {
                 ConnectionEndpoint::NamedPipe { host, name } => {
                     format!(r"\\{host}\pipe\{name}")
                 }
-                _ => return Err(Error::new("expected named pipe endpoint")),
+                _ => return Err(Error::config("expected named pipe endpoint")),
             }
         } else {
             // Treat as direct pipe path (e.g., \\.\pipe\hyper-12345)
@@ -374,7 +374,7 @@ impl ConnectionBuilder {
     fn build_grpc(self) -> Result<Connection> {
         // Validate create_mode - gRPC is read-only
         if self.create_mode != CreateMode::DoNotCreate {
-            return Err(Error::new(
+            return Err(Error::feature_not_supported(
                 "gRPC transport is read-only. Use CreateMode::DoNotCreate for gRPC connections.",
             ));
         }

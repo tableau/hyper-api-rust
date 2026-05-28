@@ -90,7 +90,7 @@ impl AuthMode {
         private_key_pem: &str,
     ) -> SalesforceAuthResult<Self> {
         let private_key = RsaPrivateKey::from_pkcs8_pem(private_key_pem).map_err(|e| {
-            SalesforceAuthError::PrivateKey(format!(
+            SalesforceAuthError::private_key(format!(
                 "failed to parse private key (expected PKCS#8 PEM format): {e}"
             ))
         })?;
@@ -216,15 +216,13 @@ impl SalesforceAuthConfig {
 
         // Validate the URL has a scheme and host
         if login_url.scheme() != "https" && login_url.scheme() != "http" {
-            return Err(SalesforceAuthError::Config(
-                "login_url must use http or https scheme".to_string(),
+            return Err(SalesforceAuthError::config(
+                "login_url must use http or https scheme",
             ));
         }
 
         if login_url.host().is_none() {
-            return Err(SalesforceAuthError::Config(
-                "login_url must have a host".to_string(),
-            ));
+            return Err(SalesforceAuthError::config("login_url must have a host"));
         }
 
         Ok(SalesforceAuthConfig {
@@ -298,14 +296,13 @@ impl SalesforceAuthConfig {
         let auth_mode = self
             .auth_mode
             .as_ref()
-            .ok_or_else(|| SalesforceAuthError::Config("auth_mode is required".to_string()))?;
+            .ok_or_else(|| SalesforceAuthError::config("auth_mode is required"))?;
 
         match auth_mode {
             AuthMode::Password { .. } | AuthMode::RefreshToken { .. } => {
                 if self.client_secret.is_none() {
-                    return Err(SalesforceAuthError::Config(
-                        "client_secret is required for Password and RefreshToken auth modes"
-                            .to_string(),
+                    return Err(SalesforceAuthError::config(
+                        "client_secret is required for Password and RefreshToken auth modes",
                     ));
                 }
             }

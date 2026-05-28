@@ -322,7 +322,7 @@ fn worker_thread(
         // Send chunk when it reaches the target size
         if chunk.row_count() >= rows_per_chunk || chunk.should_flush() {
             tx.send(chunk)
-                .map_err(|e| hyperdb_api::Error::new(format!("Channel send failed: {e}")))?;
+                .map_err(|e| hyperdb_api::Error::internal(format!("Channel send failed: {e}")))?;
             chunks_created += 1;
             chunk = InsertChunk::from_table_definition(table_def);
         }
@@ -331,7 +331,7 @@ fn worker_thread(
     // Send any remaining rows
     if !chunk.is_empty() {
         tx.send(chunk)
-            .map_err(|e| hyperdb_api::Error::new(format!("Channel send failed: {e}")))?;
+            .map_err(|e| hyperdb_api::Error::internal(format!("Channel send failed: {e}")))?;
         chunks_created += 1;
     }
 

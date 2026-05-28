@@ -53,26 +53,17 @@ pub fn download_and_verify(
         .arg(dest)
         .arg(url)
         .status()
-        .map_err(|source| Error::Io {
-            context: "spawning curl".to_string(),
-            source,
-        })?;
+        .map_err(|source| Error::io("spawning curl", source))?;
 
     if !status.success() {
-        return Err(Error::CurlFailed {
-            url: url.to_string(),
-            code: status.code().unwrap_or(-1),
-        });
+        return Err(Error::curl_failed(url, status.code().unwrap_or(-1)));
     }
 
     let actual = hash_file(dest)?;
     match expected_sha256 {
         Some(expected) => {
             if !actual.eq_ignore_ascii_case(expected) {
-                return Err(Error::ChecksumMismatch {
-                    expected: expected.to_string(),
-                    actual,
-                });
+                return Err(Error::checksum_mismatch(expected, actual));
             }
             tracing::info!(sha256 = %actual, "sha256 verified");
         }
@@ -91,17 +82,14 @@ pub fn download_and_verify(
     reason = "readable hex/string formatting loop; refactoring to fold! obscures intent"
 )]
 fn hash_file(path: &Path) -> Result<String, Error> {
-    let mut file = File::open(path).map_err(|source| Error::Io {
-        context: format!("opening {} for hashing", path.display()),
-        source,
-    })?;
+    let mut file = File::open(path)
+        .map_err(|source| Error::io(format!("opening {} for hashing", path.display()), source))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; HASH_CHUNK];
     loop {
-        let n = file.read(&mut buf).map_err(|source| Error::Io {
-            context: format!("reading {}", path.display()),
-            source,
-        })?;
+        let n = file
+            .read(&mut buf)
+            .map_err(|source| Error::io(format!("reading {}", path.display()), source))?;
         if n == 0 {
             break;
         }

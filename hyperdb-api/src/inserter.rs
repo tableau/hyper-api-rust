@@ -121,18 +121,18 @@ impl<'conn> Inserter<'conn> {
     ///
     /// - Returns [`Error::InvalidTableDefinition`] if `table_def` has zero
     ///   columns.
-    /// - Returns [`Error::Other`] if `connection` is using gRPC transport
+    /// - Returns [`Error::FeatureNotSupported`] if `connection` is using gRPC transport
     ///   (COPY is TCP-only).
     pub fn new(connection: &'conn Connection, table_def: &TableDefinition) -> Result<Self> {
         if table_def.column_count() == 0 {
-            return Err(Error::InvalidTableDefinition(
-                "Table definition must have at least one column".into(),
+            return Err(Error::invalid_table_definition(
+                "Table definition must have at least one column",
             ));
         }
 
         // Fail fast: verify the connection supports COPY (TCP only)
         if connection.tcp_client().is_none() {
-            return Err(Error::new(
+            return Err(Error::feature_not_supported(
                 "Inserter requires a TCP connection. \
                  gRPC connections do not support COPY operations.",
             ));
@@ -264,7 +264,7 @@ impl<'conn> Inserter<'conn> {
     ///
     /// - Returns an error if `target_table` fails to convert into a
     ///   [`TableName`](crate::TableName).
-    /// - Returns [`Error::Client`] if creating the temporary staging table
+    /// - Returns [`Error::Server`] if creating the temporary staging table
     ///   fails on the server.
     /// - Returns the errors from [`Inserter::new`] for the staging table
     ///   (zero-column table definition, gRPC transport).
@@ -302,7 +302,7 @@ impl<'conn> Inserter<'conn> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Other`] if the current row already has all columns
+    /// Returns [`Error::InvalidTableDefinition`] if the current row already has all columns
     /// supplied, or if the current column is marked `NOT NULL` in the table
     /// definition.
     #[inline]
@@ -314,7 +314,7 @@ impl<'conn> Inserter<'conn> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Other`] with message `"Too many columns in row"` if
+    /// Returns [`Error::InvalidTableDefinition`] with message `"Too many columns in row"` if
     /// the current row already has all columns supplied.
     #[inline]
     pub fn add_bool(&mut self, value: bool) -> Result<()> {
@@ -424,7 +424,7 @@ impl<'conn> Inserter<'conn> {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] if fewer (or more) columns were supplied
+    /// - Returns [`Error::InvalidTableDefinition`] if fewer (or more) columns were supplied
     ///   than the table definition requires.
     /// - Returns any error from [`flush`](Self::flush) when an automatic
     ///   flush is triggered by reaching the chunk byte/row limit.
@@ -447,9 +447,9 @@ impl<'conn> Inserter<'conn> {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] if the connection is using gRPC transport
+    /// - Returns [`Error::FeatureNotSupported`] if the connection is using gRPC transport
     ///   (COPY is TCP-only) and no COPY session exists yet.
-    /// - Returns [`Error::Client`] if the server rejects the `COPY IN` start
+    /// - Returns [`Error::Server`] if the server rejects the `COPY IN` start
     ///   or the subsequent data send.
     /// - Returns [`Error::Io`] on transport-level I/O failures while writing
     ///   the chunk.
@@ -466,7 +466,9 @@ impl<'conn> Inserter<'conn> {
         // Ensure the COPY connection is started
         if self.writer.is_none() {
             let client = self.connection.tcp_client().ok_or_else(|| {
-                crate::Error::new("Inserter requires a TCP connection. gRPC connections do not support COPY operations.")
+                crate::Error::feature_not_supported(
+                    "Inserter requires a TCP connection. gRPC connections do not support COPY operations.",
+                )
             })?;
             let columns: Vec<&str> = self
                 .table_def
@@ -542,7 +544,7 @@ impl<'conn> Inserter<'conn> {
     pub fn add_row(&mut self, values: &[&dyn IntoValue]) -> Result<()> {
         let column_count = self.table_def.column_count();
         if values.len() != column_count {
-            return Err(Error::new(format!(
+            return Err(Error::invalid_table_definition(format!(
                 "Column count mismatch: expected {} columns but got {}",
                 column_count,
                 values.len()
@@ -633,7 +635,7 @@ impl<'conn> Inserter<'conn> {
                     .columns
                     .get(column_index)
                     .map_or("<unknown>", |c| c.name.as_str());
-                Error::new(format!(
+                Error::conversion(format!(
                     "Cannot determine numeric precision for column '{col_name}' at index {column_index}. \
                      Ensure the column is defined with explicit SqlType including precision.\n\n\
                      Example fix:\n  \
@@ -645,7 +647,7 @@ impl<'conn> Inserter<'conn> {
             // Small numeric: stored as i64
             let unscaled = value.unscaled_value();
             let narrowed = i64::try_from(unscaled).map_err(|_| {
-                Error::new(format!(
+                Error::conversion(format!(
                     "Numeric value {unscaled} is out of range for i64 storage (precision {precision})"
                 ))
             })?;
@@ -674,7 +676,9 @@ impl<'conn> Inserter<'conn> {
     /// - Sending data fails
     pub fn execute(&mut self) -> Result<u64> {
         if self.chunk.column_index() != 0 {
-            return Err(Error::new("Incomplete row at execute time"));
+            return Err(Error::invalid_table_definition(
+                "Incomplete row at execute time",
+            ));
         }
 
         if self.row_count == 0 {
@@ -684,7 +688,9 @@ impl<'conn> Inserter<'conn> {
         // Ensure COPY connection exists before proceeding when we have rows
         if self.writer.is_none() {
             let client = self.connection.tcp_client().ok_or_else(|| {
-                Error::new("Inserter requires a TCP connection. gRPC connections do not support COPY operations.")
+                Error::feature_not_supported(
+                    "Inserter requires a TCP connection. gRPC connections do not support COPY operations.",
+                )
             })?;
             let columns: Vec<&str> = self
                 .table_def
@@ -700,7 +706,7 @@ impl<'conn> Inserter<'conn> {
         let writer = self
             .writer
             .as_mut()
-            .ok_or_else(|| Error::new("Failed to initialize COPY connection for inserter"))?;
+            .ok_or_else(|| Error::internal("Failed to initialize COPY connection for inserter"))?;
 
         // If we have buffered data that hasn't been sent yet
         if !self.chunk.is_empty() {
@@ -1279,10 +1285,10 @@ impl<'conn> MappedInserter<'conn> {
     ///
     /// - Returns the error from the inner [`Inserter::execute`] if writing
     ///   the staging rows fails.
-    /// - Returns [`Error::Client`] if the `INSERT ... SELECT` from staging
+    /// - Returns [`Error::Server`] if the `INSERT ... SELECT` from staging
     ///   to the target table is rejected (e.g. a mapping expression fails
     ///   to evaluate).
-    /// - Returns [`Error::Client`] if dropping the staging table fails.
+    /// - Returns [`Error::Server`] if dropping the staging table fails.
     pub fn execute(&mut self) -> Result<u64> {
         let connection = self.inner.connection;
         let staging_table = self.staging_table.clone();
@@ -1501,17 +1507,19 @@ impl InsertChunk {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] with message `"Too many columns in row"`
+    /// - Returns [`Error::InvalidTableDefinition`] with message `"Too many columns in row"`
     ///   if the current row already has all columns supplied.
-    /// - Returns [`Error::Other`] with message
+    /// - Returns [`Error::InvalidTableDefinition`] with message
     ///   `"Cannot add NULL to non-nullable column"` if the current column
     ///   is `NOT NULL` in the schema.
     pub fn add_null(&mut self) -> Result<()> {
         if self.column_index >= self.column_count {
-            return Err(Error::new("Too many columns in row"));
+            return Err(Error::invalid_table_definition("Too many columns in row"));
         }
         if !self.current_column_nullable() {
-            return Err(Error::new("Cannot add NULL to non-nullable column"));
+            return Err(Error::invalid_table_definition(
+                "Cannot add NULL to non-nullable column",
+            ));
         }
         self.ensure_header();
         copy::write_null(&mut self.buffer);
@@ -1523,11 +1531,11 @@ impl InsertChunk {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Other`] with message `"Too many columns in row"` if
+    /// Returns [`Error::InvalidTableDefinition`] with message `"Too many columns in row"` if
     /// the current row already has all columns supplied.
     pub fn add_bool(&mut self, value: bool) -> Result<()> {
         if self.column_index >= self.column_count {
-            return Err(Error::new("Too many columns in row"));
+            return Err(Error::invalid_table_definition("Too many columns in row"));
         }
         self.ensure_header();
         let int_value = i8::from(value);
@@ -1547,7 +1555,7 @@ impl InsertChunk {
     /// See [`add_bool`](Self::add_bool).
     pub fn add_i16(&mut self, value: i16) -> Result<()> {
         if self.column_index >= self.column_count {
-            return Err(Error::new("Too many columns in row"));
+            return Err(Error::invalid_table_definition("Too many columns in row"));
         }
         self.ensure_header();
         if self.current_column_nullable() {
@@ -1566,7 +1574,7 @@ impl InsertChunk {
     /// See [`add_bool`](Self::add_bool).
     pub fn add_i32(&mut self, value: i32) -> Result<()> {
         if self.column_index >= self.column_count {
-            return Err(Error::new("Too many columns in row"));
+            return Err(Error::invalid_table_definition("Too many columns in row"));
         }
         self.ensure_header();
         if self.current_column_nullable() {
@@ -1585,7 +1593,7 @@ impl InsertChunk {
     /// See [`add_bool`](Self::add_bool).
     pub fn add_i64(&mut self, value: i64) -> Result<()> {
         if self.column_index >= self.column_count {
-            return Err(Error::new("Too many columns in row"));
+            return Err(Error::invalid_table_definition("Too many columns in row"));
         }
         self.ensure_header();
         if self.current_column_nullable() {
@@ -1604,7 +1612,7 @@ impl InsertChunk {
     /// See [`add_bool`](Self::add_bool).
     pub fn add_f32(&mut self, value: f32) -> Result<()> {
         if self.column_index >= self.column_count {
-            return Err(Error::new("Too many columns in row"));
+            return Err(Error::invalid_table_definition("Too many columns in row"));
         }
         self.ensure_header();
         if self.current_column_nullable() {
@@ -1623,7 +1631,7 @@ impl InsertChunk {
     /// See [`add_bool`](Self::add_bool).
     pub fn add_f64(&mut self, value: f64) -> Result<()> {
         if self.column_index >= self.column_count {
-            return Err(Error::new("Too many columns in row"));
+            return Err(Error::invalid_table_definition("Too many columns in row"));
         }
         self.ensure_header();
         if self.current_column_nullable() {
@@ -1651,10 +1659,10 @@ impl InsertChunk {
     /// See [`add_bool`](Self::add_bool).
     pub fn add_bytes(&mut self, value: &[u8]) -> Result<()> {
         if self.column_index >= self.column_count {
-            return Err(Error::new("Too many columns in row"));
+            return Err(Error::invalid_table_definition("Too many columns in row"));
         }
         if value.len() > u32::MAX as usize {
-            return Err(Error::new(format!(
+            return Err(Error::conversion(format!(
                 "Value length {} exceeds HyperBinary 4-byte length limit ({})",
                 value.len(),
                 u32::MAX
@@ -1677,7 +1685,7 @@ impl InsertChunk {
     /// See [`add_bool`](Self::add_bool).
     pub fn add_data128(&mut self, value: &[u8; 16]) -> Result<()> {
         if self.column_index >= self.column_count {
-            return Err(Error::new("Too many columns in row"));
+            return Err(Error::invalid_table_definition("Too many columns in row"));
         }
         self.ensure_header();
         if self.current_column_nullable() {
@@ -1696,7 +1704,7 @@ impl InsertChunk {
     /// See [`add_bool`](Self::add_bool).
     pub fn add_date(&mut self, value: Date) -> Result<()> {
         if self.column_index >= self.column_count {
-            return Err(Error::new("Too many columns in row"));
+            return Err(Error::invalid_table_definition("Too many columns in row"));
         }
         self.ensure_header();
         let julian_day = value.to_julian_day();
@@ -1716,7 +1724,7 @@ impl InsertChunk {
     /// See [`add_bool`](Self::add_bool).
     pub fn add_time(&mut self, value: Time) -> Result<()> {
         if self.column_index >= self.column_count {
-            return Err(Error::new("Too many columns in row"));
+            return Err(Error::invalid_table_definition("Too many columns in row"));
         }
         self.ensure_header();
         let micros = value.to_microseconds();
@@ -1736,7 +1744,7 @@ impl InsertChunk {
     /// See [`add_bool`](Self::add_bool).
     pub fn add_timestamp(&mut self, value: Timestamp) -> Result<()> {
         if self.column_index >= self.column_count {
-            return Err(Error::new("Too many columns in row"));
+            return Err(Error::invalid_table_definition("Too many columns in row"));
         }
         self.ensure_header();
         let micros = value.to_microseconds();
@@ -1756,7 +1764,7 @@ impl InsertChunk {
     /// See [`add_bool`](Self::add_bool).
     pub fn add_offset_timestamp(&mut self, value: OffsetTimestamp) -> Result<()> {
         if self.column_index >= self.column_count {
-            return Err(Error::new("Too many columns in row"));
+            return Err(Error::invalid_table_definition("Too many columns in row"));
         }
         self.ensure_header();
         let micros = value.to_microseconds_utc();
@@ -1776,7 +1784,7 @@ impl InsertChunk {
     /// See [`add_bool`](Self::add_bool).
     pub fn add_interval(&mut self, value: Interval) -> Result<()> {
         if self.column_index >= self.column_count {
-            return Err(Error::new("Too many columns in row"));
+            return Err(Error::invalid_table_definition("Too many columns in row"));
         }
         self.ensure_header();
         let packed = value.to_packed();
@@ -1795,11 +1803,11 @@ impl InsertChunk {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Other`] if fewer (or more) columns were supplied
+    /// Returns [`Error::InvalidTableDefinition`] if fewer (or more) columns were supplied
     /// for this row than the chunk's column count.
     pub fn end_row(&mut self) -> Result<()> {
         if self.column_index != self.column_count {
-            return Err(Error::new(format!(
+            return Err(Error::invalid_table_definition(format!(
                 "Expected {} columns, got {}",
                 self.column_count, self.column_index
             )));
@@ -1897,8 +1905,8 @@ impl<'conn> ChunkSender<'conn> {
     /// [`send_chunk`](Self::send_chunk), so transport errors surface there.
     pub fn new(connection: &'conn Connection, table_def: &TableDefinition) -> Result<Self> {
         if table_def.column_count() == 0 {
-            return Err(Error::InvalidTableDefinition(
-                "Table definition must have at least one column".into(),
+            return Err(Error::invalid_table_definition(
+                "Table definition must have at least one column",
             ));
         }
 
@@ -1941,12 +1949,14 @@ impl<'conn> ChunkSender<'conn> {
         let mut writer_guard = self
             .writer
             .lock()
-            .map_err(|_| Error::new("ChunkSender mutex poisoned"))?;
+            .map_err(|_| Error::internal("ChunkSender mutex poisoned"))?;
 
         // Lazily initialize the COPY connection
         if writer_guard.is_none() {
             let client = self.connection.tcp_client().ok_or_else(|| {
-                Error::new("ChunkSender requires a TCP connection. gRPC connections do not support COPY operations.")
+                Error::feature_not_supported(
+                    "ChunkSender requires a TCP connection. gRPC connections do not support COPY operations."
+                )
             })?;
             let columns: Vec<&str> = self
                 .columns
@@ -2017,15 +2027,15 @@ impl<'conn> ChunkSender<'conn> {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] with message `"ChunkSender mutex poisoned"`
+    /// - Returns [`Error::Internal`] with message `"ChunkSender mutex poisoned"`
     ///   if a sender thread panicked while holding the writer lock.
-    /// - Returns [`Error::Client`] or [`Error::Io`] if sending the COPY
+    /// - Returns [`Error::Server`] or [`Error::Io`] if sending the COPY
     ///   trailer or finishing the COPY operation fails.
     pub fn finish(self) -> Result<u64> {
         let mut writer_guard = self
             .writer
             .lock()
-            .map_err(|_| Error::new("ChunkSender mutex poisoned"))?;
+            .map_err(|_| Error::internal("ChunkSender mutex poisoned"))?;
 
         // If no chunks were sent, return 0
         let Some(writer) = writer_guard.take() else {

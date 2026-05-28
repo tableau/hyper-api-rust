@@ -110,7 +110,8 @@ fn does_not_classify_unrelated_errors_as_connection_lost() {
 /// to read wire-level messages and was the reason we built `inspect_file`.
 #[test]
 fn maps_22003_to_schema_mismatch_with_override_suggestion() {
-    let upstream = hyperdb_api::Error::new("ERROR: numeric overflow (SQLSTATE 22003)");
+    let upstream =
+        hyperdb_api::Error::server(Some("22003".to_string()), "numeric overflow", None, None);
     let mcp: McpError = upstream.into();
     assert_eq!(mcp.code, ErrorCode::SchemaMismatch);
     let suggestion = mcp.suggestion.expect("22003 must have a suggestion");
@@ -130,7 +131,8 @@ fn maps_22003_to_schema_mismatch_with_override_suggestion() {
 /// differently.
 #[test]
 fn maps_out_of_range_phrase_to_schema_mismatch() {
-    let upstream = hyperdb_api::Error::new("value out of range for type integer");
+    let upstream =
+        hyperdb_api::Error::server(None, "value out of range for type integer", None, None);
     let mcp: McpError = upstream.into();
     assert_eq!(mcp.code, ErrorCode::SchemaMismatch);
     assert!(mcp.suggestion.is_some());
@@ -142,8 +144,12 @@ fn maps_out_of_range_phrase_to_schema_mismatch() {
 /// and casting in SQL rather than guessing a new type.
 #[test]
 fn maps_22p02_to_schema_mismatch_with_text_suggestion() {
-    let upstream =
-        hyperdb_api::Error::new("ERROR: invalid input syntax for type date (SQLSTATE 22P02)");
+    let upstream = hyperdb_api::Error::server(
+        Some("22P02".to_string()),
+        "invalid input syntax for type date",
+        None,
+        None,
+    );
     let mcp: McpError = upstream.into();
     assert_eq!(mcp.code, ErrorCode::SchemaMismatch);
     let suggestion = mcp.suggestion.expect("22P02 must have a suggestion");

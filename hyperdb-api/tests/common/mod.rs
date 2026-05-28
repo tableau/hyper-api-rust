@@ -113,7 +113,7 @@ impl TestConnection {
     pub(crate) fn execute_scalar_i32(&self, sql: &str) -> Result<i32> {
         self.connection
             .execute_scalar_query::<i32>(sql)?
-            .ok_or_else(|| hyperdb_api::Error::new(format!("NULL value for query: {sql}")))
+            .ok_or_else(|| hyperdb_api::Error::conversion(format!("NULL value for query: {sql}")))
     }
 
     /// Executes a scalar query and returns a single i64 value.
@@ -124,7 +124,7 @@ impl TestConnection {
     pub(crate) fn execute_scalar_i64(&self, sql: &str) -> Result<i64> {
         self.connection
             .execute_scalar_query::<i64>(sql)?
-            .ok_or_else(|| hyperdb_api::Error::new(format!("NULL value for query: {sql}")))
+            .ok_or_else(|| hyperdb_api::Error::conversion(format!("NULL value for query: {sql}")))
     }
 
     /// Executes a scalar query and returns a single String value.
@@ -135,7 +135,7 @@ impl TestConnection {
     pub(crate) fn execute_scalar_string(&self, sql: &str) -> Result<String> {
         self.connection
             .execute_scalar_query::<String>(sql)?
-            .ok_or_else(|| hyperdb_api::Error::new(format!("NULL value for query: {sql}")))
+            .ok_or_else(|| hyperdb_api::Error::conversion(format!("NULL value for query: {sql}")))
     }
 
     /// Executes a scalar query and returns a single bool value.
@@ -146,7 +146,7 @@ impl TestConnection {
     pub(crate) fn execute_scalar_bool(&self, sql: &str) -> Result<bool> {
         self.connection
             .execute_scalar_query::<bool>(sql)?
-            .ok_or_else(|| hyperdb_api::Error::new(format!("NULL value for query: {sql}")))
+            .ok_or_else(|| hyperdb_api::Error::conversion(format!("NULL value for query: {sql}")))
     }
 
     /// Counts the number of tuples in a table.

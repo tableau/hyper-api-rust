@@ -45,6 +45,54 @@ pub enum SalesforceAuthError {
     Io(String),
 }
 
+impl SalesforceAuthError {
+    /// Constructs a [`Self::Config`] error.
+    pub fn config(message: impl Into<String>) -> Self {
+        SalesforceAuthError::Config(message.into())
+    }
+
+    /// Constructs a [`Self::PrivateKey`] error.
+    pub fn private_key(message: impl Into<String>) -> Self {
+        SalesforceAuthError::PrivateKey(message.into())
+    }
+
+    /// Constructs a [`Self::Jwt`] error.
+    pub fn jwt(message: impl Into<String>) -> Self {
+        SalesforceAuthError::Jwt(message.into())
+    }
+
+    /// Constructs a [`Self::Http`] error.
+    pub fn http(message: impl Into<String>) -> Self {
+        SalesforceAuthError::Http(message.into())
+    }
+
+    /// Constructs a [`Self::Authorization`] error.
+    pub fn authorization(
+        error_code: impl Into<String>,
+        error_description: impl Into<String>,
+    ) -> Self {
+        SalesforceAuthError::Authorization {
+            error_code: error_code.into(),
+            error_description: error_description.into(),
+        }
+    }
+
+    /// Constructs a [`Self::TokenExchange`] error.
+    pub fn token_exchange(message: impl Into<String>) -> Self {
+        SalesforceAuthError::TokenExchange(message.into())
+    }
+
+    /// Constructs a [`Self::TokenParse`] error.
+    pub fn token_parse(message: impl Into<String>) -> Self {
+        SalesforceAuthError::TokenParse(message.into())
+    }
+
+    /// Constructs a [`Self::Io`] error.
+    pub fn io(message: impl Into<String>) -> Self {
+        SalesforceAuthError::Io(message.into())
+    }
+}
+
 impl fmt::Display for SalesforceAuthError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

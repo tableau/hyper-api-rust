@@ -189,13 +189,13 @@ impl CopyOptions {
     fn validate(&self) -> Result<()> {
         if self.format == CopyFormat::Text {
             if self.quote.is_some() {
-                return Err(Error::new(
+                return Err(Error::config(
                     "QUOTE option is only supported with CSV format. \
                      Use CopyOptions::csv() instead of CopyOptions::text().",
                 ));
             }
             if self.escape.is_some() {
-                return Err(Error::new(
+                return Err(Error::config(
                     "ESCAPE option is only supported with CSV format. \
                      Use CopyOptions::csv() instead of CopyOptions::text().",
                 ));
@@ -268,9 +268,9 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] if the connection is using gRPC transport
+    /// - Returns [`Error::FeatureNotSupported`] if the connection is using gRPC transport
     ///   (COPY is TCP-only).
-    /// - Returns [`Error::Client`] if the server rejects the
+    /// - Returns [`Error::Server`] if the server rejects the
     ///   `COPY (<select_query>) TO STDOUT` statement.
     /// - Returns [`Error::Io`] if writing to `writer` fails.
     pub fn export_csv(&self, select_query: &str, writer: &mut dyn std::io::Write) -> Result<u64> {
@@ -311,10 +311,10 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] if `options` fail validation (e.g. an
-    ///   illegal delimiter/quote combination) or the connection is on
-    ///   gRPC.
-    /// - Returns [`Error::Client`] if the server rejects the
+    /// - Returns [`Error::Config`] if `options` fail validation (e.g. an
+    ///   illegal delimiter/quote combination), or
+    ///   [`Error::FeatureNotSupported`] if the connection is on gRPC.
+    /// - Returns [`Error::Server`] if the server rejects the
     ///   `COPY TO STDOUT` statement.
     /// - Returns [`Error::Io`] if writing to `writer` fails.
     pub fn export_text(
@@ -330,7 +330,7 @@ impl Connection {
             options.to_copy_out_options()
         );
         let client = self.tcp_client().ok_or_else(|| {
-            Error::new(
+            Error::feature_not_supported(
                 "CSV export requires a TCP connection. gRPC does not support COPY operations.",
             )
         })?;
@@ -358,7 +358,7 @@ impl Connection {
     /// # Errors
     ///
     /// - Returns whatever [`export_csv`](Self::export_csv) returns.
-    /// - Returns [`Error::Other`] with message
+    /// - Returns [`Error::Conversion`] with message
     ///   `"CSV output is not valid UTF-8"` if the server emitted bytes that
     ///   are not valid UTF-8 (a Hyper server only emits UTF-8, so this
     ///   indicates a non-UTF-8 `CLIENT_ENCODING` setting).
@@ -366,7 +366,7 @@ impl Connection {
         let mut buf = Vec::new();
         self.export_csv(select_query, &mut buf)?;
         String::from_utf8(buf)
-            .map_err(|e| Error::new(format!("CSV output is not valid UTF-8: {e}")))
+            .map_err(|e| Error::conversion(format!("CSV output is not valid UTF-8: {e}")))
     }
 
     /// Imports CSV data from a reader into a table.
@@ -452,9 +452,9 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] if `options` fail validation or the
-    ///   connection is on gRPC.
-    /// - Returns [`Error::Client`] if the server rejects the
+    /// - Returns [`Error::Config`] if `options` fail validation, or
+    ///   [`Error::FeatureNotSupported`] if the connection is on gRPC.
+    /// - Returns [`Error::Server`] if the server rejects the
     ///   `COPY <table> FROM STDIN` statement or a row during import.
     /// - Returns [`Error::Io`] if reading from `reader` fails.
     pub fn import_text(
@@ -472,7 +472,7 @@ impl Connection {
         );
 
         let client = self.tcp_client().ok_or_else(|| {
-            Error::new(
+            Error::feature_not_supported(
                 "CSV import requires a TCP connection. gRPC does not support COPY operations.",
             )
         })?;
@@ -485,7 +485,7 @@ impl Connection {
         loop {
             let n = reader
                 .read(&mut buf)
-                .map_err(|e| Error::with_cause("Failed to read import data", e))?;
+                .map_err(|e| Error::connection_with_io("Failed to read import data", e))?;
             if n == 0 {
                 break;
             }

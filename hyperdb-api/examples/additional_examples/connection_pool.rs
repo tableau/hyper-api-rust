@@ -47,7 +47,7 @@ async fn main() -> Result<()> {
         let conn = pool
             .get()
             .await
-            .map_err(|e| hyperdb_api::Error::new(e.to_string()))?;
+            .map_err(|e| hyperdb_api::Error::internal(e.to_string()))?;
         conn.execute_command(
             "CREATE TABLE counters (
                 id INT NOT NULL,

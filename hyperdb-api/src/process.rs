@@ -281,7 +281,7 @@ impl HyperProcess {
                     }
                 }
             }
-            return Err(Error::new(
+            return Err(Error::config(
                 "HYPERD_PATH is not set. Point it at a hyperd executable, \
                 or run `make download-hyperd` (or `cargo run -p hyperd-bootstrap -- download`) \
                 to install a pinned release at `.hyperd/current/hyperd`.",
@@ -301,7 +301,7 @@ impl HyperProcess {
                     return Ok(without_exe);
                 }
             }
-            return Err(Error::new(format!(
+            return Err(Error::config(format!(
                 "HYPERD_PATH set to '{path_str}' but {HYPERD_EXE} not found in that directory"
             )));
         }
@@ -315,7 +315,7 @@ impl HyperProcess {
                 return Ok(with_ext);
             }
         }
-        Err(Error::new(format!(
+        Err(Error::config(format!(
             "HYPERD_PATH set to '{}' but hyperd executable not found (checked: {})",
             path_str,
             path.display()
@@ -326,7 +326,7 @@ impl HyperProcess {
     fn start_server(hyperd_path: &Path, parameters: Option<&Parameters>) -> Result<Self> {
         // Verify hyperd exists
         if !hyperd_path.exists() {
-            return Err(Error::new(format!(
+            return Err(Error::config(format!(
                 "Hyper executable not found at: {}",
                 hyperd_path.display()
             )));
@@ -341,17 +341,17 @@ impl HyperProcess {
         // Create callback listener on ephemeral port
         // This is the "dead man's switch" - when this connection is closed, Hyper shuts down
         let callback_listener = TcpListener::bind("127.0.0.1:0")
-            .map_err(|e| Error::new(format!("Failed to create callback listener: {e}")))?;
+            .map_err(|e| Error::internal(format!("Failed to create callback listener: {e}")))?;
 
         let callback_port = callback_listener
             .local_addr()
-            .map_err(|e| Error::new(format!("Failed to get callback port: {e}")))?
+            .map_err(|e| Error::internal(format!("Failed to get callback port: {e}")))?
             .port();
 
         // Set a timeout for accepting the callback connection
-        callback_listener
-            .set_nonblocking(false)
-            .map_err(|e| Error::new(format!("Failed to set callback listener to blocking: {e}")))?;
+        callback_listener.set_nonblocking(false).map_err(|e| {
+            Error::internal(format!("Failed to set callback listener to blocking: {e}"))
+        })?;
 
         // Check if user wants to disable default parameters
         let use_defaults = parameters.map_or(true, |p| !p.contains_key(NO_DEFAULT_PARAMETERS));
@@ -383,8 +383,9 @@ impl HyperProcess {
             } else {
                 // Create a temp directory for the socket
                 let temp_dir = std::env::temp_dir().join(format!("hyper-{}", std::process::id()));
-                std::fs::create_dir_all(&temp_dir)
-                    .map_err(|e| Error::new(format!("Failed to create socket directory: {e}")))?;
+                std::fs::create_dir_all(&temp_dir).map_err(|e| {
+                    Error::internal(format!("Failed to create socket directory: {e}"))
+                })?;
                 temp_dir
             };
             Some(dir)
@@ -609,7 +610,7 @@ impl HyperProcess {
 
         // Start the process
         let child = cmd.spawn().map_err(|e| {
-            Error::new(format!(
+            Error::internal(format!(
                 "Failed to start Hyper server at {}: {}",
                 hyperd_path.display(),
                 e
@@ -714,7 +715,7 @@ impl HyperProcess {
         // Poll for incoming connection with timeout
         let mut stream = loop {
             if start.elapsed() > timeout {
-                return Err(Error::new(
+                return Err(Error::internal(
                     "Timeout waiting for Hyper to connect to callback listener. \
                     Hyper may have failed to start - check hyperd logs for details.",
                 ));
@@ -726,7 +727,7 @@ impl HyperProcess {
                     thread::sleep(Duration::from_millis(50));
                 }
                 Err(e) => {
-                    return Err(Error::new(format!(
+                    return Err(Error::internal(format!(
                         "Failed to accept callback connection: {e}"
                     )));
                 }
@@ -734,9 +735,9 @@ impl HyperProcess {
         };
 
         // Set stream back to blocking for reading
-        stream
-            .set_nonblocking(false)
-            .map_err(|e| Error::new(format!("Failed to set callback stream to blocking: {e}")))?;
+        stream.set_nonblocking(false).map_err(|e| {
+            Error::internal(format!("Failed to set callback stream to blocking: {e}"))
+        })?;
 
         // Set read timeout
         stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
@@ -744,24 +745,24 @@ impl HyperProcess {
         // Read the endpoint descriptor from Hyper
         // Protocol: [1 byte length][N bytes descriptor string]
         let mut len_buf = [0u8; 1];
-        stream
-            .read_exact(&mut len_buf)
-            .map_err(|e| Error::new(format!("Failed to read endpoint length from Hyper: {e}")))?;
+        stream.read_exact(&mut len_buf).map_err(|e| {
+            Error::internal(format!("Failed to read endpoint length from Hyper: {e}"))
+        })?;
 
         let len = len_buf[0] as usize;
         if len == 0 {
-            return Err(Error::new("Hyper sent empty endpoint descriptor"));
+            return Err(Error::internal("Hyper sent empty endpoint descriptor"));
         }
 
         let mut descriptor_buf = vec![0u8; len];
         stream.read_exact(&mut descriptor_buf).map_err(|e| {
-            Error::new(format!(
+            Error::internal(format!(
                 "Failed to read endpoint descriptor from Hyper: {e}"
             ))
         })?;
 
         let descriptor = String::from_utf8(descriptor_buf)
-            .map_err(|e| Error::new(format!("Invalid UTF-8 in endpoint descriptor: {e}")))?;
+            .map_err(|e| Error::internal(format!("Invalid UTF-8 in endpoint descriptor: {e}")))?;
 
         // Trim null bytes and whitespace that Hyper may include
         let descriptor = descriptor.trim_matches(|c: char| c == '\0' || c.is_whitespace());
@@ -826,7 +827,7 @@ impl HyperProcess {
         if without_prefix.contains(':') && !without_prefix.is_empty() {
             Ok(without_prefix.to_string())
         } else {
-            Err(Error::new(format!(
+            Err(Error::internal(format!(
                 "Invalid connection descriptor format: '{descriptor}'. Expected '<scheme>://host:port' or 'tab.domain://<dir>/domain/<name>'"
             )))
         }
@@ -866,7 +867,7 @@ impl HyperProcess {
     /// ```
     pub fn require_endpoint(&self) -> crate::error::Result<&str> {
         self.endpoint().ok_or_else(|| {
-            crate::error::Error::new(
+            crate::error::Error::internal(
                 "HyperProcess does not have a libpq endpoint (gRPC-only mode). \
                  Use grpc_endpoint() instead or start with LibPq or Both listen mode.",
             )
@@ -893,7 +894,7 @@ impl HyperProcess {
     /// Returns an error if this process was started in libpq-only mode.
     pub fn require_grpc_endpoint(&self) -> crate::error::Result<&str> {
         self.grpc_endpoint().ok_or_else(|| {
-            crate::error::Error::new(
+            crate::error::Error::internal(
                 "HyperProcess does not have a gRPC endpoint (libpq-only mode). \
                  Use endpoint() instead or start with Grpc or Both listen mode.",
             )
@@ -1100,19 +1101,21 @@ impl HyperProcess {
                                 // Then force kill
                                 let _ = child.kill();
                                 break child.wait().map_err(|e| {
-                                    Error::new(format!("Failed to wait for hyperd: {e}"))
+                                    Error::internal(format!("Failed to wait for hyperd: {e}"))
                                 });
                             }
                             thread::sleep(Duration::from_millis(100));
                         }
-                        Err(e) => break Err(Error::new(format!("Failed to wait for hyperd: {e}"))),
+                        Err(e) => {
+                            break Err(Error::internal(format!("Failed to wait for hyperd: {e}")))
+                        }
                     }
                 }
             } else {
                 // Wait indefinitely
                 child
                     .wait()
-                    .map_err(|e| Error::new(format!("Failed to wait for hyperd: {e}")))
+                    .map_err(|e| Error::internal(format!("Failed to wait for hyperd: {e}")))
             };
 
             wait_result?;

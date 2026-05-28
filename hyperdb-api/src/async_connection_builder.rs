@@ -173,11 +173,11 @@ impl AsyncConnectionBuilder {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Io`] or [`Error::Client`] if the transport
+    /// - Returns [`Error::Io`] or [`Error::Connection`] if the transport
     ///   handshake fails (TCP refused, TLS rejected, named-pipe not
     ///   found, gRPC channel setup failure).
-    /// - Returns [`Error::Client`] if authentication is rejected.
-    /// - Returns [`Error::Client`] if the `CreateMode` SQL is rejected
+    /// - Returns [`Error::Authentication`] if authentication is rejected.
+    /// - Returns [`Error::Server`] if the `CreateMode` SQL is rejected
     ///   for a builder that configured a database path.
     pub async fn build(self) -> Result<AsyncConnection> {
         let transport_type = detect_transport_type(&self.endpoint);
@@ -196,7 +196,7 @@ impl AsyncConnectionBuilder {
         let mut config: Config = self
             .endpoint
             .parse()
-            .map_err(|e| Error::new(format!("invalid endpoint: {e}")))?;
+            .map_err(|e| Error::config(format!("invalid endpoint: {e}")))?;
 
         if let Some(user) = &self.user {
             config = config.with_user(user);
@@ -235,11 +235,11 @@ impl AsyncConnectionBuilder {
 
         let socket_path = if self.endpoint.starts_with("tab.domain://") {
             let endpoint = ConnectionEndpoint::parse(&self.endpoint)
-                .map_err(|e| Error::new(format!("invalid Unix socket endpoint: {e}")))?;
+                .map_err(|e| Error::config(format!("invalid Unix socket endpoint: {e}")))?;
             match endpoint {
                 ConnectionEndpoint::DomainSocket { directory, name } => directory.join(&name),
                 ConnectionEndpoint::Tcp { .. } => {
-                    return Err(Error::new("expected Unix domain socket endpoint"))
+                    return Err(Error::config("expected Unix domain socket endpoint"))
                 }
             }
         } else {
@@ -278,12 +278,12 @@ impl AsyncConnectionBuilder {
 
         let pipe_path = if self.endpoint.starts_with("tab.pipe://") {
             let endpoint = ConnectionEndpoint::parse(&self.endpoint)
-                .map_err(|e| Error::new(format!("invalid named pipe endpoint: {e}")))?;
+                .map_err(|e| Error::config(format!("invalid named pipe endpoint: {e}")))?;
             match endpoint {
                 ConnectionEndpoint::NamedPipe { host, name } => {
                     format!(r"\\{host}\pipe\{name}")
                 }
-                _ => return Err(Error::new("expected named pipe endpoint")),
+                _ => return Err(Error::config("expected named pipe endpoint")),
             }
         } else {
             self.endpoint.clone()
@@ -317,7 +317,7 @@ impl AsyncConnectionBuilder {
     /// Build a gRPC connection (async).
     async fn build_grpc(self) -> Result<AsyncConnection> {
         if self.create_mode != CreateMode::DoNotCreate {
-            return Err(Error::new(
+            return Err(Error::feature_not_supported(
                 "gRPC transport is read-only. Use CreateMode::DoNotCreate for gRPC connections.",
             ));
         }

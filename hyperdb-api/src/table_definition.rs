@@ -762,12 +762,14 @@ impl TableDefinition {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Other`] with message
+    /// Returns [`Error::InvalidTableDefinition`] with message
     /// `"Table must have at least one column"` if this definition has no
     /// columns.
     pub fn to_create_sql(&self, fail_if_exists: bool) -> Result<String> {
         if self.columns.is_empty() {
-            return Err(Error::new("Table must have at least one column"));
+            return Err(Error::invalid_table_definition(
+                "Table must have at least one column",
+            ));
         }
 
         let mut sql = String::new();

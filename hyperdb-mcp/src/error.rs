@@ -119,50 +119,103 @@ fn default_suggestion(code: ErrorCode, _message: &str) -> Option<String> {
     }
 }
 
-/// Converts a `hyperdb_api::Error` into an [`McpError`] by sniffing the message text
-/// to pick the most specific error code. Falls back to [`ErrorCode::InternalError`].
+/// Converts a `hyperdb_api::Error` into an [`McpError`] by inspecting
+/// the structured variant first, falling back to message-substring
+/// classification for variants whose payload is just a `String`.
 impl From<hyperdb_api::Error> for McpError {
     fn from(err: hyperdb_api::Error) -> Self {
+        // Structured variants get classified by their type, not their
+        // message. SQLSTATE-bearing server errors are routed by
+        // SQLSTATE code directly — no string sniffing.
+        if let hyperdb_api::Error::Server {
+            sqlstate: Some(ref code),
+            ..
+        } = err
+        {
+            match code.as_str() {
+                "22003" => {
+                    // numeric_value_out_of_range
+                    return McpError::new(ErrorCode::SchemaMismatch, err.to_string()).with_suggestion(
+                        "A numeric value exceeded its column's range. Retry with a partial schema override that widens the offending column, e.g. schema: {\"Population\": \"BIGINT\"} or {\"Amount\": \"NUMERIC(38,0)\"}. The override is a partial dictionary keyed by column name — unlisted columns keep their inferred type. Call inspect_file first if you don't know which column is too narrow.");
+                }
+                "22P02" => {
+                    // invalid_text_representation
+                    return McpError::new(ErrorCode::SchemaMismatch, err.to_string()).with_suggestion(
+                        "A value could not be parsed into its column type. Retry with a partial schema override forcing TEXT for the offending column, e.g. schema: {\"Id\": \"TEXT\"}, and cast in SQL as needed.");
+                }
+                "0A000" => {
+                    // feature_not_supported — Hyper's "Multi-part queries"
+                    return McpError::new(ErrorCode::SqlError, err.to_string()).with_suggestion(
+                        "Hyper only accepts one SQL statement per call. Split your query into separate execute/query calls — one per statement.");
+                }
+                _ => {} // fall through to message-based classification
+            }
+        }
+
+        // Connection-lost / transport-desync detection — these may
+        // arrive as Connection, Closed, or Internal variants depending
+        // on where they originate; sniff the message string.
         let msg = err.to_string();
         let lower = msg.to_lowercase();
         if is_connection_lost(&msg) {
-            McpError::new(ErrorCode::ConnectionLost, msg)
-        } else if msg.contains("Multi-part queries") || msg.contains("0A000") {
-            // Hyper only allows one statement per call. Rewrite the error
-            // with an actionable suggestion instead of the cryptic code.
-            McpError::new(ErrorCode::SqlError, msg)
-                .with_suggestion("Hyper only accepts one SQL statement per call. Split your query into separate execute/query calls — one per statement.")
-        } else if msg.contains("22003")
-            || lower.contains("numeric overflow")
-            || lower.contains("out of range")
-        {
-            // SQLSTATE 22003: numeric_value_out_of_range. Happens at COPY/INSERT
-            // time when a value exceeds its column type. With the partial
-            // name-keyed schema override now in place, widening a single column
-            // is a one-line retry.
-            McpError::new(ErrorCode::SchemaMismatch, msg).with_suggestion(
-                "A numeric value exceeded its column's range. Retry with a partial schema override that widens the offending column, e.g. schema: {\"Population\": \"BIGINT\"} or {\"Amount\": \"NUMERIC(38,0)\"}. The override is a partial dictionary keyed by column name — unlisted columns keep their inferred type. Call inspect_file first if you don't know which column is too narrow.")
-        } else if msg.contains("22P02") || lower.contains("invalid input syntax") {
-            // SQLSTATE 22P02: invalid_text_representation. A value couldn't be
-            // parsed into its column type (e.g. non-date string in a DATE
-            // column). Usually the safe fix is to keep the column as TEXT and
-            // cast later in SQL.
-            McpError::new(ErrorCode::SchemaMismatch, msg).with_suggestion(
-                "A value could not be parsed into its column type. Retry with a partial schema override forcing TEXT for the offending column, e.g. schema: {\"Id\": \"TEXT\"}, and cast in SQL as needed.")
-        } else if msg.contains("syntax error")
-            || (msg.contains("does not exist") && msg.contains("column"))
-        {
-            McpError::new(ErrorCode::SqlError, msg)
-        } else if msg.contains("No such file") || msg.contains("not found") {
-            McpError::new(ErrorCode::FileNotFound, msg)
-        } else if is_resource_busy(&msg) {
-            // ATTACH on a .hyper file already held by another hyperd
-            // surfaces as a "database is in use" / "already attached" /
-            // "could not lock" error. Route to ResourceBusy so the LLM
-            // sees an actionable recovery hint instead of InternalError.
-            McpError::new(ErrorCode::ResourceBusy, msg)
-        } else {
-            McpError::new(ErrorCode::InternalError, msg)
+            return McpError::new(ErrorCode::ConnectionLost, msg);
+        }
+
+        // Resource-busy is a hyperd attach-time error; same multi-source
+        // problem as connection-lost.
+        if is_resource_busy(&msg) {
+            return McpError::new(ErrorCode::ResourceBusy, msg);
+        }
+
+        // Variant-driven classification for the remaining cases.
+        match err {
+            // File-not-found errors come back as NotFound or as a Server
+            // error containing the phrase; check both.
+            hyperdb_api::Error::NotFound(_) => McpError::new(ErrorCode::FileNotFound, msg),
+
+            // Server errors without a SQLSTATE we recognize fall through
+            // to the substring fallback below.
+            hyperdb_api::Error::Server { .. } => {
+                // Legacy substring fallback — covers messages whose
+                // SQLSTATE was carried in the text (older hyperd
+                // versions) rather than the structured field.
+                if msg.contains("22003")
+                    || lower.contains("numeric overflow")
+                    || lower.contains("out of range")
+                {
+                    McpError::new(ErrorCode::SchemaMismatch, msg).with_suggestion(
+                        "A numeric value exceeded its column's range. Retry with a partial schema override that widens the offending column, e.g. schema: {\"Population\": \"BIGINT\"} or {\"Amount\": \"NUMERIC(38,0)\"}. The override is a partial dictionary keyed by column name — unlisted columns keep their inferred type. Call inspect_file first if you don't know which column is too narrow.")
+                } else if msg.contains("22P02") || lower.contains("invalid input syntax") {
+                    McpError::new(ErrorCode::SchemaMismatch, msg).with_suggestion(
+                        "A value could not be parsed into its column type. Retry with a partial schema override forcing TEXT for the offending column, e.g. schema: {\"Id\": \"TEXT\"}, and cast in SQL as needed.")
+                } else if msg.contains("syntax error")
+                    || (msg.contains("does not exist") && msg.contains("column"))
+                {
+                    McpError::new(ErrorCode::SqlError, msg)
+                } else if msg.contains("No such file") || msg.contains("not found") {
+                    McpError::new(ErrorCode::FileNotFound, msg)
+                } else {
+                    McpError::new(ErrorCode::SqlError, msg)
+                }
+            }
+
+            // Conversion errors are usually decode failures from
+            // result-row processing; map to InternalError until we
+            // surface them more specifically.
+            hyperdb_api::Error::Conversion(_) => McpError::new(ErrorCode::InternalError, msg),
+
+            // Configuration errors are caller-visible setup mistakes.
+            hyperdb_api::Error::Config(_) => McpError::new(ErrorCode::InvalidArgument, msg),
+
+            // Connection / Closed / Timeout — surface as ConnectionLost
+            // so the engine recycles. is_connection_lost above already
+            // catches most of these via message; this is a fallback.
+            hyperdb_api::Error::Connection { .. }
+            | hyperdb_api::Error::Closed(_)
+            | hyperdb_api::Error::Timeout(_)
+            | hyperdb_api::Error::Cancelled(_) => McpError::new(ErrorCode::ConnectionLost, msg),
+
+            _ => McpError::new(ErrorCode::InternalError, msg),
         }
     }
 }

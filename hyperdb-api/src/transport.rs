@@ -161,7 +161,7 @@ impl Transport {
     pub(crate) fn execute_command(&self, sql: &str) -> Result<u64> {
         match self {
             Transport::Tcp(tcp) => Ok(tcp.client.exec(sql)?),
-            Transport::Grpc(_) => Err(Error::new(
+            Transport::Grpc(_) => Err(Error::feature_not_supported(
                 "gRPC transport is read-only. Write operations (INSERT, UPDATE, DELETE, DDL) \
                  are not yet supported over gRPC. Use a TCP connection for write operations.",
             )),

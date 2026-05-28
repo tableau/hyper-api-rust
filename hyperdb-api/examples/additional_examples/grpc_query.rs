@@ -433,7 +433,7 @@ mod grpc_example {
 
         let arrow_data = conn.execute_query_to_arrow(query)?;
         let reader = StreamReader::try_new(Cursor::new(&arrow_data), None)
-            .map_err(|e| hyperdb_api::Error::new(format!("Arrow error: {e}")))?;
+            .map_err(|e| hyperdb_api::Error::conversion(format!("Arrow error: {e}")))?;
 
         println!("Schema:");
         for field in reader.schema().fields() {
@@ -447,8 +447,8 @@ mod grpc_example {
         println!("{}", "-".repeat(35));
 
         for batch_result in reader {
-            let batch =
-                batch_result.map_err(|e| hyperdb_api::Error::new(format!("Arrow error: {e}")))?;
+            let batch = batch_result
+                .map_err(|e| hyperdb_api::Error::conversion(format!("Arrow error: {e}")))?;
 
             // Get columns by index (matching the SELECT order)
             let id_col = batch
@@ -501,7 +501,7 @@ mod grpc_example {
 
         let arrow_data = conn.execute_query_to_arrow(&query)?;
         let reader = StreamReader::try_new(Cursor::new(&arrow_data), None)
-            .map_err(|e| hyperdb_api::Error::new(format!("Arrow error: {e}")))?;
+            .map_err(|e| hyperdb_api::Error::conversion(format!("Arrow error: {e}")))?;
 
         // Aggregate statistics
         let mut total_rows: u64 = 0;
@@ -513,8 +513,8 @@ mod grpc_example {
         let mut category_sums: [f64; 5] = [0.0; 5];
 
         for batch_result in reader {
-            let batch =
-                batch_result.map_err(|e| hyperdb_api::Error::new(format!("Arrow error: {e}")))?;
+            let batch = batch_result
+                .map_err(|e| hyperdb_api::Error::conversion(format!("Arrow error: {e}")))?;
 
             let category_col = batch
                 .column(1)
@@ -598,7 +598,7 @@ mod grpc_example {
 
         let arrow_data = conn.execute_query_to_arrow(&agg_query)?;
         let reader = StreamReader::try_new(Cursor::new(&arrow_data), None)
-            .map_err(|e| hyperdb_api::Error::new(format!("Arrow error: {e}")))?;
+            .map_err(|e| hyperdb_api::Error::conversion(format!("Arrow error: {e}")))?;
 
         println!("Server-side aggregation results:");
         println!(
@@ -608,8 +608,8 @@ mod grpc_example {
         println!("{}", "-".repeat(75));
 
         for batch_result in reader {
-            let batch =
-                batch_result.map_err(|e| hyperdb_api::Error::new(format!("Arrow error: {e}")))?;
+            let batch = batch_result
+                .map_err(|e| hyperdb_api::Error::conversion(format!("Arrow error: {e}")))?;
 
             let cat_col = batch
                 .column(0)

@@ -445,12 +445,7 @@ impl Engine {
         }
         self.hyper
             .as_ref()
-            .ok_or_else(|| {
-                McpError::new(
-                    ErrorCode::InternalError,
-                    "no hyperd endpoint available".to_string(),
-                )
-            })?
+            .ok_or_else(|| McpError::new(ErrorCode::InternalError, "no hyperd endpoint available"))?
             .require_endpoint()
             .map(std::string::ToString::to_string)
             .map_err(|e| McpError::new(ErrorCode::InternalError, e.to_string()))

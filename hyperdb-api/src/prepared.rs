@@ -96,9 +96,9 @@ impl<'conn> PreparedStatement<'conn> {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] if the underlying [`Connection`] is on
+    /// - Returns [`Error::FeatureNotSupported`] if the underlying [`Connection`] is on
     ///   gRPC transport (prepared statements are TCP-only).
-    /// - Returns [`Error::Client`] if the server rejects `Bind` or
+    /// - Returns [`Error::Server`] if the server rejects `Bind` or
     ///   `Execute` (type mismatch, runtime error while streaming).
     /// - Returns [`Error::Io`] on transport-level I/O failures.
     pub fn query(&self, params: &[&dyn ToSqlParam]) -> Result<Rowset<'conn>> {
@@ -117,8 +117,8 @@ impl<'conn> PreparedStatement<'conn> {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] on gRPC transport.
-    /// - Returns [`Error::Client`] if the server rejects `Bind` or
+    /// - Returns [`Error::FeatureNotSupported`] on gRPC transport.
+    /// - Returns [`Error::Server`] if the server rejects `Bind` or
     ///   `Execute`.
     /// - Returns [`Error::Io`] on transport-level I/O failures.
     pub fn execute(&self, params: &[&dyn ToSqlParam]) -> Result<u64> {
@@ -132,7 +132,7 @@ impl<'conn> PreparedStatement<'conn> {
     /// # Errors
     ///
     /// - Returns the error from [`query`](Self::query).
-    /// - Returns [`Error::Other`] with message `"Query returned no rows"`
+    /// - Returns [`Error::Conversion`] with message `"Query returned no rows"`
     ///   if the result is empty.
     pub fn fetch_one(&self, params: &[&dyn ToSqlParam]) -> Result<Row> {
         self.query(params)?.require_first_row()
@@ -163,9 +163,9 @@ impl<'conn> PreparedStatement<'conn> {
     /// # Errors
     ///
     /// - Returns the error from [`query`](Self::query).
-    /// - Returns [`Error::Other`] with message `"Query returned no rows"`
+    /// - Returns [`Error::Conversion`] with message `"Query returned no rows"`
     ///   if the result is empty.
-    /// - Returns [`Error::Other`] with message `"Scalar query returned NULL"`
+    /// - Returns [`Error::Conversion`] with message `"Scalar query returned NULL"`
     ///   if the first cell is SQL `NULL`.
     pub fn fetch_scalar<T: RowValue>(&self, params: &[&dyn ToSqlParam]) -> Result<T> {
         self.query(params)?.require_scalar()
@@ -197,7 +197,7 @@ pub(crate) fn encode_params(params: &[&dyn ToSqlParam]) -> Vec<Option<Vec<u8>>> 
 pub(crate) fn tcp_client(connection: &Connection) -> Result<&hyperdb_api_core::client::Client> {
     match connection.transport() {
         Transport::Tcp(tcp) => Ok(&tcp.client),
-        Transport::Grpc(_) => Err(Error::new(
+        Transport::Grpc(_) => Err(Error::feature_not_supported(
             "prepared statements are not supported over gRPC transport",
         )),
     }

@@ -67,9 +67,8 @@ impl PinnedRelease {
     /// Returns [`Error::Io`] if the file cannot be read, or
     /// [`Error::TomlParse`] if the content is not a valid `PinnedRelease`.
     pub fn from_toml_file(path: &Path) -> Result<Self, Error> {
-        let text = std::fs::read_to_string(path).map_err(|source| Error::Io {
-            context: format!("reading version file {}", path.display()),
-            source,
+        let text = std::fs::read_to_string(path).map_err(|source| {
+            Error::io(format!("reading version file {}", path.display()), source)
         })?;
         Self::from_toml_str(&text)
     }

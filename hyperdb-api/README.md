@@ -108,7 +108,7 @@ async fn main() -> Result<()> {
     let pool = create_pool(config)?;
 
     // Get connections from the pool — returned automatically when dropped
-    let conn = pool.get().await.map_err(|e| hyperdb_api::Error::new(e.to_string()))?;
+    let conn = pool.get().await.map_err(|e| hyperdb_api::Error::internal(e.to_string()))?;
     conn.execute_command("SELECT 1").await?;
 
     Ok(())

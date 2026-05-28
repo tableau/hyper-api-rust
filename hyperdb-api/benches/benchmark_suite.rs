@@ -111,7 +111,7 @@ fn main() -> Result<()> {
     let hyper = HyperProcess::new(None, Some(&params))?;
     let endpoint = hyper
         .endpoint()
-        .ok_or_else(|| hyperdb_api::Error::new("HyperProcess has no endpoint"))?
+        .ok_or_else(|| hyperdb_api::Error::internal("HyperProcess has no endpoint"))?
         .to_string();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -430,13 +430,13 @@ fn chunk_sender_worker(
         chunk.end_row()?;
         if chunk.row_count() >= ROWS_PER_BATCH || chunk.should_flush() {
             tx.send(chunk)
-                .map_err(|e| hyperdb_api::Error::new(format!("mpsc send: {e}")))?;
+                .map_err(|e| hyperdb_api::Error::internal(format!("mpsc send: {e}")))?;
             chunk = InsertChunk::from_table_definition(table_def);
         }
     }
     if !chunk.is_empty() {
         tx.send(chunk)
-            .map_err(|e| hyperdb_api::Error::new(format!("mpsc send: {e}")))?;
+            .map_err(|e| hyperdb_api::Error::internal(format!("mpsc send: {e}")))?;
     }
     Ok(())
 }
@@ -585,7 +585,7 @@ async fn async_arrow_parallel(
     for t in tasks {
         total += t
             .await
-            .map_err(|e| hyperdb_api::Error::new(format!("join: {e}")))??;
+            .map_err(|e| hyperdb_api::Error::internal(format!("join: {e}")))??;
     }
     let elapsed = start.elapsed().as_secs_f64();
 
@@ -624,7 +624,7 @@ async fn async_blocking_chunksender_parallel(
             conn.close()
         })
         .await
-        .map_err(|e| hyperdb_api::Error::new(format!("bootstrap join: {e}")))??;
+        .map_err(|e| hyperdb_api::Error::internal(format!("bootstrap join: {e}")))??;
     }
 
     let per_worker = rows / num_workers as i64;
@@ -668,7 +668,7 @@ async fn async_blocking_chunksender_parallel(
     for t in tasks {
         total += t
             .await
-            .map_err(|e| hyperdb_api::Error::new(format!("blocking join: {e}")))??;
+            .map_err(|e| hyperdb_api::Error::internal(format!("blocking join: {e}")))??;
     }
     let elapsed = start.elapsed().as_secs_f64();
 
@@ -842,7 +842,7 @@ async fn async_query_parallel(
     for t in tasks {
         total += t
             .await
-            .map_err(|e| hyperdb_api::Error::new(format!("query join: {e}")))??;
+            .map_err(|e| hyperdb_api::Error::internal(format!("query join: {e}")))??;
     }
     let elapsed = start.elapsed().as_secs_f64();
 

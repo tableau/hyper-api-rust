@@ -23,7 +23,7 @@
 //!     let pool = create_pool(config)?;
 //!
 //!     // Get a connection from the pool
-//!     let conn = pool.get().await.map_err(|e| hyperdb_api::Error::new(e.to_string()))?;
+//!     let conn = pool.get().await.map_err(|e| hyperdb_api::Error::internal(e.to_string()))?;
 //!
 //!     // Use the connection
 //!     conn.execute_command("SELECT 1").await?;
@@ -341,7 +341,7 @@ pub type PooledConnection = managed::Object<ConnectionManager>;
 ///
 /// # Errors
 ///
-/// Returns [`Error::Other`] wrapping the `deadpool` builder failure if
+/// Returns [`Error::Config`] wrapping the `deadpool` builder failure if
 /// the pool cannot be constructed (e.g. invalid `max_size`). Connections
 /// themselves are opened lazily on first use, so endpoint/auth errors
 /// surface from [`Pool::get`](managed::Pool::get), not here.
@@ -351,7 +351,7 @@ pub fn create_pool(config: PoolConfig) -> Result<Pool> {
     Pool::builder(manager)
         .max_size(max_size)
         .build()
-        .map_err(|e| Error::new(format!("Failed to create pool: {e}")))
+        .map_err(|e| Error::config(format!("Failed to create pool: {e}")))
 }
 
 #[cfg(test)]
