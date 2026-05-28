@@ -92,7 +92,7 @@ impl DataCloudTokenProvider {
         let http_client = HttpClient::builder()
             .timeout(Duration::from_secs(config.timeout_secs))
             .build()
-            .map_err(|e| SalesforceAuthError::Http(format!("failed to create HTTP client: {e}")))?;
+            .map_err(|e| SalesforceAuthError::http(format!("failed to create HTTP client: {e}")))?;
 
         Ok(DataCloudTokenProvider {
             config,
@@ -293,10 +293,11 @@ impl DataCloudTokenProvider {
 
     /// Fetches a fresh OAuth Access Token from Salesforce.
     async fn fetch_oauth_access_token(&self) -> SalesforceAuthResult<OAuthToken> {
-        let auth_mode =
-            self.config.auth_mode.as_ref().ok_or_else(|| {
-                SalesforceAuthError::Config("auth_mode not configured".to_string())
-            })?;
+        let auth_mode = self
+            .config
+            .auth_mode
+            .as_ref()
+            .ok_or_else(|| SalesforceAuthError::config("auth_mode not configured"))?;
 
         let mut form_data = HashMap::new();
         form_data.insert("client_id", self.config.client_id.clone());
@@ -345,7 +346,7 @@ impl DataCloudTokenProvider {
         }
 
         let token_url = self.config.login_url.join(OAUTH_TOKEN_PATH).map_err(|e| {
-            SalesforceAuthError::Config(format!("failed to build OAuth Access Token URL: {e}"))
+            SalesforceAuthError::config(format!("failed to build OAuth Access Token URL: {e}"))
         })?;
 
         debug!(url = %token_url, "Requesting OAuth Access Token");
@@ -357,7 +358,7 @@ impl DataCloudTokenProvider {
 
         let oauth_response: OAuthTokenResponse =
             serde_json::from_str(&response_text).map_err(|e| {
-                SalesforceAuthError::TokenParse(format!(
+                SalesforceAuthError::token_parse(format!(
                     "failed to parse OAuth Access Token response: {e}"
                 ))
             })?;
@@ -405,7 +406,7 @@ impl DataCloudTokenProvider {
             .instance_url
             .join(DATA_CLOUD_TOKEN_PATH)
             .map_err(|e| {
-                SalesforceAuthError::Config(format!("failed to build DC JWT exchange URL: {e}"))
+                SalesforceAuthError::config(format!("failed to build DC JWT exchange URL: {e}"))
             })?;
 
         debug!(url = %exchange_url, "Exchanging OAuth Access Token for DC JWT");
@@ -417,7 +418,7 @@ impl DataCloudTokenProvider {
 
         let dc_response: DataCloudTokenResponse =
             serde_json::from_str(&response_text).map_err(|e| {
-                SalesforceAuthError::TokenParse(format!("failed to parse DC JWT response: {e}"))
+                SalesforceAuthError::token_parse(format!("failed to parse DC JWT response: {e}"))
             })?;
 
         debug!(
@@ -481,19 +482,19 @@ impl DataCloudTokenProvider {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or(&body);
 
-                            return Err(SalesforceAuthError::Authorization {
-                                error_code: error_code.to_string(),
-                                error_description: error_desc.to_string(),
-                            });
+                            return Err(SalesforceAuthError::authorization(
+                                error_code.to_string(),
+                                error_desc.to_string(),
+                            ));
                         }
 
-                        return Err(SalesforceAuthError::Http(format!(
+                        return Err(SalesforceAuthError::http(format!(
                             "HTTP {status} error: {body}"
                         )));
                     }
 
                     if response.status().is_server_error() {
-                        last_error = Some(SalesforceAuthError::Http(format!(
+                        last_error = Some(SalesforceAuthError::http(format!(
                             "HTTP {} error",
                             response.status()
                         )));
@@ -508,9 +509,7 @@ impl DataCloudTokenProvider {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| {
-            SalesforceAuthError::Http("request failed after retries".to_string())
-        }))
+        Err(last_error.unwrap_or_else(|| SalesforceAuthError::http("request failed after retries")))
     }
 }
 

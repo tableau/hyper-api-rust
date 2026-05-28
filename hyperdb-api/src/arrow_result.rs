@@ -386,7 +386,7 @@ pub trait ChunkSource: Send {
     /// # Errors
     ///
     /// Implementations return whatever transport error the underlying
-    /// source produces (typically [`Error::Client`] from a gRPC stream or
+    /// source produces (typically [`Error::Server`] from a gRPC stream or
     /// [`Error::Io`] on network failures).
     fn next_chunk(&mut self) -> Result<Option<Bytes>>;
 }
@@ -473,7 +473,7 @@ impl ArrowRowset {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Other`] wrapping an Arrow IPC decode error if
+    /// Returns [`Error::Conversion`] wrapping an Arrow IPC decode error if
     /// `bytes` is not a valid Arrow IPC stream (or concatenation thereof).
     pub fn from_bytes(bytes: Bytes) -> Result<Self> {
         if bytes.is_empty() {
@@ -489,7 +489,7 @@ impl ArrowRowset {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Other`] wrapping an Arrow IPC decode error if
+    /// Returns [`Error::Conversion`] wrapping an Arrow IPC decode error if
     /// `buf` is not a valid Arrow IPC stream.
     pub fn from_buffer(buf: Buffer) -> Result<Self> {
         if buf.is_empty() {
@@ -514,7 +514,7 @@ impl ArrowRowset {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Other`] wrapping an Arrow IPC decode error if any
+    /// Returns [`Error::Conversion`] wrapping an Arrow IPC decode error if any
     /// chunk cannot be parsed as a self-contained IPC stream.
     pub fn from_chunks<I>(chunks: I) -> Result<Self>
     where
@@ -559,7 +559,7 @@ impl ArrowRowset {
     ///
     /// - Returns the transport error from `source.next_chunk()` when
     ///   priming the decoder with the first chunk.
-    /// - Returns [`Error::Other`] wrapping an Arrow IPC decode error if
+    /// - Returns [`Error::Conversion`] wrapping an Arrow IPC decode error if
     ///   that first chunk is not a valid Arrow IPC stream prefix.
     pub fn from_stream(source: Box<dyn ChunkSource>) -> Result<Self> {
         let mut rowset = ArrowRowset {
@@ -627,7 +627,7 @@ impl ArrowRowset {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Other`] wrapping an Arrow IPC decode error if
+    /// Returns [`Error::Conversion`] wrapping an Arrow IPC decode error if
     /// `data` is not a valid Arrow IPC stream.
     pub fn from_ipc_slice(data: &[u8]) -> Result<Self> {
         if data.is_empty() {
@@ -677,7 +677,7 @@ impl ArrowRowset {
     ///
     /// For streaming rowsets:
     /// - Returns the transport error from `source.next_chunk()`.
-    /// - Returns [`Error::Other`] wrapping an Arrow IPC decode error if a
+    /// - Returns [`Error::Conversion`] wrapping an Arrow IPC decode error if a
     ///   chunk contains malformed stream bytes.
     ///
     /// Buffered rowsets never error — they walk a pre-decoded vector.
@@ -839,7 +839,7 @@ pub(crate) fn arrow_type_to_sql_type(dt: &DataType) -> SqlType {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Other`] wrapping an Arrow IPC decode error if `bytes`
+/// Returns [`Error::Conversion`] wrapping an Arrow IPC decode error if `bytes`
 /// is not a valid Arrow IPC stream (or concatenation thereof).
 pub fn parse_arrow_ipc(bytes: Bytes) -> Result<Vec<RecordBatch>> {
     if bytes.is_empty() {
@@ -935,7 +935,9 @@ fn drive_streaming_decoder(
                     *decoder = StreamDecoder::new();
                     continue;
                 }
-                return Err(Error::new(format!("Failed to parse Arrow IPC data: {e}")));
+                return Err(Error::conversion(format!(
+                    "Failed to parse Arrow IPC data: {e}"
+                )));
             }
         }
     }
@@ -1011,7 +1013,7 @@ fn decode_possibly_concatenated_streams(
             // drive_streaming_decoder consumed nothing; we're either
             // done (if buf is empty) or stuck (malformed input).
             if !buf.is_empty() {
-                return Err(Error::new(
+                return Err(Error::conversion(
                     "Failed to parse Arrow IPC data: decoder made no progress",
                 ));
             }

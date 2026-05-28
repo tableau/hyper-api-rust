@@ -253,7 +253,7 @@ impl FromRow for TestUser {
         Ok(TestUser {
             id: row
                 .get::<i32>(0)
-                .ok_or_else(|| hyperdb_api::Error::new("NULL id"))?,
+                .ok_or_else(|| hyperdb_api::Error::conversion("NULL id"))?,
             name: row.get::<String>(1).unwrap_or_default(),
             score: row.get::<f64>(2).unwrap_or(0.0),
         })

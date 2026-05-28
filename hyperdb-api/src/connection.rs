@@ -317,10 +317,9 @@ impl Connection {
                     escape_sql_path(database_path)
                 )) {
                     if !is_already_exists_error(&e) {
-                        return Err(Error::with_cause(
-                            format!("Failed to create database '{database_path}': {e}"),
-                            e,
-                        ));
+                        return Err(Error::internal(format!(
+                            "Failed to create database '{database_path}': {e}"
+                        )));
                     }
                 }
             }
@@ -391,7 +390,7 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] if the TCP or gRPC handshake fails, and
+    /// Returns [`Error::Connection`] if the TCP or gRPC handshake fails, and
     /// [`Error::Io`] if the endpoint cannot be reached.
     pub fn without_database(endpoint: &str) -> Result<Self> {
         crate::ConnectionBuilder::new(endpoint).build()
@@ -462,7 +461,7 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Client`] wrapping a `hyperdb_api_core::client::Error` if the
+    /// - Returns [`Error::Server`] wrapping a `hyperdb_api_core::client::Error` if the
     ///   SQL fails to parse, execute, or if the server reports an error
     ///   while streaming.
     /// - Returns [`Error::Io`] on transport-level I/O failures.
@@ -532,7 +531,7 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// Propagates any [`Error::Client`] from the TCP or gRPC transport when
+    /// Propagates any [`Error::Server`] from the TCP or gRPC transport when
     /// the query fails or the server cannot produce Arrow IPC output.
     pub fn execute_query_to_arrow(&self, select_query: &str) -> Result<bytes::Bytes> {
         self.transport.execute_query_to_arrow(select_query)
@@ -567,7 +566,7 @@ impl Connection {
     ///
     /// Returns whatever [`execute_query_to_arrow`](Self::execute_query_to_arrow)
     /// would return for `SELECT * FROM <table_name>` — typically
-    /// [`Error::Client`] if the table does not exist or the query is rejected.
+    /// [`Error::Server`] if the table does not exist or the query is rejected.
     pub fn export_table_to_arrow(&self, table_name: &str) -> Result<bytes::Bytes> {
         self.execute_query_to_arrow(&format!("SELECT * FROM {table_name}"))
     }
@@ -597,8 +596,8 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Client`] if the query itself fails.
-    /// - Returns [`Error::Other`] if the Arrow IPC payload returned by the
+    /// - Returns [`Error::Server`] if the query itself fails.
+    /// - Returns [`Error::Conversion`] if the Arrow IPC payload returned by the
     ///   server is malformed and cannot be decoded into record batches.
     pub fn execute_query_to_batches(
         &self,
@@ -630,7 +629,7 @@ impl Connection {
     ///
     /// - Returns the error from [`execute_query`](Self::execute_query) if
     ///   the query itself fails.
-    /// - Returns [`Error::Other`] with message `"Query returned no rows"` if
+    /// - Returns [`Error::Conversion`] with message `"Query returned no rows"` if
     ///   the query produced zero rows.
     pub fn fetch_one<Q>(&self, query: Q) -> Result<crate::Row>
     where
@@ -721,7 +720,7 @@ impl Connection {
     /// impl FromRow for User {
     ///     fn from_row(row: &Row) -> Result<Self> {
     ///         Ok(User {
-    ///             id: row.get::<i32>(0).ok_or_else(|| hyperdb_api::Error::new("NULL id"))?,
+    ///             id: row.get::<i32>(0).ok_or_else(|| hyperdb_api::Error::conversion("NULL id"))?,
     ///             name: row.get::<String>(1).unwrap_or_default(),
     ///         })
     ///     }
@@ -795,9 +794,9 @@ impl Connection {
     ///
     /// - Returns the error from [`execute_query`](Self::execute_query) if
     ///   the query itself fails.
-    /// - Returns [`Error::Other`] with message `"Query returned no rows"` if
+    /// - Returns [`Error::Conversion`] with message `"Query returned no rows"` if
     ///   the query produced zero rows.
-    /// - Returns [`Error::Other`] with message `"Scalar query returned NULL"`
+    /// - Returns [`Error::Conversion`] with message `"Scalar query returned NULL"`
     ///   if the single cell is SQL `NULL`.
     pub fn fetch_scalar<T, Q>(&self, query: Q) -> Result<T>
     where
@@ -830,7 +829,7 @@ impl Connection {
     ///
     /// - Returns the error from [`execute_query`](Self::execute_query) if
     ///   the query itself fails.
-    /// - Returns [`Error::Other`] with message `"Query returned no rows"` if
+    /// - Returns [`Error::Conversion`] with message `"Query returned no rows"` if
     ///   the query produced zero rows. (An empty result is treated as an
     ///   error here because we need at least one row to inspect; SQL `NULL`
     ///   in the single cell yields `Ok(None)`.)
@@ -956,9 +955,9 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] if the connection is using gRPC transport
+    /// - Returns [`Error::FeatureNotSupported`] if the connection is using gRPC transport
     ///   (prepared statements are TCP-only).
-    /// - Returns [`Error::Client`] if the server rejects the statement at
+    /// - Returns [`Error::Server`] if the server rejects the statement at
     ///   `Parse`, `Bind`, or `Execute` time, including on type-mismatch
     ///   between `params` and the inferred OIDs.
     /// - Returns [`Error::Io`] on transport-level I/O failures.
@@ -977,7 +976,7 @@ impl Connection {
         let client = match &self.transport {
             Transport::Tcp(tcp) => &tcp.client,
             Transport::Grpc(_) => {
-                return Err(Error::new(
+                return Err(Error::feature_not_supported(
                     "prepared statements are not supported over gRPC transport",
                 ));
             }
@@ -1011,8 +1010,8 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] if the connection is using gRPC transport.
-    /// - Returns [`Error::Client`] if the server rejects the statement at
+    /// - Returns [`Error::FeatureNotSupported`] if the connection is using gRPC transport.
+    /// - Returns [`Error::Server`] if the server rejects the statement at
     ///   `Parse`, `Bind`, or `Execute` time.
     /// - Returns [`Error::Io`] on transport-level I/O failures.
     pub fn command_params(
@@ -1025,7 +1024,7 @@ impl Connection {
         let client = match &self.transport {
             Transport::Tcp(tcp) => &tcp.client,
             Transport::Grpc(_) => {
-                return Err(Error::new(
+                return Err(Error::feature_not_supported(
                     "prepared statements are not supported over gRPC transport",
                 ));
             }
@@ -1064,8 +1063,8 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// Returns a wrapped [`Error::Other`] on the first statement that fails;
-    /// its `source` is the original [`Error::Client`] from
+    /// Returns a wrapped [`Error::Internal`] on the first statement that fails;
+    /// its `source` is the original [`Error::Server`] from
     /// [`execute_command`](Self::execute_command). The error message
     /// includes the failing statement's ordinal and an 80-character preview
     /// of its SQL.
@@ -1075,15 +1074,13 @@ impl Connection {
             if !stmt.trim().is_empty() {
                 total += self.execute_command(stmt).map_err(|e| {
                     let preview: String = stmt.chars().take(80).collect();
-                    Error::with_cause(
-                        format!(
-                            "execute_batch failed at statement {} of {}: {}",
-                            i + 1,
-                            statements.len(),
-                            preview,
-                        ),
+                    Error::internal(format!(
+                        "execute_batch failed at statement {} of {}: {}: {}",
+                        i + 1,
+                        statements.len(),
+                        preview,
                         e,
-                    )
+                    ))
                 })?;
             }
         }
@@ -1111,7 +1108,7 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] if the server rejects the
+    /// Returns [`Error::Server`] if the server rejects the
     /// `CREATE DATABASE IF NOT EXISTS` statement (e.g. the path is not
     /// writable on the server).
     pub fn create_database(&self, path: &str) -> Result<()> {
@@ -1136,7 +1133,7 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] if the server rejects the
+    /// Returns [`Error::Server`] if the server rejects the
     /// `DROP DATABASE IF EXISTS` statement (e.g. the database is still
     /// attached or permissions deny deletion).
     pub fn drop_database(&self, path: &str) -> Result<()> {
@@ -1230,7 +1227,7 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] if the server rejects the
+    /// Returns [`Error::Server`] if the server rejects the
     /// `DETACH ALL DATABASES` statement (e.g. a database is still in use by
     /// another session).
     pub fn detach_all_databases(&self) -> Result<()> {
@@ -1244,7 +1241,7 @@ impl Connection {
     ///
     /// - Returns an error if `schema_name` cannot be converted into a
     ///   [`SchemaName`](crate::SchemaName) (invalid identifier).
-    /// - Returns [`Error::Client`] if the server rejects the
+    /// - Returns [`Error::Server`] if the server rejects the
     ///   `CREATE SCHEMA` statement (e.g. the schema already exists).
     pub fn create_schema<T>(&self, schema_name: T) -> Result<()>
     where
@@ -1278,7 +1275,7 @@ impl Connection {
     ///
     /// - Returns an error if `schema` cannot be converted into a
     ///   [`SchemaName`](crate::SchemaName).
-    /// - Returns [`Error::Client`] if the catalog lookup query fails.
+    /// - Returns [`Error::Server`] if the catalog lookup query fails.
     pub fn has_schema<T>(&self, schema: T) -> Result<bool>
     where
         T: TryInto<crate::SchemaName>,
@@ -1312,7 +1309,7 @@ impl Connection {
     ///
     /// - Returns an error if `table_name` cannot be converted into a
     ///   [`TableName`](crate::TableName).
-    /// - Returns [`Error::Client`] if the catalog lookup query fails.
+    /// - Returns [`Error::Server`] if the catalog lookup query fails.
     pub fn has_table<T>(&self, table_name: T) -> Result<bool>
     where
         T: TryInto<crate::TableName>,
@@ -1367,7 +1364,7 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] if the server rejects the
+    /// Returns [`Error::Server`] if the server rejects the
     /// `COPY DATABASE` statement — e.g. the source is not attached, the
     /// destination path is not writable, or it already exists.
     pub fn copy_database(&self, source: &str, destination: &str) -> Result<()> {
@@ -1397,7 +1394,7 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] if `EXPLAIN <query>` fails to parse or
+    /// Returns [`Error::Server`] if `EXPLAIN <query>` fails to parse or
     /// plan, or if the streamed result cannot be consumed.
     pub fn explain(&self, query: &str) -> Result<String> {
         let explain_sql = format!("EXPLAIN {query}");
@@ -1418,7 +1415,7 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] if `EXPLAIN ANALYZE <query>` fails — this
+    /// Returns [`Error::Server`] if `EXPLAIN ANALYZE <query>` fails — this
     /// includes any runtime error raised by actually executing `query`.
     pub fn explain_analyze(&self, query: &str) -> Result<String> {
         let explain_sql = format!("EXPLAIN ANALYZE {query}");
@@ -1494,9 +1491,9 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] if the connection is using gRPC transport
+    /// - Returns [`Error::FeatureNotSupported`] if the connection is using gRPC transport
     ///   (prepared statements are TCP-only).
-    /// - Returns [`Error::Client`] if the server rejects the `Parse`
+    /// - Returns [`Error::Server`] if the server rejects the `Parse`
     ///   message, e.g. SQL syntax error or unknown OID.
     /// - Returns [`Error::Io`] on transport-level I/O failures.
     pub fn prepare_typed(
@@ -1507,7 +1504,7 @@ impl Connection {
         let client = match &self.transport {
             Transport::Tcp(tcp) => &tcp.client,
             Transport::Grpc(_) => {
-                return Err(Error::new(
+                return Err(Error::feature_not_supported(
                     "prepared statements are not supported over gRPC transport",
                 ));
             }
@@ -1546,7 +1543,7 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] or [`Error::Io`] if the `SELECT 1`
+    /// Returns [`Error::Server`] or [`Error::Io`] if the `SELECT 1`
     /// round-trip fails — i.e. the connection is no longer usable.
     pub fn ping(&self) -> Result<()> {
         self.execute_command("SELECT 1")?;
@@ -1627,14 +1624,14 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] on gRPC connections — cancellation is not
+    /// - Returns [`Error::FeatureNotSupported`] on gRPC connections — cancellation is not
     ///   yet implemented for gRPC transport.
-    /// - Returns [`Error::Client`] or [`Error::Io`] if the separate
+    /// - Returns [`Error::Connection`] or [`Error::Io`] if the separate
     ///   cancel-request connection to the server fails.
     pub fn cancel(&self) -> Result<()> {
         match &self.transport {
             Transport::Tcp(tcp) => tcp.client.cancel().map_err(Error::from),
-            Transport::Grpc(_) => Err(Error::new(
+            Transport::Grpc(_) => Err(Error::feature_not_supported(
                 "Query cancellation is not yet supported for gRPC connections.",
             )),
         }
@@ -1644,10 +1641,10 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] wrapping the underlying close failure
+    /// - Returns [`Error::Internal`] wrapping the underlying close failure
     ///   (its `source` is the transport error) if the client cannot be
     ///   shut down cleanly.
-    /// - Returns [`Error::Other`] wrapping the detach failure if the
+    /// - Returns [`Error::Internal`] wrapping the detach failure if the
     ///   attached database could not be detached but close itself
     ///   succeeded.
     pub fn close(self) -> Result<()> {
@@ -1671,15 +1668,14 @@ impl Connection {
         };
 
         if let Err(e) = close_result {
-            return Err(Error::with_cause("Failed to close connection", e));
+            return Err(Error::internal(format!("Failed to close connection: {e}")));
         }
 
         if let Some(e) = detach_err {
             // Detach failed but close succeeded; surface the detach error.
-            return Err(Error::with_cause(
-                "Failed to detach database during close",
-                e,
-            ));
+            return Err(Error::internal(format!(
+                "Failed to detach database during close: {e}"
+            )));
         }
 
         Ok(())
@@ -1719,7 +1715,7 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] if the server rejects the `UNLOAD DATABASE`
+    /// Returns [`Error::Server`] if the server rejects the `UNLOAD DATABASE`
     /// command (e.g. the database is still in use by another session).
     pub fn unload_database(&self) -> Result<()> {
         self.execute_command("UNLOAD DATABASE")?;
@@ -1763,7 +1759,7 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] if the server rejects `UNLOAD RELEASE`, most
+    /// Returns [`Error::Server`] if the server rejects `UNLOAD RELEASE`, most
     /// commonly because multiple databases are attached to the same session
     /// (Hyper only supports `UNLOAD RELEASE` with exactly one attached DB).
     pub fn unload_release(&self) -> Result<()> {
@@ -1902,7 +1898,7 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] if the server rejects `BEGIN TRANSACTION`
+    /// Returns [`Error::Server`] if the server rejects `BEGIN TRANSACTION`
     /// (e.g. a transaction is already open on this session).
     pub fn begin_transaction(&self) -> Result<()> {
         self.execute_command("BEGIN TRANSACTION")?;
@@ -1913,7 +1909,7 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] if the server rejects `COMMIT` — most
+    /// Returns [`Error::Server`] if the server rejects `COMMIT` — most
     /// commonly because no transaction is currently open.
     pub fn commit(&self) -> Result<()> {
         self.execute_command("COMMIT")?;
@@ -1924,7 +1920,7 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] if the server rejects `ROLLBACK` — most
+    /// Returns [`Error::Server`] if the server rejects `ROLLBACK` — most
     /// commonly because no transaction is currently open.
     pub fn rollback(&self) -> Result<()> {
         self.execute_command("ROLLBACK")?;
@@ -1954,7 +1950,7 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] if the server rejects the `BEGIN`
+    /// Returns [`Error::Server`] if the server rejects the `BEGIN`
     /// statement issued internally by
     /// [`Transaction::new`](crate::Transaction).
     pub fn transaction(&mut self) -> Result<crate::Transaction<'_>> {

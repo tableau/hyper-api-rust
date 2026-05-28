@@ -48,7 +48,7 @@ pub(crate) const PG_IDENTIFIER_LIMIT: usize = 63;
 pub fn escape_name(name: &str) -> Result<String> {
     let len = name.chars().count();
     if len > PG_IDENTIFIER_LIMIT {
-        return Err(Error::InvalidName(format!(
+        return Err(Error::invalid_name(format!(
             "Name exceeds PostgreSQL identifier limit ({len} > {PG_IDENTIFIER_LIMIT})"
         )));
     }
@@ -146,7 +146,7 @@ impl Name {
     pub fn try_new(name: impl Into<String>) -> Result<Self> {
         let unescaped = name.into();
         if unescaped.is_empty() {
-            return Err(Error::InvalidName("Name must not be empty".into()));
+            return Err(Error::invalid_name("Name must not be empty"));
         }
         // escape_name validates the length limit and returns an error if exceeded
         let escaped = escape_name(&unescaped)?;
@@ -504,7 +504,7 @@ impl FromStr for SchemaName {
         match parts.as_slice() {
             [s] => SchemaName::try_new(s),
             [d, s] => SchemaName::try_new(s)?.with_database(d),
-            _ => Err(Error::InvalidName(format!("Invalid SQL identifier: {s}"))),
+            _ => Err(Error::invalid_name(format!("Invalid SQL identifier: {s}"))),
         }
     }
 }
@@ -726,7 +726,7 @@ impl FromStr for TableName {
             [t] => TableName::try_new(t),
             [s, t] => TableName::try_new(t)?.with_schema(s),
             [d, s, t] => TableName::try_new(t)?.with_schema(s)?.with_database(d),
-            _ => Err(Error::InvalidName(format!("Invalid SQL identifier: {s}"))),
+            _ => Err(Error::invalid_name(format!("Invalid SQL identifier: {s}"))),
         }
     }
 }

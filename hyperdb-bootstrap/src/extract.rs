@@ -26,16 +26,12 @@ use crate::Error;
 /// archive cannot be opened or parsed, and [`Error::HyperdNotInArchive`]
 /// if the archive does not contain a `hyperd` / `hyperd.exe` entry.
 pub fn extract_hyperd(zip_path: &Path, dest_dir: &Path) -> Result<Vec<PathBuf>, Error> {
-    let file = File::open(zip_path).map_err(|source| Error::Io {
-        context: format!("opening zip {}", zip_path.display()),
-        source,
-    })?;
+    let file = File::open(zip_path)
+        .map_err(|source| Error::io(format!("opening zip {}", zip_path.display()), source))?;
     let mut archive = zip::ZipArchive::new(file).map_err(Error::Zip)?;
 
-    fs::create_dir_all(dest_dir).map_err(|source| Error::Io {
-        context: format!("creating {}", dest_dir.display()),
-        source,
-    })?;
+    fs::create_dir_all(dest_dir)
+        .map_err(|source| Error::io(format!("creating {}", dest_dir.display()), source))?;
 
     let mut extracted = Vec::new();
     let mut found_hyperd = false;
@@ -54,26 +50,18 @@ pub fn extract_hyperd(zip_path: &Path, dest_dir: &Path) -> Result<Vec<PathBuf>, 
 
         let out_path = dest_dir.join(&rel);
         if entry.is_dir() {
-            fs::create_dir_all(&out_path).map_err(|source| Error::Io {
-                context: format!("creating {}", out_path.display()),
-                source,
-            })?;
+            fs::create_dir_all(&out_path)
+                .map_err(|source| Error::io(format!("creating {}", out_path.display()), source))?;
             continue;
         }
         if let Some(parent) = out_path.parent() {
-            fs::create_dir_all(parent).map_err(|source| Error::Io {
-                context: format!("creating {}", parent.display()),
-                source,
-            })?;
+            fs::create_dir_all(parent)
+                .map_err(|source| Error::io(format!("creating {}", parent.display()), source))?;
         }
-        let mut out = File::create(&out_path).map_err(|source| Error::Io {
-            context: format!("creating {}", out_path.display()),
-            source,
-        })?;
-        io::copy(&mut entry, &mut out).map_err(|source| Error::Io {
-            context: format!("writing {}", out_path.display()),
-            source,
-        })?;
+        let mut out = File::create(&out_path)
+            .map_err(|source| Error::io(format!("creating {}", out_path.display()), source))?;
+        io::copy(&mut entry, &mut out)
+            .map_err(|source| Error::io(format!("writing {}", out_path.display()), source))?;
 
         #[cfg(unix)]
         {

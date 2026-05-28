@@ -144,7 +144,7 @@ impl<'conn> Catalog<'conn> {
     ///
     /// - Returns an error if `schema_name` cannot be converted to a
     ///   [`SchemaName`](crate::SchemaName).
-    /// - Returns [`Error::Client`] if the server rejects
+    /// - Returns [`Error::Server`] if the server rejects
     ///   `CREATE SCHEMA IF NOT EXISTS`.
     pub fn create_schema<T>(&self, schema_name: T) -> Result<()>
     where
@@ -262,7 +262,7 @@ impl<'conn> Catalog<'conn> {
     ///
     /// - Returns an error if `schema` cannot be converted to a
     ///   [`SchemaName`](crate::SchemaName).
-    /// - Returns [`Error::Client`] if the `pg_catalog.pg_namespace` lookup
+    /// - Returns [`Error::Server`] if the `pg_catalog.pg_namespace` lookup
     ///   query fails.
     pub fn has_schema<T>(&self, schema: T) -> Result<bool>
     where
@@ -304,7 +304,7 @@ impl<'conn> Catalog<'conn> {
     ///
     /// - Returns an error if `table_name` cannot be converted to a
     ///   [`TableName`](crate::TableName).
-    /// - Returns [`Error::Client`] if the `pg_catalog.pg_tables` lookup
+    /// - Returns [`Error::Server`] if the `pg_catalog.pg_tables` lookup
     ///   query fails.
     pub fn has_table<T>(&self, table_name: T) -> Result<bool>
     where
@@ -444,7 +444,7 @@ impl<'conn> Catalog<'conn> {
         }
 
         if !found_columns {
-            return Err(Error::NotFound(format!("Table {schema}.{table}")));
+            return Err(Error::not_found(format!("Table {schema}.{table}")));
         }
 
         Ok(table_def)
@@ -478,7 +478,7 @@ impl<'conn> Catalog<'conn> {
     ///
     /// - Returns [`Error::InvalidTableDefinition`] if `table_def` cannot be
     ///   rendered as valid SQL (zero columns, bad identifiers).
-    /// - Returns [`Error::Client`] if the server rejects
+    /// - Returns [`Error::Server`] if the server rejects
     ///   `CREATE TABLE IF NOT EXISTS`.
     pub fn create_table_if_not_exists(&self, table_def: &TableDefinition) -> Result<()> {
         let sql = table_def.to_create_sql(false)?;
@@ -515,7 +515,7 @@ impl<'conn> Catalog<'conn> {
     ///
     /// - Returns an error if `table_name` cannot be converted to a
     ///   [`TableName`](crate::TableName).
-    /// - Returns [`Error::Client`] if the server rejects
+    /// - Returns [`Error::Server`] if the server rejects
     ///   `DROP TABLE IF EXISTS`.
     pub fn drop_table_if_exists<T>(&self, table_name: T) -> Result<()>
     where
@@ -559,7 +559,7 @@ impl<'conn> Catalog<'conn> {
     ///
     /// - Returns an error if `schema_name` cannot be converted to a
     ///   [`SchemaName`](crate::SchemaName).
-    /// - Returns [`Error::Client`] if the server rejects
+    /// - Returns [`Error::Server`] if the server rejects
     ///   `DROP SCHEMA IF EXISTS` — typically because `cascade` was `false`
     ///   and the schema is not empty.
     pub fn drop_schema_if_exists<T>(&self, schema_name: T, cascade: bool) -> Result<()>
@@ -601,7 +601,7 @@ impl<'conn> Catalog<'conn> {
     ///
     /// - Returns an error if `table_name` cannot be converted to a
     ///   [`TableName`](crate::TableName).
-    /// - Returns [`Error::Client`] if the `SELECT COUNT(*)` query fails
+    /// - Returns [`Error::Server`] if the `SELECT COUNT(*)` query fails
     ///   (e.g. table does not exist).
     pub fn get_row_count<T>(&self, table_name: T) -> Result<i64>
     where
@@ -661,7 +661,7 @@ impl<'conn> Catalog<'conn> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] if the
+    /// Returns [`Error::Server`] if the
     /// `SELECT datname FROM pg_catalog.pg_database` query fails or a
     /// streaming error occurs while draining the result.
     pub fn get_database_names(&self) -> Result<Vec<String>> {

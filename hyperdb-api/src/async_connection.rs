@@ -73,9 +73,9 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Io`] / [`Error::Client`] if the handshake with
+    /// - Returns [`Error::Io`] / [`Error::Connection`] if the handshake with
     ///   the server fails.
-    /// - Returns [`Error::Client`] if the `CreateMode` SQL (`CREATE`
+    /// - Returns [`Error::Server`] if the `CreateMode` SQL (`CREATE`
     ///   / `DROP` / `ATTACH`) is rejected by the server.
     pub async fn connect(endpoint: &str, database: &str, mode: CreateMode) -> Result<Self> {
         let transport = AsyncTransport::connect(endpoint, Some(database)).await?;
@@ -98,9 +98,9 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Client`] if authentication is rejected.
+    /// - Returns [`Error::Authentication`] if authentication is rejected.
     /// - Returns [`Error::Io`] if the endpoint cannot be reached.
-    /// - Returns [`Error::Client`] if the `CreateMode` SQL is rejected.
+    /// - Returns [`Error::Server`] if the `CreateMode` SQL is rejected.
     pub async fn connect_with_auth(
         endpoint: &str,
         database: &str,
@@ -129,7 +129,7 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] or [`Error::Client`] if the TCP handshake
+    /// Returns [`Error::Io`] or [`Error::Connection`] if the TCP handshake
     /// with `endpoint` fails.
     pub async fn without_database(endpoint: &str) -> Result<Self> {
         let transport = AsyncTransport::connect_tcp(endpoint).await?;
@@ -249,9 +249,9 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] on gRPC transports that do not yet
+    /// - Returns [`Error::FeatureNotSupported`] on gRPC transports that do not yet
     ///   support write operations.
-    /// - Returns [`Error::Client`] if the SQL fails to parse or execute.
+    /// - Returns [`Error::Server`] if the SQL fails to parse or execute.
     /// - Returns [`Error::Io`] on transport-level I/O failures.
     pub async fn execute_command(&self, sql: &str) -> Result<u64> {
         let token = self.stats_before_query(sql);
@@ -267,7 +267,7 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// Returns an [`Error::Other`] wrapping the first failing statement's
+    /// Returns an [`Error::Internal`] wrapping the first failing statement's
     /// error; the wrapping message includes the statement's ordinal and
     /// an 80-character SQL preview.
     pub async fn execute_batch(&self, statements: &[&str]) -> Result<u64> {
@@ -276,15 +276,13 @@ impl AsyncConnection {
             if !stmt.trim().is_empty() {
                 total += self.execute_command(stmt).await.map_err(|e| {
                     let preview: String = stmt.chars().take(80).collect();
-                    Error::with_cause(
-                        format!(
-                            "execute_batch failed at statement {} of {}: {}",
-                            i + 1,
-                            statements.len(),
-                            preview,
-                        ),
+                    Error::internal(format!(
+                        "execute_batch failed at statement {} of {}: {}: {}",
+                        i + 1,
+                        statements.len(),
+                        preview,
                         e,
-                    )
+                    ))
                 })?;
             }
         }
@@ -303,7 +301,7 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Client`] if the SQL is rejected by the server.
+    /// - Returns [`Error::Server`] if the SQL is rejected by the server.
     /// - Returns [`Error::Io`] on transport-level I/O failures while
     ///   opening the stream.
     pub async fn execute_query(&self, query: &str) -> Result<AsyncRowset<'_>> {
@@ -319,7 +317,7 @@ impl AsyncConnection {
     ///
     /// - Returns the error from [`execute_query`](Self::execute_query) if
     ///   the query fails.
-    /// - Returns [`Error::Other`] with message `"Query returned no rows"` if
+    /// - Returns [`Error::Conversion`] with message `"Query returned no rows"` if
     ///   the query produced zero rows.
     pub async fn fetch_one<Q: AsRef<str>>(&self, query: Q) -> Result<Row> {
         self.execute_query(query.as_ref())
@@ -380,9 +378,9 @@ impl AsyncConnection {
     /// # Errors
     ///
     /// - Returns the error from [`execute_query`](Self::execute_query).
-    /// - Returns [`Error::Other`] with message `"Query returned no rows"` if
+    /// - Returns [`Error::Conversion`] with message `"Query returned no rows"` if
     ///   the query is empty.
-    /// - Returns [`Error::Other`] with message `"Scalar query returned NULL"`
+    /// - Returns [`Error::Conversion`] with message `"Scalar query returned NULL"`
     ///   if the first cell is SQL `NULL`.
     pub async fn fetch_scalar<T, Q>(&self, query: Q) -> Result<T>
     where
@@ -433,7 +431,7 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// Propagates any [`Error::Client`] from the transport when the query
+    /// Propagates any [`Error::Server`] from the transport when the query
     /// fails or the server cannot produce Arrow IPC output.
     pub async fn execute_query_to_arrow(&self, sql: &str) -> Result<bytes::Bytes> {
         self.transport.execute_query_to_arrow(sql).await
@@ -453,8 +451,8 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Client`] if the query fails.
-    /// - Returns [`Error::Other`] if the Arrow IPC payload cannot be
+    /// - Returns [`Error::Server`] if the query fails.
+    /// - Returns [`Error::Conversion`] if the Arrow IPC payload cannot be
     ///   decoded into record batches.
     pub async fn execute_query_to_batches(
         &self,
@@ -476,9 +474,9 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] on gRPC transports (prepared statements
+    /// - Returns [`Error::FeatureNotSupported`] on gRPC transports (prepared statements
     ///   are TCP-only).
-    /// - Returns [`Error::Client`] if the server rejects the statement at
+    /// - Returns [`Error::Server`] if the server rejects the statement at
     ///   `Parse`, `Bind`, or `Execute` time.
     /// - Returns [`Error::Io`] on transport-level I/O failures.
     pub async fn query_params(
@@ -492,7 +490,7 @@ impl AsyncConnection {
         let client = match &self.transport {
             AsyncTransport::Tcp(tcp) => &tcp.client,
             AsyncTransport::Grpc(_) => {
-                return Err(Error::new(
+                return Err(Error::feature_not_supported(
                     "prepared statements are not supported over gRPC transport",
                 ));
             }
@@ -511,8 +509,8 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] on gRPC transports.
-    /// - Returns [`Error::Client`] if the server rejects the statement at
+    /// - Returns [`Error::FeatureNotSupported`] on gRPC transports.
+    /// - Returns [`Error::Server`] if the server rejects the statement at
     ///   `Parse`, `Bind`, or `Execute` time.
     /// - Returns [`Error::Io`] on transport-level I/O failures.
     pub async fn command_params(
@@ -523,7 +521,7 @@ impl AsyncConnection {
         let client = match &self.transport {
             AsyncTransport::Tcp(tcp) => &tcp.client,
             AsyncTransport::Grpc(_) => {
-                return Err(Error::new(
+                return Err(Error::feature_not_supported(
                     "prepared statements are not supported over gRPC transport",
                 ));
             }
@@ -542,7 +540,7 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] if the server rejects
+    /// Returns [`Error::Server`] if the server rejects
     /// `CREATE DATABASE IF NOT EXISTS` (e.g. the path is not writable).
     pub async fn create_database(&self, path: &str) -> Result<()> {
         let sql = format!("CREATE DATABASE IF NOT EXISTS {}", escape_sql_path(path));
@@ -554,7 +552,7 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] if the server rejects
+    /// Returns [`Error::Server`] if the server rejects
     /// `DROP DATABASE IF EXISTS` (e.g. the database is still attached).
     pub async fn drop_database(&self, path: &str) -> Result<()> {
         let sql = format!("DROP DATABASE IF EXISTS {}", escape_sql_path(path));
@@ -566,7 +564,7 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] if the server rejects the
+    /// Returns [`Error::Server`] if the server rejects the
     /// `ATTACH DATABASE` statement (file missing, permission denied,
     /// alias conflict).
     pub async fn attach_database(&self, path: &str, alias: Option<&str>) -> Result<()> {
@@ -587,7 +585,7 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] if the alias is not attached or the
+    /// Returns [`Error::Server`] if the alias is not attached or the
     /// server cannot flush pending updates.
     pub async fn detach_database(&self, alias: &str) -> Result<()> {
         let sql = format!("DETACH DATABASE {}", escape_sql_path(alias));
@@ -599,7 +597,7 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] if the server rejects
+    /// Returns [`Error::Server`] if the server rejects
     /// `DETACH ALL DATABASES`.
     pub async fn detach_all_databases(&self) -> Result<()> {
         self.execute_command("DETACH ALL DATABASES").await?;
@@ -610,7 +608,7 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] if the server rejects the
+    /// Returns [`Error::Server`] if the server rejects the
     /// `COPY DATABASE` statement — e.g. the source is not attached or the
     /// destination path is not writable.
     pub async fn copy_database(&self, source: &str, destination: &str) -> Result<()> {
@@ -629,7 +627,7 @@ impl AsyncConnection {
     ///
     /// - Returns an error if `schema_name` cannot be converted to a
     ///   [`SchemaName`](crate::SchemaName).
-    /// - Returns [`Error::Client`] if the server rejects
+    /// - Returns [`Error::Server`] if the server rejects
     ///   `CREATE SCHEMA IF NOT EXISTS`.
     pub async fn create_schema<T>(&self, schema_name: T) -> Result<()>
     where
@@ -648,7 +646,7 @@ impl AsyncConnection {
     ///
     /// - Returns an error if `schema` cannot be converted to a
     ///   [`SchemaName`](crate::SchemaName).
-    /// - Returns [`Error::Client`] if the catalog lookup query fails.
+    /// - Returns [`Error::Server`] if the catalog lookup query fails.
     pub async fn has_schema<T>(&self, schema: T) -> Result<bool>
     where
         T: TryInto<crate::SchemaName>,
@@ -674,7 +672,7 @@ impl AsyncConnection {
     ///
     /// - Returns an error if `table_name` cannot be converted to a
     ///   [`TableName`](crate::TableName).
-    /// - Returns [`Error::Client`] if the catalog lookup query fails.
+    /// - Returns [`Error::Server`] if the catalog lookup query fails.
     pub async fn has_table<T>(&self, table_name: T) -> Result<bool>
     where
         T: TryInto<crate::TableName>,
@@ -702,7 +700,7 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] if the server rejects `UNLOAD DATABASE`
+    /// Returns [`Error::Server`] if the server rejects `UNLOAD DATABASE`
     /// (e.g. the database is in use by another session).
     pub async fn unload_database(&self) -> Result<()> {
         self.execute_command("UNLOAD DATABASE").await?;
@@ -713,7 +711,7 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] if the server rejects `UNLOAD RELEASE`,
+    /// Returns [`Error::Server`] if the server rejects `UNLOAD RELEASE`,
     /// most commonly because multiple databases are attached to the same
     /// session.
     pub async fn unload_release(&self) -> Result<()> {
@@ -729,7 +727,7 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] if `EXPLAIN <query>` fails to parse or plan.
+    /// Returns [`Error::Server`] if `EXPLAIN <query>` fails to parse or plan.
     pub async fn explain(&self, query: &str) -> Result<String> {
         let sql = format!("EXPLAIN {query}");
         let rows = self.fetch_all(&sql).await?;
@@ -741,7 +739,7 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] if `EXPLAIN ANALYZE <query>` fails — this
+    /// Returns [`Error::Server`] if `EXPLAIN ANALYZE <query>` fails — this
     /// includes any runtime error raised by actually executing `query`.
     pub async fn explain_analyze(&self, query: &str) -> Result<String> {
         let sql = format!("EXPLAIN ANALYZE {query}");
@@ -766,7 +764,7 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] or [`Error::Io`] if the `SELECT 1`
+    /// Returns [`Error::Server`] or [`Error::Io`] if the `SELECT 1`
     /// round-trip fails — i.e. the connection is no longer usable.
     pub async fn ping(&self) -> Result<()> {
         self.execute_command("SELECT 1").await?;
@@ -818,9 +816,9 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] on gRPC transports — cancellation is not
+    /// - Returns [`Error::FeatureNotSupported`] on gRPC transports — cancellation is not
     ///   yet implemented for gRPC.
-    /// - Returns [`Error::Client`] or [`Error::Io`] if the cancel-request
+    /// - Returns [`Error::Connection`] or [`Error::Io`] if the cancel-request
     ///   connection to the server fails.
     pub async fn cancel(&self) -> Result<()> {
         self.transport.cancel().await
@@ -830,9 +828,9 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] wrapping the transport close failure if
+    /// - Returns [`Error::Internal`] wrapping the transport close failure if
     ///   the client cannot be shut down cleanly.
-    /// - Returns [`Error::Other`] wrapping the detach failure if the
+    /// - Returns [`Error::Internal`] wrapping the detach failure if the
     ///   attached database could not be detached but the transport close
     ///   itself succeeded.
     pub async fn close(self) -> Result<()> {
@@ -851,14 +849,15 @@ impl AsyncConnection {
         let close_result = self.transport.close().await;
 
         if let Err(e) = close_result {
-            return Err(Error::with_cause("Failed to close async connection", e));
+            return Err(Error::internal(format!(
+                "Failed to close async connection: {e}"
+            )));
         }
 
         if let Some(e) = detach_err {
-            return Err(Error::with_cause(
-                "Failed to detach database during close",
-                e,
-            ));
+            return Err(Error::internal(format!(
+                "Failed to detach database during close: {e}"
+            )));
         }
 
         Ok(())
@@ -899,9 +898,9 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] on gRPC transports (prepared statements
+    /// - Returns [`Error::FeatureNotSupported`] on gRPC transports (prepared statements
     ///   are TCP-only).
-    /// - Returns [`Error::Client`] if the server rejects the `Parse`
+    /// - Returns [`Error::Server`] if the server rejects the `Parse`
     ///   message (SQL syntax error, unknown OID).
     /// - Returns [`Error::Io`] on transport-level I/O failures.
     pub async fn prepare_typed(
@@ -912,7 +911,7 @@ impl AsyncConnection {
         let client = match &self.transport {
             AsyncTransport::Tcp(tcp) => &tcp.client,
             AsyncTransport::Grpc(_) => {
-                return Err(Error::new(
+                return Err(Error::feature_not_supported(
                     "prepared statements are not supported over gRPC transport",
                 ));
             }
@@ -943,8 +942,8 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] on gRPC transports.
-    /// - Returns [`Error::Client`] if the server rejects the `Parse`
+    /// - Returns [`Error::FeatureNotSupported`] on gRPC transports.
+    /// - Returns [`Error::Server`] if the server rejects the `Parse`
     ///   message.
     /// - Returns [`Error::Io`] on transport-level I/O failures.
     pub async fn prepare_typed_arc(
@@ -955,7 +954,7 @@ impl AsyncConnection {
         let client = match &self.transport {
             AsyncTransport::Tcp(tcp) => &tcp.client,
             AsyncTransport::Grpc(_) => {
-                return Err(Error::new(
+                return Err(Error::feature_not_supported(
                     "prepared statements are not supported over gRPC transport",
                 ));
             }
@@ -1019,7 +1018,7 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] if the server rejects `BEGIN TRANSACTION`
+    /// Returns [`Error::Server`] if the server rejects `BEGIN TRANSACTION`
     /// (e.g. a transaction is already open on this session).
     pub async fn begin_transaction(&self) -> Result<()> {
         self.execute_command("BEGIN TRANSACTION").await?;
@@ -1030,7 +1029,7 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] if the server rejects `COMMIT` (e.g. no
+    /// Returns [`Error::Server`] if the server rejects `COMMIT` (e.g. no
     /// transaction is currently open).
     pub async fn commit(&self) -> Result<()> {
         self.execute_command("COMMIT").await?;
@@ -1041,7 +1040,7 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] if the server rejects `ROLLBACK` (e.g. no
+    /// Returns [`Error::Server`] if the server rejects `ROLLBACK` (e.g. no
     /// transaction is currently open).
     pub async fn rollback(&self) -> Result<()> {
         self.execute_command("ROLLBACK").await?;
@@ -1052,7 +1051,7 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] if the internal `BEGIN` issued by
+    /// Returns [`Error::Server`] if the internal `BEGIN` issued by
     /// [`AsyncTransaction::new`](crate::AsyncTransaction) fails.
     pub async fn transaction(&mut self) -> Result<crate::AsyncTransaction<'_>> {
         crate::AsyncTransaction::new(self).await

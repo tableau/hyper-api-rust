@@ -241,13 +241,13 @@ impl Row {
     ///
     /// # Errors
     ///
-    /// - Returns [`crate::Error::Other`] if `idx` is out of bounds for the row's
+    /// - Returns [`crate::Error::Conversion`] if `idx` is out of bounds for the row's
     ///   column count.
-    /// - Returns [`crate::Error::Other`] if the cell is SQL `NULL` or its value
+    /// - Returns [`crate::Error::Conversion`] if the cell is SQL `NULL` or its value
     ///   cannot be decoded as `T`.
     pub fn try_get<T: RowValue>(&self, idx: usize, column_name: &str) -> crate::error::Result<T> {
         if idx >= self.column_count() {
-            return Err(crate::error::Error::new(format!(
+            return Err(crate::error::Error::conversion(format!(
                 "Column index {} ({:?}) out of bounds — row has {} columns",
                 idx,
                 column_name,
@@ -255,7 +255,7 @@ impl Row {
             )));
         }
         self.get::<T>(idx).ok_or_else(|| {
-            crate::error::Error::new(format!(
+            crate::error::Error::conversion(format!(
                 "Column {idx} ({column_name:?}) is NULL or has incompatible type",
             ))
         })
@@ -734,7 +734,7 @@ impl RowValue for hyperdb_api_core::types::Numeric {
 /// impl FromRow for User {
 ///     fn from_row(row: &Row) -> Result<Self> {
 ///         Ok(User {
-///             id: row.get::<i32>(0).ok_or_else(|| hyperdb_api::Error::new("NULL id"))?,
+///             id: row.get::<i32>(0).ok_or_else(|| hyperdb_api::Error::conversion("NULL id"))?,
 ///             name: row.get::<String>(1).unwrap_or_default(),
 ///             active: row.get::<bool>(2).unwrap_or(false),
 ///         })
@@ -746,7 +746,7 @@ pub trait FromRow: Sized {
     ///
     /// # Errors
     ///
-    /// Returns an [`Error`](crate::Error) — typically [`crate::Error::Other`] —
+    /// Returns an [`Error`](crate::Error) — typically [`crate::Error::Conversion`] —
     /// when a required column is missing, SQL `NULL`, or cannot be
     /// decoded as the expected type. Implementations decide the exact
     /// failure shape.
@@ -1155,10 +1155,10 @@ impl<'conn> Rowset<'conn> {
     ///
     /// # Errors
     ///
-    /// - Returns [`crate::Error::Client`] if the server sends an `ErrorResponse`
+    /// - Returns [`crate::Error::Server`] if the server sends an `ErrorResponse`
     ///   while streaming the result set.
     /// - Returns [`crate::Error::Io`] on transport-level I/O failures.
-    /// - Returns [`crate::Error::Other`] if an Arrow IPC chunk cannot be decoded.
+    /// - Returns [`crate::Error::Conversion`] if an Arrow IPC chunk cannot be decoded.
     pub fn next_chunk(&mut self) -> Result<Option<Vec<Row>>> {
         // Pull the next raw chunk from the underlying transport first;
         // on TCP, this is what makes the `RowDescription` bytes arrive
@@ -1390,11 +1390,11 @@ impl<'conn> Rowset<'conn> {
     /// # Errors
     ///
     /// - Returns the error from [`first_row`](Self::first_row).
-    /// - Returns [`crate::Error::Other`] with message `"Query returned no rows"`
+    /// - Returns [`crate::Error::Conversion`] with message `"Query returned no rows"`
     ///   if the result set is empty.
     pub fn require_first_row(self) -> crate::error::Result<Row> {
         self.first_row()?
-            .ok_or_else(|| crate::error::Error::new("Query returned no rows"))
+            .ok_or_else(|| crate::error::Error::conversion("Query returned no rows"))
     }
 
     /// Gets a scalar value from the first row, first column.
@@ -1441,11 +1441,11 @@ impl<'conn> Rowset<'conn> {
     /// # Errors
     ///
     /// - Returns the error from [`scalar`](Self::scalar).
-    /// - Returns [`crate::Error::Other`] with message `"Scalar query returned NULL"`
+    /// - Returns [`crate::Error::Conversion`] with message `"Scalar query returned NULL"`
     ///   if the single cell is SQL `NULL`.
     pub fn require_scalar<T: crate::result::RowValue>(self) -> crate::error::Result<T> {
         self.scalar()?
-            .ok_or_else(|| crate::error::Error::new("Scalar query returned NULL"))
+            .ok_or_else(|| crate::error::Error::conversion("Scalar query returned NULL"))
     }
 }
 

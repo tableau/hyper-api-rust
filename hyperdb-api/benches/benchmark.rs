@@ -429,7 +429,7 @@ fn benchmark_worker_thread(
         // Send chunk when it reaches the target size
         if chunk.row_count() >= rows_per_chunk || chunk.should_flush() {
             tx.send(chunk)
-                .map_err(|e| hyperdb_api::Error::new(format!("Channel send failed: {e}")))?;
+                .map_err(|e| hyperdb_api::Error::internal(format!("Channel send failed: {e}")))?;
             chunk = InsertChunk::from_table_definition(table_def);
         }
     }
@@ -437,7 +437,7 @@ fn benchmark_worker_thread(
     // Send any remaining rows
     if !chunk.is_empty() {
         tx.send(chunk)
-            .map_err(|e| hyperdb_api::Error::new(format!("Channel send failed: {e}")))?;
+            .map_err(|e| hyperdb_api::Error::internal(format!("Channel send failed: {e}")))?;
     }
 
     Ok(())
@@ -450,10 +450,10 @@ fn validate_threaded_insert(connection: &Connection, expected_row_count: i64) ->
     // Check row count
     let actual_count: i64 = connection
         .execute_scalar_query::<i64>("SELECT COUNT(*) FROM measurements_threaded")?
-        .ok_or_else(|| hyperdb_api::Error::new("Failed to get row count"))?;
+        .ok_or_else(|| hyperdb_api::Error::internal("Failed to get row count"))?;
 
     if actual_count != expected_row_count {
-        return Err(hyperdb_api::Error::new(format!(
+        return Err(hyperdb_api::Error::internal(format!(
             "Row count mismatch! Expected {expected_row_count}, got {actual_count}"
         )));
     }
@@ -472,7 +472,7 @@ fn validate_threaded_insert(connection: &Connection, expected_row_count: i64) ->
             let _sum_id: i64 = row.get(2).unwrap_or(-1);
 
             if count != rows_per_sensor {
-                return Err(hyperdb_api::Error::new(format!(
+                return Err(hyperdb_api::Error::internal(format!(
                     "Count mismatch for sensor_id={sensor_id}: expected {rows_per_sensor}, got {count}"
                 )));
             }
@@ -658,10 +658,10 @@ fn validate_insert_persistence(connection: &Connection, expected_row_count: i64)
     // Check row count using scalar query
     let actual_count: i64 = connection
         .execute_scalar_query::<i64>("SELECT COUNT(*) FROM measurements")?
-        .ok_or_else(|| hyperdb_api::Error::new("Failed to get row count"))?;
+        .ok_or_else(|| hyperdb_api::Error::internal("Failed to get row count"))?;
 
     if actual_count != expected_row_count {
-        return Err(hyperdb_api::Error::new(format!(
+        return Err(hyperdb_api::Error::internal(format!(
             "Row count mismatch! Expected {expected_row_count}, got {actual_count}"
         )));
     }
@@ -689,7 +689,7 @@ fn validate_insert_persistence(connection: &Connection, expected_row_count: i64)
                 || (value - expected_value).abs() > 0.001
                 || timestamp != expected_timestamp
             {
-                return Err(hyperdb_api::Error::new(format!(
+                return Err(hyperdb_api::Error::internal(format!(
                     "Data mismatch at id={id}: got sensor_id={sensor_id}, value={value}, timestamp={timestamp}, expected sensor_id={expected_sensor_id}, value={expected_value}, timestamp={expected_timestamp}"
                 )));
             }
@@ -719,7 +719,7 @@ fn validate_insert_persistence(connection: &Connection, expected_row_count: i64)
                 || (value - expected_value).abs() > 0.001
                 || timestamp != expected_timestamp
             {
-                return Err(hyperdb_api::Error::new(format!(
+                return Err(hyperdb_api::Error::internal(format!(
                     "Data mismatch at id={id}: got sensor_id={sensor_id}, value={value}, timestamp={timestamp}, expected sensor_id={expected_sensor_id}, value={expected_value}, timestamp={expected_timestamp}"
                 )));
             }
@@ -739,7 +739,7 @@ fn validate_insert_persistence(connection: &Connection, expected_row_count: i64)
             let sum_id: i64 = row.get(2).unwrap_or(-1);
 
             if count != rows_per_sensor {
-                return Err(hyperdb_api::Error::new(format!(
+                return Err(hyperdb_api::Error::internal(format!(
                     "Count mismatch for sensor_id={sensor_id}: expected {rows_per_sensor}, got {count}"
                 )));
             }
@@ -803,10 +803,10 @@ struct TcpVsGrpcResult {
 
 fn bind_ephemeral_port() -> Result<u16> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")
-        .map_err(|e| hyperdb_api::Error::new(format!("failed to bind ephemeral port: {e}")))?;
+        .map_err(|e| hyperdb_api::Error::internal(format!("failed to bind ephemeral port: {e}")))?;
     let port = listener
         .local_addr()
-        .map_err(|e| hyperdb_api::Error::new(format!("local_addr: {e}")))?
+        .map_err(|e| hyperdb_api::Error::internal(format!("local_addr: {e}")))?
         .port();
     // Listener drops here, releasing the port for hyperd to claim. There is
     // a small race window between this function returning and hyperd
@@ -861,7 +861,7 @@ fn run_tcp_vs_grpc_query_benchmark(row_count: i64, _db_path: &str) -> Result<()>
 
     let grpc_url = hyper
         .grpc_url()
-        .ok_or_else(|| hyperdb_api::Error::new("Both mode did not expose a gRPC URL"))?;
+        .ok_or_else(|| hyperdb_api::Error::internal("Both mode did not expose a gRPC URL"))?;
     println!("  TCP endpoint:  {}", hyper.require_endpoint()?);
     println!("  gRPC URL:      {grpc_url}");
     println!(
@@ -881,7 +881,7 @@ fn run_tcp_vs_grpc_query_benchmark(row_count: i64, _db_path: &str) -> Result<()>
     // point it at a scratch temp file since the query itself references
     // no tables.
     let tmp = tempfile::tempdir()
-        .map_err(|e| hyperdb_api::Error::new(format!("failed to create tempdir: {e}")))?;
+        .map_err(|e| hyperdb_api::Error::internal(format!("failed to create tempdir: {e}")))?;
     let scratch_db = tmp.path().join("tcp_vs_grpc_scratch.hyper");
 
     let tcp_result = {

@@ -61,14 +61,14 @@ impl OAuthTokenResponse {
     /// Checks if the response contains an error.
     pub fn check_error(&self) -> SalesforceAuthResult<()> {
         if let (Some(code), Some(desc)) = (&self.error, &self.error_description) {
-            return Err(SalesforceAuthError::Authorization {
-                error_code: code.clone(),
-                error_description: desc.clone(),
-            });
+            return Err(SalesforceAuthError::authorization(
+                code.clone(),
+                desc.clone(),
+            ));
         }
         if self.access_token.is_empty() {
-            return Err(SalesforceAuthError::TokenParse(
-                "missing access_token in OAuth Access Token response".to_string(),
+            return Err(SalesforceAuthError::token_parse(
+                "missing access_token in OAuth Access Token response",
             ));
         }
         Ok(())
@@ -113,7 +113,7 @@ impl OAuthToken {
         response.check_error()?;
 
         let instance_url = Url::parse(&response.instance_url)
-            .map_err(|e| SalesforceAuthError::TokenParse(format!("invalid instance_url: {e}")))?;
+            .map_err(|e| SalesforceAuthError::token_parse(format!("invalid instance_url: {e}")))?;
 
         let now = Utc::now();
         let expires_at = now + Duration::seconds(OAUTH_ACCESS_TOKEN_DEFAULT_LIFETIME_SECS);
@@ -172,14 +172,14 @@ impl DataCloudTokenResponse {
     /// Checks if the response contains an error.
     pub fn check_error(&self) -> SalesforceAuthResult<()> {
         if let (Some(code), Some(desc)) = (&self.error, &self.error_description) {
-            return Err(SalesforceAuthError::Authorization {
-                error_code: code.clone(),
-                error_description: desc.clone(),
-            });
+            return Err(SalesforceAuthError::authorization(
+                code.clone(),
+                desc.clone(),
+            ));
         }
         if self.access_token.is_empty() {
-            return Err(SalesforceAuthError::TokenParse(
-                "missing access_token in DC JWT response".to_string(),
+            return Err(SalesforceAuthError::token_parse(
+                "missing access_token in DC JWT response",
             ));
         }
         Ok(())
@@ -232,7 +232,7 @@ impl DataCloudToken {
         };
 
         let tenant_url = Url::parse(&instance_url_with_scheme)
-            .map_err(|e| SalesforceAuthError::TokenParse(format!("invalid instance_url: {e}")))?;
+            .map_err(|e| SalesforceAuthError::token_parse(format!("invalid instance_url: {e}")))?;
 
         let token_type = response.token_type.unwrap_or_else(|| "Bearer".to_string());
 
@@ -361,8 +361,8 @@ impl DataCloudToken {
     pub fn tenant_id(&self) -> SalesforceAuthResult<String> {
         let parts: Vec<&str> = self.token.split('.').collect();
         if parts.len() != 3 {
-            return Err(SalesforceAuthError::TokenParse(
-                "invalid DC JWT format: expected 3 parts".to_string(),
+            return Err(SalesforceAuthError::token_parse(
+                "invalid DC JWT format: expected 3 parts",
             ));
         }
 
@@ -375,9 +375,7 @@ impl DataCloudToken {
             .and_then(|v| v.as_str())
             .map(std::string::ToString::to_string)
             .ok_or_else(|| {
-                SalesforceAuthError::TokenParse(
-                    "missing audienceTenantId in DC JWT payload".to_string(),
-                )
+                SalesforceAuthError::token_parse("missing audienceTenantId in DC JWT payload")
             })
     }
 
@@ -410,7 +408,7 @@ fn base64_url_decode(input: &str) -> SalesforceAuthResult<Vec<u8>> {
 
     URL_SAFE_NO_PAD
         .decode(padded.trim_end_matches('='))
-        .map_err(|e| SalesforceAuthError::TokenParse(format!("base64 decode error: {e}")))
+        .map_err(|e| SalesforceAuthError::token_parse(format!("base64 decode error: {e}")))
 }
 
 #[cfg(test)]

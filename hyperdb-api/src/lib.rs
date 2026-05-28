@@ -185,12 +185,13 @@ pub use async_result::AsyncRowset;
 pub use catalog::Catalog;
 pub use connection::{Connection, CreateMode, ScalarValue};
 pub use connection_builder::ConnectionBuilder;
-pub use error::{Error, Result};
+pub use error::{ColumnErrorKind, Error, Result};
 pub use params::ToSqlParam;
 pub use prepared::PreparedStatement;
-// Re-export ErrorKind for matching on error categories, and Notice for callbacks
+// Re-export Notice for callback registrants. ErrorKind is intentionally
+// NOT re-exported — callers match directly on the flat `Error` enum.
 pub use async_transaction::AsyncTransaction;
-pub use hyperdb_api_core::client::{ErrorKind, Notice, NoticeReceiver};
+pub use hyperdb_api_core::client::{Notice, NoticeReceiver};
 pub use inserter::{ChunkSender, ColumnMapping, InsertChunk, Inserter, IntoValue, MappedInserter};
 pub use names::{
     escape_name, escape_sql_path, escape_string_literal, DatabaseName, Name, SchemaName, TableName,

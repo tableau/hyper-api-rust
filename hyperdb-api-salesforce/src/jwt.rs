@@ -81,7 +81,7 @@ pub(crate) fn build_jwt_assertion(
     // Convert RSA private key to PEM for jsonwebtoken
     let private_key_pem = private_key_to_pem(private_key)?;
     let encoding_key = EncodingKey::from_rsa_pem(private_key_pem.as_bytes())
-        .map_err(|e| SalesforceAuthError::Jwt(format!("failed to create encoding key: {e}")))?;
+        .map_err(|e| SalesforceAuthError::jwt(format!("failed to create encoding key: {e}")))?;
 
     // Create JWT header with RS256 algorithm
     let header = Header::new(Algorithm::RS256);
@@ -105,7 +105,7 @@ fn private_key_to_pem(key: &RsaPrivateKey) -> SalesforceAuthResult<String> {
 
     key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
         .map(|pem| pem.to_string())
-        .map_err(|e| SalesforceAuthError::PrivateKey(format!("failed to encode private key: {e}")))
+        .map_err(|e| SalesforceAuthError::private_key(format!("failed to encode private key: {e}")))
 }
 
 #[cfg(test)]

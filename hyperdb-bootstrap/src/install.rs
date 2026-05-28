@@ -146,21 +146,14 @@ fn download_and_extract(
     versioned_dir: &Path,
 ) -> Result<(), Error> {
     if versioned_dir.exists() {
-        fs::remove_dir_all(versioned_dir).map_err(|source| Error::Io {
-            context: format!("clearing {}", versioned_dir.display()),
-            source,
-        })?;
+        fs::remove_dir_all(versioned_dir)
+            .map_err(|source| Error::io(format!("clearing {}", versioned_dir.display()), source))?;
     }
-    fs::create_dir_all(versioned_dir).map_err(|source| Error::Io {
-        context: format!("creating {}", versioned_dir.display()),
-        source,
-    })?;
+    fs::create_dir_all(versioned_dir)
+        .map_err(|source| Error::io(format!("creating {}", versioned_dir.display()), source))?;
 
     let url = build_download_url(release, platform);
-    let tmp = tempfile::tempdir().map_err(|source| Error::Io {
-        context: "creating temp dir".to_string(),
-        source,
-    })?;
+    let tmp = tempfile::tempdir().map_err(|source| Error::io("creating temp dir", source))?;
     let zip_path = tmp.path().join("hyperapi-cxx.zip");
     download_and_verify(&url, release.sha256_for(platform), &zip_path)?;
     extract_hyperd(&zip_path, versioned_dir)?;
@@ -171,48 +164,38 @@ fn refresh_current(current: &Path, source: &Path, version_tag: &str) -> Result<(
     // current/ is a fresh file copy every run — avoids Windows symlink
     // privileges and keeps the Makefile auto-discovery path stable.
     if current.exists() {
-        fs::remove_dir_all(current).map_err(|source| Error::Io {
-            context: format!("clearing {}", current.display()),
-            source,
-        })?;
+        fs::remove_dir_all(current)
+            .map_err(|source| Error::io(format!("clearing {}", current.display()), source))?;
     }
-    fs::create_dir_all(current).map_err(|source| Error::Io {
-        context: format!("creating {}", current.display()),
-        source,
-    })?;
+    fs::create_dir_all(current)
+        .map_err(|source| Error::io(format!("creating {}", current.display()), source))?;
     copy_dir_contents(source, current)?;
-    fs::write(current.join("VERSION"), version_tag).map_err(|source| Error::Io {
-        context: format!("writing {}/VERSION", current.display()),
-        source,
-    })?;
+    fs::write(current.join("VERSION"), version_tag)
+        .map_err(|source| Error::io(format!("writing {}/VERSION", current.display()), source))?;
     Ok(())
 }
 
 fn copy_dir_contents(from: &Path, to: &Path) -> Result<(), Error> {
-    for entry in fs::read_dir(from).map_err(|source| Error::Io {
-        context: format!("reading {}", from.display()),
-        source,
-    })? {
-        let entry = entry.map_err(|source| Error::Io {
-            context: format!("reading {}", from.display()),
-            source,
-        })?;
+    for entry in fs::read_dir(from)
+        .map_err(|source| Error::io(format!("reading {}", from.display()), source))?
+    {
+        let entry =
+            entry.map_err(|source| Error::io(format!("reading {}", from.display()), source))?;
         let src = entry.path();
         let dst = to.join(entry.file_name());
-        let ty = entry.file_type().map_err(|source| Error::Io {
-            context: format!("stat {}", src.display()),
-            source,
-        })?;
+        let ty = entry
+            .file_type()
+            .map_err(|source| Error::io(format!("stat {}", src.display()), source))?;
         if ty.is_dir() {
-            fs::create_dir_all(&dst).map_err(|source| Error::Io {
-                context: format!("creating {}", dst.display()),
-                source,
-            })?;
+            fs::create_dir_all(&dst)
+                .map_err(|source| Error::io(format!("creating {}", dst.display()), source))?;
             copy_dir_contents(&src, &dst)?;
         } else {
-            fs::copy(&src, &dst).map_err(|source| Error::Io {
-                context: format!("copying {} -> {}", src.display(), dst.display()),
-                source,
+            fs::copy(&src, &dst).map_err(|source| {
+                Error::io(
+                    format!("copying {} -> {}", src.display(), dst.display()),
+                    source,
+                )
             })?;
             #[cfg(unix)]
             {

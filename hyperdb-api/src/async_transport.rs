@@ -136,11 +136,11 @@ impl AsyncTransport {
 
         let socket_path = if endpoint.starts_with("tab.domain://") {
             let parsed = ConnectionEndpoint::parse(endpoint)
-                .map_err(|e| Error::new(format!("invalid Unix socket endpoint: {e}")))?;
+                .map_err(|e| Error::config(format!("invalid Unix socket endpoint: {e}")))?;
             match parsed {
                 ConnectionEndpoint::DomainSocket { directory, name } => directory.join(&name),
                 ConnectionEndpoint::Tcp { .. } => {
-                    return Err(Error::new("expected Unix domain socket endpoint"));
+                    return Err(Error::config("expected Unix domain socket endpoint"));
                 }
             }
         } else {
@@ -163,12 +163,12 @@ impl AsyncTransport {
 
         let pipe_path = if endpoint.starts_with("tab.pipe://") {
             let parsed = ConnectionEndpoint::parse(endpoint)
-                .map_err(|e| Error::new(format!("invalid named pipe endpoint: {e}")))?;
+                .map_err(|e| Error::config(format!("invalid named pipe endpoint: {e}")))?;
             match parsed {
                 ConnectionEndpoint::NamedPipe { host, name } => {
                     format!(r"\\{host}\pipe\{name}")
                 }
-                _ => return Err(Error::new("expected named pipe endpoint")),
+                _ => return Err(Error::config("expected named pipe endpoint")),
             }
         } else {
             endpoint.to_string()
@@ -184,7 +184,7 @@ impl AsyncTransport {
     pub(crate) async fn execute_command(&self, sql: &str) -> Result<u64> {
         match self {
             AsyncTransport::Tcp(tcp) => Ok(tcp.client.exec(sql).await?),
-            AsyncTransport::Grpc(_) => Err(Error::new(
+            AsyncTransport::Grpc(_) => Err(Error::feature_not_supported(
                 "gRPC transport is read-only. Write operations (INSERT, UPDATE, DELETE, DDL) \
                  are not yet supported over gRPC. Use a TCP connection for write operations.",
             )),
@@ -256,7 +256,9 @@ impl AsyncTransport {
             }
             AsyncTransport::Grpc(_) => {
                 // gRPC cancellation would be handled differently
-                Err(Error::new("Query cancellation not supported over gRPC"))
+                Err(Error::feature_not_supported(
+                    "Query cancellation not supported over gRPC",
+                ))
             }
         }
     }

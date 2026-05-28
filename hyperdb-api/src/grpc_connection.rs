@@ -132,7 +132,7 @@ impl GrpcConnection {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::Client`] wrapping a
+    /// Returns [`crate::Error::Connection`] wrapping a
     /// `hyperdb_api_core::client::Error` if the HTTP/2 channel cannot be established
     /// (endpoint unreachable, TLS handshake failure, auth rejection).
     pub fn connect(endpoint: &str, database_path: &str) -> Result<Self> {
@@ -165,7 +165,7 @@ impl GrpcConnection {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::Client`] if the HTTP/2 channel cannot be
+    /// Returns [`crate::Error::Connection`] if the HTTP/2 channel cannot be
     /// established with the supplied configuration.
     pub fn connect_with_config(config: GrpcConfig) -> Result<Self> {
         let database = config.database_path().map(std::string::ToString::to_string);
@@ -194,7 +194,7 @@ impl GrpcConnection {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::Client`] if the gRPC server rejects the query
+    /// Returns [`crate::Error::Server`] if the gRPC server rejects the query
     /// or if the HTTP/2 channel fails mid-stream.
     pub fn execute_query_to_arrow(&mut self, sql: &str) -> Result<bytes::Bytes> {
         Ok(self.client.execute_query_to_arrow(sql)?)
@@ -220,7 +220,7 @@ impl GrpcConnection {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::Client`] if the gRPC server rejects the query
+    /// Returns [`crate::Error::Server`] if the gRPC server rejects the query
     /// or the HTTP/2 channel fails.
     pub fn execute_query(&mut self, sql: &str) -> Result<GrpcQueryResult> {
         Ok(self.client.execute_query(sql)?)
@@ -276,7 +276,7 @@ impl GrpcConnection {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::Client`] on transport-level failures (channel
+    /// Returns [`crate::Error::Connection`] on transport-level failures (channel
     /// closed, network error, auth expired). An unknown or already-finished
     /// `query_id` is not an error — the server returns `Ok`.
     pub fn cancel_query(&mut self, query_id: &str) -> Result<()> {
@@ -300,7 +300,7 @@ impl GrpcConnection {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::Client`] if the underlying HTTP/2 channel cannot
+    /// Returns [`crate::Error::Connection`] if the underlying HTTP/2 channel cannot
     /// be shut down cleanly.
     pub fn close(self) -> Result<()> {
         Ok(self.client.close()?)
@@ -345,7 +345,7 @@ impl GrpcConnectionAsync {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::Client`] if the HTTP/2 channel cannot be
+    /// Returns [`crate::Error::Connection`] if the HTTP/2 channel cannot be
     /// established (endpoint unreachable, TLS handshake failure).
     pub async fn connect(endpoint: &str, database_path: &str) -> Result<Self> {
         let config = GrpcConfig::new(endpoint).database(database_path);
@@ -361,7 +361,7 @@ impl GrpcConnectionAsync {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::Client`] if the HTTP/2 channel cannot be
+    /// Returns [`crate::Error::Connection`] if the HTTP/2 channel cannot be
     /// established with the supplied configuration.
     pub async fn connect_with_config(config: GrpcConfig) -> Result<Self> {
         let database = config.database_path().map(std::string::ToString::to_string);
@@ -374,7 +374,7 @@ impl GrpcConnectionAsync {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::Client`] if the server rejects the query or the
+    /// Returns [`crate::Error::Server`] if the server rejects the query or the
     /// HTTP/2 channel fails mid-stream.
     pub async fn execute_query_to_arrow(&mut self, sql: &str) -> Result<bytes::Bytes> {
         Ok(self.client.execute_query_to_arrow(sql).await?)
@@ -384,7 +384,7 @@ impl GrpcConnectionAsync {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::Client`] if the server rejects the query or the
+    /// Returns [`crate::Error::Server`] if the server rejects the query or the
     /// HTTP/2 channel fails.
     pub async fn execute_query(&mut self, sql: &str) -> Result<GrpcQueryResult> {
         Ok(self.client.execute_query(sql).await?)
@@ -433,7 +433,7 @@ impl GrpcConnectionAsync {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::Client`] if the underlying HTTP/2 channel cannot
+    /// Returns [`crate::Error::Connection`] if the underlying HTTP/2 channel cannot
     /// be shut down cleanly.
     pub async fn close(self) -> Result<()> {
         Ok(self.client.close().await?)

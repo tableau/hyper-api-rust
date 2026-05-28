@@ -39,10 +39,7 @@ pub fn scrape_latest(platform: Platform) -> Result<PinnedRelease, Error> {
         .map_err(Error::Http)?;
     let resp = client.get(RELEASES_URL).send().map_err(Error::Http)?;
     if !resp.status().is_success() {
-        return Err(Error::HttpStatus {
-            url: RELEASES_URL.to_string(),
-            status: resp.status().as_u16(),
-        });
+        return Err(Error::http_status(RELEASES_URL, resp.status().as_u16()));
     }
     let html = resp.text().map_err(Error::Http)?;
     parse_latest(&html, platform)

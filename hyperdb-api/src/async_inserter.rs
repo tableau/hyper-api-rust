@@ -88,16 +88,16 @@ impl<'conn> AsyncInserter<'conn> {
     /// # Errors
     ///
     /// - Returns [`Error::InvalidTableDefinition`] if `table_def` has zero columns.
-    /// - Returns [`Error::Other`] if `connection` is using gRPC transport
+    /// - Returns [`Error::FeatureNotSupported`] if `connection` is using gRPC transport
     ///   (COPY is TCP-only).
     pub fn new(connection: &'conn AsyncConnection, table_def: &TableDefinition) -> Result<Self> {
         if table_def.column_count() == 0 {
-            return Err(Error::InvalidTableDefinition(
-                "Table definition must have at least one column".into(),
+            return Err(Error::invalid_table_definition(
+                "Table definition must have at least one column",
             ));
         }
         if connection.async_tcp_client().is_none() {
-            return Err(Error::new(
+            return Err(Error::feature_not_supported(
                 "AsyncInserter requires a TCP connection. \
                  gRPC connections do not support COPY operations.",
             ));
@@ -196,7 +196,7 @@ impl<'conn> AsyncInserter<'conn> {
                     .columns
                     .get(column_index)
                     .map_or("<unknown>", |c| c.name.as_str());
-                Error::new(format!(
+                Error::conversion(format!(
                     "Cannot determine numeric precision for column '{col_name}' at index {column_index}. \
                      Ensure the column is defined with explicit SqlType including precision."
                 ))
@@ -204,7 +204,7 @@ impl<'conn> AsyncInserter<'conn> {
         if precision <= Numeric::SMALL_NUMERIC_MAX_PRECISION {
             let unscaled = value.unscaled_value();
             let narrowed = i64::try_from(unscaled).map_err(|_| {
-                Error::new(format!(
+                Error::conversion(format!(
                     "Numeric value {unscaled} is out of range for i64 storage (precision {precision})"
                 ))
             })?;
@@ -219,9 +219,9 @@ impl<'conn> AsyncInserter<'conn> {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] if the column count for the row doesn't match
+    /// - Returns [`Error::InvalidTableDefinition`] if the column count for the row doesn't match
     ///   the table definition.
-    /// - Returns [`Error::Client`] / [`Error::Io`] on transport failures
+    /// - Returns [`Error::Server`] / [`Error::Io`] on transport failures
     ///   during the auto-flush.
     pub async fn end_row(&mut self) -> Result<()> {
         self.chunk.end_row()?;
@@ -238,7 +238,7 @@ impl<'conn> AsyncInserter<'conn> {
         // Lazily start the COPY session on first flush.
         if self.writer.is_none() {
             let client = self.connection.async_tcp_client().ok_or_else(|| {
-                Error::new(
+                Error::feature_not_supported(
                     "AsyncInserter requires a TCP connection. \
                      gRPC connections do not support COPY operations.",
                 )
@@ -271,12 +271,14 @@ impl<'conn> AsyncInserter<'conn> {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] if there's an incomplete row (partial column).
-    /// - Returns [`Error::Client`] / [`Error::Io`] if the COPY session or
+    /// - Returns [`Error::InvalidTableDefinition`] if there's an incomplete row (partial column).
+    /// - Returns [`Error::Server`] / [`Error::Io`] if the COPY session or
     ///   transport fails.
     pub async fn execute(&mut self) -> Result<u64> {
         if self.chunk.column_index() != 0 {
-            return Err(Error::new("Incomplete row at execute time"));
+            return Err(Error::invalid_table_definition(
+                "Incomplete row at execute time",
+            ));
         }
         if self.row_count == 0 {
             return Ok(0);

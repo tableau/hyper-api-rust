@@ -90,20 +90,22 @@ impl<'conn> AsyncArrowInserter<'conn> {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] with message
+    /// - Returns [`Error::InvalidTableDefinition`] with message
     ///   `"Table definition must have at least one column"` if `table_def`
     ///   has no columns.
-    /// - Returns [`Error::Other`] if `connection` is using gRPC transport
+    /// - Returns [`Error::FeatureNotSupported`] if `connection` is using gRPC transport
     ///   (COPY is TCP-only).
     pub fn new(connection: &'conn AsyncConnection, table_def: &TableDefinition) -> Result<Self> {
         let column_count = table_def.column_count();
         if column_count == 0 {
-            return Err(Error::new("Table definition must have at least one column"));
+            return Err(Error::invalid_table_definition(
+                "Table definition must have at least one column",
+            ));
         }
 
         // Fail fast: verify the connection supports COPY (TCP only)
         if connection.async_tcp_client().is_none() {
-            return Err(Error::new(
+            return Err(Error::feature_not_supported(
                 "AsyncArrowInserter requires a TCP connection. \
                  gRPC connections do not support COPY operations.",
             ));
@@ -144,12 +146,12 @@ impl<'conn> AsyncArrowInserter<'conn> {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] if a schema was already sent (call
+    /// - Returns [`Error::Internal`] if a schema was already sent (call
     ///   [`insert_record_batches`](Self::insert_record_batches) for
     ///   subsequent chunks instead).
-    /// - Returns [`Error::Other`] / [`Error::Client`] if the lazy COPY
+    /// - Returns [`Error::FeatureNotSupported`] / [`Error::Server`] if the lazy COPY
     ///   session cannot be opened.
-    /// - Returns [`Error::Client`] / [`Error::Io`] if the server rejects
+    /// - Returns [`Error::Server`] / [`Error::Io`] if the server rejects
     ///   the data or the socket write fails.
     pub async fn insert_data(&mut self, arrow_ipc_data: &[u8]) -> Result<()> {
         if arrow_ipc_data.is_empty() {
@@ -157,7 +159,7 @@ impl<'conn> AsyncArrowInserter<'conn> {
         }
 
         if self.schema_sent {
-            return Err(Error::new(
+            return Err(Error::internal(
                 "Arrow schema was already sent. Use insert_record_batches() for subsequent chunks without schema, \
                  or use insert_data() only once with the complete Arrow IPC stream.",
             ));
@@ -194,9 +196,9 @@ impl<'conn> AsyncArrowInserter<'conn> {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] if no schema has been sent yet (call
+    /// - Returns [`Error::Internal`] if no schema has been sent yet (call
     ///   [`insert_data`](Self::insert_data) first).
-    /// - Returns [`Error::Client`] / [`Error::Io`] if the server rejects
+    /// - Returns [`Error::Server`] / [`Error::Io`] if the server rejects
     ///   the data or the socket write fails.
     pub async fn insert_record_batches(&mut self, arrow_batch_data: &[u8]) -> Result<()> {
         if arrow_batch_data.is_empty() {
@@ -204,7 +206,7 @@ impl<'conn> AsyncArrowInserter<'conn> {
         }
 
         if !self.schema_sent {
-            return Err(Error::new(
+            return Err(Error::internal(
                 "No Arrow schema has been sent yet. Call insert_data() first with a complete \
                  Arrow IPC stream that includes the schema.",
             ));
@@ -239,9 +241,9 @@ impl<'conn> AsyncArrowInserter<'conn> {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] / [`Error::Client`] if the lazy COPY
+    /// - Returns [`Error::FeatureNotSupported`] / [`Error::Server`] if the lazy COPY
     ///   session cannot be opened.
-    /// - Returns [`Error::Client`] / [`Error::Io`] if the server rejects
+    /// - Returns [`Error::Server`] / [`Error::Io`] if the server rejects
     ///   the data or the socket write fails.
     pub async fn insert_raw(&mut self, data: &[u8]) -> Result<()> {
         if data.is_empty() {
@@ -270,7 +272,7 @@ impl<'conn> AsyncArrowInserter<'conn> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Client`] or [`Error::Io`] if the `CommandComplete`
+    /// Returns [`Error::Server`] or [`Error::Io`] if the `CommandComplete`
     /// round-trip fails (server rejected some buffered batch, or the socket
     /// closed mid-flush). If no data was ever written, returns `Ok(0)`.
     pub async fn execute(mut self) -> Result<u64> {
@@ -328,7 +330,9 @@ impl<'conn> AsyncArrowInserter<'conn> {
     async fn ensure_writer(&mut self) -> Result<()> {
         if self.writer.is_none() {
             let client = self.connection.async_tcp_client().ok_or_else(|| {
-                crate::Error::new("AsyncArrowInserter requires a TCP connection. gRPC connections do not support COPY operations.")
+                crate::Error::feature_not_supported(
+                    "AsyncArrowInserter requires a TCP connection. gRPC connections do not support COPY operations.",
+                )
             })?;
             let columns: Vec<&str> = self
                 .columns
@@ -433,18 +437,20 @@ impl AsyncArrowInserterOwned {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] with message
+    /// - Returns [`Error::InvalidTableDefinition`] with message
     ///   `"Table definition must have at least one column"` if `table_def`
     ///   has no columns.
-    /// - Returns [`Error::Other`] if `connection` is using gRPC transport.
+    /// - Returns [`Error::FeatureNotSupported`] if `connection` is using gRPC transport.
     pub fn new(connection: Arc<AsyncConnection>, table_def: &TableDefinition) -> Result<Self> {
         let column_count = table_def.column_count();
         if column_count == 0 {
-            return Err(Error::new("Table definition must have at least one column"));
+            return Err(Error::invalid_table_definition(
+                "Table definition must have at least one column",
+            ));
         }
 
         if connection.async_tcp_client().is_none() {
-            return Err(Error::new(
+            return Err(Error::feature_not_supported(
                 "AsyncArrowInserterOwned requires a TCP connection. \
                  gRPC connections do not support COPY operations.",
             ));
@@ -481,17 +487,17 @@ impl AsyncArrowInserterOwned {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] if a schema was already sent.
-    /// - Returns [`Error::Other`] / [`Error::Client`] if the lazy COPY
+    /// - Returns [`Error::Internal`] if a schema was already sent.
+    /// - Returns [`Error::FeatureNotSupported`] / [`Error::Server`] if the lazy COPY
     ///   session cannot be opened.
-    /// - Returns [`Error::Client`] / [`Error::Io`] if the server rejects
+    /// - Returns [`Error::Server`] / [`Error::Io`] if the server rejects
     ///   the data or the socket write fails.
     pub async fn insert_data(&mut self, arrow_ipc_data: &[u8]) -> Result<()> {
         if arrow_ipc_data.is_empty() {
             return Ok(());
         }
         if self.schema_sent {
-            return Err(Error::new(
+            return Err(Error::internal(
                 "Arrow schema was already sent. Use insert_record_batches() for subsequent chunks.",
             ));
         }
@@ -513,15 +519,15 @@ impl AsyncArrowInserterOwned {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] if no schema has been sent yet.
-    /// - Returns [`Error::Client`] / [`Error::Io`] if the server rejects
+    /// - Returns [`Error::Internal`] if no schema has been sent yet.
+    /// - Returns [`Error::Server`] / [`Error::Io`] if the server rejects
     ///   the data or the socket write fails.
     pub async fn insert_record_batches(&mut self, arrow_batch_data: &[u8]) -> Result<()> {
         if arrow_batch_data.is_empty() {
             return Ok(());
         }
         if !self.schema_sent {
-            return Err(Error::new(
+            return Err(Error::internal(
                 "No Arrow schema has been sent yet. Call insert_data() first.",
             ));
         }
@@ -541,9 +547,9 @@ impl AsyncArrowInserterOwned {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] / [`Error::Client`] if the lazy COPY
+    /// - Returns [`Error::FeatureNotSupported`] / [`Error::Server`] if the lazy COPY
     ///   session cannot be opened.
-    /// - Returns [`Error::Client`] / [`Error::Io`] if the server rejects
+    /// - Returns [`Error::Server`] / [`Error::Io`] if the server rejects
     ///   the data or the socket write fails.
     pub async fn insert_raw(&mut self, data: &[u8]) -> Result<()> {
         if data.is_empty() {
@@ -565,10 +571,10 @@ impl AsyncArrowInserterOwned {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] with message
+    /// - Returns [`Error::Internal`] with message
     ///   `"No data was inserted before execute()"` if no COPY session was
     ///   ever opened.
-    /// - Returns [`Error::Client`] / [`Error::Io`] if the `CommandComplete`
+    /// - Returns [`Error::Server`] / [`Error::Io`] if the `CommandComplete`
     ///   round-trip fails.
     pub async fn execute(mut self) -> Result<u64> {
         let elapsed = self.start_time.elapsed();
@@ -582,7 +588,7 @@ impl AsyncArrowInserterOwned {
         let writer = self
             .writer
             .take()
-            .ok_or_else(|| Error::new("No data was inserted before execute()"))?;
+            .ok_or_else(|| Error::internal("No data was inserted before execute()"))?;
         writer.finish().await.map_err(Into::into)
     }
 
@@ -614,7 +620,7 @@ impl AsyncArrowInserterOwned {
     async fn ensure_writer(&mut self) -> Result<()> {
         if self.writer.is_none() {
             let client: &AsyncClient = self.connection.async_tcp_client().ok_or_else(|| {
-                Error::new(
+                Error::feature_not_supported(
                     "AsyncArrowInserterOwned requires a TCP connection. \
                      gRPC connections do not support COPY operations.",
                 )

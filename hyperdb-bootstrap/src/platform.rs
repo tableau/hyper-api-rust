@@ -49,10 +49,7 @@ impl Platform {
             ("macos", "x86_64") => Ok(Self::MacosX86_64),
             ("linux", "x86_64") => Ok(Self::LinuxX86_64),
             ("windows", "x86_64") => Ok(Self::WindowsX86_64),
-            _ => Err(Error::UnsupportedPlatform {
-                os: os.to_string(),
-                arch: arch.to_string(),
-            }),
+            _ => Err(Error::unsupported_platform(os, arch)),
         }
     }
 
@@ -94,7 +91,7 @@ impl std::str::FromStr for Platform {
             "macos-x86_64" => Ok(Self::MacosX86_64),
             "linux-x86_64" => Ok(Self::LinuxX86_64),
             "windows-x86_64" => Ok(Self::WindowsX86_64),
-            other => Err(Error::UnknownPlatformSlug(other.to_string())),
+            other => Err(Error::unknown_platform_slug(other)),
         }
     }
 }

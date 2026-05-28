@@ -162,22 +162,24 @@ impl<'conn> ArrowInserter<'conn> {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] with message
+    /// - Returns [`Error::InvalidTableDefinition`] with message
     ///   `"Table definition must have at least one column"` if `table_def`
     ///   has no columns.
-    /// - Returns [`Error::Other`] if `connection` is using gRPC transport
+    /// - Returns [`Error::FeatureNotSupported`] if `connection` is using gRPC transport
     ///   (COPY is TCP-only).
     pub fn new(connection: &'conn Connection, table_def: &TableDefinition) -> Result<Self> {
         let column_count = table_def.column_count();
         if column_count == 0 {
-            return Err(Error::new("Table definition must have at least one column"));
+            return Err(Error::invalid_table_definition(
+                "Table definition must have at least one column",
+            ));
         }
 
         // Fail fast: verify the connection supports COPY (TCP only).
         // The actual COPY session is started lazily on the first data write
         // to avoid locking the connection into COPY mode prematurely.
         if connection.tcp_client().is_none() {
-            return Err(Error::new(
+            return Err(Error::feature_not_supported(
                 "ArrowInserter requires a TCP connection. \
                  gRPC connections do not support COPY operations.",
             ));
@@ -299,7 +301,7 @@ impl<'conn> ArrowInserter<'conn> {
         }
 
         if self.insert_mode == Some(InsertMode::BatchIpc) {
-            return Err(Error::new(
+            return Err(Error::internal(
                 "Cannot mix insert_data() with insert_batch(). \
                  Use either raw IPC methods (insert_data/insert_record_batches) \
                  or RecordBatch methods (insert_batch), not both.",
@@ -307,7 +309,7 @@ impl<'conn> ArrowInserter<'conn> {
         }
 
         if self.schema_sent {
-            return Err(Error::new(
+            return Err(Error::internal(
                 "Arrow schema was already sent. Use insert_record_batches() for subsequent chunks without schema, \
                  or use insert_data() only once with the complete Arrow IPC stream.",
             ));
@@ -384,7 +386,7 @@ impl<'conn> ArrowInserter<'conn> {
         }
 
         if self.insert_mode == Some(InsertMode::BatchIpc) {
-            return Err(Error::new(
+            return Err(Error::internal(
                 "Cannot mix insert_record_batches() with insert_batch(). \
                  Use either raw IPC methods (insert_data/insert_record_batches) \
                  or RecordBatch methods (insert_batch), not both.",
@@ -392,7 +394,7 @@ impl<'conn> ArrowInserter<'conn> {
         }
 
         if !self.schema_sent {
-            return Err(Error::new(
+            return Err(Error::internal(
                 "No Arrow schema has been sent yet. Call insert_data() first with a complete \
                  Arrow IPC stream that includes the schema.",
             ));
@@ -434,12 +436,12 @@ impl<'conn> ArrowInserter<'conn> {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] if a previous `insert_batch` call already
+    /// - Returns [`Error::Internal`] if a previous `insert_batch` call already
     ///   locked the inserter into `RecordBatch` IPC mode — raw IPC and
     ///   `RecordBatch` paths cannot be mixed.
-    /// - Returns [`Error::Other`] / [`Error::Client`] if the lazy COPY
+    /// - Returns [`Error::FeatureNotSupported`] / [`Error::Server`] if the lazy COPY
     ///   session fails to open.
-    /// - Returns [`Error::Client`] / [`Error::Io`] if the server rejects
+    /// - Returns [`Error::Server`] / [`Error::Io`] if the server rejects
     ///   the data or the socket write fails.
     pub fn insert_raw(&mut self, data: &[u8]) -> Result<()> {
         if data.is_empty() {
@@ -447,7 +449,7 @@ impl<'conn> ArrowInserter<'conn> {
         }
 
         if self.insert_mode == Some(InsertMode::BatchIpc) {
-            return Err(Error::new(
+            return Err(Error::internal(
                 "Cannot mix insert_raw() with insert_batch(). \
                  Use either raw IPC methods (insert_data/insert_record_batches/insert_raw) \
                  or RecordBatch methods (insert_batch), not both.",
@@ -501,9 +503,9 @@ impl<'conn> ArrowInserter<'conn> {
         // On error, `self` is dropped, and the Drop impl cancels the COPY
         // writer, so the connection is always left in a clean state.
         if let Some(ipc) = self.batch_ipc_writer.take() {
-            let buf = ipc
-                .into_inner()
-                .map_err(|e| Error::new(format!("Failed to finalize Arrow IPC stream: {e}")))?;
+            let buf = ipc.into_inner().map_err(|e| {
+                Error::conversion(format!("Failed to finalize Arrow IPC stream: {e}"))
+            })?;
             if !buf.is_empty() {
                 if let Some(ref mut writer) = self.writer {
                     writer.send_direct(&buf)?;
@@ -609,15 +611,15 @@ impl<'conn> ArrowInserter<'conn> {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] if a previous raw-IPC call locked this
+    /// - Returns [`Error::Internal`] if a previous raw-IPC call locked this
     ///   inserter into the other mode — raw IPC and `RecordBatch` paths
     ///   cannot be mixed.
-    /// - Returns [`Error::Other`] / [`Error::Client`] if the lazy COPY
+    /// - Returns [`Error::FeatureNotSupported`] / [`Error::Server`] if the lazy COPY
     ///   session cannot be opened.
-    /// - Returns [`Error::Other`] wrapping the underlying Arrow IPC
+    /// - Returns [`Error::Conversion`] wrapping the underlying Arrow IPC
     ///   writer error if the schema or batch cannot be serialized (e.g.
     ///   dictionary misalignment, encoding failure).
-    /// - Returns [`Error::Client`] / [`Error::Io`] if the server rejects
+    /// - Returns [`Error::Server`] / [`Error::Io`] if the server rejects
     ///   the data or the socket write fails.
     ///
     /// # Panics
@@ -628,7 +630,7 @@ impl<'conn> ArrowInserter<'conn> {
     /// `Some`, so the unwrap is unreachable.
     pub fn insert_batch(&mut self, batch: &arrow::record_batch::RecordBatch) -> Result<()> {
         if self.insert_mode == Some(InsertMode::RawIpc) {
-            return Err(Error::new(
+            return Err(Error::internal(
                 "Cannot mix insert_batch() with raw IPC methods. \
                  Use either RecordBatch methods (insert_batch) \
                  or raw IPC methods (insert_data/insert_record_batches/insert_raw), not both.",
@@ -640,8 +642,9 @@ impl<'conn> ArrowInserter<'conn> {
 
         // Create the IPC StreamWriter on first use — this writes the schema message
         if self.batch_ipc_writer.is_none() {
-            let ipc_writer = StreamWriter::try_new(Vec::new(), &batch.schema())
-                .map_err(|e| Error::new(format!("Failed to create Arrow IPC writer: {e}")))?;
+            let ipc_writer = StreamWriter::try_new(Vec::new(), &batch.schema()).map_err(|e| {
+                Error::conversion(format!("Failed to create Arrow IPC writer: {e}"))
+            })?;
             self.batch_ipc_writer = Some(ipc_writer);
 
             // Drain the schema bytes that StreamWriter wrote during construction
@@ -654,7 +657,7 @@ impl<'conn> ArrowInserter<'conn> {
             .as_mut()
             .expect("IPC writer must exist")
             .write(batch)
-            .map_err(|e| Error::new(format!("Failed to write Arrow batch: {e}")))?;
+            .map_err(|e| Error::conversion(format!("Failed to write Arrow batch: {e}")))?;
 
         // Drain the batch bytes and send them immediately
         self.drain_ipc_buffer()?;
@@ -741,7 +744,9 @@ impl<'conn> ArrowInserter<'conn> {
     fn ensure_writer(&mut self) -> Result<()> {
         if self.writer.is_none() {
             let client = self.connection.tcp_client().ok_or_else(|| {
-                crate::Error::new("ArrowInserter requires a TCP connection. gRPC connections do not support COPY operations.")
+                crate::Error::feature_not_supported(
+                    "ArrowInserter requires a TCP connection. gRPC connections do not support COPY operations.",
+                )
             })?;
             let columns: Vec<&str> = self
                 .columns

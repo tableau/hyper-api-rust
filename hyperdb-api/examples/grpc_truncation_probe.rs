@@ -53,7 +53,7 @@ fn main() -> hyperdb_api::Result<()> {
     let hyper = HyperProcess::new(None, Some(&params))?;
     let grpc_url = hyper
         .grpc_url()
-        .ok_or_else(|| hyperdb_api::Error::new("no gRPC URL"))?
+        .ok_or_else(|| hyperdb_api::Error::internal("no gRPC URL"))?
         .clone();
 
     let query = format!(

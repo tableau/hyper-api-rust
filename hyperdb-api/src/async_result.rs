@@ -177,10 +177,10 @@ impl<'conn> AsyncRowset<'conn> {
     ///
     /// # Errors
     ///
-    /// - Returns [`crate::Error::Client`] if the server sends an `ErrorResponse`
+    /// - Returns [`crate::Error::Server`] if the server sends an `ErrorResponse`
     ///   while streaming the result set.
     /// - Returns [`crate::Error::Io`] on transport-level I/O failures.
-    /// - Returns [`crate::Error::Other`] if an Arrow IPC chunk cannot be decoded.
+    /// - Returns [`crate::Error::Conversion`] if an Arrow IPC chunk cannot be decoded.
     pub async fn next_chunk(&mut self) -> Result<Option<Vec<Row>>> {
         enum TransportChunk {
             Tcp(Vec<StreamRow>),
@@ -279,12 +279,12 @@ impl<'conn> AsyncRowset<'conn> {
     /// # Errors
     ///
     /// - Returns the error from [`first_row`](Self::first_row).
-    /// - Returns [`crate::Error::Other`] with message `"Query returned no rows"`
+    /// - Returns [`crate::Error::Conversion`] with message `"Query returned no rows"`
     ///   if the result set is empty.
     pub async fn require_first_row(self) -> Result<Row> {
         self.first_row()
             .await?
-            .ok_or_else(|| crate::error::Error::new("Query returned no rows"))
+            .ok_or_else(|| crate::error::Error::conversion("Query returned no rows"))
     }
 
     /// Returns the first column of the first row as `Option<T>`, or an
@@ -305,11 +305,11 @@ impl<'conn> AsyncRowset<'conn> {
     /// # Errors
     ///
     /// - Returns the error from [`scalar`](Self::scalar).
-    /// - Returns [`crate::Error::Other`] with message `"Scalar query returned NULL"`
+    /// - Returns [`crate::Error::Conversion`] with message `"Scalar query returned NULL"`
     ///   if the single cell is SQL `NULL`.
     pub async fn require_scalar<T: RowValue>(self) -> Result<T> {
         self.scalar()
             .await?
-            .ok_or_else(|| crate::error::Error::new("Scalar query returned NULL"))
+            .ok_or_else(|| crate::error::Error::conversion("Scalar query returned NULL"))
     }
 }

@@ -94,18 +94,18 @@ impl TestServer {
 
         // Connect without a database, then create the database via SQL
         let client = Client::connect(&config)
-            .map_err(|e| hyperdb_api::Error::new(format!("Failed to connect: {e}")))?;
+            .map_err(|e| hyperdb_api::Error::internal(format!("Failed to connect: {e}")))?;
 
         // Drop database if it exists (from previous test run), then create it
         let db_path_escaped = database_path.to_string_lossy().replace('"', "\"\"");
         let _ = client.exec(&format!("DROP DATABASE IF EXISTS \"{db_path_escaped}\""));
         client
             .exec(&format!("CREATE DATABASE \"{db_path_escaped}\""))
-            .map_err(|e| hyperdb_api::Error::new(format!("Failed to create database: {e}")))?;
+            .map_err(|e| hyperdb_api::Error::internal(format!("Failed to create database: {e}")))?;
 
         client
             .close()
-            .map_err(|e| hyperdb_api::Error::new(format!("Failed to close: {e}")))?;
+            .map_err(|e| hyperdb_api::Error::internal(format!("Failed to close: {e}")))?;
 
         Ok(TestServer {
             hyper,

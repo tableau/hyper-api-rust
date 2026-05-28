@@ -83,3 +83,50 @@ pub enum Error {
     #[error("failed to scrape latest release: {0}")]
     ScrapeFailed(&'static str),
 }
+
+impl Error {
+    /// Constructs an [`Self::UnsupportedPlatform`] error.
+    pub fn unsupported_platform(os: impl Into<String>, arch: impl Into<String>) -> Self {
+        Error::UnsupportedPlatform {
+            os: os.into(),
+            arch: arch.into(),
+        }
+    }
+
+    /// Constructs an [`Self::UnknownPlatformSlug`] error.
+    pub fn unknown_platform_slug(slug: impl Into<String>) -> Self {
+        Error::UnknownPlatformSlug(slug.into())
+    }
+
+    /// Constructs an [`Self::Io`] error.
+    pub fn io(context: impl Into<String>, source: std::io::Error) -> Self {
+        Error::Io {
+            context: context.into(),
+            source,
+        }
+    }
+
+    /// Constructs an [`Self::HttpStatus`] error.
+    pub fn http_status(url: impl Into<String>, status: u16) -> Self {
+        Error::HttpStatus {
+            url: url.into(),
+            status,
+        }
+    }
+
+    /// Constructs an [`Self::CurlFailed`] error.
+    pub fn curl_failed(url: impl Into<String>, code: i32) -> Self {
+        Error::CurlFailed {
+            url: url.into(),
+            code,
+        }
+    }
+
+    /// Constructs an [`Self::ChecksumMismatch`] error.
+    pub fn checksum_mismatch(expected: impl Into<String>, actual: impl Into<String>) -> Self {
+        Error::ChecksumMismatch {
+            expected: expected.into(),
+            actual: actual.into(),
+        }
+    }
+}

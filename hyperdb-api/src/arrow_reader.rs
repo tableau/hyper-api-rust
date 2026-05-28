@@ -103,15 +103,17 @@ impl<'conn> ArrowReader<'conn> {
     ///
     /// # Errors
     ///
-    /// - Returns [`crate::Error::Other`] if the connection is using gRPC
+    /// - Returns [`crate::Error::FeatureNotSupported`] if the connection is using gRPC
     ///   transport (ArrowReader wraps `COPY TO STDOUT`, which is TCP-only).
-    /// - Returns [`crate::Error::Client`] if the server rejects the
+    /// - Returns [`crate::Error::Server`] if the server rejects the
     ///   `COPY (<query>) TO STDOUT WITH (format arrowstream)` statement.
     /// - Returns [`crate::Error::Io`] on transport-level I/O failures.
     pub fn query_to_arrow(&self, select_query: &str) -> Result<Vec<u8>> {
         let copy_query = format!("COPY ({select_query}) TO STDOUT WITH (format arrowstream)");
         let client = self.connection.tcp_client().ok_or_else(|| {
-            crate::Error::new("ArrowReader requires a TCP connection. Use Connection::execute_query_to_arrow() for gRPC.")
+            crate::Error::feature_not_supported(
+                "ArrowReader requires a TCP connection. Use Connection::execute_query_to_arrow() for gRPC."
+            )
         })?;
         Ok(client.copy_out(&copy_query)?)
     }

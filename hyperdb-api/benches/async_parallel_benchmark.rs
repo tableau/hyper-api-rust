@@ -69,7 +69,7 @@ async fn try_join_all_tasks<T>(handles: Vec<tokio::task::JoinHandle<Result<T>>>)
     for h in handles {
         let v = h
             .await
-            .map_err(|e| hyperdb_api::Error::new(format!("task join error: {e}")))??;
+            .map_err(|e| hyperdb_api::Error::internal(format!("task join error: {e}")))??;
         out.push(v);
     }
     Ok(out)
@@ -118,7 +118,7 @@ fn main() -> Result<()> {
     let hyper = HyperProcess::new(None, Some(&params))?;
     let endpoint = hyper
         .endpoint()
-        .ok_or_else(|| hyperdb_api::Error::new("HyperProcess has no TCP endpoint"))?
+        .ok_or_else(|| hyperdb_api::Error::internal("HyperProcess has no TCP endpoint"))?
         .to_string();
 
     // Multi-thread runtime so tokio can run N async inserts truly in parallel.
@@ -443,7 +443,7 @@ async fn run_parallel_chunk_sender(
             conn.close()
         })
         .await
-        .map_err(|e| hyperdb_api::Error::new(format!("bootstrap join error: {e}")))??;
+        .map_err(|e| hyperdb_api::Error::internal(format!("bootstrap join error: {e}")))??;
     }
 
     let wall_start = Instant::now();
