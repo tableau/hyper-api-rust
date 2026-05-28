@@ -9,7 +9,7 @@
 mod common;
 
 use common::{test_hyper_params, test_result_path};
-use hyperdb_api::{AsyncConnection, CreateMode, FromRow, HyperProcess, Result, Row};
+use hyperdb_api::{AsyncConnection, CreateMode, FromRow, HyperProcess, Result};
 
 async fn fresh_async_conn(name: &str) -> Result<(HyperProcess, AsyncConnection)> {
     let db_path = test_result_path(name, "hyper")?;
@@ -120,12 +120,10 @@ struct User {
 }
 
 impl FromRow for User {
-    fn from_row(row: &Row) -> Result<Self> {
+    fn from_row(row: hyperdb_api::RowAccessor<'_>) -> Result<Self> {
         Ok(User {
-            id: row
-                .get::<i32>(0)
-                .ok_or_else(|| hyperdb_api::Error::conversion("NULL id"))?,
-            name: row.get::<String>(1),
+            id: row.get("id")?,
+            name: row.get_opt("name")?,
         })
     }
 }

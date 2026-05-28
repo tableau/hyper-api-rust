@@ -226,17 +226,18 @@ impl Row {
     ///
     /// # Example
     ///
+    /// Most callers should reach for [`crate::FromRow`] +
+    /// [`crate::RowAccessor`] for typed mapping. `try_get` is the
+    /// underlying positional building block; useful when you need
+    /// indexed access from a hand-rolled loop.
+    ///
     /// ```no_run
-    /// # use hyperdb_api::{Row, FromRow, Result};
-    /// # struct User { id: i32, name: String }
-    /// impl FromRow for User {
-    ///     fn from_row(row: &Row) -> Result<Self> {
-    ///         Ok(User {
-    ///             id: row.try_get::<i32>(0, "id")?,
-    ///             name: row.try_get::<String>(1, "name")?,
-    ///         })
-    ///     }
-    /// }
+    /// # use hyperdb_api::{Row, Result};
+    /// # fn read(row: &Row) -> Result<(i32, String)> {
+    /// let id: i32 = row.try_get(0, "id")?;
+    /// let name: String = row.try_get(1, "name")?;
+    /// # Ok((id, name))
+    /// # }
     /// ```
     ///
     /// # Errors
@@ -259,6 +260,35 @@ impl Row {
                 "Column {idx} ({column_name:?}) is NULL or has incompatible type",
             ))
         })
+    }
+
+    /// Looks up a column by name and returns its value as `T`.
+    ///
+    /// Convenient for hand-coded paths that aren't using
+    /// [`FromRow`]. The lookup is a linear scan over
+    /// [`ResultSchema::column_index`]; for hot paths (many rows × many
+    /// fields), prefer
+    /// [`fetch_one_as`](crate::Connection::fetch_one_as) /
+    /// [`fetch_all_as`](crate::Connection::fetch_all_as), which build
+    /// a cached column-name → index lookup once per query and hand
+    /// every `FromRow` impl a [`RowAccessor`](crate::RowAccessor) that
+    /// reuses it.
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::Error::Column`] with [`crate::ColumnErrorKind::Missing`]
+    ///   if no column with `name` exists in the row's schema (or the
+    ///   row has no schema attached).
+    /// - [`crate::Error::Conversion`] if the cell is `NULL` or cannot
+    ///   be decoded as `T`. (Inherited from [`Self::try_get`].)
+    pub fn get_by_name<T: RowValue>(&self, name: &str) -> crate::error::Result<T> {
+        let idx = self
+            .schema()
+            .and_then(|s| s.column_index(name))
+            .ok_or_else(|| {
+                crate::error::Error::column(name, crate::error::ColumnErrorKind::Missing)
+            })?;
+        self.try_get(idx, name)
     }
 
     /// Returns an Arrow column reference, or `None` if the index is out of bounds.
@@ -715,75 +745,65 @@ impl RowValue for hyperdb_api_core::types::Numeric {
 
 /// Trait for types that can be constructed from a database row.
 ///
-/// Implement this trait for your structs to enable direct mapping from
-/// query results using [`Connection::fetch_one_as`](crate::Connection::fetch_one_as),
-/// [`Connection::fetch_all_as`](crate::Connection::fetch_all_as), or by calling
-/// [`FromRow::from_row`](FromRow::from_row) on each [`Row`](crate::Row) from a [`Rowset`](crate::Rowset).
+/// Used by [`Connection::fetch_one_as`](crate::Connection::fetch_one_as)
+/// and [`Connection::fetch_all_as`](crate::Connection::fetch_all_as)
+/// to map query results into typed structs. Implementations receive
+/// a [`RowAccessor`](crate::RowAccessor), which provides name-based
+/// access via a column-name → index lookup built once per query.
 ///
-/// # Example
+/// # Recommended: derive
 ///
-/// ```no_run
-/// use hyperdb_api::{Row, FromRow, Result};
+/// In most cases the `#[derive(FromRow)]` macro handles the mapping
+/// for you — match struct field names to column names automatically,
+/// with `#[hyperdb(rename = "...")]` for cases where they differ:
 ///
+/// ```ignore
+/// use hyperdb_api::FromRow;
+///
+/// #[derive(FromRow)]
 /// struct User {
 ///     id: i32,
 ///     name: String,
-///     active: bool,
+///     #[hyperdb(rename = "email_address")]
+///     email: Option<String>,
 /// }
+/// ```
+///
+/// # Hand-written impl
+///
+/// For custom mapping logic (computed fields, multi-column composition,
+/// etc.) implement the trait directly:
+///
+/// ```no_run
+/// use hyperdb_api::{FromRow, RowAccessor, Result};
+///
+/// struct User { id: i32, name: String, active: bool }
 ///
 /// impl FromRow for User {
-///     fn from_row(row: &Row) -> Result<Self> {
+///     fn from_row(row: RowAccessor<'_>) -> Result<Self> {
 ///         Ok(User {
-///             id: row.get::<i32>(0).ok_or_else(|| hyperdb_api::Error::conversion("NULL id"))?,
-///             name: row.get::<String>(1).unwrap_or_default(),
-///             active: row.get::<bool>(2).unwrap_or(false),
+///             id: row.get("id")?,
+///             name: row.get("name")?,
+///             active: row.get("active")?,
 ///         })
 ///     }
 /// }
 /// ```
+///
+/// For ad-hoc tuple destructuring of small results, use
+/// [`Row::get`](crate::Row::get) directly — there are no blanket
+/// tuple `FromRow` impls. Define a struct with `#[derive(FromRow)]`
+/// for typed access in `fetch_*_as`.
 pub trait FromRow: Sized {
     /// Constructs an instance from a database row.
     ///
     /// # Errors
     ///
-    /// Returns an [`Error`](crate::Error) — typically [`crate::Error::Conversion`] —
-    /// when a required column is missing, SQL `NULL`, or cannot be
-    /// decoded as the expected type. Implementations decide the exact
-    /// failure shape.
-    fn from_row(row: &Row) -> crate::error::Result<Self>;
-}
-
-// Tuple implementations for common patterns
-
-impl<A: RowValue> FromRow for (Option<A>,) {
-    fn from_row(row: &Row) -> crate::error::Result<Self> {
-        Ok((row.get::<A>(0),))
-    }
-}
-
-impl<A: RowValue, B: RowValue> FromRow for (Option<A>, Option<B>) {
-    fn from_row(row: &Row) -> crate::error::Result<Self> {
-        Ok((row.get::<A>(0), row.get::<B>(1)))
-    }
-}
-
-impl<A: RowValue, B: RowValue, C: RowValue> FromRow for (Option<A>, Option<B>, Option<C>) {
-    fn from_row(row: &Row) -> crate::error::Result<Self> {
-        Ok((row.get::<A>(0), row.get::<B>(1), row.get::<C>(2)))
-    }
-}
-
-impl<A: RowValue, B: RowValue, C: RowValue, D: RowValue> FromRow
-    for (Option<A>, Option<B>, Option<C>, Option<D>)
-{
-    fn from_row(row: &Row) -> crate::error::Result<Self> {
-        Ok((
-            row.get::<A>(0),
-            row.get::<B>(1),
-            row.get::<C>(2),
-            row.get::<D>(3),
-        ))
-    }
+    /// Returns an [`Error`](crate::Error) — typically
+    /// [`crate::Error::Column`] — when a required column is missing,
+    /// SQL `NULL`, or cannot be decoded as the expected type.
+    /// Implementations decide the exact failure shape.
+    fn from_row(row: crate::RowAccessor<'_>) -> crate::error::Result<Self>;
 }
 
 // =============================================================================

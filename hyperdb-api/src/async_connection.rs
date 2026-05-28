@@ -358,7 +358,11 @@ impl AsyncConnection {
     ///   produces when the row cannot be mapped.
     pub async fn fetch_one_as<T: crate::FromRow>(&self, query: &str) -> Result<T> {
         let row = self.fetch_one(query).await?;
-        T::from_row(&row)
+        let indices = row
+            .schema()
+            .map(crate::row_accessor::RowAccessor::build_indices)
+            .unwrap_or_default();
+        T::from_row(crate::RowAccessor::new(&row, &indices))
     }
 
     /// Fetches all rows and maps them to structs using [`crate::FromRow`].
@@ -370,7 +374,16 @@ impl AsyncConnection {
     ///   [`FromRow::from_row`](crate::FromRow::from_row) on any row.
     pub async fn fetch_all_as<T: crate::FromRow>(&self, query: &str) -> Result<Vec<T>> {
         let rows = self.fetch_all(query).await?;
-        rows.iter().map(|r| T::from_row(r)).collect()
+        // Build the column-name → index lookup once from the first
+        // row's schema; reuse for every row.
+        let indices = rows
+            .first()
+            .and_then(crate::result::Row::schema)
+            .map(crate::row_accessor::RowAccessor::build_indices)
+            .unwrap_or_default();
+        rows.iter()
+            .map(|r| T::from_row(crate::RowAccessor::new(r, &indices)))
+            .collect()
     }
 
     /// Fetches a single non-NULL scalar value. Errors on empty / NULL.

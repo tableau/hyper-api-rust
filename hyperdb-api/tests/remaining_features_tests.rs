@@ -14,7 +14,7 @@
 mod common;
 use common::TestConnection;
 
-use hyperdb_api::{Catalog, FromRow, Row, ServerVersion};
+use hyperdb_api::{Catalog, FromRow, ServerVersion};
 
 // =============================================================================
 // #7: Batch Statement Execution
@@ -249,13 +249,11 @@ struct TestUser {
 }
 
 impl FromRow for TestUser {
-    fn from_row(row: &Row) -> hyperdb_api::Result<Self> {
+    fn from_row(row: hyperdb_api::RowAccessor<'_>) -> hyperdb_api::Result<Self> {
         Ok(TestUser {
-            id: row
-                .get::<i32>(0)
-                .ok_or_else(|| hyperdb_api::Error::conversion("NULL id"))?,
-            name: row.get::<String>(1).unwrap_or_default(),
-            score: row.get::<f64>(2).unwrap_or(0.0),
+            id: row.get("id")?,
+            name: row.get_opt("name")?.unwrap_or_default(),
+            score: row.get_opt("score")?.unwrap_or(0.0),
         })
     }
 }
@@ -308,25 +306,11 @@ fn test_fetch_all_as() {
     assert_eq!(users[2].name, "Carol");
 }
 
-#[test]
-fn test_from_row_tuple() {
-    let test = TestConnection::new().expect("Failed to create test connection");
-
-    test.execute_command("CREATE TABLE tuple_test (id INT NOT NULL, name TEXT)")
-        .expect("create");
-    test.execute_command("INSERT INTO tuple_test VALUES (1, 'Alice')")
-        .expect("insert");
-
-    let row = test
-        .connection
-        .fetch_one("SELECT id, name FROM tuple_test")
-        .expect("fetch");
-
-    let tuple: (Option<i32>, Option<String>) =
-        <(Option<i32>, Option<String>) as FromRow>::from_row(&row).expect("from_row");
-    assert_eq!(tuple.0, Some(1));
-    assert_eq!(tuple.1, Some("Alice".to_string()));
-}
+// `test_from_row_tuple` was removed in v0.3.0 along with the blanket
+// `(Option<A>,)` … `(Option<A>, Option<B>, Option<C>, Option<D>)`
+// `FromRow` impls. For ad-hoc tuple-shaped destructuring, callers
+// should now use `Row::get(idx)` directly on each row, or define a
+// struct with `#[derive(FromRow)]`.
 
 // =============================================================================
 // #16: Connection Health (ping)

@@ -10,7 +10,7 @@
 //! "async is a first-class equivalent of sync" contract holds.
 
 use hyperdb_api::{
-    AsyncConnection, AsyncConnectionBuilder, CreateMode, FromRow, HyperProcess, Result, Row,
+    AsyncConnection, AsyncConnectionBuilder, CreateMode, FromRow, HyperProcess, Result, RowAccessor,
 };
 
 #[derive(Debug)]
@@ -25,13 +25,11 @@ struct Order {
 }
 
 impl FromRow for Order {
-    fn from_row(row: &Row) -> Result<Self> {
+    fn from_row(row: RowAccessor<'_>) -> Result<Self> {
         Ok(Order {
-            id: row
-                .get::<i32>(0)
-                .ok_or_else(|| hyperdb_api::Error::conversion("NULL id"))?,
-            customer: row.get::<String>(1).unwrap_or_default(),
-            total: row.get::<f64>(2).unwrap_or(0.0),
+            id: row.get("id")?,
+            customer: row.get_opt("customer")?.unwrap_or_default(),
+            total: row.get_opt("total")?.unwrap_or(0.0),
         })
     }
 }
@@ -69,15 +67,14 @@ async fn main() -> Result<()> {
     println!("inserted {count} orders");
 
     // 5. Parameterized query + streaming rowset + struct mapping.
-    let rs = conn
-        .query_params(
-            "SELECT id, customer, total FROM orders WHERE total > $1 ORDER BY id",
-            &[&50.0_f64],
-        )
+    // Use fetch_all_as to drive Order::from_row through the cached
+    // RowAccessor path. (Direct `Order::from_row(row)?` is no longer a
+    // one-liner because the trait takes a RowAccessor with a
+    // pre-resolved column-index map.)
+    let high_value: Vec<Order> = conn
+        .fetch_all_as("SELECT id, customer, total FROM orders WHERE total > 50.0 ORDER BY id")
         .await?;
-    let rows = rs.collect_rows().await?;
-    for row in &rows {
-        let order = Order::from_row(row)?;
+    for order in &high_value {
         println!("  high-value: {order:?}");
     }
 
