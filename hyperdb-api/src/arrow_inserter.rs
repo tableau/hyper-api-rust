@@ -301,7 +301,7 @@ impl<'conn> ArrowInserter<'conn> {
         }
 
         if self.insert_mode == Some(InsertMode::BatchIpc) {
-            return Err(Error::internal(
+            return Err(Error::invalid_operation(
                 "Cannot mix insert_data() with insert_batch(). \
                  Use either raw IPC methods (insert_data/insert_record_batches) \
                  or RecordBatch methods (insert_batch), not both.",
@@ -309,7 +309,7 @@ impl<'conn> ArrowInserter<'conn> {
         }
 
         if self.schema_sent {
-            return Err(Error::internal(
+            return Err(Error::invalid_operation(
                 "Arrow schema was already sent. Use insert_record_batches() for subsequent chunks without schema, \
                  or use insert_data() only once with the complete Arrow IPC stream.",
             ));
@@ -386,7 +386,7 @@ impl<'conn> ArrowInserter<'conn> {
         }
 
         if self.insert_mode == Some(InsertMode::BatchIpc) {
-            return Err(Error::internal(
+            return Err(Error::invalid_operation(
                 "Cannot mix insert_record_batches() with insert_batch(). \
                  Use either raw IPC methods (insert_data/insert_record_batches) \
                  or RecordBatch methods (insert_batch), not both.",
@@ -394,7 +394,7 @@ impl<'conn> ArrowInserter<'conn> {
         }
 
         if !self.schema_sent {
-            return Err(Error::internal(
+            return Err(Error::invalid_operation(
                 "No Arrow schema has been sent yet. Call insert_data() first with a complete \
                  Arrow IPC stream that includes the schema.",
             ));
@@ -436,9 +436,9 @@ impl<'conn> ArrowInserter<'conn> {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Internal`] if a previous `insert_batch` call already
-    ///   locked the inserter into `RecordBatch` IPC mode — raw IPC and
-    ///   `RecordBatch` paths cannot be mixed.
+    /// - Returns [`Error::InvalidOperation`] if a previous `insert_batch`
+    ///   call already locked the inserter into `RecordBatch` IPC mode —
+    ///   raw IPC and `RecordBatch` paths cannot be mixed.
     /// - Returns [`Error::FeatureNotSupported`] / [`Error::Server`] if the lazy COPY
     ///   session fails to open.
     /// - Returns [`Error::Server`] / [`Error::Io`] if the server rejects
@@ -449,7 +449,7 @@ impl<'conn> ArrowInserter<'conn> {
         }
 
         if self.insert_mode == Some(InsertMode::BatchIpc) {
-            return Err(Error::internal(
+            return Err(Error::invalid_operation(
                 "Cannot mix insert_raw() with insert_batch(). \
                  Use either raw IPC methods (insert_data/insert_record_batches/insert_raw) \
                  or RecordBatch methods (insert_batch), not both.",
@@ -611,9 +611,9 @@ impl<'conn> ArrowInserter<'conn> {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Internal`] if a previous raw-IPC call locked this
-    ///   inserter into the other mode — raw IPC and `RecordBatch` paths
-    ///   cannot be mixed.
+    /// - Returns [`Error::InvalidOperation`] if a previous raw-IPC call
+    ///   locked this inserter into the other mode — raw IPC and
+    ///   `RecordBatch` paths cannot be mixed.
     /// - Returns [`Error::FeatureNotSupported`] / [`Error::Server`] if the lazy COPY
     ///   session cannot be opened.
     /// - Returns [`Error::Conversion`] wrapping the underlying Arrow IPC
@@ -630,7 +630,7 @@ impl<'conn> ArrowInserter<'conn> {
     /// `Some`, so the unwrap is unreachable.
     pub fn insert_batch(&mut self, batch: &arrow::record_batch::RecordBatch) -> Result<()> {
         if self.insert_mode == Some(InsertMode::RawIpc) {
-            return Err(Error::internal(
+            return Err(Error::invalid_operation(
                 "Cannot mix insert_batch() with raw IPC methods. \
                  Use either RecordBatch methods (insert_batch) \
                  or raw IPC methods (insert_data/insert_record_batches/insert_raw), not both.",

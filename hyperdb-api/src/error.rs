@@ -144,6 +144,15 @@ pub enum Error {
     #[error("already exists: {0}")]
     AlreadyExists(String),
 
+    /// Caller-API misuse: a method was called in an invalid sequence
+    /// or combination (e.g. mixing two mutually exclusive insertion
+    /// modes on a single inserter, calling a method after the resource
+    /// has been finalized). Distinct from [`Self::Internal`], which is
+    /// reserved for true library invariant violations the caller could
+    /// not have triggered. Construct via [`Self::invalid_operation`].
+    #[error("invalid operation: {0}")]
+    InvalidOperation(String),
+
     // ---- Column / row mapping ------------------------------------------
     /// Structured error for named-column access in row decoding. Used
     /// by `FromRow` impls and `Row::try_get` / `Row::get_by_name` to
@@ -169,13 +178,15 @@ pub enum Error {
     },
 
     // ---- Internal ------------------------------------------------------
-    /// Internal invariant violation. Used as a default for state
-    /// assertions that should be unreachable in correct callers;
-    /// callers generally cannot recover beyond logging and bailing.
+    /// Internal invariant violation — a state the library believes
+    /// should be unreachable. Callers cannot trigger this from the
+    /// public API in well-formed code; reaching it indicates a bug
+    /// inside `hyperdb-api`. Recovery is generally impossible beyond
+    /// logging and bailing.
     ///
-    /// Construction of this variant should be rare — every site is a
-    /// candidate for either a more specific variant or removal once
-    /// the assertion is proven unreachable.
+    /// For caller-API misuse (e.g. mixing two mutually exclusive
+    /// methods, using a finalized resource), prefer
+    /// [`Self::InvalidOperation`].
     ///
     /// Construct via [`Self::internal`].
     #[error("internal error: {message}")]
@@ -341,6 +352,11 @@ impl Error {
     /// Constructs an [`Self::AlreadyExists`] error.
     pub fn already_exists(message: impl Into<String>) -> Self {
         Error::AlreadyExists(message.into())
+    }
+
+    /// Constructs an [`Self::InvalidOperation`] error.
+    pub fn invalid_operation(message: impl Into<String>) -> Self {
+        Error::InvalidOperation(message.into())
     }
 
     /// Returns the error message in human-readable form. Equivalent to
@@ -605,5 +621,15 @@ mod tests {
     fn internal_constructor_round_trip() {
         let err = Error::internal("invariant violated");
         assert_eq!(err.to_string(), "internal error: invariant violated");
+    }
+
+    #[test]
+    fn invalid_operation_constructor_round_trip() {
+        let err = Error::invalid_operation("cannot mix insert_data with insert_batch");
+        assert_eq!(
+            err.to_string(),
+            "invalid operation: cannot mix insert_data with insert_batch"
+        );
+        assert!(matches!(err, Error::InvalidOperation(_)));
     }
 }

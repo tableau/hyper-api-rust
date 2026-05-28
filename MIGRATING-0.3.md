@@ -52,6 +52,7 @@ pub enum Error {
     InvalidTableDefinition(String),
     NotFound(String),
     AlreadyExists(String),
+    InvalidOperation(String),  // added in Follow-up B
 
     // Column / row mapping
     Column { name: String, kind: ColumnErrorKind },
@@ -97,6 +98,7 @@ Error::invalid_name("...");
 Error::invalid_table_definition("...");
 Error::not_found("...");
 Error::already_exists("...");
+Error::invalid_operation("...");
 ```
 
 Pattern-matching uses the PascalCase variant names (e.g. `Error::Conversion(msg)`); only construction switches to snake_case. Forward-compatibility for new struct-variant fields relies on going through these constructors — `#[non_exhaustive]` on individual struct variants is forbidden by Rust E0639.
@@ -370,6 +372,44 @@ For one-off named access on a `Row` outside `fetch_*_as`, `Row::get_by_name` is 
 ### `hyperdb-api-derive` crate
 
 The proc-macro lives in a new `hyperdb-api-derive` workspace crate (Rust requires proc-macro code to live in its own `proc-macro = true` crate). It's re-exported from `hyperdb-api`, so callers don't need a direct dependency — same pattern as serde / thiserror. **Don't add `hyperdb-api-derive` to your `Cargo.toml`**; just `use hyperdb_api::FromRow;`.
+
+---
+
+## Follow-up B — `Error::InvalidOperation` for caller-API misuse
+
+A new `Error::InvalidOperation(String)` variant separates caller-API misuse from `Error::Internal`. `Error::Internal` is now reserved for true library invariant violations the caller could not have triggered; misuse of caller-facing methods (mixing two mutually exclusive insertion modes, calling `insert_record_batches()` before `insert_data()`, etc.) returns `Error::InvalidOperation`.
+
+### Affected sites
+
+`ArrowInserter` state-machine errors that were previously `Error::Internal` are now `Error::InvalidOperation`:
+
+- Mixing `insert_data()` / `insert_record_batches()` / `insert_raw()` with `insert_batch()` (and vice versa).
+- Calling `insert_record_batches()` before `insert_data()` has sent the schema.
+- Calling `insert_data()` after the schema has already been sent.
+
+### Migration recipe
+
+Match arms that previously caught `Error::Internal { .. }` for any of these caller-misuse cases must now match `Error::InvalidOperation(_)`:
+
+```rust
+// Before
+match err {
+    Error::Internal { message } if message.starts_with("Cannot mix") => /* user-API misuse */,
+    Error::Internal { .. } => /* invariant violation */,
+    other => return Err(other),
+}
+
+// After
+match err {
+    Error::InvalidOperation(_) => /* user-API misuse, caller bug */,
+    Error::Internal { .. } => /* library invariant violation, hyperdb-api bug */,
+    other => return Err(other),
+}
+```
+
+### Constructor
+
+`Error::invalid_operation(message: impl Into<String>)`. `String`-shaped tuple variant, matching the `Error::Conversion` / `Error::Config` / `Error::FeatureNotSupported` pattern — no `.to_string()` ceremony needed.
 
 ---
 
