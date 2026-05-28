@@ -2,7 +2,7 @@
 
 This is the consolidated migration guide for the v0.3.0 bundle of breaking and additive changes. Each section corresponds to a bundle PR; the guide grows as each PR lands. The bundle ships as one major bump after the last PR merges.
 
-> Each bundle PR uses `chore:` Conventional Commit prefix to defer release-please from cutting an early version. After all PRs merge, a single `feat!:` commit with a `BREAKING CHANGE:` footer triggers v0.3.0.
+> Each bundle PR uses `chore:` Conventional Commit prefix to defer release-please from cutting an early version. After all PRs merge, a single `feat:` commit with a `BREAKING CHANGE:` footer triggers v0.3.0.
 
 ---
 
