@@ -1,0 +1,23 @@
+[package]
+name = "hyperdb-api-derive"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Procedural macros for hyperdb-api (FromRow derive)"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["database", "hyper", "derive", "proc-macro"]
+categories = ["database"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+
+[lints]
+workspace = true

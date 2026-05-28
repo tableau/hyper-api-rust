@@ -313,6 +313,139 @@ fn test_fetch_all_as() {
 // struct with `#[derive(FromRow)]`.
 
 // =============================================================================
+// #17 cont: #[derive(FromRow)] parity with hand-written impl
+// =============================================================================
+//
+// Verifies that the proc-macro-generated impl produces the same values
+// as the hand-written `TestUser` impl for the same query.
+
+#[derive(Debug, PartialEq, FromRow)]
+struct TestUserDerived {
+    id: i32,
+    name: Option<String>,
+    score: Option<f64>,
+}
+
+#[test]
+fn test_derive_from_row_parity_with_handwritten() {
+    let test = TestConnection::new().expect("Failed to create test connection");
+
+    test.execute_command(
+        "CREATE TABLE derive_parity (id INT NOT NULL, name TEXT, score DOUBLE PRECISION)",
+    )
+    .expect("create");
+    test.execute_command("INSERT INTO derive_parity VALUES (1, 'Alice', 95.5), (2, 'Bob', 87.0)")
+        .expect("insert");
+
+    let handwritten: Vec<TestUser> = test
+        .connection
+        .fetch_all_as("SELECT id, name, score FROM derive_parity ORDER BY id")
+        .expect("fetch_all_as TestUser");
+
+    let derived: Vec<TestUserDerived> = test
+        .connection
+        .fetch_all_as("SELECT id, name, score FROM derive_parity ORDER BY id")
+        .expect("fetch_all_as TestUserDerived");
+
+    assert_eq!(handwritten.len(), 2);
+    assert_eq!(derived.len(), 2);
+    for (hw, drv) in handwritten.iter().zip(derived.iter()) {
+        assert_eq!(hw.id, drv.id);
+        assert_eq!(Some(hw.name.clone()), drv.name);
+        assert_eq!(Some(hw.score), drv.score);
+    }
+}
+
+#[test]
+fn test_derive_from_row_null_in_optional_field_returns_none() {
+    // Regression test for the Option<T> -> get_opt path: a NULL cell
+    // in an Option<T> field on a derived FromRow must produce None,
+    // not an Error::Column { kind: Null }.
+    let test = TestConnection::new().expect("Failed to create test connection");
+
+    test.execute_command(
+        "CREATE TABLE derive_null (id INT NOT NULL, name TEXT, score DOUBLE PRECISION)",
+    )
+    .expect("create");
+    test.execute_command("INSERT INTO derive_null VALUES (1, NULL, NULL)")
+        .expect("insert null row");
+
+    let row: TestUserDerived = test
+        .connection
+        .fetch_one_as("SELECT id, name, score FROM derive_null WHERE id = 1")
+        .expect("fetch_one_as");
+
+    assert_eq!(row.id, 1);
+    assert_eq!(row.name, None);
+    assert_eq!(row.score, None);
+}
+
+#[test]
+fn test_derive_from_row_with_rename() {
+    // Verify `#[hyperdb(rename = "...")]` redirects field-name lookup
+    // to a different column name.
+    #[derive(Debug, PartialEq, FromRow)]
+    struct UserWithRename {
+        id: i32,
+        #[hyperdb(rename = "score")]
+        rating: Option<f64>,
+    }
+
+    let test = TestConnection::new().expect("Failed to create test connection");
+    test.execute_command("CREATE TABLE rename_test (id INT NOT NULL, score DOUBLE PRECISION)")
+        .expect("create");
+    test.execute_command("INSERT INTO rename_test VALUES (1, 99.9)")
+        .expect("insert");
+
+    let user: UserWithRename = test
+        .connection
+        .fetch_one_as("SELECT id, score FROM rename_test")
+        .expect("fetch_one_as UserWithRename");
+
+    assert_eq!(user.id, 1);
+    assert_eq!(user.rating, Some(99.9));
+}
+
+#[test]
+fn test_derive_from_row_missing_column_errors() {
+    // Asking for a column that isn't in the SELECT list should
+    // surface as Error::Column { kind: Missing }.
+    use hyperdb_api::{ColumnErrorKind, Error};
+
+    #[derive(Debug, FromRow)]
+    #[allow(
+        dead_code,
+        reason = "fields populated by the generated impl; only error path is asserted"
+    )]
+    struct NeedsColumn {
+        id: i32,
+        not_in_query: i32,
+    }
+
+    let test = TestConnection::new().expect("Failed to create test connection");
+    test.execute_command("CREATE TABLE missing_col_test (id INT NOT NULL)")
+        .expect("create");
+    test.execute_command("INSERT INTO missing_col_test VALUES (1)")
+        .expect("insert");
+
+    let err = test
+        .connection
+        .fetch_one_as::<NeedsColumn>("SELECT id FROM missing_col_test")
+        .expect_err("expected missing-column error");
+
+    match err {
+        Error::Column { name, kind } => {
+            assert_eq!(name, "not_in_query");
+            assert!(
+                matches!(kind, ColumnErrorKind::Missing),
+                "expected Missing kind, got {kind:?}",
+            );
+        }
+        other => panic!("expected Error::Column {{ kind: Missing }}, got {other:?}"),
+    }
+}
+
+// =============================================================================
 // #16: Connection Health (ping)
 // =============================================================================
 

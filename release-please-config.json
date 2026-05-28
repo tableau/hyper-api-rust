@@ -11,6 +11,7 @@
         { "type": "toml", "path": "Cargo.toml", "jsonpath": "$.workspace.package.version" },
         { "type": "generic", "path": "hyperdb-api-core/Cargo.toml" },
         { "type": "generic", "path": "hyperdb-api/Cargo.toml" },
+        { "type": "generic", "path": "hyperdb-api-derive/Cargo.toml" },
         { "type": "generic", "path": "hyperdb-mcp/Cargo.toml" }
       ]
     }

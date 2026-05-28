@@ -1817,6 +1817,7 @@ dependencies = [
  "bytes",
  "deadpool",
  "hyperdb-api-core",
+ "hyperdb-api-derive",
  "libc",
  "rand 0.10.1",
  "serde",
@@ -1868,6 +1869,15 @@ dependencies = [
  "webpki-roots",
  "wkt",
  "zeroize",
+]
+
+[[package]]
+name = "hyperdb-api-derive"
+version = "0.2.3"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

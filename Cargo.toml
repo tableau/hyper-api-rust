@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "hyperdb-api-core",
     "hyperdb-api",
+    "hyperdb-api-derive",
     "hyperdb-api-node",
     "hyperdb-api-salesforce",
     "hyperdb-mcp",
