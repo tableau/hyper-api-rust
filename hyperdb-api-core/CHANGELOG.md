@@ -13,6 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `Numeric`'s `Display` implementation no longer drops the sign of negative
+  values with magnitude less than 1 (the open interval `(-1, 0)`). Values such
+  as `-0.5` previously rendered as `0.5000` because the sign was derived from
+  the integer part, which is `0` for sub-unit magnitudes. The sign is now
+  computed explicitly and the magnitude formatted via `unsigned_abs`, which
+  also removes a latent `i128::MIN` overflow panic.
+
 ## [0.1.1] - 2026-05-13
 
 ### Added

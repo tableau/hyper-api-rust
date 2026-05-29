@@ -1225,14 +1225,19 @@ impl fmt::Display for Numeric {
         if self.scale == 0 {
             write!(f, "{}", self.value)
         } else {
-            let divisor = 10i128.pow(u32::from(self.scale));
-            let int_part = self.value / divisor;
-            let frac_part = (self.value % divisor).abs();
+            // Compute the sign explicitly and format the magnitude. Deriving
+            // the sign from `int_part` alone loses it whenever `|value| < 1`
+            // (the integer part is `0`, which prints without a sign), so
+            // values like -0.5 would render as "0.5000". `unsigned_abs` also
+            // avoids the `i128::MIN` overflow that `.abs()` would hit.
+            let divisor = 10u128.pow(u32::from(self.scale));
+            let sign = if self.value < 0 { "-" } else { "" };
+            let abs = self.value.unsigned_abs();
+            let int_part = abs / divisor;
+            let frac_part = abs % divisor;
             write!(
                 f,
-                "{}.{:0width$}",
-                int_part,
-                frac_part,
+                "{sign}{int_part}.{frac_part:0width$}",
                 width = self.scale as usize
             )
         }
@@ -2219,6 +2224,30 @@ mod tests {
     fn test_numeric_display() {
         let num = Numeric::new(12345, 2);
         assert_eq!(num.to_string(), "123.45");
+    }
+
+    #[test]
+    fn test_numeric_display_negative_sign_preserved() {
+        // Regression: values in (-1, 0) must keep their sign. The integer
+        // part is 0 for these, which previously dropped the minus sign and
+        // rendered -0.5000 as "0.5000".
+        assert_eq!(Numeric::new(-5000, 4).to_string(), "-0.5000");
+        assert_eq!(Numeric::new(-9990, 4).to_string(), "-0.9990");
+        assert_eq!(Numeric::new(-1, 4).to_string(), "-0.0001");
+
+        // |value| >= 1 already worked; guard against regressions.
+        assert_eq!(Numeric::new(-15000, 4).to_string(), "-1.5000");
+        assert_eq!(Numeric::new(-10000, 4).to_string(), "-1.0000");
+
+        // Zero and positive sub-unit values must not gain a spurious sign.
+        assert_eq!(Numeric::new(0, 4).to_string(), "0.0000");
+        assert_eq!(Numeric::new(5000, 4).to_string(), "0.5000");
+
+        // scale == 0 path keeps negative integers intact.
+        assert_eq!(Numeric::new(-1, 0).to_string(), "-1");
+
+        // i128::MIN must not panic (unsigned_abs avoids the .abs() overflow).
+        let _ = Numeric::new(i128::MIN, 4).to_string();
     }
 
     #[test]

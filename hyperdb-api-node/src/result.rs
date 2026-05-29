@@ -26,6 +26,10 @@ pub(crate) enum CellValue {
     F64(f64),
     String(String),
     Bytes(Vec<u8>),
+    /// Arbitrary-precision decimal, decoded with the column's scale. Stored
+    /// as the schema-aware `Numeric` so `getString` can return the exact
+    /// decimal text while `getFloat64` returns the (possibly lossy) `f64`.
+    Numeric(hyperdb_api::Numeric),
     /// Date as Unix milliseconds (for JS Date interop)
     DateMs(f64),
     /// Timestamp as Unix milliseconds (for JS Date interop)
@@ -62,8 +66,12 @@ pub(crate) fn extract_row(
             hyperdb_api::SqlType::Float => CellValue::F32(row.get_f32(i).unwrap_or(0.0)),
             hyperdb_api::SqlType::Double => CellValue::F64(row.get_f64(i).unwrap_or(0.0)),
             hyperdb_api::SqlType::Numeric { .. } => {
-                // Numeric doesn't have a direct get method; use f64 or string
-                CellValue::F64(row.get_f64(i).unwrap_or(0.0))
+                // Schema-aware decode: `get_numeric` reads the column's scale
+                // and dispatches on the wire form (8/16-byte, Arrow Decimal).
+                // `get_f64` must NOT be used here — it reinterprets the raw
+                // unscaled-integer bytes as an IEEE-754 double (garbage/NaN).
+                row.get_numeric(i)
+                    .map_or(CellValue::Null, CellValue::Numeric)
             }
             hyperdb_api::SqlType::ByteA => CellValue::Bytes(row.get_bytes(i).unwrap_or_default()),
             hyperdb_api::SqlType::Date => {
@@ -179,6 +187,14 @@ impl RowData {
                 let x = *v as i32;
                 Some(x)
             }
+            CellValue::Numeric(n) => {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "caller-selected column coercion: Numeric cell narrowed to i32 per get_int32 contract"
+                )]
+                let x = n.to_f64() as i32;
+                Some(x)
+            }
             _ => None,
         }
     }
@@ -198,6 +214,14 @@ impl RowData {
                     reason = "caller-selected column coercion: F64 cell narrowed to i64 per get_int64 contract"
                 )]
                 let x = *v as i64;
+                Some(x)
+            }
+            CellValue::Numeric(n) => {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "caller-selected column coercion: Numeric cell narrowed to i64 per get_int64 contract"
+                )]
+                let x = n.to_f64() as i64;
                 Some(x)
             }
             _ => None,
@@ -250,13 +274,17 @@ impl RowData {
     /// Gets a 64-bit integer as a `BigInt` (no precision loss).
     ///
     /// Unlike `getInt64()` which returns a JS `number` (lossy above 2^53),
-    /// this returns a native `BigInt`.
+    /// this returns a native `BigInt`. For `NUMERIC(p, 0)` columns this
+    /// preserves the full 128-bit unscaled value; for `NUMERIC(p, scale>0)`
+    /// the cell is not an integer and `null` is returned (use `getString`
+    /// for exact decimal text, or `getFloat64` for a lossy numeric value).
     #[napi]
     pub fn get_big_int(&self, index: u32) -> Option<BigInt> {
         match self.values.get(index as usize)? {
             CellValue::I16(v) => Some(BigInt::from(i64::from(*v))),
             CellValue::I32(v) => Some(BigInt::from(i64::from(*v))),
             CellValue::I64(v) => Some(BigInt::from(*v)),
+            CellValue::Numeric(n) if n.scale() == 0 => Some(BigInt::from(n.unscaled_value())),
             _ => None,
         }
     }
@@ -270,6 +298,7 @@ impl RowData {
             CellValue::I16(v) => Some(f64::from(*v)),
             CellValue::I32(v) => Some(f64::from(*v)),
             CellValue::I64(v) => Some(*v as f64),
+            CellValue::Numeric(n) => Some(n.to_f64()),
             _ => None,
         }
     }
@@ -287,6 +316,8 @@ impl RowData {
             CellValue::I64(v) => Some(v.to_string()),
             CellValue::F32(v) => Some(v.to_string()),
             CellValue::F64(v) => Some(v.to_string()),
+            // Exact decimal text (preserves scale and sign); never lossy.
+            CellValue::Numeric(n) => Some(n.to_string()),
             CellValue::Bytes(v) => Some(hex::encode(v)),
             CellValue::DateMs(ms) => {
                 // Convert back to ISO date string for getString. A Date is

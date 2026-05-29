@@ -252,9 +252,19 @@ pub(crate) fn extract_chunk_columnar(
                         v[row_idx] = f64::from(row.get_f32(col_idx).unwrap_or(0.0));
                     }
                 }
-                hyperdb_api::SqlType::Double | hyperdb_api::SqlType::Numeric { .. } => {
+                hyperdb_api::SqlType::Double => {
                     if let ColumnData::Float64(ref mut v) = columns[col_idx] {
                         v[row_idx] = row.get_f64(col_idx).unwrap_or(0.0);
+                    }
+                }
+                hyperdb_api::SqlType::Numeric { .. } => {
+                    // Schema-aware decode then narrow to f64. `get_f64` must NOT
+                    // be used: it reinterprets the unscaled-integer bytes as an
+                    // IEEE-754 double (garbage/NaN). The columnar fast path
+                    // surfaces numerics as f64 (lossy for >15 sig digits); the
+                    // row-wise path preserves exact text via `getString`.
+                    if let ColumnData::Float64(ref mut v) = columns[col_idx] {
+                        v[row_idx] = row.get_numeric(col_idx).map_or(0.0, |n| n.to_f64());
                     }
                 }
                 hyperdb_api::SqlType::Date => {

@@ -14,6 +14,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `NUMERIC` columns are now decoded correctly. Previously the bindings read
+  numerics with `getF64`, which reinterpreted the raw unscaled-integer bytes as
+  an IEEE-754 double and returned garbage values or `NaN`. Numerics are now
+  decoded schema-aware (honoring the column scale): `getString` returns the
+  exact decimal text (preserving scale and sign, including sub-unit negatives
+  such as `-0.5000`), `getFloat64` returns the correct (possibly lossy) value,
+  and `getInt32`/`getInt64` return the truncated integer. `getBigInt` on a
+  `NUMERIC(p, 0)` column now preserves the full unscaled value (use it instead
+  of `getInt64` for integer NUMERIC values above `Number.MAX_SAFE_INTEGER`); on
+  a `NUMERIC(p, scale>0)` column it returns `null` (use `getString` for exact
+  text or `getFloat64` for a lossy value). The columnar fast path
+  (`executeQueryColumnar`) surfaces numerics as correct `f64` values instead of
+  garbage. Relates to [#84](https://github.com/tableau/hyper-api-rust/issues/84).
+
 ## [0.1.1] - 2026-05-13
 
 ### Added
