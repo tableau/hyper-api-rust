@@ -3,12 +3,14 @@
   "include-component-in-tag": false,
   "separate-pull-requests": false,
   "bump-minor-pre-major": true,
+  "skip-github-release": true,
   "packages": {
     ".": {
       "release-type": "simple",
       "component": "hyper-api-rust",
       "changelog-path": "CHANGELOG.md",
       "bump-minor-pre-major": true,
+      "skip-github-release": true,
       "extra-files": [
         { "type": "toml", "path": "Cargo.toml", "jsonpath": "$.workspace.package.version" },
         { "type": "generic", "path": "hyperdb-api-core/Cargo.toml" },
