@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/tableau/hyper-api-rust/compare/v0.3.0...v0.3.1) (2026-05-29)
+
+
+### Bug Fixes
+
+* NUMERIC sign loss in Display + Node bindings decode ([#84](https://github.com/tableau/hyper-api-rust/issues/84)) ([#86](https://github.com/tableau/hyper-api-rust/issues/86)) ([d504a71](https://github.com/tableau/hyper-api-rust/commit/d504a71cb93fe8c8bbf81ec48558bdc6191c1edc))
+
 ## [0.3.0](https://github.com/tableau/hyper-api-rust/compare/v0.2.3...v0.3.0) (2026-05-29)
 
 This release aggregates a coordinated set of breaking and additive API changes that landed across four PRs during the v0.3.0 bundle window. See [MIGRATING-0.3.md](./MIGRATING-0.3.md) for complete migration recipes covering every change.
