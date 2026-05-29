@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.3.1](https://github.com/tableau/hyper-api-rust/compare/v0.3.0...v0.3.1) (2026-05-29)
+
+Patch release that fixes two related but distinct bugs surfaced by [#84](https://github.com/tableau/hyper-api-rust/issues/84) — wrong NUMERIC values in MCP query results and Node bindings.
+
+### Bug Fixes
+
+* **Core: `Numeric::Display` no longer drops the sign for sub-unit negatives.** Values in the open interval `(-1, 0)` previously rendered without the minus sign — `Numeric::new(-5000, 4).to_string()` returned `"0.5000"` instead of `"-0.5000"`. The Display impl now computes the sign explicitly and formats the magnitude via `unsigned_abs()`, which also removes a latent `i128::MIN` overflow panic. This silently flipped the sign of any correlation, 0-1 index, or regression residual that crossed the stringify path — including the MCP `query` tool's JSON serialization. ([#84](https://github.com/tableau/hyper-api-rust/issues/84), [#86](https://github.com/tableau/hyper-api-rust/pull/86))
+* **Node bindings: `NUMERIC` columns no longer decode as garbage / NaN.** `extract_row` and the columnar fast path were calling `row.get_f64()` for `SqlType::Numeric` columns, which reinterpreted the unscaled-integer bytes as IEEE-754 doubles. Every NUMERIC cell was wrong, regardless of sign. The bindings now use schema-aware `row.get_numeric()`, which honors the column scale and dispatches on wire form. `getString` returns the exact decimal text (preserving scale and sign), `getFloat64` returns the lossy-but-correct double, `getInt32`/`getInt64` return the truncated integer, and the columnar `getFloat64Column` returns correct `f64` values. Related to [#84](https://github.com/tableau/hyper-api-rust/issues/84).
+* **Node bindings: `getBigInt` now preserves precision on `NUMERIC(p, 0)` columns.** Previously `getBigInt` returned `null` for any NUMERIC cell. It now preserves the full 128-bit unscaled value for integer-shaped numerics — use it instead of `getInt64` for NUMERIC integer values above `Number.MAX_SAFE_INTEGER`. On `NUMERIC(p, scale>0)` columns it returns `null` (use `getString` for exact text or `getFloat64` for a lossy value). Related to [#84](https://github.com/tableau/hyper-api-rust/issues/84).
+
 ## [0.3.0](https://github.com/tableau/hyper-api-rust/compare/v0.2.3...v0.3.0) (2026-05-29)
 
 This release aggregates a coordinated set of breaking and additive API changes that landed across four PRs during the v0.3.0 bundle window. See [MIGRATING-0.3.md](./MIGRATING-0.3.md) for complete migration recipes covering every change.
