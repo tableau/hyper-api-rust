@@ -338,6 +338,122 @@ async function main() {
   const verify = await conn.executeQuery('SELECT COUNT(*) FROM arrow_t');
   console.log(`   Verified COUNT(*): ${verify[0].getBigInt(0)}`);
 
+  // 18b. NUMERIC decoding — sign, scale, precision (row-wise + columnar)
+  console.log('\n18b. NUMERIC types...');
+  await conn.executeCommand('DROP TABLE IF EXISTS numeric_test');
+  await conn.executeCommand(
+    'CREATE TABLE numeric_test (id INT NOT NULL, n NUMERIC(20,4), hp NUMERIC(38,12))'
+  );
+  await conn.executeCommand(
+    `INSERT INTO numeric_test VALUES
+       (1, 123.4500, 0),
+       (2, -67.8900, 0),
+       (3, -0.5000, 0),
+       (4, -0.9990, 0),
+       (5, 0.0000, 123456789.123456789012)`
+  );
+
+  const numRows = await conn.executeQuery(
+    'SELECT id, n, hp FROM numeric_test ORDER BY id'
+  );
+
+  // Exact decimal text via getString (preserves scale + sign).
+  const nStrings = numRows.map((r) => r.getString(1));
+  console.log(`   getString(n): ${JSON.stringify(nStrings)}`);
+  assert.equal(nStrings[0], '123.4500', 'positive numeric exact text');
+  assert.equal(nStrings[1], '-67.8900', 'negative numeric exact text');
+  // Regression: sub-unit negatives must keep their sign (issue #84).
+  assert.equal(nStrings[2], '-0.5000', 'sub-unit negative keeps sign');
+  assert.equal(nStrings[3], '-0.9990', 'sub-unit negative keeps sign');
+
+  // getFloat64 must be the real value, not a reinterpreted-bytes garbage/NaN.
+  const nFloats = numRows.map((r) => r.getFloat64(1));
+  console.log(`   getFloat64(n): ${JSON.stringify(nFloats)}`);
+  assert.ok(Math.abs(nFloats[0] - 123.45) < 1e-9, 'positive f64');
+  assert.ok(Math.abs(nFloats[1] - -67.89) < 1e-9, 'negative f64');
+  assert.ok(Math.abs(nFloats[2] - -0.5) < 1e-12, 'sub-unit negative f64 keeps sign');
+  assert.ok(nFloats[2] < 0, 'sub-unit negative f64 is negative');
+  assert.ok(nFloats.every((v) => !Number.isNaN(v)), 'no NaN from NUMERIC decode');
+
+  // High precision (>15 significant digits): exact via string, lossy via f64.
+  const hp = numRows[4].getString(2);
+  console.log(`   getString(hp): ${hp}`);
+  assert.equal(hp, '123456789.123456789012', 'high-precision exact text');
+
+  // AVG over a numeric column returns a numeric — decode it correctly.
+  const avgRow = await conn.executeQuery(
+    'SELECT AVG(n) FROM numeric_test WHERE id <= 4'
+  );
+  const avg = avgRow[0].getFloat64(0);
+  console.log(`   AVG(n) where id<=4: ${avg}`);
+  // (123.45 - 67.89 - 0.5 - 0.999) / 4 = 13.51525
+  assert.ok(Math.abs(avg - 13.51525) < 1e-6, 'AVG numeric decodes correctly');
+
+  // Columnar path surfaces NUMERIC as f64 — must match row-wise, not garbage.
+  const numColStream = conn.executeQueryColumnar(
+    'SELECT id, n FROM numeric_test ORDER BY id'
+  );
+  const numChunk = await numColStream.nextChunk();
+  const nCol = numChunk.getFloat64Column(1);
+  console.log(`   columnar getFloat64Column(n): [${Array.from(nCol).join(', ')}]`);
+  assert.ok(Math.abs(nCol[0] - 123.45) < 1e-9, 'columnar positive');
+  assert.ok(Math.abs(nCol[2] - -0.5) < 1e-12, 'columnar sub-unit negative keeps sign');
+  assert.ok(Array.from(nCol).every((v) => !Number.isNaN(v)), 'columnar no NaN');
+
+  // NUMERIC(p, 0) integer-shaped paths: getInt32 / getInt64 / getBigInt.
+  // Use a separate table so we can exercise scale=0 specifically.
+  await conn.executeCommand('DROP TABLE IF EXISTS numeric_int_test');
+  await conn.executeCommand(
+    'CREATE TABLE numeric_int_test (id INT NOT NULL, big NUMERIC(38,0))'
+  );
+  // Includes a value > 2^53 to exercise the BigInt path's precision
+  // preservation (i64::MAX = 9223372036854775807 > Number.MAX_SAFE_INTEGER).
+  await conn.executeCommand(
+    `INSERT INTO numeric_int_test VALUES
+       (1,  42),
+       (2, -42),
+       (3, 9223372036854775807)`
+  );
+
+  const intRows = await conn.executeQuery(
+    'SELECT id, big FROM numeric_int_test ORDER BY id'
+  );
+
+  // getInt32 / getInt64 narrow through f64 — fine for small values.
+  assert.equal(intRows[0].getInt32(1), 42, 'NUMERIC(p,0) -> Int32 positive');
+  assert.equal(intRows[1].getInt32(1), -42, 'NUMERIC(p,0) -> Int32 negative');
+  assert.equal(intRows[0].getInt64(1), 42, 'NUMERIC(p,0) -> Int64 positive');
+  assert.equal(intRows[1].getInt64(1), -42, 'NUMERIC(p,0) -> Int64 negative');
+
+  // getBigInt preserves full precision for NUMERIC(p, 0); a value above
+  // Number.MAX_SAFE_INTEGER must round-trip exactly.
+  const bigSmall = intRows[0].getBigInt(1);
+  const bigNeg = intRows[1].getBigInt(1);
+  const bigLarge = intRows[2].getBigInt(1);
+  console.log(
+    `   getBigInt(NUMERIC(38,0)): ${bigSmall}, ${bigNeg}, ${bigLarge}`
+  );
+  assert.equal(bigSmall, 42n, 'BigInt small positive');
+  assert.equal(bigNeg, -42n, 'BigInt small negative');
+  assert.equal(
+    bigLarge,
+    9223372036854775807n,
+    'BigInt preserves precision above 2^53'
+  );
+
+  // getBigInt on a non-zero-scale NUMERIC must return null (the cell is
+  // not an integer; callers should use getString or getFloat64).
+  const decBigInt = numRows[0].getBigInt(1);
+  assert.equal(
+    decBigInt,
+    null,
+    'getBigInt on NUMERIC(p, scale>0) returns null'
+  );
+
+  await conn.executeCommand('DROP TABLE numeric_int_test');
+  await conn.executeCommand('DROP TABLE numeric_test');
+  console.log('   All NUMERIC tests passed ✓');
+
   // 19. Clean up
   console.log('\n19. Cleaning up...');
   await catalog.dropTable('test_users');

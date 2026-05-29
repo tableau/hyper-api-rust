@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Query results now preserve the sign of negative `NUMERIC`/`DECIMAL` values
+  with magnitude less than 1. Previously a value like `CAST(-0.5 AS
+  numeric(10,4))` was serialized to JSON as `0.5` because `row_value_to_json`
+  stringifies NUMERIC via `Numeric::to_string()`, whose `Display` impl dropped
+  the sign for sub-unit magnitudes (fixed in `hyperdb-api-core`). This silently
+  flipped the sign of correlations, 0–1 indices, and regression residuals.
+
 ### Added
 
 - **Single-instance `hyperd` daemon** — by default, all MCP clients now

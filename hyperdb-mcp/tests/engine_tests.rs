@@ -336,6 +336,43 @@ fn engine_numeric_columns_and_aggregates_render_as_json_numbers() {
     assert!((avg - 2.0).abs() < 1e-9, "got {avg}");
 }
 
+/// Regression test: negative NUMERIC values with magnitude < 1 (the open
+/// interval `(-1, 0)`) must keep their sign through `execute_query_to_json`.
+///
+/// `row_value_to_json` serializes NUMERIC via `Numeric::to_string()`, whose
+/// `Display` impl previously derived the sign from the integer part alone.
+/// For `-0.5` the integer part is `0` (which prints without a sign), so the
+/// value rendered as `0.5` — silently flipping the sign of correlations,
+/// 0–1 indices, and regression residuals. Values with `|x| >= 1` and the
+/// `DOUBLE PRECISION` path were unaffected, which this test also guards.
+#[test]
+fn engine_negative_sub_unit_numeric_keeps_sign() {
+    let te = TestEngine::new_ephemeral();
+
+    let rows = te
+        .engine
+        .execute_query_to_json(
+            "SELECT \
+                 CAST(-0.5   AS numeric(10,4)) AS a, \
+                 CAST(-0.999 AS numeric(10,4)) AS b, \
+                 CAST(-1.5   AS numeric(10,4)) AS c, \
+                 CAST(-0.5   AS double precision) AS d",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+
+    let val = |k: &str| {
+        row[k]
+            .as_f64()
+            .unwrap_or_else(|| panic!("{k} rendered as non-number: {:?}", row[k]))
+    };
+    assert!((val("a") - (-0.5)).abs() < 1e-9, "got {}", val("a"));
+    assert!((val("b") - (-0.999)).abs() < 1e-9, "got {}", val("b"));
+    assert!((val("c") - (-1.5)).abs() < 1e-9, "got {}", val("c"));
+    assert!((val("d") - (-0.5)).abs() < 1e-9, "got {}", val("d"));
+}
+
 /// `resolve_log_dir` helper: persistent mode uses the workspace's parent,
 /// ephemeral mode uses the per-PID temp dir.
 #[test]
