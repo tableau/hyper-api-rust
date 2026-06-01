@@ -1,0 +1,30 @@
+[package]
+name = "hyperdb-compile-check"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Compile-time SQL validation logic for hyperdb-api (not a proc-macro)"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["database", "hyper", "sql", "validation"]
+categories = ["database", "development-tools"]
+
+# NOT proc-macro = true — this is a regular library so its logic can be
+# unit-tested without trybuild. The proc-macro shells (hyperdb-api-derive)
+# call into this crate.
+
+[dependencies]
+# x-release-please-start-version
+hyperdb-api = { path = "../hyperdb-api", version = "=0.3.1" }
+hyperdb-api-core = { path = "../hyperdb-api-core", version = "=0.3.1" }
+# x-release-please-end
+parking_lot = { workspace = true }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
