@@ -9,6 +9,7 @@
 mod common;
 
 use common::{test_hyper_params, test_result_path};
+use futures::{StreamExt, TryStreamExt};
 use hyperdb_api::{AsyncConnection, CreateMode, FromRow, HyperProcess, Result};
 
 async fn fresh_async_conn(name: &str) -> Result<(HyperProcess, AsyncConnection)> {
@@ -263,6 +264,166 @@ async fn transaction_with_commit() {
     }
     let count: i64 = conn.fetch_scalar("SELECT COUNT(*) FROM t").await.unwrap();
     assert_eq!(count, 2);
+
+    conn.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stream_as_happy_path() {
+    let (_hyper, conn) = fresh_async_conn("async_stream_as_happy").await.unwrap();
+
+    conn.execute_command("CREATE TABLE users (id INT NOT NULL, name TEXT)")
+        .await
+        .unwrap();
+    conn.execute_command("INSERT INTO users VALUES (1, 'alice'), (2, 'bob'), (3, NULL)")
+        .await
+        .unwrap();
+
+    let users = {
+        let stream = conn.stream_as::<User>("SELECT id, name FROM users ORDER BY id");
+        tokio::pin!(stream);
+        stream.try_collect::<Vec<User>>().await.unwrap()
+    };
+
+    assert_eq!(users.len(), 3);
+    assert_eq!(
+        users[0],
+        User {
+            id: 1,
+            name: Some("alice".to_string())
+        }
+    );
+    assert_eq!(
+        users[1],
+        User {
+            id: 2,
+            name: Some("bob".to_string())
+        }
+    );
+    assert_eq!(users[2], User { id: 3, name: None });
+
+    // Verify it matches fetch_all_as
+    let fetch_all: Vec<User> = conn
+        .fetch_all_as("SELECT id, name FROM users ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(users, fetch_all);
+
+    conn.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stream_as_multi_chunk() {
+    let (_hyper, conn) = fresh_async_conn("async_stream_as_multi_chunk")
+        .await
+        .unwrap();
+
+    conn.execute_command("CREATE TABLE big (id INT NOT NULL, name TEXT)")
+        .await
+        .unwrap();
+    // The TCP client accumulates up to DEFAULT_BINARY_CHUNK_SIZE (65_536) rows
+    // per chunk, so insert > 2× that to force at least two non-empty chunks and
+    // genuinely exercise the cross-chunk re-entry path (index map built once,
+    // reused on the second chunk).
+    const ROWS: i32 = 140_000;
+    conn.execute_command(&format!(
+        "INSERT INTO big SELECT id, 'user_' || id::TEXT FROM GENERATE_SERIES(1, {ROWS}) AS id",
+    ))
+    .await
+    .unwrap();
+
+    let users = {
+        let stream = conn.stream_as::<User>("SELECT id, name FROM big ORDER BY id");
+        tokio::pin!(stream);
+        stream.try_collect::<Vec<User>>().await.unwrap()
+    };
+
+    let last = usize::try_from(ROWS).expect("row count fits usize") - 1;
+    assert_eq!(users.len(), ROWS as usize);
+    // Verify first and last
+    assert_eq!(
+        users[0],
+        User {
+            id: 1,
+            name: Some("user_1".to_string())
+        }
+    );
+    assert_eq!(
+        users[last],
+        User {
+            id: ROWS,
+            name: Some(format!("user_{ROWS}"))
+        }
+    );
+
+    conn.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stream_as_submit_error() {
+    let (_hyper, conn) = fresh_async_conn("async_stream_as_submit_error")
+        .await
+        .unwrap();
+
+    // Query a nonexistent table
+    {
+        let stream = conn.stream_as::<User>("SELECT id, name FROM nonexistent_table");
+        tokio::pin!(stream);
+
+        // The first item should be an Err (submit error surfaces lazily)
+        let first = stream.next().await;
+        assert!(first.is_some());
+        assert!(first.unwrap().is_err());
+    }
+
+    conn.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stream_as_empty() {
+    let (_hyper, conn) = fresh_async_conn("async_stream_as_empty").await.unwrap();
+
+    conn.execute_command("CREATE TABLE empty_users (id INT NOT NULL, name TEXT)")
+        .await
+        .unwrap();
+
+    let users = {
+        let stream = conn.stream_as::<User>("SELECT id, name FROM empty_users WHERE 1=0");
+        tokio::pin!(stream);
+        stream.try_collect::<Vec<User>>().await.unwrap()
+    };
+
+    assert_eq!(users.len(), 0);
+
+    conn.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stream_as_lenient_extra_column() {
+    let (_hyper, conn) = fresh_async_conn("async_stream_as_lenient").await.unwrap();
+
+    conn.execute_command("CREATE TABLE users_extra (id INT NOT NULL, name TEXT, extra TEXT)")
+        .await
+        .unwrap();
+    conn.execute_command("INSERT INTO users_extra VALUES (1, 'alice', 'data')")
+        .await
+        .unwrap();
+
+    // SELECT * includes the extra column, but User only maps id and name
+    let users = {
+        let stream = conn.stream_as::<User>("SELECT * FROM users_extra");
+        tokio::pin!(stream);
+        stream.try_collect::<Vec<User>>().await.unwrap()
+    };
+
+    assert_eq!(users.len(), 1);
+    assert_eq!(
+        users[0],
+        User {
+            id: 1,
+            name: Some("alice".to_string())
+        }
+    );
 
     conn.close().await.unwrap();
 }

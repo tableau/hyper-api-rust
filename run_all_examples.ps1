@@ -54,7 +54,10 @@ $examples = @(
     "threaded_inserter",
     "grpc_query",
     "connection_pool",
-    "transactions"
+    "transactions",
+    "async_parity_smoke",
+    "prepared_statements",
+    "row_mapping_forms"
 )
 
 # No feature-gated examples — hyperdb-api has zero feature flags.

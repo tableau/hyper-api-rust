@@ -478,6 +478,183 @@ fn test_derive_from_row_missing_column_errors() {
 }
 
 // =============================================================================
+// #17 cont: stream_as — Lazy FromRow Iterator
+// =============================================================================
+
+#[test]
+fn test_stream_as_happy_path() {
+    let test = TestConnection::new().expect("Failed to create test connection");
+
+    test.execute_command(
+        "CREATE TABLE stream_as_test (id INT NOT NULL, name TEXT, score DOUBLE PRECISION)",
+    )
+    .expect("create");
+    test.execute_command(
+        "INSERT INTO stream_as_test VALUES (1, 'Alice', 95.5), (2, 'Bob', 87.0), (3, 'Carol', 92.3)",
+    )
+    .expect("insert");
+
+    let users: Vec<TestUser> = test
+        .connection
+        .stream_as::<TestUser>("SELECT id, name, score FROM stream_as_test ORDER BY id")
+        .expect("stream_as")
+        .collect::<hyperdb_api::Result<Vec<_>>>()
+        .expect("collect");
+
+    let expected: Vec<TestUser> = test
+        .connection
+        .fetch_all_as("SELECT id, name, score FROM stream_as_test ORDER BY id")
+        .expect("fetch_all_as");
+
+    assert_eq!(users, expected);
+    assert_eq!(users.len(), 3);
+    assert_eq!(users[0].id, 1);
+    assert_eq!(users[0].name, "Alice");
+    assert_eq!(users[2].id, 3);
+    assert_eq!(users[2].name, "Carol");
+}
+
+#[test]
+fn test_stream_as_multi_chunk() {
+    // Insert enough rows to span multiple transport chunks, proving the
+    // index map is built once and reused across chunk boundaries. The TCP
+    // client accumulates up to DEFAULT_BINARY_CHUNK_SIZE (65_536) rows per
+    // chunk, so we insert > 2× that to force at least two non-empty chunks
+    // and exercise the cross-chunk re-entry path.
+    const ROWS: i32 = 140_000;
+    let test = TestConnection::new().expect("Failed to create test connection");
+
+    test.execute_command(
+        "CREATE TABLE stream_multi_chunk (id INT NOT NULL, name TEXT, score DOUBLE PRECISION)",
+    )
+    .expect("create");
+    test.execute_command(&format!(
+        "INSERT INTO stream_multi_chunk SELECT id, 'name' || id, id * 1.0 \
+         FROM GENERATE_SERIES(1, {ROWS}) AS g(id)",
+    ))
+    .expect("insert rows");
+
+    let users: Vec<TestUser> = test
+        .connection
+        .stream_as::<TestUser>("SELECT id, name, score FROM stream_multi_chunk ORDER BY id")
+        .expect("stream_as")
+        .collect::<hyperdb_api::Result<Vec<_>>>()
+        .expect("collect");
+
+    let last = usize::try_from(ROWS).expect("row count fits usize") - 1;
+    assert_eq!(users.len(), ROWS as usize);
+    assert_eq!(users[0].id, 1);
+    assert_eq!(users[0].name, "name1");
+    assert!((users[0].score - 1.0).abs() < 0.001);
+    assert_eq!(users[last].id, ROWS);
+    assert_eq!(users[last].name, format!("name{ROWS}"));
+    assert!((users[last].score - f64::from(ROWS)).abs() < 0.001);
+}
+
+#[test]
+fn test_stream_as_submit_error() {
+    // SQL errors (like referencing a non-existent table) surface during
+    // iteration, not at stream creation. Streaming queries defer validation
+    // until the first chunk is fetched.
+    let test = TestConnection::new().expect("Failed to create test connection");
+
+    let mut iter = test
+        .connection
+        .stream_as::<TestUser>("SELECT * FROM no_such_table_xyz")
+        .expect("stream creation succeeds");
+
+    let first = iter.next().expect("iterator yields an item");
+    assert!(
+        first.is_err(),
+        "Expected Err for non-existent table, got Ok(_)"
+    );
+}
+
+#[test]
+fn test_stream_as_per_row_map_error() {
+    // Per-row mapping errors surface lazily as Err items during iteration.
+    // Define a struct whose FromRow requests a non-existent column.
+    #[derive(Debug)]
+    #[allow(
+        dead_code,
+        reason = "fields are accessed via FromRow impl, not directly"
+    )]
+    struct BadUser {
+        id: i32,
+        does_not_exist: String,
+    }
+
+    impl FromRow for BadUser {
+        fn from_row(row: hyperdb_api::RowAccessor<'_>) -> hyperdb_api::Result<Self> {
+            Ok(BadUser {
+                id: row.get("id")?,
+                does_not_exist: row.get("does_not_exist")?,
+            })
+        }
+    }
+
+    let test = TestConnection::new().expect("Failed to create test connection");
+    test.execute_command("CREATE TABLE bad_map (id INT NOT NULL)")
+        .expect("create");
+    test.execute_command("INSERT INTO bad_map VALUES (1)")
+        .expect("insert");
+
+    let mut iter = test
+        .connection
+        .stream_as::<BadUser>("SELECT id FROM bad_map")
+        .expect("stream_as succeeds (submit)");
+
+    let first = iter.next().expect("iterator yields an item");
+    assert!(first.is_err(), "Expected Err for missing column, got Ok(_)");
+}
+
+#[test]
+fn test_stream_as_empty() {
+    // Empty result set yields an empty iterator, no error.
+    let test = TestConnection::new().expect("Failed to create test connection");
+
+    test.execute_command(
+        "CREATE TABLE stream_empty (id INT NOT NULL, name TEXT, score DOUBLE PRECISION)",
+    )
+    .expect("create");
+    // no INSERT
+
+    let users: Vec<TestUser> = test
+        .connection
+        .stream_as::<TestUser>("SELECT id, name, score FROM stream_empty WHERE 1=0")
+        .expect("stream_as")
+        .collect::<hyperdb_api::Result<Vec<_>>>()
+        .expect("collect");
+
+    assert_eq!(users.len(), 0);
+}
+
+#[test]
+fn test_stream_as_lenient_extra_column() {
+    // Selecting extra columns not present in TestUser's FromRow impl should
+    // not cause errors — mirror fetch_all_as lenient semantics.
+    let test = TestConnection::new().expect("Failed to create test connection");
+
+    test.execute_command(
+        "CREATE TABLE stream_lenient (id INT NOT NULL, name TEXT, score DOUBLE PRECISION, extra TEXT)",
+    )
+    .expect("create");
+    test.execute_command("INSERT INTO stream_lenient VALUES (1, 'Alice', 95.5, 'extra_val')")
+        .expect("insert");
+
+    let users: Vec<TestUser> = test
+        .connection
+        .stream_as::<TestUser>("SELECT id, name, score, extra FROM stream_lenient ORDER BY id")
+        .expect("stream_as")
+        .collect::<hyperdb_api::Result<Vec<_>>>()
+        .expect("collect");
+
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].id, 1);
+    assert_eq!(users[0].name, "Alice");
+}
+
+// =============================================================================
 // #16: Connection Health (ping)
 // =============================================================================
 

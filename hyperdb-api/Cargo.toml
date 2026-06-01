@@ -33,6 +33,13 @@ deadpool = { version = "0.13" }
 # tokio sync primitives — already present transitively via hyperdb-api-core's
 # async TCP client; declared here for the pool's first-connection mutex.
 tokio = { workspace = true, features = ["sync"] }
+# async-stream's try_stream! powers AsyncConnection::stream_as, letting us
+# await next_chunk() inside a natural loop and surface the submit error as
+# the stream's first item.
+async-stream = "0.3"
+# futures-core provides the Stream trait used in stream_as's return type.
+# Already present transitively; pinned here as a direct dep for the public API.
+futures-core = "0.3"
 # Serde JSON - for query stats log parsing
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -48,6 +55,8 @@ tempfile = { workspace = true }
 libc = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["full"] }
+# StreamExt/TryStreamExt for draining stream_as in async tests
+futures = "0.3"
 rand = { workspace = true }
 serde = { workspace = true }
 sysinfo = { workspace = true }
@@ -65,6 +74,10 @@ path = "tests/stress_test_main.rs"
 harness = true
 
 # Additional examples (in additional_examples/ subdirectory)
+
+[[example]]
+name = "row_mapping_forms"
+path = "examples/additional_examples/row_mapping_forms.rs"
 
 [[example]]
 name = "compile_time_validation"

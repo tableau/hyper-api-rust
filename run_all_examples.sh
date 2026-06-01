@@ -59,6 +59,7 @@ examples=(
     "transactions"
     "async_parity_smoke"
     "prepared_statements"
+    "row_mapping_forms"
 )
 
 # Examples that require additional feature flags
