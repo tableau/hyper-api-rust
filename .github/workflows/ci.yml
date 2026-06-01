@@ -202,9 +202,10 @@ jobs:
     # include paths, etc.) on the subset of crates that have no
     # workspace deps — those are the only ones `cargo publish --dry-run`
     # can check before anything's on crates.io. The other crates
-    # (hyperdb-api-core, hyperdb-api-salesforce, hyperdb-api, hyperdb-mcp)
-    # resolve their path+version deps against the live index, which can't
-    # succeed until those deps are themselves published. (Note:
+    # (hyperdb-api-core, hyperdb-api-salesforce, hyperdb-api, hyperdb-mcp,
+    # hyperdb-compile-check) resolve their path+version deps against the
+    # live index, which can't succeed until those deps are themselves
+    # published. (Note:
     # hyperdb-api-core has an optional workspace dep on
     # hyperdb-api-salesforce via its `salesforce-auth` feature, which
     # triggers the same path-resolution failure even though the dep is

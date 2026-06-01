@@ -173,6 +173,8 @@ jobs:
       - name: Confirm tag matches workspace version
         # All publishable crates are in lockstep. Use hyperdb-api-core as
         # the bellwether (it's the foundation every other crate depends on).
+        # hyperdb-compile-check is outside the workspace but must also be
+        # in lockstep — check its version separately via its own Cargo.toml.
         env:
           EXPECTED: ${{ steps.tag.outputs.version }}
         run: |
@@ -181,6 +183,15 @@ jobs:
             | jq -r '.packages[] | select(.name=="hyperdb-api-core") | .version')
           if [[ "$EXPECTED" != "$ACTUAL" ]]; then
             echo "::error::Tag version ($EXPECTED) does not match hyperdb-api-core Cargo.toml ($ACTUAL). Bump all workspace Cargo.tomls to match the tag before releasing." >&2
+            exit 1
+          fi
+          # hyperdb-compile-check lives outside the workspace; check its
+          # version via cargo metadata targeted at its own Cargo.toml.
+          CC_ACTUAL=$(cargo metadata --no-deps --format-version 1 \
+            --manifest-path hyperdb-compile-check/Cargo.toml \
+            | jq -r '.packages[] | select(.name=="hyperdb-compile-check") | .version')
+          if [[ "$EXPECTED" != "$CC_ACTUAL" ]]; then
+            echo "::error::Tag version ($EXPECTED) does not match hyperdb-compile-check/Cargo.toml ($CC_ACTUAL). Bump it to match before releasing." >&2
             exit 1
           fi
 
@@ -215,12 +226,27 @@ jobs:
           # - hyperdb-api: depends on hyperdb-api-core AND
           #   hyperdb-api-derive (=X.Y.Z strict pin → derive must be
           #   on the index when hyperdb-api builds).
+          # - hyperdb-compile-check: depends on hyperdb-api; outside the
+          #   workspace (avoids dep cycle) but published in lockstep.
+          #   Uses --manifest-path since it's not a workspace member.
           # - hyperdb-mcp, hyperdb-bootstrap, sea-query-hyperdb: depend
           #   on hyperdb-api / hyperdb-api-core; publish last.
           publish hyperdb-api-salesforce
           publish hyperdb-api-derive
           publish hyperdb-api-core
           publish hyperdb-api
+          # hyperdb-compile-check is not a workspace member; publish via manifest path
+          echo "::group::Publishing hyperdb-compile-check"
+          if ! cargo publish --manifest-path hyperdb-compile-check/Cargo.toml 2>&1 | tee /tmp/publish_out; then
+            if grep -q "already exists on" /tmp/publish_out; then
+              echo "::warning::hyperdb-compile-check already published — skipping"
+            else
+              echo "::endgroup::"
+              exit 1
+            fi
+          fi
+          echo "::endgroup::"
+          sleep 45
           publish hyperdb-mcp
           publish hyperdb-bootstrap
           publish sea-query-hyperdb

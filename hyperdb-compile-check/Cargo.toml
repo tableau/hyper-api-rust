@@ -6,7 +6,9 @@
 
 [package]
 name = "hyperdb-compile-check"
+# x-release-please-start-version
 version = "0.3.1"
+# x-release-please-end
 edition = "2021"
 rust-version = "1.81"
 description = "Compile-time SQL validation logic for hyperdb-api (not a proc-macro)"
