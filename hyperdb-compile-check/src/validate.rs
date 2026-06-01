@@ -51,11 +51,8 @@ pub fn validate_query_as(struct_name: &str, sql: &str) -> Result<(), ValidationE
 
     let mut db = get_or_init().lock();
 
-    // Step 2+4: dry-run with seed-and-retry on 42P01 (shared helper).
-    let schema = match run_dry_run_with_seed(sql, &mut db)? {
-        Some(s) => s,
-        None => unreachable!("run_dry_run_with_seed always returns Some or Err"),
-    };
+    // Step 2+4: dry-run with bounded seed-and-retry on 42P01.
+    let schema = run_dry_run_with_seed(sql, &mut db)?;
 
     drop(db);
 
@@ -67,7 +64,10 @@ pub fn validate_query_as(struct_name: &str, sql: &str) -> Result<(), ValidationE
 /// projects exactly one column. Used by `query_scalar!`.
 ///
 /// Does not require a struct registration — scalars project a single column
-/// of a primitive type without mapping to a struct.
+/// of a primitive type without mapping to a struct. However, tables referenced
+/// by the SQL still need to be registered via `derive(Table) #[hyperdb(register)]`
+/// for compile-time validation to work; unregistered tables produce a
+/// `TablesNotRegistered` diagnostic.
 ///
 /// # Errors
 ///
@@ -76,11 +76,7 @@ pub fn validate_query_as(struct_name: &str, sql: &str) -> Result<(), ValidationE
 pub fn validate_scalar_sql(sql: &str) -> Result<(), ValidationError> {
     let mut db = get_or_init().lock();
 
-    // Run dry-run; on 42P01 seed the missing table and retry once.
-    let schema = match run_dry_run_with_seed(sql, &mut db)? {
-        Some(s) => s,
-        None => return Ok(()), // unreachable in practice — run_dry_run_with_seed always returns Some or Err
-    };
+    let schema = run_dry_run_with_seed(sql, &mut db)?;
 
     drop(db);
 
@@ -96,34 +92,58 @@ pub fn validate_scalar_sql(sql: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
-/// Shared dry-run helper: runs the dry-run and handles the 42P01 seed-and-retry.
-/// Returns `Ok(Some(schema))` on success, `Err(ValidationError)` on failure.
+/// Shared dry-run helper with bounded seed-and-retry on SQLSTATE 42P01.
+///
+/// Loops up to `MAX_SEED_ROUNDS` times: on each 42P01, extracts the missing
+/// table name, seeds it from the registry if known, and retries. This handles
+/// multi-table queries (JOINs) where several registered tables need seeding
+/// before the first `query_as!` invocation in a crate — without the loop,
+/// only the first missing table would be seeded per call.
+///
+/// Stops early on syntax errors, missing-column errors, or unregistered tables.
 fn run_dry_run_with_seed(
     sql: &str,
     db: &mut crate::db::CompileTimeDb,
-) -> Result<Option<hyperdb_api::ResultSchema>, ValidationError> {
-    match dry_run(db, sql) {
-        Ok(s) => Ok(Some(s)),
-        Err(e) => match classify(&e) {
-            ErrorClass::MissingTable(t) => match Registry::seed_if_known(&t, db) {
-                Ok(true) => match dry_run(db, sql) {
-                    Ok(s) => Ok(Some(s)),
-                    Err(retry_err) => Err(ValidationError::HyperError {
-                        message: format!("{retry_err}"),
-                    }),
+) -> Result<hyperdb_api::ResultSchema, ValidationError> {
+    // Bound to prevent infinite loops on pathological SQL (e.g., a self-join
+    // that repeatedly 42P01s on the same unregistered table after seeding).
+    const MAX_SEED_ROUNDS: usize = 8;
+
+    for _ in 0..MAX_SEED_ROUNDS {
+        match dry_run(db, sql) {
+            Ok(schema) => return Ok(schema),
+            Err(e) => match classify(&e) {
+                ErrorClass::MissingTable(t) => match Registry::seed_if_known(&t, db) {
+                    Ok(true) => continue, // seeded successfully; retry the dry-run
+                    Ok(false) => {
+                        return Err(ValidationError::TablesNotRegistered { tables: vec![t] })
+                    }
+                    Err(seed_err) => {
+                        return Err(ValidationError::HyperError {
+                            message: format!("{seed_err}"),
+                        })
+                    }
                 },
-                Ok(false) => Err(ValidationError::TablesNotRegistered { tables: vec![t] }),
-                Err(seed_err) => Err(ValidationError::HyperError {
-                    message: format!("{seed_err}"),
-                }),
+                ErrorClass::SyntaxError(msg) => {
+                    return Err(ValidationError::SqlSyntaxError { message: msg })
+                }
+                ErrorClass::MissingColumn(col) => {
+                    return Err(ValidationError::HyperError {
+                        message: format!("unknown column {col:?}"),
+                    })
+                }
+                ErrorClass::Other(msg) => return Err(ValidationError::HyperError { message: msg }),
             },
-            ErrorClass::SyntaxError(msg) => Err(ValidationError::SqlSyntaxError { message: msg }),
-            ErrorClass::MissingColumn(col) => Err(ValidationError::HyperError {
-                message: format!("unknown column {col:?}"),
-            }),
-            ErrorClass::Other(msg) => Err(ValidationError::HyperError { message: msg }),
-        },
+        }
     }
+
+    Err(ValidationError::HyperError {
+        message: format!(
+            "compile-time validation exceeded {MAX_SEED_ROUNDS} seed-and-retry rounds; \
+             ensure all tables referenced by this query are registered via \
+             `#[derive(Table)] #[hyperdb(register)]`"
+        ),
+    })
 }
 
 /// Check that every field in `struct_fields` appears as a column name in

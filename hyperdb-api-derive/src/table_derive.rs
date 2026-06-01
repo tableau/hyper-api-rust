@@ -110,11 +110,9 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
 
 struct StructOpts {
     table_name: Option<String>,
-    /// Parsed but not yet used — registration wired in Milestone B.
-    #[allow(
-        dead_code,
-        reason = "registration wired in Milestone B (cycle resolution)"
-    )]
+    /// Whether `#[hyperdb(register)]` was present.
+    /// Only used when `compile-time` feature is enabled.
+    #[allow(dead_code, reason = "only used when compile-time feature is enabled")]
     register: bool,
 }
 

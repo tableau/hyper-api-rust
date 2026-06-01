@@ -89,13 +89,30 @@ pub fn table_derive(input: TokenStream) -> TokenStream {
     }
 }
 
-/// Stub `query_as!` macro for A8 rust-analyzer behavior confirmation.
-///
-/// For now this is a pass-through that just returns `QueryAs::new(sql, args)`.
-/// Compile-time validation will be wired in Milestone B once the
-/// `hyperdb-compile-check` dependency cycle is resolved.
+/// Compile-time validated typed query macro.
 ///
 /// Syntax: `query_as!(Type, "SQL")` or `query_as!(Type, "SQL", arg1, arg2, …)`
+///
+/// Returns a [`hyperdb_api::QueryAs<Type>`] builder. `Type` must implement
+/// [`hyperdb_api::FromRow`] and must be registered via
+/// `#[derive(Table)] #[hyperdb(register)]`.
+///
+/// With the `compile-time` cargo feature enabled, validates at build time that
+/// the SQL is syntactically valid, all referenced tables are registered, and
+/// all struct fields appear in the projected columns.
+///
+/// # Module ordering constraint (`compile-time` feature)
+///
+/// Registration happens at proc-macro expansion time in the proc-macro host
+/// process. Rust expands macros in the order modules are declared in `mod`
+/// statements (top-to-bottom in `lib.rs`/`main.rs`). If `derive(Table)` and
+/// `query_as!` are in different modules, the module containing `derive(Table)`
+/// structs **must be declared (via `mod`) before** the module containing
+/// `query_as!` calls, otherwise a false `StructNotRegistered` compile error
+/// is emitted.
+///
+/// Within a single file, struct-level derives always expand before
+/// function-body macros, so ordering within a file is not a concern.
 #[proc_macro]
 pub fn query_as(input: TokenStream) -> TokenStream {
     match expand_query_as(&input.into()) {
