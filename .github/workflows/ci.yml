@@ -214,17 +214,16 @@ jobs:
   publish-dry-run:
     # Catches Cargo.toml metadata regressions (missing license, bad
     # include paths, etc.) on the subset of crates that have no
-    # workspace deps — those are the only ones `cargo publish --dry-run`
-    # can check before anything's on crates.io. The other crates
-    # (hyperdb-api-core, hyperdb-api-salesforce, hyperdb-api, hyperdb-mcp,
-    # hyperdb-compile-check) resolve their path+version deps against the
-    # live index, which can't succeed until those deps are themselves
-    # published. (Note:
-    # hyperdb-api-core has an optional workspace dep on
-    # hyperdb-api-salesforce via its `salesforce-auth` feature, which
-    # triggers the same path-resolution failure even though the dep is
-    # optional.) They're exercised end-to-end by release.yml at tag
-    # time, when the whole wave ships together.
+    # unresolvable path deps before the full wave ships.
+    # Excluded from dry-run (resolved only at release time):
+    #   hyperdb-api-core, hyperdb-api-salesforce, hyperdb-api, hyperdb-mcp:
+    #     path+version deps on workspace siblings not yet on crates.io.
+    #   hyperdb-api-derive: now has an optional path dep on
+    #     hyperdb-compile-check, which is not a workspace member and not on
+    #     crates.io until the release wave lands. Even optional deps are
+    #     resolved by `cargo publish --dry-run` during verification.
+    #   hyperdb-compile-check: depends on hyperdb-api (not yet published).
+    # All of the above are exercised end-to-end by release.yml at tag time.
     name: publish dry-run
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -238,9 +237,12 @@ jobs:
           cache-key: publish-dry-run
           rustflags: ""
       - run: |
-          cargo publish -p hyperdb-bootstrap     --dry-run
-          cargo publish -p sea-query-hyperdb     --dry-run
-          cargo publish -p hyperdb-api-derive    --dry-run
+          cargo publish -p hyperdb-bootstrap  --dry-run
+          cargo publish -p sea-query-hyperdb  --dry-run
+          # hyperdb-api-derive excluded: has an optional path dep on
+          # hyperdb-compile-check which isn't on crates.io until the full
+          # release wave lands. Cargo resolves optional deps during dry-run
+          # verification regardless of whether the feature is enabled.
 
   deny:
     # Enforces license allowlist, advisory ignore list, and banned-source
