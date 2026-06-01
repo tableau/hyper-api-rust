@@ -52,12 +52,6 @@ rand = { workspace = true }
 serde = { workspace = true }
 sysinfo = { workspace = true }
 
-# A8 rust-analyzer expansion behavior check (not a real test; remove after confirmation)
-[[test]]
-name = "ra_expansion_check"
-path = "tests/ra_expansion_check.rs"
-harness = true
-
 # B4 compile-time validation end-to-end integration tests
 [[test]]
 name = "compile_time_validation_tests"
