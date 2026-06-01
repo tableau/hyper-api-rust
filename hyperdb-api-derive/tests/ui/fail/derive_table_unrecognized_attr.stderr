@@ -1,0 +1,5 @@
+error: unrecognized hyperdb attribute `unknown_attr`; supported struct attributes: table, register
+ --> tests/ui/fail/derive_table_unrecognized_attr.rs:4:11
+  |
+4 | #[hyperdb(unknown_attr)]
+  |           ^^^^^^^^^^^^

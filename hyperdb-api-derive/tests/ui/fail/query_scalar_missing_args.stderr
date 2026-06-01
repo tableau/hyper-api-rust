@@ -1,0 +1,5 @@
+error: query_scalar! expects a SQL string literal as the second argument
+ --> tests/ui/fail/query_scalar_missing_args.rs:4:27
+  |
+4 |     let _ = query_scalar!(i64); // missing SQL argument
+  |                           ^^^

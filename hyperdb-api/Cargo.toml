@@ -73,6 +73,10 @@ harness = true
 # Additional examples (in additional_examples/ subdirectory)
 
 [[example]]
+name = "compile_time_validation"
+path = "examples/additional_examples/compile_time_validation.rs"
+
+[[example]]
 name = "async_usage"
 path = "examples/additional_examples/async_usage.rs"
 

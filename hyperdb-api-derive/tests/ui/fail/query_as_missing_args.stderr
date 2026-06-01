@@ -1,0 +1,5 @@
+error: query_as! expects a SQL string literal as the second argument
+ --> tests/ui/fail/query_as_missing_args.rs:4:23
+  |
+4 |     let _ = query_as!(User); // missing SQL argument
+  |                       ^^^^

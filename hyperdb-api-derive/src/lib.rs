@@ -357,6 +357,9 @@ fn field_source_for(field: &Field, default: &syn::Ident) -> syn::Result<FieldSou
                 let parsed: usize = n.base10_parse()?;
                 index = Some((parsed, meta.path.span()));
                 Ok(())
+            } else if meta.path.is_ident("primary_key") {
+                // Table-derive attribute; silently ignored by FromRow.
+                Ok(())
             } else {
                 Err(meta.error(format!(
                     "unrecognized hyperdb attribute `{}`; supported attributes: rename, index",

@@ -1,0 +1,5 @@
+error: unsupported field type `Vec < String >` for derive(Table): only Vec<u8> is supported (maps to BYTES); other Vec<T> types have no Hyper SQL equivalent. Use a manual `impl Table` for this field.
+ --> tests/ui/fail/derive_table_unsupported_type.rs:6:5
+  |
+6 |     tags: Vec<String>, // Vec<T> other than Vec<u8> is unsupported
+  |     ^^^^^^^^^^^^^^^^^

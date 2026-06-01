@@ -28,5 +28,11 @@ quote = "1"
 proc-macro2 = "1"
 hyperdb-compile-check = { path = "../hyperdb-compile-check", version = "=0.3.1", optional = true }
 
+[dev-dependencies]
+# x-release-please-start-version
+hyperdb-api = { path = "../hyperdb-api", version = "=0.3.1" }
+# x-release-please-end
+trybuild = { version = "1", features = ["diff"] }
+
 [lints]
 workspace = true
