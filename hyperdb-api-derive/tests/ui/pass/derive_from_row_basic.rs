@@ -1,4 +1,5 @@
-use hyperdb_api::FromRow;
+// FromRow trait is in hyperdb_api; the derive macro is in hyperdb_api_derive.
+// No need to import the trait here since we don't call any trait methods.
 use hyperdb_api_derive::FromRow;
 
 #[derive(FromRow)]
