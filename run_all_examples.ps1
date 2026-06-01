@@ -55,6 +55,8 @@ $examples = @(
     "grpc_query",
     "connection_pool",
     "transactions",
+    "async_parity_smoke",
+    "prepared_statements",
     "row_mapping_forms"
 )
 

@@ -33,38 +33,30 @@ echo "=== Running All Rust API Examples ==="
 echo "HYPERD_PATH=$HYPERD_PATH"
 echo ""
 
+# Keep this list in sync with run_all_examples.sh — both run the same set of
+# registered hyperdb-api examples (see the [[example]] targets in
+# hyperdb-api/Cargo.toml). Benchmarks and the feature-gated
+# compile_time_validation example are intentionally excluded.
 examples=(
+    # Core canonical examples (matching C++/Python APIs)
     "insert_data_into_single_table"
     "insert_data_into_multiple_tables"
     "create_hyper_file_from_csv"
+    "delete_data_in_existing_hyper_file"
+    "update_data_in_existing_hyper_file"
     "read_and_print_data_from_existing_hyper_file"
     "insert_data_with_expressions"
     "insert_geospatial_data_to_a_hyper_file"
-    "delete_data_in_existing_hyper_file"
-    "update_data_in_existing_hyper_file"
-    # Consolidated examples
-    "reading_data"              # Was: read_data + result_types
-    "inserter"
-    "threaded_inserter"
+    # Rust-specific value-add examples
     "arrow"
-    "catalog_and_schema"        # Was: catalog_operations + schema_introspection
-    "multiple_databases"
-    "name_types"
-    "type_system"
-    "geography"
-    "logging"
-    "notice_receiver"
-    "parameterized_queries"
-    "struct_mapping"
-    "row_mapping_forms"         # All five FromRow mapping forms (sync + async stream_as)
-    "async_usage"               # Was: async_connection + async_integration
-    "sharding_cluster"
-    "query_builder"             # Was: query_builder_demo + advanced_query_builder
-    "future_improvements"
-    "grpc_query"                # Now includes grpc_query_builder_demo content
+    "async_usage"
+    "threaded_inserter"
+    "grpc_query"
+    "connection_pool"
     "transactions"
-    "grpc_benchmark_tests"
-    "grpc_compilation_check"
+    "async_parity_smoke"
+    "prepared_statements"
+    "row_mapping_forms"         # All five FromRow mapping forms (sync + async stream_as)
 )
 
 passed=0
@@ -77,35 +69,6 @@ for ex in "${examples[@]}"; do
     echo "----------------------------------------"
 
     if cargo run --release -p hyperdb-api --example "$ex" > "/tmp/rust_ex_${ex}.log" 2>&1; then
-        echo "✓ PASSED: $ex"
-        passed=$((passed + 1))
-    else
-        echo "✗ FAILED: $ex"
-        echo "Last few lines:"
-        tail -5 "/tmp/rust_ex_${ex}.log" | sed 's/^/  /'
-        failed=$((failed + 1))
-        failed_list+=("$ex")
-    fi
-    echo ""
-done
-
-# Examples that require additional feature flags
-# Format: "example_name:feature1,feature2"
-feature_examples=(
-    "sea_query:sea-query"
-    "connection_pool:pool"
-)
-
-for entry in "${feature_examples[@]}"; do
-    # Parse "example_name:features" format
-    ex="${entry%%:*}"
-    features="${entry#*:}"
-
-    echo "----------------------------------------"
-    echo "Running: $ex (features: $features)"
-    echo "----------------------------------------"
-
-    if cargo run --release -p hyperdb-api --features "$features" --example "$ex" > "/tmp/rust_ex_${ex}.log" 2>&1; then
         echo "✓ PASSED: $ex"
         passed=$((passed + 1))
     else
