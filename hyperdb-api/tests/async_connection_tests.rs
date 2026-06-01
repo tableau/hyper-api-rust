@@ -321,11 +321,14 @@ async fn stream_as_multi_chunk() {
     conn.execute_command("CREATE TABLE big (id INT NOT NULL, name TEXT)")
         .await
         .unwrap();
-    // Insert 5000 rows to span multiple chunks (default chunk size is 64K rows,
-    // but even with a smaller chunk size this exercises the multi-chunk path)
-    conn.execute_command(
-        "INSERT INTO big SELECT id, 'user_' || id::TEXT FROM GENERATE_SERIES(1, 5000) AS id",
-    )
+    // The TCP client accumulates up to DEFAULT_BINARY_CHUNK_SIZE (65_536) rows
+    // per chunk, so insert > 2× that to force at least two non-empty chunks and
+    // genuinely exercise the cross-chunk re-entry path (index map built once,
+    // reused on the second chunk).
+    const ROWS: i32 = 140_000;
+    conn.execute_command(&format!(
+        "INSERT INTO big SELECT id, 'user_' || id::TEXT FROM GENERATE_SERIES(1, {ROWS}) AS id",
+    ))
     .await
     .unwrap();
 
@@ -335,7 +338,8 @@ async fn stream_as_multi_chunk() {
         stream.try_collect::<Vec<User>>().await.unwrap()
     };
 
-    assert_eq!(users.len(), 5000);
+    let last = usize::try_from(ROWS).expect("row count fits usize") - 1;
+    assert_eq!(users.len(), ROWS as usize);
     // Verify first and last
     assert_eq!(
         users[0],
@@ -345,10 +349,10 @@ async fn stream_as_multi_chunk() {
         }
     );
     assert_eq!(
-        users[4999],
+        users[last],
         User {
-            id: 5000,
-            name: Some("user_5000".to_string())
+            id: ROWS,
+            name: Some(format!("user_{ROWS}"))
         }
     );
 

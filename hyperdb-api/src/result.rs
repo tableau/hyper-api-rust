@@ -1559,16 +1559,15 @@ impl Iterator for RowIterator<'_> {
 
 /// Iterator over rows of a result set with `FromRow` deserialization.
 ///
-/// Returned by [`Rowset::typed_rows`] and [`Connection::stream_as`]. Lazily
-/// fetches chunks from the server and maps each row to `T` via
-/// [`FromRow::from_row`]. Memory usage is bounded by the chunk size: at most
-/// one chunk of rows is held in memory at a time.
+/// Returned by [`Connection::stream_as`]. Lazily fetches chunks from the
+/// server and maps each row to `T` via [`FromRow::from_row`]. Memory usage is
+/// bounded by the chunk size: at most one chunk of rows is held in memory at a
+/// time.
 ///
 /// The column-name → index lookup table is built exactly once (on the first
 /// non-empty chunk) and reused for all rows, making per-row mapping O(1) in
 /// column count.
 ///
-/// [`Rowset::typed_rows`]: Rowset::typed_rows
 /// [`Connection::stream_as`]: crate::Connection::stream_as
 /// [`FromRow::from_row`]: crate::FromRow::from_row
 ///
@@ -1635,23 +1634,30 @@ impl<T: crate::FromRow> Iterator for TypedRowIterator<'_, T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            // Try to get next row from current chunk
+            // Try to get next row from current chunk. `get_or_insert_with` is
+            // a no-op here (the map was already built when this chunk was
+            // fetched, below) but lets us borrow it without an Option unwrap.
             if let Some(row) = self.current_iter.next() {
-                // indices is guaranteed Some here: it's built below the
-                // moment a non-empty chunk arrives, before we hand out any row.
-                let indices = self.indices.as_ref()?;
+                let indices = self.indices.get_or_insert_with(Default::default);
                 return Some(T::from_row(crate::RowAccessor::new_owned(&row, indices)));
             }
 
             // Current chunk exhausted, fetch next chunk
             match self.rowset.next_chunk() {
                 Ok(Some(chunk)) => {
-                    // Build the index map once, on first non-empty chunk.
-                    // The schema is populated by `next_chunk` as a side effect.
+                    // Build the index map once, on the first chunk. The schema
+                    // is populated by `next_chunk` as a side effect. If the
+                    // schema is somehow unavailable, fall back to an empty map
+                    // so column lookups surface a `Missing` error per row —
+                    // matching `fetch_all_as`'s `unwrap_or_default()` rather
+                    // than silently truncating the stream.
                     if self.indices.is_none() {
-                        if let Some(schema) = self.rowset.schema() {
-                            self.indices = Some(crate::RowAccessor::build_owned_indices(&schema));
-                        }
+                        let map = self
+                            .rowset
+                            .schema()
+                            .map(|schema| crate::RowAccessor::build_owned_indices(&schema))
+                            .unwrap_or_default();
+                        self.indices = Some(map);
                     }
                     self.current_iter = chunk.into_iter();
                     // loop around to drain the freshly fetched chunk

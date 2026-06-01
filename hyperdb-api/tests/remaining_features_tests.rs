@@ -517,18 +517,22 @@ fn test_stream_as_happy_path() {
 #[test]
 fn test_stream_as_multi_chunk() {
     // Insert enough rows to span multiple transport chunks, proving the
-    // index map is built once and reused across chunk boundaries.
+    // index map is built once and reused across chunk boundaries. The TCP
+    // client accumulates up to DEFAULT_BINARY_CHUNK_SIZE (65_536) rows per
+    // chunk, so we insert > 2× that to force at least two non-empty chunks
+    // and exercise the cross-chunk re-entry path.
+    const ROWS: i32 = 140_000;
     let test = TestConnection::new().expect("Failed to create test connection");
 
     test.execute_command(
         "CREATE TABLE stream_multi_chunk (id INT NOT NULL, name TEXT, score DOUBLE PRECISION)",
     )
     .expect("create");
-    test.execute_command(
+    test.execute_command(&format!(
         "INSERT INTO stream_multi_chunk SELECT id, 'name' || id, id * 1.0 \
-         FROM GENERATE_SERIES(1, 5000) AS g(id)",
-    )
-    .expect("insert 5000 rows");
+         FROM GENERATE_SERIES(1, {ROWS}) AS g(id)",
+    ))
+    .expect("insert rows");
 
     let users: Vec<TestUser> = test
         .connection
@@ -537,13 +541,14 @@ fn test_stream_as_multi_chunk() {
         .collect::<hyperdb_api::Result<Vec<_>>>()
         .expect("collect");
 
-    assert_eq!(users.len(), 5000);
+    let last = usize::try_from(ROWS).expect("row count fits usize") - 1;
+    assert_eq!(users.len(), ROWS as usize);
     assert_eq!(users[0].id, 1);
     assert_eq!(users[0].name, "name1");
     assert!((users[0].score - 1.0).abs() < 0.001);
-    assert_eq!(users[4999].id, 5000);
-    assert_eq!(users[4999].name, "name5000");
-    assert!((users[4999].score - 5000.0).abs() < 0.001);
+    assert_eq!(users[last].id, ROWS);
+    assert_eq!(users[last].name, format!("name{ROWS}"));
+    assert!((users[last].score - f64::from(ROWS)).abs() < 0.001);
 }
 
 #[test]
@@ -570,7 +575,10 @@ fn test_stream_as_per_row_map_error() {
     // Per-row mapping errors surface lazily as Err items during iteration.
     // Define a struct whose FromRow requests a non-existent column.
     #[derive(Debug)]
-    #[allow(dead_code, reason = "fields are accessed via FromRow impl, not directly")]
+    #[allow(
+        dead_code,
+        reason = "fields are accessed via FromRow impl, not directly"
+    )]
     struct BadUser {
         id: i32,
         does_not_exist: String,

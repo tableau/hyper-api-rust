@@ -443,20 +443,23 @@ impl AsyncConnection {
             let mut rs = self.execute_query(&query).await?;   // submit err → first Err item
             let mut indices: Option<std::collections::HashMap<String, usize>> = None;
             while let Some(chunk) = rs.next_chunk().await? {
-                // Build the name→index map once, on the first non-empty chunk,
-                // after next_chunk() has materialized the schema (TCP sends the
-                // RowDescription as the first stream message).
+                // Build the name→index map once, on the first chunk, after
+                // next_chunk() has materialized the schema (TCP sends the
+                // RowDescription as the first stream message). If the schema is
+                // somehow unavailable, fall back to an empty map so per-row
+                // lookups surface a `Missing` error — matching `fetch_all_as`'s
+                // `unwrap_or_default()` and the sync `stream_as`, rather than
+                // silently skipping the chunk.
                 if indices.is_none() {
-                    if let Some(schema) = rs.schema() {
-                        indices = Some(crate::RowAccessor::build_owned_indices(&schema));
-                    }
+                    let map = rs
+                        .schema()
+                        .map(|schema| crate::RowAccessor::build_owned_indices(&schema))
+                        .unwrap_or_default();
+                    indices = Some(map);
                 }
-                // Once a chunk exists the schema is present; if somehow absent
-                // (empty schema), skip mapping by yielding nothing for this chunk.
-                if let Some(idx) = indices.as_ref() {
-                    for row in &chunk {
-                        yield T::from_row(crate::RowAccessor::new_owned(row, idx))?;
-                    }
+                let idx = indices.get_or_insert_with(Default::default);
+                for row in &chunk {
+                    yield T::from_row(crate::RowAccessor::new_owned(row, idx))?;
                 }
             }
         }
