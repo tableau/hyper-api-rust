@@ -17,15 +17,22 @@ pub struct CompileTimeDb {
     pub(crate) conn: hyperdb_api::Connection,
 }
 
-// `HyperProcess` is the subprocess manager; a single instance can produce many
-// `Connection`s. `Connection` is one TCP session — it is NOT designed for
-// concurrent access from multiple threads (internal mutable TCP + protocol state).
+// `HyperProcess` manages the hyperd subprocess; it can produce many independent
+// `Connection`s (see `hyperdb_api::pool` for the production N-connection pool).
+// Here we hold exactly ONE `Connection` — a single TCP session used for all
+// `LIMIT 0` dry-runs. A `Connection` has internal mutable TCP + protocol state
+// and is NOT safe to use from multiple threads simultaneously.
 //
-// Neither type is `Send`/`Sync` in `hyperdb-api`'s public API. We implement
-// both here because `OnceLock<T>` requires `T: Send + Sync`. The safety
-// invariant is maintained entirely by the `parking_lot::Mutex` wrapper:
-// the `Mutex` ensures only one thread holds a reference to the inner
-// `CompileTimeDb` at any time, so `Connection` is never accessed concurrently.
+// The `parking_lot::Mutex` is what makes this safe: it ensures only one
+// proc-macro expansion thread touches the connection at a time. Each `query_as!`
+// site locks, runs one dry-run (~7ms), unlocks. They serialize on the one
+// connection rather than each getting their own (a connection-pool approach
+// would work too but adds startup cost for negligible gain at v1 scale).
+//
+// Neither `HyperProcess` nor `Connection` is `Send`/`Sync` in the public API.
+// We implement both here because `OnceLock<T>` requires `T: Send + Sync`.
+// The `Mutex` upholds the invariant that only one thread ever accesses the
+// fields — making the `Send`/`Sync` impls sound.
 //
 // REVISIT: if `HyperProcess`/`Connection` are made `Send` upstream, remove
 // these impls and let the compiler derive them.
