@@ -15,14 +15,19 @@
 //! - **Form 5** — streaming `FromRow`: `stream_as`, constant memory.
 //!
 //! Every form prints the same four products, so you can see they are
-//! equivalent. Run with:
+//! equivalent. Form 5 is shown on both the sync `Connection` and the async
+//! `AsyncConnection` (which returns an `impl Stream` instead of an iterator).
+//! Run with:
 //!
 //!   cargo run -p hyperdb-api --example row_mapping_forms
 //!
 //! `#[derive(FromRow)]` lives in the `hyperdb-api-derive` crate (it is not
 //! re-exported from `hyperdb-api`), so Forms 4 and 5 import it directly.
 
-use hyperdb_api::{Connection, CreateMode, FromRow, HyperProcess, Parameters, Result, RowAccessor};
+use futures::StreamExt;
+use hyperdb_api::{
+    AsyncConnection, Connection, CreateMode, FromRow, HyperProcess, Parameters, Result, RowAccessor,
+};
 use hyperdb_api_derive::FromRow;
 
 const QUERY: &str = "SELECT id, name, price, in_stock FROM products ORDER BY id";
@@ -46,6 +51,17 @@ fn main() -> Result<()> {
     form3_manual_from_row(&conn)?;
     form4_derive_from_row(&conn)?;
     form5_streaming_from_row(&conn)?;
+
+    // Form 5 also has an async flavor. Drop the sync connection first so the
+    // async one reopens the same database file cleanly, then drive the stream
+    // on a small Tokio runtime built just for this section.
+    drop(conn);
+    let endpoint = hyper.require_endpoint()?.to_string();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| hyperdb_api::Error::config(format!("failed to build Tokio runtime: {e}")))?
+        .block_on(form5_streaming_from_row_async(&endpoint))?;
 
     Ok(())
 }
@@ -196,6 +212,37 @@ fn form5_streaming_from_row(conn: &Connection) -> Result<()> {
         let p = row_result?;
         print_row(p.id, &p.name, p.price, p.in_stock);
     }
+    println!();
+    Ok(())
+}
+
+/// Form 5, async flavor. `AsyncConnection::stream_as` returns an
+/// `impl Stream<Item = Result<T>>` rather than an iterator — otherwise the
+/// shape is identical to the sync version: lazy, one chunk in memory at a
+/// time, index map built once. The stream is `!Unpin`, so it must be pinned
+/// (here with `tokio::pin!`) before polling with `StreamExt::next`.
+async fn form5_streaming_from_row_async(endpoint: &str) -> Result<()> {
+    println!("== Form 5 (async) — AsyncConnection::stream_as (impl Stream) ==");
+
+    let conn = AsyncConnection::connect(
+        endpoint,
+        "test_results/row_mapping_forms.hyper",
+        CreateMode::DoNotCreate,
+    )
+    .await?;
+
+    // Scope the stream so it (and its borrow of `conn`) is dropped before the
+    // `conn.close()` below, which moves `conn`.
+    {
+        let stream = conn.stream_as::<ProductDerived>(QUERY);
+        tokio::pin!(stream);
+        while let Some(row_result) = stream.next().await {
+            let p = row_result?;
+            print_row(p.id, &p.name, p.price, p.in_stock);
+        }
+    }
+
+    conn.close().await?;
     println!();
     Ok(())
 }

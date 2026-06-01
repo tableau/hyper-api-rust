@@ -56,6 +56,7 @@ examples=(
     "notice_receiver"
     "parameterized_queries"
     "struct_mapping"
+    "row_mapping_forms"         # All five FromRow mapping forms (sync + async stream_as)
     "async_usage"               # Was: async_connection + async_integration
     "sharding_cluster"
     "query_builder"             # Was: query_builder_demo + advanced_query_builder
