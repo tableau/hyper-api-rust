@@ -65,13 +65,20 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
     // Struct field names for the name-subset diff (used by compile-time registry).
     // Exclude fields marked `#[hyperdb(index = N)]` — those are positional, not named.
     // Prefixed with _ because registration is deferred to Milestone B (cycle resolution).
+    // Named column fields only; `column_name_for` returns `""` for index-based
+    // fields (no stable name). Filter those out so registration doesn't include
+    // empty strings in the field list (which would cause spurious MissingColumns
+    // errors when the validator checks `"" ∈ result columns`).
     let _field_names: Vec<String> = fields
         .iter()
         .filter_map(|f| {
             let ident = f.ident.as_ref()?;
-            // Compute the column name: default is field ident, overridden by `rename`.
             let col = column_name_for(f, ident).ok()?;
-            Some(col)
+            if col.is_empty() {
+                None
+            } else {
+                Some(col)
+            }
         })
         .collect();
 
@@ -256,9 +263,26 @@ fn rust_type_to_sql<'a>(field: &Field, ty: &'a Type) -> syn::Result<&'a str> {
         Some("f64") => Ok("DOUBLE PRECISION"),
         Some("bool") => Ok("BOOLEAN"),
         Some("String") => Ok("TEXT"),
-        // `Vec<u8>` would appear as `Vec` in the last segment; this is
-        // approximate — full generic inspection is out of scope for v1.
-        Some("Vec") => Ok("BYTES"),
+        // Only Vec<u8> maps to BYTES. Vec<T> for any other T is unsupported —
+        // silently mapping Vec<String>/Vec<i32>/etc. to BYTES would produce an
+        // incorrect CREATE TABLE that fails at runtime. We inspect the generic
+        // argument to distinguish Vec<u8> from other Vec<T>.
+        Some("Vec") => {
+            if is_vec_u8(ty) {
+                Ok("BYTES")
+            } else {
+                Err(syn::Error::new_spanned(
+                    field,
+                    format!(
+                        "unsupported field type `{}` for derive(Table): \
+                         only Vec<u8> is supported (maps to BYTES); \
+                         other Vec<T> types have no Hyper SQL equivalent. \
+                         Use a manual `impl Table` for this field.",
+                        quote::quote!(#ty)
+                    ),
+                ))
+            }
+        }
         Some("NaiveDate") => Ok("DATE"),
         Some("NaiveDateTime") => Ok("TIMESTAMP"),
         Some("NaiveTime") => Ok("TIME"),
@@ -301,6 +325,27 @@ fn unwrap_option(ty: &Type) -> (&Type, bool) {
     } else {
         (ty, false)
     }
+}
+
+/// Returns `true` if `ty` is exactly `Vec<u8>` (the only `Vec<_>` that maps to BYTES).
+fn is_vec_u8(ty: &Type) -> bool {
+    let Type::Path(TypePath { path, qself: None }) = ty else {
+        return false;
+    };
+    let Some(last) = path.segments.last() else {
+        return false;
+    };
+    if last.ident != "Vec" {
+        return false;
+    }
+    let PathArguments::AngleBracketed(ref args) = last.arguments else {
+        return false;
+    };
+    matches!(
+        args.args.first(),
+        Some(GenericArgument::Type(Type::Path(TypePath { path, qself: None })))
+            if path.is_ident("u8")
+    )
 }
 
 /// Extract the last path segment ident from a type, if it's a simple `TypePath`.

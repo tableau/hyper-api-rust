@@ -30,6 +30,7 @@
 use hyperdb_api::{query_as, FromRow};
 
 #[derive(Debug, FromRow)]
+#[allow(dead_code, reason = "A8 RA observation harness — fields not read in tests")]
 struct User {
     id: i64,
     name: String,
