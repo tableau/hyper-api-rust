@@ -89,6 +89,54 @@ pub fn table_derive(input: TokenStream) -> TokenStream {
     }
 }
 
+/// Stub `query_as!` macro for A8 rust-analyzer behavior confirmation.
+///
+/// For now this is a pass-through that just returns `QueryAs::new(sql, args)`.
+/// Compile-time validation will be wired in Milestone B once the
+/// `hyperdb-compile-check` dependency cycle is resolved.
+///
+/// Syntax: `query_as!(Type, "SQL")` or `query_as!(Type, "SQL", arg1, arg2, …)`
+#[proc_macro]
+pub fn query_as(input: TokenStream) -> TokenStream {
+    match expand_query_as(&input.into()) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+fn expand_query_as(input: &TokenStream2) -> syn::Result<TokenStream2> {
+    use syn::{parse::Parser, punctuated::Punctuated, Expr, Token};
+
+    // Parse: Type, "sql_literal" [, expr, expr, ...]
+    let parser = Punctuated::<Expr, Token![,]>::parse_terminated;
+    let args = parser.parse2(input.clone())?;
+    let mut iter = args.iter();
+
+    let ty_expr = iter.next().ok_or_else(|| {
+        syn::Error::new_spanned(
+            input,
+            "query_as! expects at least two arguments: query_as!(Type, \"SQL\")",
+        )
+    })?;
+
+    // Re-parse the first token as a type (not an expression).
+    let ty: Type = syn::parse2(quote!(#ty_expr))?;
+
+    let sql_expr = iter.next().ok_or_else(|| {
+        syn::Error::new_spanned(
+            ty_expr,
+            "query_as! expects a SQL string literal as the second argument",
+        )
+    })?;
+
+    // Remaining args are the bind parameters.
+    let rest: Vec<&Expr> = iter.collect();
+
+    Ok(quote! {
+        ::hyperdb_api::QueryAs::<#ty>::new(#sql_expr, &[#(&#rest),*])
+    })
+}
+
 /// Derives `hyperdb_api::FromRow` for a struct.
 ///
 /// See the crate-level documentation for the full feature list.
