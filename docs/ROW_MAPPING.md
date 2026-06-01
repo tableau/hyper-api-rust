@@ -6,7 +6,13 @@ convenience; Form 5 combines the automatic struct mapping of Form 4 with the
 constant-memory streaming of Form 1. Start with the simplest that fits your
 situation.
 
-The examples all use the same schema:
+All five forms are demonstrated end-to-end in one runnable example:
+
+```
+cargo run -p hyperdb-api --example row_mapping_forms
+```
+
+The examples below all use the same schema:
 
 ```sql
 CREATE TABLE products (
