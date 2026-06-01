@@ -1,0 +1,13 @@
+{
+  // Enable the compile-time feature on hyperdb-api-derive so rust-analyzer
+  // uses the real validation path (not the pass-through stub).
+  // NOTE: this is a flat array of `package/feature` strings, NOT a map.
+  "rust-analyzer.cargo.features": ["hyperdb-api-derive/compile-time"],
+
+  // Make the hyperd binary discoverable by the proc-macro host that RA spawns.
+  // The macro calls HyperProcess::new(None, ...) which looks for HYPERD_PATH
+  // or walks up from CWD for .hyperd/current/hyperd.
+  "rust-analyzer.server.extraEnv": {
+    "HYPERD_PATH": "${workspaceFolder}/.hyperd/current"
+  }
+}

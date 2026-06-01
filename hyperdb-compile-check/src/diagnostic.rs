@@ -31,6 +31,14 @@ pub enum ValidationError {
         missing: Vec<String>,
     },
 
+    /// The SQL references a column that does not exist on any table in the
+    /// query (SQLSTATE 42703). Distinct from `MissingColumns`, which is when
+    /// the query is valid but omits a column the struct needs.
+    UnknownColumn {
+        /// The column identifier Hyper reported as undefined.
+        column: String,
+    },
+
     /// The SQL has a syntax error; the message is forwarded verbatim from Hyper.
     SqlSyntaxError {
         /// Hyper's error message.
@@ -85,6 +93,10 @@ impl ValidationError {
                     )
                 }
             }
+            Self::UnknownColumn { column } => format!(
+                "column {column:?} does not exist on any table in the query; \
+                 check for a typo or a renamed/dropped column"
+            ),
             Self::SqlSyntaxError { message } => {
                 format!("SQL syntax error: {message}")
             }
@@ -145,5 +157,14 @@ mod tests {
         };
         assert!(e.to_diagnostic().contains("ghosts"));
         assert!(e.to_diagnostic().contains("derive(Table)"));
+    }
+
+    #[test]
+    fn unknown_column_message() {
+        let e = ValidationError::UnknownColumn { column: "d".into() };
+        let msg = e.to_diagnostic();
+        assert!(msg.contains("\"d\""), "message: {msg}");
+        assert!(msg.contains("does not exist"), "message: {msg}");
+        assert!(msg.contains("typo"), "message: {msg}");
     }
 }

@@ -114,7 +114,7 @@ fn run_dry_run_with_seed(
             Ok(schema) => return Ok(schema),
             Err(e) => match classify(&e) {
                 ErrorClass::MissingTable(t) => match Registry::seed_if_known(&t, db) {
-                    Ok(true) => continue, // seeded successfully; retry the dry-run
+                    Ok(true) => {} // seeded successfully; loop iterates to retry the dry-run
                     Ok(false) => {
                         return Err(ValidationError::TablesNotRegistered { tables: vec![t] })
                     }
@@ -128,9 +128,7 @@ fn run_dry_run_with_seed(
                     return Err(ValidationError::SqlSyntaxError { message: msg })
                 }
                 ErrorClass::MissingColumn(col) => {
-                    return Err(ValidationError::HyperError {
-                        message: format!("unknown column {col:?}"),
-                    })
+                    return Err(ValidationError::UnknownColumn { column: col })
                 }
                 ErrorClass::Other(msg) => return Err(ValidationError::HyperError { message: msg }),
             },
