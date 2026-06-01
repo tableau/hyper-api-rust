@@ -166,6 +166,73 @@ fn last_type_ident(ty: &Type) -> Option<&syn::Ident> {
     path.segments.last().map(|s| &s.ident)
 }
 
+/// Validated single-column query macro.
+///
+/// Syntax: `query_scalar!(Type, "SQL")` or `query_scalar!(Type, "SQL", arg1, …)`
+///
+/// Returns a [`hyperdb_api::QueryScalar<Type>`] builder. `Type` must implement
+/// [`hyperdb_api::RowValue`]. No `derive(Table)` is required — scalars project
+/// a single column and don't map to a struct.
+///
+/// With the `compile-time` feature enabled, validates at build time that the
+/// SQL returns exactly one column.
+#[proc_macro]
+pub fn query_scalar(input: TokenStream) -> TokenStream {
+    match expand_query_scalar(&input.into()) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+fn expand_query_scalar(input: &TokenStream2) -> syn::Result<TokenStream2> {
+    use syn::{parse::Parser, punctuated::Punctuated, Expr, Token};
+
+    let parser = Punctuated::<Expr, Token![,]>::parse_terminated;
+    let args = parser.parse2(input.clone())?;
+    let mut iter = args.iter();
+
+    let ty_expr = iter.next().ok_or_else(|| {
+        syn::Error::new_spanned(
+            input,
+            "query_scalar! expects at least two arguments: query_scalar!(Type, \"SQL\")",
+        )
+    })?;
+
+    let ty: Type = syn::parse2(quote!(#ty_expr))?;
+
+    let sql_expr = iter.next().ok_or_else(|| {
+        syn::Error::new_spanned(
+            ty_expr,
+            "query_scalar! expects a SQL string literal as the second argument",
+        )
+    })?;
+
+    let rest: Vec<&Expr> = iter.collect();
+
+    // Compile-time validation: verify the SQL returns exactly one column.
+    #[cfg(feature = "compile-time")]
+    {
+        let sql_lit: Option<LitStr> = syn::parse2(quote!(#sql_expr)).ok();
+        if let Some(sql_lit) = sql_lit {
+            let sql_str = sql_lit.value();
+            // Validate SQL structure (syntax + table existence) using a dummy
+            // struct name that won't be in the registry — we only care about
+            // one-column check, not struct-field matching.
+            match hyperdb_compile_check::validate_scalar_sql(&sql_str) {
+                Ok(()) => {}
+                Err(e) => {
+                    let msg = e.to_diagnostic();
+                    return Ok(quote! { ::std::compile_error!(#msg) });
+                }
+            }
+        }
+    }
+
+    Ok(quote! {
+        ::hyperdb_api::QueryScalar::<#ty>::new(#sql_expr, &[#(&#rest),*])
+    })
+}
+
 /// Derives `hyperdb_api::FromRow` for a struct.
 ///
 /// See the crate-level documentation for the full feature list.

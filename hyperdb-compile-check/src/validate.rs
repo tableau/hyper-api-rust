@@ -51,59 +51,79 @@ pub fn validate_query_as(struct_name: &str, sql: &str) -> Result<(), ValidationE
 
     let mut db = get_or_init().lock();
 
-    // Step 2+4: dry-run with seed-and-retry on 42P01.
-    let schema = match dry_run(&mut db, sql) {
-        Ok(s) => s,
-        Err(e) => {
-            return Err(match classify(&e) {
-                ErrorClass::MissingTable(sql_table_name) => {
-                    // Seed and retry once. `sql_table_name` is the SQL name
-                    // extracted from Hyper's 42P01 error — matches registry keys.
-                    match Registry::seed_if_known(&sql_table_name, &mut db) {
-                        Ok(true) => {
-                            // Seeded; retry the dry-run.
-                            match dry_run(&mut db, sql) {
-                                Ok(s) => {
-                                    drop(db);
-                                    return finish_name_check(struct_name, &entry.fields, &s);
-                                }
-                                Err(retry_err) => match classify(&retry_err) {
-                                    ErrorClass::MissingTable(t) => {
-                                        ValidationError::TablesNotRegistered { tables: vec![t] }
-                                    }
-                                    ErrorClass::MissingColumn(col) => ValidationError::HyperError {
-                                        message: format!("unknown column {col:?}"),
-                                    },
-                                    ErrorClass::SyntaxError(msg) => {
-                                        ValidationError::SqlSyntaxError { message: msg }
-                                    }
-                                    ErrorClass::Other(msg) => {
-                                        ValidationError::HyperError { message: msg }
-                                    }
-                                },
-                            }
-                        }
-                        Ok(false) => ValidationError::TablesNotRegistered {
-                            tables: vec![sql_table_name],
-                        },
-                        Err(seed_err) => ValidationError::HyperError {
-                            message: format!("{seed_err}"),
-                        },
-                    }
-                }
-                ErrorClass::MissingColumn(col) => ValidationError::HyperError {
-                    message: format!("unknown column {col:?}"),
-                },
-                ErrorClass::SyntaxError(msg) => ValidationError::SqlSyntaxError { message: msg },
-                ErrorClass::Other(msg) => ValidationError::HyperError { message: msg },
-            });
-        }
+    // Step 2+4: dry-run with seed-and-retry on 42P01 (shared helper).
+    let schema = match run_dry_run_with_seed(sql, &mut db)? {
+        Some(s) => s,
+        None => unreachable!("run_dry_run_with_seed always returns Some or Err"),
     };
 
     drop(db);
 
     // Step 3: name-subset diff.
     finish_name_check(struct_name, &entry.fields, &schema)
+}
+
+/// Validate a scalar SQL string: runs the dry-run and checks the result
+/// projects exactly one column. Used by `query_scalar!`.
+///
+/// Does not require a struct registration — scalars project a single column
+/// of a primitive type without mapping to a struct.
+///
+/// # Errors
+///
+/// Returns a [`ValidationError`] if the SQL is invalid, references an
+/// unregistered table, or the result schema does not have exactly one column.
+pub fn validate_scalar_sql(sql: &str) -> Result<(), ValidationError> {
+    let mut db = get_or_init().lock();
+
+    // Run dry-run; on 42P01 seed the missing table and retry once.
+    let schema = match run_dry_run_with_seed(sql, &mut db)? {
+        Some(s) => s,
+        None => return Ok(()), // unreachable in practice — run_dry_run_with_seed always returns Some or Err
+    };
+
+    drop(db);
+
+    let col_count = schema.column_count();
+    if col_count != 1 {
+        return Err(ValidationError::HyperError {
+            message: format!(
+                "query_scalar! requires exactly one projected column, but the query projects {col_count}"
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+/// Shared dry-run helper: runs the dry-run and handles the 42P01 seed-and-retry.
+/// Returns `Ok(Some(schema))` on success, `Err(ValidationError)` on failure.
+fn run_dry_run_with_seed(
+    sql: &str,
+    db: &mut crate::db::CompileTimeDb,
+) -> Result<Option<hyperdb_api::ResultSchema>, ValidationError> {
+    match dry_run(db, sql) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) => match classify(&e) {
+            ErrorClass::MissingTable(t) => match Registry::seed_if_known(&t, db) {
+                Ok(true) => match dry_run(db, sql) {
+                    Ok(s) => Ok(Some(s)),
+                    Err(retry_err) => Err(ValidationError::HyperError {
+                        message: format!("{retry_err}"),
+                    }),
+                },
+                Ok(false) => Err(ValidationError::TablesNotRegistered { tables: vec![t] }),
+                Err(seed_err) => Err(ValidationError::HyperError {
+                    message: format!("{seed_err}"),
+                }),
+            },
+            ErrorClass::SyntaxError(msg) => Err(ValidationError::SqlSyntaxError { message: msg }),
+            ErrorClass::MissingColumn(col) => Err(ValidationError::HyperError {
+                message: format!("unknown column {col:?}"),
+            }),
+            ErrorClass::Other(msg) => Err(ValidationError::HyperError { message: msg }),
+        },
+    }
 }
 
 /// Check that every field in `struct_fields` appears as a column name in

@@ -33,4 +33,4 @@ pub mod validate;
 pub use db::CompileTimeDb;
 pub use diagnostic::ValidationError;
 pub use registry::Registry;
-pub use validate::validate_query_as;
+pub use validate::{validate_query_as, validate_scalar_sql};

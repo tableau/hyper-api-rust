@@ -58,6 +58,12 @@ name = "ra_expansion_check"
 path = "tests/ra_expansion_check.rs"
 harness = true
 
+# B4 compile-time validation end-to-end integration tests
+[[test]]
+name = "compile_time_validation_tests"
+path = "tests/compile_time_validation_tests.rs"
+harness = true
+
 # Stress test integration test
 [[test]]
 name = "stress_test"

@@ -209,7 +209,7 @@ pub use row_accessor::RowAccessor;
 // absent from hyperdb-api. Re-exporting them creates a dependency cycle:
 //   hyperdb-api → hyperdb-api-derive → hyperdb-compile-check → hyperdb-api
 // Users add `hyperdb-api-derive` directly with the features they need.
-pub use query_as::QueryAs;
+pub use query_as::{QueryAs, QueryScalar};
 pub use server_version::ServerVersion;
 pub use table::Table;
 pub use table_definition::{ColumnDefinition, Persistence, TableDefinition};
