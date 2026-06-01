@@ -17,12 +17,15 @@ pub struct CompileTimeDb {
     pub(crate) conn: hyperdb_api::Connection,
 }
 
-// SAFETY: `HyperProcess` and `Connection` are not `Send`/`Sync` in the public
-// API surface but are safe to share behind a `Mutex` — they are accessed
-// exclusively through the single-threaded proc-macro expansion serialized by
-// the `Mutex`. We implement `Send` + `Sync` here to satisfy the `OnceCell`
-// storage requirement; callers MUST hold the `Mutex` guard before touching
-// either field.
+// `HyperProcess` is the subprocess manager; a single instance can produce many
+// `Connection`s. `Connection` is one TCP session — it is NOT designed for
+// concurrent access from multiple threads (internal mutable TCP + protocol state).
+//
+// Neither type is `Send`/`Sync` in `hyperdb-api`'s public API. We implement
+// both here because `OnceLock<T>` requires `T: Send + Sync`. The safety
+// invariant is maintained entirely by the `parking_lot::Mutex` wrapper:
+// the `Mutex` ensures only one thread holds a reference to the inner
+// `CompileTimeDb` at any time, so `Connection` is never accessed concurrently.
 //
 // REVISIT: if `HyperProcess`/`Connection` are made `Send` upstream, remove
 // these impls and let the compiler derive them.
@@ -35,10 +38,11 @@ pub struct CompileTimeDb {
 // whether they have anything to do with the failing site. `parking_lot::Mutex`
 // never poisons — lock acquisition always succeeds after the panicking thread
 // releases the lock, so a bad `query_as!` site doesn't cascade.
-// SAFETY: see block comment above — `Send`/`Sync` are safe here because callers
-// always hold the `Mutex` guard before touching the fields.
+
+// SAFETY: `OnceLock` requires `Send`; safe because the `Mutex` guarantees
+// exclusive access — `CompileTimeDb` is never touched without holding the lock.
 unsafe impl Send for CompileTimeDb {}
-// SAFETY: same rationale as `Send` above.
+// SAFETY: `OnceLock` requires `Sync`; safe for the same reason as `Send` above.
 unsafe impl Sync for CompileTimeDb {}
 
 /// Global storage: initialized at most once per proc-macro host process.

@@ -4,13 +4,26 @@ members = [
     "hyperdb-api-core",
     "hyperdb-api",
     "hyperdb-api-derive",
-    "hyperdb-compile-check",
     "hyperdb-api-node",
     "hyperdb-api-salesforce",
     "hyperdb-mcp",
     "hyperdb-bootstrap",
     "sea-query-hyperdb",
 ]
+# Exclude hyperdb-compile-check from the workspace resolver: it has its own
+# [workspace] declaration to avoid the Cargo cycle that would arise from
+# hyperdb-api → hyperdb-api-derive → hyperdb-compile-check → hyperdb-api.
+# See the comment block below for full rationale.
+exclude = ["hyperdb-compile-check"]
+
+# hyperdb-compile-check is intentionally NOT a workspace member.
+# It depends on hyperdb-api, which depends on hyperdb-api-derive, which
+# optionally depends on hyperdb-compile-check. Adding it to the workspace
+# would create a cycle that Cargo rejects even for optional deps.
+# It lives in the repository as a standalone crate with its own Cargo.toml
+# and is referenced as a path dep by hyperdb-api-derive when the
+# compile-time feature is enabled. CI builds it explicitly via
+# `cargo build --manifest-path hyperdb-compile-check/Cargo.toml`.
 
 [workspace.package]
 version = "0.3.1"

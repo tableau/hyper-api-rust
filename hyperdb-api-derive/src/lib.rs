@@ -45,6 +45,8 @@
 //! [`RowAccessor::position`]: https://docs.rs/hyperdb-api
 //! [`RowAccessor::position_opt`]: https://docs.rs/hyperdb-api
 
+mod table_derive;
+
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
@@ -59,6 +61,32 @@ use syn::{
 enum FieldSource {
     Name(String),
     Index(usize),
+}
+
+/// Derives `hyperdb_api::Table` for a struct.
+///
+/// Generates `impl Table` with `NAME` and `CREATE_SQL` consts. When the
+/// `compile-time` cargo feature is enabled and `#[hyperdb(register)]` is
+/// present, also registers the table with the compile-time validator.
+///
+/// # Attributes (struct level)
+///
+/// - `#[hyperdb(table = "name")]` — override the SQL table name (default:
+///   lower_snake_case of the struct ident).
+/// - `#[hyperdb(register)]` — register for compile-time `query_as!` validation.
+///
+/// # Attributes (field level)
+///
+/// - `#[hyperdb(primary_key)]` — marks the column as NOT NULL (always true
+///   for non-`Option` fields, but documents intent).
+/// - `#[hyperdb(rename = "col")]` — use a different SQL column name.
+#[proc_macro_derive(Table, attributes(hyperdb))]
+pub fn table_derive(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    match table_derive::expand(&input) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
 }
 
 /// Derives `hyperdb_api::FromRow` for a struct.

@@ -1,12 +1,18 @@
+# hyperdb-compile-check is intentionally NOT a member of the top-level workspace.
+# See the comment in the root Cargo.toml [workspace] section for rationale.
+# This crate has its own workspace declaration so it can be built and tested
+# independently of the main workspace.
+[workspace]
+
 [package]
 name = "hyperdb-compile-check"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
+version = "0.3.1"
+edition = "2021"
+rust-version = "1.81"
 description = "Compile-time SQL validation logic for hyperdb-api (not a proc-macro)"
-license.workspace = true
-repository.workspace = true
-homepage.workspace = true
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tableau/hyper-api-rust"
+homepage = "https://github.com/tableau/hyper-api-rust"
 readme = "README.md"
 keywords = ["database", "hyper", "sql", "validation"]
 categories = ["database", "development-tools"]
@@ -18,13 +24,52 @@ categories = ["database", "development-tools"]
 [dependencies]
 # x-release-please-start-version
 hyperdb-api = { path = "../hyperdb-api", version = "=0.3.1" }
-hyperdb-api-core = { path = "../hyperdb-api-core", version = "=0.3.1" }
 # x-release-please-end
-parking_lot = { workspace = true }
-tempfile = { workspace = true }
+parking_lot = "0.12"
+tempfile = "3.20"
 
 [dev-dependencies]
-tempfile = { workspace = true }
+tempfile = "3.20"
 
-[lints]
-workspace = true
+[lints.rust]
+unexpected_cfgs               = { level = "warn", check-cfg = ['cfg(kani)'] }
+unsafe_op_in_unsafe_fn        = "deny"
+missing_docs                  = "warn"
+missing_debug_implementations = "warn"
+ambiguous_negative_literals   = "warn"
+redundant_imports             = "warn"
+redundant_lifetimes           = "warn"
+trivial_numeric_casts         = "warn"
+unused_lifetimes              = "warn"
+unreachable_pub               = "warn"
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious  = { level = "deny", priority = -1 }
+perf        = { level = "warn", priority = -1 }
+style       = { level = "warn", priority = -1 }
+complexity  = { level = "warn", priority = -1 }
+pedantic    = { level = "warn", priority = -1 }
+cargo       = { level = "warn", priority = -1 }
+cast_possible_truncation = "deny"
+cast_sign_loss           = "deny"
+cast_possible_wrap       = "deny"
+cast_lossless            = "warn"
+cast_precision_loss      = "warn"
+as_underscore            = "warn"
+undocumented_unsafe_blocks = "deny"
+unnecessary_safety_comment = "warn"
+unnecessary_safety_doc     = "warn"
+allow_attributes_without_reason = "warn"
+clone_on_ref_ptr = "warn"
+module_name_repetitions   = "allow"
+too_many_lines            = "allow"
+doc_markdown              = "allow"
+must_use_candidate        = "allow"
+unreadable_literal        = "allow"
+items_after_statements    = "allow"
+match_same_arms           = "allow"
+match_wildcard_for_single_variants = "allow"
+missing_errors_doc        = "warn"
+missing_panics_doc        = "warn"
+multiple_crate_versions   = { level = "allow", priority = 1 }

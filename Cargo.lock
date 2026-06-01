@@ -1932,16 +1932,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hyperdb-compile-check"
-version = "0.3.1"
-dependencies = [
- "hyperdb-api",
- "hyperdb-api-core",
- "parking_lot",
- "tempfile",
-]
-
-[[package]]
 name = "hyperdb-mcp"
 version = "0.3.1"
 dependencies = [
