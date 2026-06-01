@@ -77,10 +77,24 @@ jobs:
           # See fmt job for rationale; clippy enforces -D warnings via
           # the explicit `-- -D warnings` arg below, not via env.
           rustflags: ""
+      - name: Cache hyperd binary
+        # --all-features enables the compile-time feature, which starts an
+        # embedded Hyper instance inside the proc-macro host during clippy.
+        # hyperd must be present or the proc-macro panics.
+        id: hyperd-cache
+        uses: actions/cache@v5
+        with:
+          path: .hyperd
+          key: hyperd-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('hyperdb-bootstrap/hyperd-version.toml') }}
+      - name: Download hyperd
+        if: steps.hyperd-cache.outputs.cache-hit != 'true'
+        run: cargo run --release -p hyperdb-bootstrap --bin hyperdb-bootstrap -- download
       - name: Clippy (workspace, all targets)
         # Every crate in the workspace is linted under the Microsoft Rust
         # Guidelines config in `[workspace.lints]` (see Cargo.toml and
         # docs/RUST_GUIDELINES.md). Warnings are treated as errors.
+        env:
+          HYPERD_PATH: ${{ github.workspace }}/.hyperd/current
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
