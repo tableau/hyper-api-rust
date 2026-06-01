@@ -787,6 +787,60 @@ impl Connection {
             .collect()
     }
 
+    /// Returns a lazy iterator over rows, mapping each to `T` via
+    /// [`FromRow`].
+    ///
+    /// This is the streaming variant of [`fetch_all_as`](Self::fetch_all_as):
+    /// memory usage is bounded by the chunk size (default 64K rows), not by
+    /// the total row count. Use this for large result sets where collecting
+    /// all rows into a `Vec` would exceed memory limits.
+    ///
+    /// The column-name → index lookup table is built exactly once (on the
+    /// first non-empty chunk) and reused for all rows, so per-row mapping is
+    /// O(1) in column count.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use hyperdb_api::{Connection, CreateMode, FromRow, RowAccessor, Result};
+    /// # struct User { id: i32, name: String }
+    /// # impl FromRow for User {
+    /// #     fn from_row(row: RowAccessor<'_>) -> Result<Self> {
+    /// #         Ok(User { id: row.get("id")?, name: row.get("name")? })
+    /// #     }
+    /// # }
+    /// # fn example(conn: &Connection) -> Result<()> {
+    /// for row_result in conn.stream_as::<User>("SELECT id, name FROM users")? {
+    ///     let user = row_result?;
+    ///     println!("{}: {}", user.id, user.name);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// - The returned `Result` wraps SQL submission errors (parse failures,
+    ///   server errors, transport failures). These are surfaced **eagerly**
+    ///   before iteration begins.
+    /// - Each yielded item is itself a `Result<T>`:
+    ///   - `Ok(T)` if the row was successfully mapped via `FromRow`.
+    ///   - `Err(e)` if mapping failed (missing column, type mismatch, NULL in
+    ///     a non-optional field). These errors surface **lazily** during
+    ///     iteration.
+    ///
+    /// [`FromRow`]: crate::FromRow
+    pub fn stream_as<'a, T>(
+        &'a self,
+        query: &str,
+    ) -> Result<impl Iterator<Item = Result<T>> + 'a>
+    where
+        T: crate::FromRow + 'a,
+    {
+        let rowset = self.execute_query(query)?;
+        Ok(crate::result::TypedRowIterator::<T>::new(rowset))
+    }
+
     /// Fetches a single scalar value from a query.
     ///
     /// Returns an error if the query returns no rows or NULL.

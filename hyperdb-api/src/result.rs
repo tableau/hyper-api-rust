@@ -1557,6 +1557,112 @@ impl Iterator for RowIterator<'_> {
     }
 }
 
+/// Iterator over rows of a result set with `FromRow` deserialization.
+///
+/// Returned by [`Rowset::typed_rows`] and [`Connection::stream_as`]. Lazily
+/// fetches chunks from the server and maps each row to `T` via
+/// [`FromRow::from_row`]. Memory usage is bounded by the chunk size: at most
+/// one chunk of rows is held in memory at a time.
+///
+/// The column-name → index lookup table is built exactly once (on the first
+/// non-empty chunk) and reused for all rows, making per-row mapping O(1) in
+/// column count.
+///
+/// [`Rowset::typed_rows`]: Rowset::typed_rows
+/// [`Connection::stream_as`]: crate::Connection::stream_as
+/// [`FromRow::from_row`]: crate::FromRow::from_row
+///
+/// # Example
+///
+/// ```no_run
+/// # use hyperdb_api::{Connection, CreateMode, FromRow, RowAccessor, Result};
+/// # struct User { id: i32, name: String }
+/// # impl FromRow for User {
+/// #     fn from_row(row: RowAccessor<'_>) -> Result<Self> {
+/// #         Ok(User { id: row.get("id")?, name: row.get("name")? })
+/// #     }
+/// # }
+/// # fn example(conn: &Connection) -> Result<()> {
+/// for row in conn.stream_as::<User>("SELECT id, name FROM users")? {
+///     let user = row?;
+///     println!("{}: {}", user.id, user.name);
+/// }
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Errors
+///
+/// Each yielded item is a `Result<T>`:
+/// - `Ok(T)` if the row was successfully mapped via `FromRow`.
+/// - `Err(e)` if mapping failed (e.g., missing column, type mismatch, NULL in
+///   a non-optional field).
+///
+/// Transport-level errors (chunk-fetching failures) are also surfaced as
+/// `Err` items.
+pub(crate) struct TypedRowIterator<'conn, T> {
+    rowset: Rowset<'conn>,
+    current_iter: std::vec::IntoIter<Row>,
+    indices: Option<std::collections::HashMap<String, usize>>,
+    _marker: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T> std::fmt::Debug for TypedRowIterator<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypedRowIterator")
+            .field("rowset", &self.rowset)
+            .field("current_iter_len", &self.current_iter.len())
+            .field("indices_built", &self.indices.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'conn, T> TypedRowIterator<'conn, T> {
+    /// Constructs a new `TypedRowIterator` over the given rowset.
+    /// Crate-internal: callers go through `Connection::stream_as`.
+    pub(crate) fn new(rowset: Rowset<'conn>) -> Self {
+        Self {
+            rowset,
+            current_iter: Vec::new().into_iter(),
+            indices: None,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T: crate::FromRow> Iterator for TypedRowIterator<'_, T> {
+    type Item = Result<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            // Try to get next row from current chunk
+            if let Some(row) = self.current_iter.next() {
+                // indices is guaranteed Some here: it's built below the
+                // moment a non-empty chunk arrives, before we hand out any row.
+                let indices = self.indices.as_ref()?;
+                return Some(T::from_row(crate::RowAccessor::new_owned(&row, indices)));
+            }
+
+            // Current chunk exhausted, fetch next chunk
+            match self.rowset.next_chunk() {
+                Ok(Some(chunk)) => {
+                    // Build the index map once, on first non-empty chunk.
+                    // The schema is populated by `next_chunk` as a side effect.
+                    if self.indices.is_none() {
+                        if let Some(schema) = self.rowset.schema() {
+                            self.indices = Some(crate::RowAccessor::build_owned_indices(&schema));
+                        }
+                    }
+                    self.current_iter = chunk.into_iter();
+                    // loop around to drain the freshly fetched chunk
+                }
+                Ok(None) => return None,       // No more rows
+                Err(e) => return Some(Err(e)), // Error fetching chunk
+            }
+        }
+    }
+}
+
 // =============================================================================
 // Unit tests that don't need a live hyperd backend.
 //

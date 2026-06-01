@@ -34,7 +34,6 @@ use crate::result::{Row, RowValue};
 /// uses an owned `String`-keyed map (the `Owned` variant). Both look up by
 /// `&str` via `HashMap`'s `Borrow` bound, so the getters are agnostic.
 #[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code, reason = "Owned variant wired in a later step (stream_as)"))]
 enum Indices<'a> {
     Borrowed(&'a HashMap<&'a str, usize>),
     Owned(&'a HashMap<String, usize>),
@@ -95,7 +94,6 @@ impl<'a> RowAccessor<'a> {
     /// Constructs a new `RowAccessor` over the given row and an owned
     /// lookup map. Crate-internal: used by `stream_as` where the map must
     /// persist across iterator steps.
-    #[cfg_attr(not(test), allow(dead_code, reason = "Wired in a later step (stream_as)"))]
     pub(crate) fn new_owned(row: &'a Row, indices: &'a HashMap<String, usize>) -> Self {
         Self {
             row,
@@ -125,7 +123,6 @@ impl<'a> RowAccessor<'a> {
     /// entry per column plus string copies.
     ///
     /// [`ResultSchema`]: crate::ResultSchema
-    #[cfg_attr(not(test), allow(dead_code, reason = "Wired in a later step (stream_as)"))]
     pub(crate) fn build_owned_indices(schema: &crate::ResultSchema) -> HashMap<String, usize> {
         let mut map = HashMap::with_capacity(schema.column_count());
         for i in 0..schema.column_count() {
