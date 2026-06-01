@@ -1875,6 +1875,7 @@ dependencies = [
 name = "hyperdb-api-derive"
 version = "0.3.1"
 dependencies = [
+ "hyperdb-compile-check",
  "proc-macro2",
  "quote",
  "syn",
@@ -1929,6 +1930,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zip",
+]
+
+[[package]]
+name = "hyperdb-compile-check"
+version = "0.3.1"
+dependencies = [
+ "hyperdb-api",
+ "parking_lot",
+ "tempfile",
 ]
 
 [[package]]

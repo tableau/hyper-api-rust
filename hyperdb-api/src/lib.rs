@@ -205,15 +205,10 @@ pub use query_stats::{LogFileStatsProvider, QueryStats, QueryStatsProvider};
 pub use result::{FromRow, ResultColumn, ResultSchema, Row, RowIterator, RowValue, Rowset};
 pub use row_accessor::RowAccessor;
 
-// Re-export proc-macros from the companion crate so callers don't need to add
-// `hyperdb-api-derive` as a direct dependency. Same pattern as serde / thiserror.
-//
-// NOTE: `#[derive(Table)]` is intentionally NOT re-exported here.
-// Re-exporting it would create a dependency cycle:
-//   hyperdb-api → hyperdb-api-derive(compile-time) → hyperdb-compile-check → hyperdb-api
-// Users who want `derive(Table)` add `hyperdb-api-derive` directly.
-pub use hyperdb_api_derive::query_as;
-pub use hyperdb_api_derive::FromRow;
+// NOTE: proc-macro re-exports (FromRow, Table, query_as!) are intentionally
+// absent from hyperdb-api. Re-exporting them creates a dependency cycle:
+//   hyperdb-api → hyperdb-api-derive → hyperdb-compile-check → hyperdb-api
+// Users add `hyperdb-api-derive` directly with the features they need.
 pub use query_as::QueryAs;
 pub use server_version::ServerVersion;
 pub use table::Table;

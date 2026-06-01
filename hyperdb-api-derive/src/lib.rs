@@ -132,9 +132,38 @@ fn expand_query_as(input: &TokenStream2) -> syn::Result<TokenStream2> {
     // Remaining args are the bind parameters.
     let rest: Vec<&Expr> = iter.collect();
 
+    // Compile-time validation: runs inside the proc-macro host at expansion time.
+    // The `compile-time` feature gates this — without it the macro is a
+    // pure pass-through with zero overhead. The variables are extracted inside
+    // the cfg block to avoid unused-variable warnings in the feature-off build.
+    #[cfg(feature = "compile-time")]
+    {
+        let struct_name = last_type_ident(&ty).map(ToString::to_string);
+        let sql_lit: Option<LitStr> = syn::parse2(quote!(#sql_expr)).ok();
+        if let (Some(struct_name), Some(sql_lit)) = (struct_name, sql_lit) {
+            let sql_str = sql_lit.value();
+            if let Err(e) = hyperdb_compile_check::validate_query_as(&struct_name, &sql_str) {
+                let msg = e.to_diagnostic();
+                return Ok(quote! {
+                    ::std::compile_error!(#msg)
+                });
+            }
+        }
+    }
+
     Ok(quote! {
         ::hyperdb_api::QueryAs::<#ty>::new(#sql_expr, &[#(&#rest),*])
     })
+}
+
+/// Extract the last path segment ident from a type path (e.g. `User` from `crate::User`).
+/// Only needed when `compile-time` feature is enabled (used for registry lookup).
+#[cfg(feature = "compile-time")]
+fn last_type_ident(ty: &Type) -> Option<&syn::Ident> {
+    let Type::Path(syn::TypePath { path, qself: None }) = ty else {
+        return None;
+    };
+    path.segments.last().map(|s| &s.ident)
 }
 
 /// Derives `hyperdb_api::FromRow` for a struct.

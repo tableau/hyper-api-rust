@@ -14,19 +14,19 @@ categories = ["database"]
 [lib]
 proc-macro = true
 
-# NOTE: the compile-time feature and hyperdb-compile-check dep are intentionally
-# absent from this Cargo.toml. A direct path dep on hyperdb-compile-check would
-# create a cycle:
-#   hyperdb-api → hyperdb-api-derive → hyperdb-compile-check → hyperdb-api
-# Cargo rejects this even for optional deps. The wiring strategy for Milestone B
-# is tracked in the compile-time SQL validator plan (see COMPILE_TIME_SQL_VALIDATOR_PLAN.md).
-# Options under consideration: build.rs with OUT_DIR, out-of-process subprocess, or
-# promoting HyperProcess/Connection to hyperdb-api-core.
+[features]
+# Enable compile-time SQL validation via query_as! and derive(Table) #[hyperdb(register)].
+# Off by default. When enabled, hyperdb-compile-check is pulled in as a dep.
+# The dep cycle (hyperdb-api → hyperdb-api-derive → hyperdb-compile-check → hyperdb-api)
+# is broken by removing hyperdb-api-derive from hyperdb-api's dependencies entirely.
+# Users of derive macros add hyperdb-api-derive directly.
+compile-time = ["dep:hyperdb-compile-check"]
 
 [dependencies]
 syn = { version = "2", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
+hyperdb-compile-check = { path = "../hyperdb-compile-check", version = "=0.3.1", optional = true }
 
 [lints]
 workspace = true

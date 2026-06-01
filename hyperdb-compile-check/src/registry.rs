@@ -150,8 +150,7 @@ mod tests {
             "CREATE TABLE reg_test_profiles (id BIGINT, bio TEXT)",
             vec!["id".into(), "bio".into()],
         );
-        let (table_name, entry) =
-            get_by_struct("RegTestProfile").expect("lookup by struct name");
+        let (table_name, entry) = get_by_struct("RegTestProfile").expect("lookup by struct name");
         assert_eq!(table_name, "reg_test_profiles");
         assert_eq!(entry.fields, &["id", "bio"]);
     }

@@ -15,6 +15,8 @@ mod common;
 use common::TestConnection;
 
 use hyperdb_api::{Catalog, FromRow, ServerVersion};
+// The derive macro is no longer re-exported from hyperdb_api; import directly.
+use hyperdb_api_derive::FromRow;
 
 // =============================================================================
 // #7: Batch Statement Execution

@@ -759,6 +759,7 @@ impl RowValue for hyperdb_api_core::types::Numeric {
 ///
 /// ```ignore
 /// use hyperdb_api::FromRow;
+/// use hyperdb_api_derive::FromRow; // proc-macro derive
 ///
 /// #[derive(FromRow)]
 /// struct User {

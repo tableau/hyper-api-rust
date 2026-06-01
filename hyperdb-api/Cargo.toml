@@ -15,8 +15,12 @@ autobenches = false
 [dependencies]
 # x-release-please-start-version
 hyperdb-api-core = { path = "../hyperdb-api-core", version = "=0.3.1" }
-hyperdb-api-derive = { path = "../hyperdb-api-derive", version = "=0.3.1" }
 # x-release-please-end
+# NOTE: hyperdb-api-derive is intentionally NOT a dep of hyperdb-api.
+# Adding it creates a cycle:
+#   hyperdb-api → hyperdb-api-derive → hyperdb-compile-check → hyperdb-api
+# proc-macro re-exports (FromRow, Table, query_as!) are gone from hyperdb-api;
+# users add hyperdb-api-derive directly.
 bytes = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -37,6 +41,9 @@ serde_json = { workspace = true }
 workspace = true
 
 [dev-dependencies]
+# x-release-please-start-version
+hyperdb-api-derive = { path = "../hyperdb-api-derive", version = "=0.3.1" }
+# x-release-please-end
 tempfile = { workspace = true }
 libc = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

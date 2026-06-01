@@ -27,10 +27,14 @@
 //! is to give RA a real proc-macro invocation to observe. Remove it once
 //! the observation is confirmed.
 
-use hyperdb_api::{query_as, FromRow};
+use hyperdb_api_derive::{query_as, FromRow, Table};
 
-#[derive(Debug, FromRow)]
-#[allow(dead_code, reason = "A8 RA observation harness — fields not read in tests")]
+#[derive(Debug, FromRow, Table)]
+#[hyperdb(table = "users", register)]
+#[allow(
+    dead_code,
+    reason = "A8 RA observation harness — fields not read in tests"
+)]
 struct User {
     id: i64,
     name: String,

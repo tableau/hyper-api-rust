@@ -62,39 +62,38 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
         col_defs.join(", ")
     );
 
-    // Struct field names for the name-subset diff (used by compile-time registry).
-    // Exclude fields marked `#[hyperdb(index = N)]` — those are positional, not named.
-    // Prefixed with _ because registration is deferred to Milestone B (cycle resolution).
-    // Named column fields only; `column_name_for` returns `""` for index-based
-    // fields (no stable name). Filter those out so registration doesn't include
-    // empty strings in the field list (which would cause spurious MissingColumns
-    // errors when the validator checks `"" ∈ result columns`).
-    let _field_names: Vec<String> = fields
-        .iter()
-        .filter_map(|f| {
-            let ident = f.ident.as_ref()?;
-            let col = column_name_for(f, ident).ok()?;
-            if col.is_empty() {
-                None
-            } else {
-                Some(col)
-            }
-        })
-        .collect();
-
     let name_lit = LitStr::new(&table_name, struct_name.span());
     let create_sql_lit = LitStr::new(&create_sql, struct_name.span());
-    let struct_name_str = struct_name.to_string();
 
-    // NOTE: compile-time registration (#[hyperdb(register)] → Registry::register)
-    // is NOT emitted here yet. Wiring hyperdb-compile-check into the proc-macro
-    // host creates a Cargo dependency cycle:
-    //   hyperdb-api → hyperdb-api-derive → hyperdb-compile-check → hyperdb-api
-    // The cycle-resolution strategy is tracked in the SQL validator plan and will
-    // be addressed in Milestone B. For now, `#[hyperdb(register)]` is parsed and
-    // validated (unknown attrs still error) but has no runtime effect.
-
-    let _ = struct_name_str;
+    // When `compile-time` feature is enabled and `#[hyperdb(register)]` is
+    // present, register this table directly in the proc-macro host process at
+    // expansion time. The registry lives in the proc-macro host, and `query_as!`
+    // (also expanding in the same host process) finds the entry when it runs.
+    // No code is emitted into the user's binary — registration is a side-effect
+    // of macro expansion only.
+    #[cfg(feature = "compile-time")]
+    if struct_opts.register {
+        // Named column field names: exclude index-based fields (column_name_for
+        // returns "" for them) to avoid spurious MissingColumns{ missing: [""] }.
+        let field_names: Vec<String> = fields
+            .iter()
+            .filter_map(|f| {
+                let ident = f.ident.as_ref()?;
+                let col = column_name_for(f, ident).ok()?;
+                if col.is_empty() {
+                    None
+                } else {
+                    Some(col)
+                }
+            })
+            .collect();
+        hyperdb_compile_check::registry::register(
+            struct_name.to_string(),
+            table_name.clone(),
+            create_sql.clone(),
+            field_names,
+        );
+    }
 
     Ok(quote! {
         #[automatically_derived]
@@ -218,6 +217,7 @@ fn parse_field_opts(field: &Field) -> syn::Result<FieldOpts> {
 /// Compute the SQL column name for a field (honoring `rename`, excluding
 /// `index`-based fields by returning `None`). Used to build the field-name list
 /// for the compile-time registry.
+#[cfg(feature = "compile-time")]
 fn column_name_for(field: &Field, default: &syn::Ident) -> syn::Result<String> {
     let opts = parse_field_opts(field)?;
     if opts.index.is_some() {

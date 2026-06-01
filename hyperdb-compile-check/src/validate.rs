@@ -43,10 +43,11 @@ use crate::registry::{self, Registry};
 /// the result schema is missing columns the struct requires.
 pub fn validate_query_as(struct_name: &str, sql: &str) -> Result<(), ValidationError> {
     // Step 1: look up by struct ident (not SQL table name — they differ).
-    let (_table_name, entry) =
-        registry::get_by_struct(struct_name).ok_or_else(|| ValidationError::StructNotRegistered {
+    let (_table_name, entry) = registry::get_by_struct(struct_name).ok_or_else(|| {
+        ValidationError::StructNotRegistered {
             struct_name: struct_name.to_owned(),
-        })?;
+        }
+    })?;
 
     let mut db = get_or_init().lock();
 
@@ -179,14 +180,16 @@ mod tests {
     #[ignore = "requires HYPERD_PATH; run manually"]
     fn missing_column_error() {
         setup_users();
-        let err =
-            validate_query_as("User", "SELECT id, name FROM users").unwrap_err();
+        let err = validate_query_as("User", "SELECT id, name FROM users").unwrap_err();
         assert!(
             matches!(err, ValidationError::MissingColumns { .. }),
             "expected MissingColumns, got: {err}"
         );
         let msg = err.to_diagnostic();
-        assert!(msg.contains("email"), "missing column name in message: {msg}");
+        assert!(
+            msg.contains("email"),
+            "missing column name in message: {msg}"
+        );
     }
 
     #[test]
@@ -211,8 +214,7 @@ mod tests {
             "CREATE TABLE IF NOT EXISTS known (id BIGINT)",
             vec!["id".into()],
         );
-        let err =
-            validate_query_as("Known", "SELECT * FROM nonexistent_xyz").unwrap_err();
+        let err = validate_query_as("Known", "SELECT * FROM nonexistent_xyz").unwrap_err();
         assert!(
             matches!(err, ValidationError::TablesNotRegistered { .. }),
             "expected TablesNotRegistered, got: {err}"
