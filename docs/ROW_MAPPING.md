@@ -237,8 +237,10 @@ constant memory but is positional and untyped.
 that maps each row to `T` via `FromRow` (hand-written or `#[derive(FromRow)]`,
 exactly as in Forms 3 and 4) while holding only one chunk in memory at a time.
 The column-name → index lookup is built once from the first chunk's schema and
-reused for every row, so per-row mapping stays O(1) in the column count and
-total memory is O(chunk\_size) — independent of how many rows the query returns.
+reused for every row, so per-row mapping stays O(1) in the column count. Rows
+arrive one transport chunk at a time (up to ~64K rows per chunk), and only the
+current chunk is held in memory — so peak memory is bounded by the chunk size,
+not by how many rows the query returns.
 
 ```rust
 use hyperdb_api::{Connection, CreateMode, FromRow, HyperProcess, Result};
