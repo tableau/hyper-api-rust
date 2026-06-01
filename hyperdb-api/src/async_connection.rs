@@ -386,6 +386,82 @@ impl AsyncConnection {
             .collect()
     }
 
+    /// Returns a lazy `Stream` over rows, mapping each to `T` via
+    /// [`FromRow`].
+    ///
+    /// This is the streaming variant of [`fetch_all_as`](Self::fetch_all_as):
+    /// memory usage is bounded by the chunk size (default 64K rows), not by
+    /// the total row count. Use this for large result sets where collecting
+    /// all rows into a `Vec` would exceed memory limits.
+    ///
+    /// The column-name → index lookup table is built exactly once (on the
+    /// first non-empty chunk) and reused for all rows, so per-row mapping is
+    /// O(1) in column count.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use hyperdb_api::{AsyncConnection, CreateMode, FromRow, RowAccessor, Result};
+    /// # use futures::StreamExt;
+    /// # struct User { id: i32, name: String }
+    /// # impl FromRow for User {
+    /// #     fn from_row(row: RowAccessor<'_>) -> Result<Self> {
+    /// #         Ok(User { id: row.get("id")?, name: row.get("name")? })
+    /// #     }
+    /// # }
+    /// # async fn example(conn: &AsyncConnection) -> Result<()> {
+    /// let stream = conn.stream_as::<User>("SELECT id, name FROM users");
+    /// tokio::pin!(stream);
+    /// while let Some(row_result) = stream.next().await {
+    ///     let user = row_result?;
+    ///     println!("{}: {}", user.id, user.name);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Each yielded item is a `Result<T>`:
+    /// - The first item will be `Err(e)` if query submission fails (parse
+    ///   failures, server errors, transport failures). The stream is lazy and
+    ///   does not execute the query until first polled.
+    /// - Subsequent items are `Ok(T)` if the row was successfully mapped via
+    ///   `FromRow`, or `Err(e)` if mapping failed (missing column, type
+    ///   mismatch, NULL in a non-optional field). These errors surface lazily
+    ///   during iteration.
+    ///
+    /// [`FromRow`]: crate::FromRow
+    pub fn stream_as<'a, T: crate::FromRow + 'a>(
+        &'a self,
+        query: &str,
+    ) -> impl futures_core::Stream<Item = Result<T>> + 'a {
+        // Own the query string so the stream doesn't borrow the &str arg
+        // across await points.
+        let query = query.to_owned();
+        async_stream::try_stream! {
+            let mut rs = self.execute_query(&query).await?;   // submit err → first Err item
+            let mut indices: Option<std::collections::HashMap<String, usize>> = None;
+            while let Some(chunk) = rs.next_chunk().await? {
+                // Build the name→index map once, on the first non-empty chunk,
+                // after next_chunk() has materialized the schema (TCP sends the
+                // RowDescription as the first stream message).
+                if indices.is_none() {
+                    if let Some(schema) = rs.schema() {
+                        indices = Some(crate::RowAccessor::build_owned_indices(&schema));
+                    }
+                }
+                // Once a chunk exists the schema is present; if somehow absent
+                // (empty schema), skip mapping by yielding nothing for this chunk.
+                if let Some(idx) = indices.as_ref() {
+                    for row in &chunk {
+                        yield T::from_row(crate::RowAccessor::new_owned(row, idx))?;
+                    }
+                }
+            }
+        }
+    }
+
     /// Fetches a single non-NULL scalar value. Errors on empty / NULL.
     ///
     /// # Errors
