@@ -820,20 +820,24 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// - The returned `Result` wraps SQL submission errors (parse failures,
-    ///   server errors, transport failures). These are surfaced **eagerly**
-    ///   before iteration begins.
+    /// - The returned `Result` wraps errors detected while *opening* the
+    ///   result stream — transport/connection failures, and (on the gRPC
+    ///   transport, which establishes the query stream eagerly) SQL parse and
+    ///   server errors. On the default TCP transport the query is streamed
+    ///   lazily, so SQL errors such as a missing table are typically reported
+    ///   as the **first yielded item** rather than by this outer `Result`.
     /// - Each yielded item is itself a `Result<T>`:
     ///   - `Ok(T)` if the row was successfully mapped via `FromRow`.
-    ///   - `Err(e)` if mapping failed (missing column, type mismatch, NULL in
-    ///     a non-optional field). These errors surface **lazily** during
-    ///     iteration.
+    ///   - `Err(e)` for a server/transport error encountered while streaming a
+    ///     later chunk, or for a per-row mapping failure (missing column, type
+    ///     mismatch, NULL in a non-optional field).
+    ///
+    /// In short: always handle errors *both* on the outer `Result` and on each
+    /// item — do not assume a successfully-returned iterator means the query
+    /// succeeded.
     ///
     /// [`FromRow`]: crate::FromRow
-    pub fn stream_as<'a, T>(
-        &'a self,
-        query: &str,
-    ) -> Result<impl Iterator<Item = Result<T>> + 'a>
+    pub fn stream_as<'a, T>(&'a self, query: &str) -> Result<impl Iterator<Item = Result<T>> + 'a>
     where
         T: crate::FromRow + 'a,
     {
