@@ -25,6 +25,31 @@ use std::collections::HashMap;
 use crate::error::{ColumnErrorKind, Error, Result};
 use crate::result::{Row, RowValue};
 
+/// Storage for the column-name → index lookup behind a [`RowAccessor`].
+///
+/// `fetch_*_as` builds a zero-alloc `&str`-keyed map borrowing from the
+/// `ResultSchema` (the `Borrowed` variant). The streaming path
+/// (`Connection::stream_as`) needs to own its map across iterator steps,
+/// which a `&str`-keyed map can't do (its keys borrow the schema), so it
+/// uses an owned `String`-keyed map (the `Owned` variant). Both look up by
+/// `&str` via `HashMap`'s `Borrow` bound, so the getters are agnostic.
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code, reason = "Owned variant wired in a later step (stream_as)"))]
+enum Indices<'a> {
+    Borrowed(&'a HashMap<&'a str, usize>),
+    Owned(&'a HashMap<String, usize>),
+}
+
+impl Indices<'_> {
+    /// Resolves a column name to its index, agnostic to key ownership.
+    fn get(&self, name: &str) -> Option<usize> {
+        match self {
+            Indices::Borrowed(m) => m.get(name).copied(),
+            Indices::Owned(m) => m.get(name).copied(),
+        }
+    }
+}
+
 /// A view over a [`Row`] that supports name-based access via a
 /// pre-resolved column-name → index lookup table.
 ///
@@ -53,7 +78,7 @@ use crate::result::{Row, RowValue};
 #[derive(Debug)]
 pub struct RowAccessor<'a> {
     row: &'a Row,
-    indices: &'a HashMap<&'a str, usize>,
+    indices: Indices<'a>,
 }
 
 impl<'a> RowAccessor<'a> {
@@ -61,7 +86,21 @@ impl<'a> RowAccessor<'a> {
     /// lookup map. Crate-internal: callers go through `fetch_*_as` to
     /// get a `RowAccessor`, never construct one directly.
     pub(crate) fn new(row: &'a Row, indices: &'a HashMap<&'a str, usize>) -> Self {
-        Self { row, indices }
+        Self {
+            row,
+            indices: Indices::Borrowed(indices),
+        }
+    }
+
+    /// Constructs a new `RowAccessor` over the given row and an owned
+    /// lookup map. Crate-internal: used by `stream_as` where the map must
+    /// persist across iterator steps.
+    #[cfg_attr(not(test), allow(dead_code, reason = "Wired in a later step (stream_as)"))]
+    pub(crate) fn new_owned(row: &'a Row, indices: &'a HashMap<String, usize>) -> Self {
+        Self {
+            row,
+            indices: Indices::Owned(indices),
+        }
     }
 
     /// Builds a `name → index` lookup table from a [`ResultSchema`].
@@ -75,6 +114,22 @@ impl<'a> RowAccessor<'a> {
         let mut map = HashMap::with_capacity(schema.column_count());
         for i in 0..schema.column_count() {
             map.insert(schema.column(i).name(), i);
+        }
+        map
+    }
+
+    /// Builds an owned `name → index` lookup table from a [`ResultSchema`].
+    ///
+    /// Used by `stream_as` where the map must persist across iterator
+    /// steps, requiring owned keys. Consumes O(N) time and allocates one
+    /// entry per column plus string copies.
+    ///
+    /// [`ResultSchema`]: crate::ResultSchema
+    #[cfg_attr(not(test), allow(dead_code, reason = "Wired in a later step (stream_as)"))]
+    pub(crate) fn build_owned_indices(schema: &crate::ResultSchema) -> HashMap<String, usize> {
+        let mut map = HashMap::with_capacity(schema.column_count());
+        for i in 0..schema.column_count() {
+            map.insert(schema.column(i).name().to_string(), i);
         }
         map
     }
@@ -93,7 +148,6 @@ impl<'a> RowAccessor<'a> {
         let idx = self
             .indices
             .get(name)
-            .copied()
             .ok_or_else(|| Error::column(name, ColumnErrorKind::Missing))?;
         match self.row.get::<T>(idx) {
             Some(v) => Ok(v),
@@ -133,7 +187,6 @@ impl<'a> RowAccessor<'a> {
         let idx = self
             .indices
             .get(name)
-            .copied()
             .ok_or_else(|| Error::column(name, ColumnErrorKind::Missing))?;
         if self.row.is_null(idx) {
             return Ok(None);
@@ -415,5 +468,61 @@ mod tests {
             }
             other => panic!("expected Error::Column {{ kind: Null }}, got {other:?}"),
         }
+    }
+
+    // --- Owned-key variant tests ---
+
+    #[test]
+    fn owned_happy_path_get_returns_value() {
+        let (row, schema) = user_row(Some(42), Some("alice"));
+        let indices = RowAccessor::build_owned_indices(&schema);
+        let accessor = RowAccessor::new_owned(&row, &indices);
+
+        let id: i32 = accessor.get("id").expect("get id");
+        let name: String = accessor.get("name").expect("get name");
+        assert_eq!(id, 42);
+        assert_eq!(name, "alice");
+    }
+
+    #[test]
+    fn owned_missing_column_errors_with_kind_missing() {
+        let (row, schema) = user_row(Some(1), Some("alice"));
+        let indices = RowAccessor::build_owned_indices(&schema);
+        let accessor = RowAccessor::new_owned(&row, &indices);
+
+        let err = accessor.get::<i32>("does_not_exist").unwrap_err();
+        match err {
+            Error::Column { name, kind } => {
+                assert_eq!(name, "does_not_exist");
+                assert!(matches!(kind, ColumnErrorKind::Missing));
+            }
+            other => panic!("expected Error::Column {{ kind: Missing }}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn owned_null_in_required_column_errors_with_kind_null() {
+        let (row, schema) = user_row(Some(1), None);
+        let indices = RowAccessor::build_owned_indices(&schema);
+        let accessor = RowAccessor::new_owned(&row, &indices);
+
+        let err = accessor.get::<String>("name").unwrap_err();
+        match err {
+            Error::Column { name, kind } => {
+                assert_eq!(name, "name");
+                assert!(matches!(kind, ColumnErrorKind::Null));
+            }
+            other => panic!("expected Error::Column {{ kind: Null }}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn owned_null_in_optional_column_returns_none() {
+        let (row, schema) = user_row(Some(1), None);
+        let indices = RowAccessor::build_owned_indices(&schema);
+        let accessor = RowAccessor::new_owned(&row, &indices);
+
+        let v: Option<String> = accessor.get_opt("name").expect("get_opt for NULL");
+        assert_eq!(v, None);
     }
 }
