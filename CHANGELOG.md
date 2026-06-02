@@ -6,6 +6,7 @@
 ### Features
 
 * streaming FromRow mapping (stream_as) — constant-memory struct-mapped queries ([#91](https://github.com/tableau/hyper-api-rust/issues/91)) ([#94](https://github.com/tableau/hyper-api-rust/issues/94)) ([3327fc0](https://github.com/tableau/hyper-api-rust/commit/3327fc0fd8d61faaa55b8d5ae2922ff7284348c5))
+* opt-in compile-time SQL validation — `query_as!` / `query_scalar!` validate SQL against `#[derive(Table)]` structs at build time, with VS Code diagnostics ([#93](https://github.com/tableau/hyper-api-rust/issues/93)) ([73f9b0f](https://github.com/tableau/hyper-api-rust/commit/73f9b0f))
 
 
 ### Bug Fixes
