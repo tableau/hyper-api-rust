@@ -119,13 +119,14 @@ jobs:
 
       # `cargo metadata --format-version=1` forces a lockfile
       # reconciliation pass against the current Cargo.tomls. Empirically
-      # validated on this workspace: it flips exactly the 8 workspace-
-      # member version rows (hyperdb-api, hyperdb-api-core,
+      # validated on this workspace: it flips exactly the 9 path-crate
+      # version rows in the root lockfile (hyperdb-api, hyperdb-api-core,
       # hyperdb-api-derive, hyperdb-api-node, hyperdb-api-salesforce,
-      # hyperdb-bootstrap, hyperdb-mcp, sea-query-hyperdb) and touches
-      # no external dep rows. The "Verify lockfile diff is workspace-
-      # only" sentinel below catches it if a future cargo version
-      # diverges.
+      # hyperdb-bootstrap, hyperdb-mcp, sea-query-hyperdb, and
+      # hyperdb-compile-check — the last is its own workspace but is
+      # still a path dep in the root lock) and touches no external dep
+      # rows. The "Verify lockfile diff is workspace-only" sentinel below
+      # catches it if a future cargo version diverges.
       #
       # Why not `cargo generate-lockfile`: it does a full re-resolve
       # and bumps unrelated transitive deps to their latest semver
@@ -182,7 +183,19 @@ jobs:
           # Layer 2: enumerate workspace members at runtime, then
           # check each name appearing in the diff is in that set.
           # `select(.source==null)` filters out registry packages.
-          WORKSPACE=$(cargo metadata --no-deps --format-version=1 \
+          #
+          # hyperdb-compile-check is deliberately NOT a member of the root
+          # workspace (it declares its own `[workspace]` so it can build/test
+          # standalone), so root `cargo metadata` omits it — yet it IS a path
+          # crate in the root lockfile and gets a version bump on release. Union
+          # in its own workspace's members so the guard doesn't false-positive
+          # on it. Both sides are runtime-derived, so workspace additions stay
+          # automatically in sync with no hard-coded list.
+          WORKSPACE=$( { \
+              cargo metadata --no-deps --format-version=1; \
+              cargo metadata --no-deps --format-version=1 \
+                --manifest-path hyperdb-compile-check/Cargo.toml; \
+            } \
             | jq -r '.packages[] | select(.source==null) | .name' \
             | sort -u)
           CHANGED=$(git diff -U1 -- Cargo.lock \
