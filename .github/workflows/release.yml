@@ -246,8 +246,17 @@ jobs:
           # hyperdb-compile-check depends on hyperdb-api (runtime) and is outside
           # the workspace; publish via manifest path after hyperdb-api is indexed.
           # Must come BEFORE hyperdb-api-derive, which optionally depends on it.
+          #
+          # --allow-dirty: hyperdb-compile-check is its OWN workspace with its own
+          # committed Cargo.lock. Publishing hyperdb-api to crates.io moments
+          # earlier means cargo re-resolves this crate's lockfile against the live
+          # index during packaging, leaving hyperdb-compile-check/Cargo.lock
+          # modified in the working tree. Without --allow-dirty, `cargo publish`
+          # aborts on the dirty lockfile. (The root-workspace crates don't hit
+          # this — they share the root Cargo.lock that release-please already
+          # synced. Only this out-of-workspace crate regenerates its own lock.)
           echo "::group::Publishing hyperdb-compile-check"
-          if ! cargo publish --manifest-path hyperdb-compile-check/Cargo.toml 2>&1 | tee /tmp/publish_out; then
+          if ! cargo publish --allow-dirty --manifest-path hyperdb-compile-check/Cargo.toml 2>&1 | tee /tmp/publish_out; then
             if grep -q "already exists on" /tmp/publish_out; then
               echo "::warning::hyperdb-compile-check already published — skipping"
             else
