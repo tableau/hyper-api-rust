@@ -218,29 +218,34 @@ jobs:
             # window for small crates.
             sleep 45
           }
-          # Publish order is dependency-topological:
-          # - hyperdb-api-salesforce, hyperdb-api-derive: leaves (no
-          #   workspace deps).
-          # - hyperdb-api-core: depends on hyperdb-api-salesforce
-          #   (optional, via salesforce-auth feature).
-          # Publish order (strict dependency chain):
-          #   hyperdb-api-salesforce: no sibling runtime deps
-          #   hyperdb-api-core: optional runtime dep on hyperdb-api-salesforce
-          #   hyperdb-api-derive: optional runtime dep on hyperdb-compile-check
-          #     (path-only dev-dep on hyperdb-api — no crates.io check needed)
-          #   hyperdb-api: runtime dep on hyperdb-api-core
-          #     (path-only dev-dep on hyperdb-api-derive — no crates.io check)
-          #   hyperdb-compile-check: runtime dep on hyperdb-api; outside the
-          #     workspace (avoids dep cycle) — uses --manifest-path.
-          #     Must come AFTER hyperdb-api-derive (which it optionally
-          #     depends on) and AFTER hyperdb-api (which it depends on).
-          #   hyperdb-mcp, hyperdb-bootstrap, sea-query-hyperdb: last.
+          # Publish order — strict topological sort of the version-pinned
+          # sibling deps. `cargo publish` resolves EVERY sibling dep that
+          # carries a version requirement against the live crates.io index
+          # (in any section, including [dev-dependencies] and optional deps),
+          # so each crate must be published only after the crates it pins are
+          # already on the index. Path-only deps (no `version = `) are resolved
+          # locally and impose no ordering — that's why hyperdb-api's dev-dep on
+          # hyperdb-api-derive (and vice-versa) is path-only, which is what lets
+          # this be a DAG rather than a cycle.
+          #
+          # Version-pinned sibling edges (X needs Y published first):
+          #   hyperdb-api-core      → hyperdb-api-salesforce (optional)
+          #   hyperdb-api           → hyperdb-api-core
+          #   hyperdb-compile-check → hyperdb-api
+          #   hyperdb-api-derive    → hyperdb-compile-check (optional)
+          #   hyperdb-mcp           → hyperdb-api
+          #   (hyperdb-api-salesforce, hyperdb-bootstrap, sea-query-hyperdb:
+          #    no version-pinned sibling deps)
+          #
+          # Resulting order:
+          #   salesforce → core → api → compile-check → derive → mcp
+          #              → bootstrap → sea-query
           publish hyperdb-api-salesforce
           publish hyperdb-api-core
-          publish hyperdb-api-derive
           publish hyperdb-api
           # hyperdb-compile-check depends on hyperdb-api (runtime) and is outside
           # the workspace; publish via manifest path after hyperdb-api is indexed.
+          # Must come BEFORE hyperdb-api-derive, which optionally depends on it.
           echo "::group::Publishing hyperdb-compile-check"
           if ! cargo publish --manifest-path hyperdb-compile-check/Cargo.toml 2>&1 | tee /tmp/publish_out; then
             if grep -q "already exists on" /tmp/publish_out; then
@@ -252,6 +257,9 @@ jobs:
           fi
           echo "::endgroup::"
           sleep 45
+          # hyperdb-api-derive optionally depends on hyperdb-compile-check (now
+          # indexed above), so it must publish after it.
+          publish hyperdb-api-derive
           publish hyperdb-mcp
           publish hyperdb-bootstrap
           publish sea-query-hyperdb
