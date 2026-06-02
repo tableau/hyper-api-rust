@@ -31,9 +31,10 @@ hyperdb-compile-check = { path = "../hyperdb-compile-check", version = "=0.4.0",
 # x-release-please-end
 
 [dev-dependencies]
-# x-release-please-start-version
-hyperdb-api = { path = "../hyperdb-api", version = "=0.4.0" }
-# x-release-please-end
+# path-only: no version pin so cargo doesn't try to resolve hyperdb-api against
+# crates.io during `cargo publish` (circular: hyperdb-api dev-depends on
+# hyperdb-api-derive which dev-depends on hyperdb-api).
+hyperdb-api = { path = "../hyperdb-api" }
 trybuild = { version = "1", features = ["diff"] }
 
 [lints]
