@@ -10,11 +10,13 @@ A **pure-Rust** implementation of the Hyper database API, using the PostgreSQL
 wire protocol with Hyper-specific extensions. Create, read, and manipulate Hyper
 database files (`.hyper`) without any C library dependencies.
 
-> **Project Status — 0.2.x, AI-Engineered**
+> **Project Status — 0.4.x, AI-Assisted**
 >
-> This crate was vibe-engineered with heavy use of AI coding assistants. The
-> **0.2.x** line will probably undergo more large breaking changes; the public API
-> won't settle until the 1.0.0 release.
+> This crate is **AI-assisted but human-directed**: much of the code was written
+> by AI coding assistants under close review, with the design, architecture, and
+> engineering trade-offs decided by an experienced developer. The pre-1.0
+> (**0.x**) line will probably undergo more large breaking changes; the public
+> API won't settle until the 1.0.0 release.
 >
 > Contributors and reviewers should, at a minimum, run an **AI code reviewer**
 > over any changes, following the conventions, layering rules, and patterns
@@ -28,6 +30,8 @@ database files (`.hyper`) without any C library dependencies.
 - **High Performance** — 22-24M rows/sec inserts, 18M rows/sec queries (100M row benchmark)
 - **Memory Safe** — streaming by default, constant memory for billion-row results
 - **Dual Architecture** — sync (`Connection`) and async (`AsyncConnection`) APIs
+- **Typed Row Mapping** — `#[derive(FromRow)]` structs, including streaming `stream_as` for constant-memory typed queries
+- **Compile-time SQL Validation** — opt-in `query_as!` macro checks SQL against your schema at build time (red squigglies in VS Code)
 - **Connection Pooling** — async pooling via `deadpool` for high-concurrency applications
 - **Arrow Integration** — insert and read data in Arrow IPC stream format
 - **gRPC Transport** — read-only access with Arrow IPC and load balancing support
@@ -338,6 +342,9 @@ See [hyperdb-api-node/README.md](hyperdb-api-node/README.md) for full documentat
 | Resource | Description |
 |----------|-------------|
 | **[hyperdb-api/README.md](hyperdb-api/README.md)** | Full user guide for the `hyperdb-api` crate |
+| **[docs/WHATS_NEW_0.4.md](docs/WHATS_NEW_0.4.md)** | Highlights of the 0.4.0 release |
+| **[docs/ROW_MAPPING.md](docs/ROW_MAPPING.md)** | The five ways to map result rows into Rust values |
+| **[hyperdb-api-derive/README.md](hyperdb-api-derive/README.md)** | `#[derive(FromRow)]`, `#[derive(Table)]`, and compile-time SQL validation |
 | **[DEVELOPMENT.md](DEVELOPMENT.md)** | Architecture, building, testing, benchmarks — for contributors |
 | **[CONTRIBUTING.md](CONTRIBUTING.md)** | How to contribute |
 | **[docs/TRANSACTIONS.md](docs/TRANSACTIONS.md)** | Transaction API design |

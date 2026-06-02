@@ -6,13 +6,15 @@ Hyper database files (`.hyper`) without any C library dependencies.
 - 22-24M rows/sec inserts, 18M rows/sec queries (100M row benchmark)
 - Streaming by default — constant memory for billion-row results
 - Both sync (`Connection`) and async (`AsyncConnection`) APIs
-- No feature flags — everything is always available
+- No feature flags on `hyperdb-api` — everything is always available (opt-in
+  compile-time SQL validation lives behind a feature on the separate
+  `hyperdb-api-derive` crate)
 
 ## Installation
 
 ```toml
 [dependencies]
-hyperdb-api = "0.1"
+hyperdb-api = "0.4"
 ```
 
 ## Runtime Requirements
@@ -194,6 +196,15 @@ let rows_affected = conn.command_params(
 Supported parameter types: `i16`, `i32`, `i64`, `f32`, `f64`, `bool`, `&str`, `String`,
 `Option<T>`, `Date`, `Time`, `Timestamp`, `OffsetTimestamp`, `Vec<u8>`, `&[u8]`.
 
+#### Compile-time SQL validation (opt-in)
+
+With the `hyperdb-api-derive` crate's `compile-time` feature, the `query_as!`
+and `query_scalar!` macros validate your SQL against registered
+`#[derive(Table)]` structs **at build time** — typos, unknown columns, and
+struct/SQL mismatches become compile errors (with red squigglies in VS Code)
+instead of runtime failures. It's entirely opt-in and off by default. See
+[hyperdb-api-derive/README.md](../hyperdb-api-derive/README.md) for setup.
+
 ### Streaming Results
 
 Results are always streaming with constant memory usage:
@@ -214,6 +225,38 @@ for row in result.rows() {
     let id: Option<i32> = row.get(0);
 }
 ```
+
+#### Streaming typed structs (`stream_as`)
+
+`stream_as::<T>()` maps each row to a `FromRow` struct lazily — the same struct
+mapping as `fetch_all_as`, but with O(chunk) memory instead of buffering every
+row. The column-name → index map is built once and reused across all chunks:
+
+```rust
+#[derive(hyperdb_api_derive::FromRow)]
+struct User { id: i32, name: String }
+
+// Sync — lazy iterator, constant memory regardless of result size
+for row in conn.stream_as::<User>("SELECT id, name FROM users")? {
+    let user = row?;
+}
+
+// Async — impl Stream<Item = Result<T>>
+use futures::StreamExt; // add `futures = "0.3"` to your Cargo.toml for `.next()`
+let stream = conn.stream_as::<User>("SELECT id, name FROM users");
+tokio::pin!(stream);
+while let Some(row) = stream.next().await {
+    let user = row?;
+}
+```
+
+The async form yields an `impl Stream`; driving it needs the `StreamExt` /
+`TryStreamExt` extension traits from the [`futures`](https://crates.io/crates/futures)
+crate (`hyperdb-api` itself only depends on `futures-core` for the `Stream`
+type).
+
+See [docs/ROW_MAPPING.md](../docs/ROW_MAPPING.md) for all five row-mapping forms,
+from positional `row.get(0)` to streaming `stream_as`.
 
 ## Bulk Data Insertion
 
