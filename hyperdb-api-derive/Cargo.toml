@@ -26,7 +26,9 @@ compile-time = ["dep:hyperdb-compile-check"]
 syn = { version = "2", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
+# x-release-please-start-version
 hyperdb-compile-check = { path = "../hyperdb-compile-check", version = "=0.3.1", optional = true }
+# x-release-please-end
 
 [dev-dependencies]
 # x-release-please-start-version
