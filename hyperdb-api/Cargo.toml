@@ -48,9 +48,10 @@ serde_json = { workspace = true }
 workspace = true
 
 [dev-dependencies]
-# x-release-please-start-version
-hyperdb-api-derive = { path = "../hyperdb-api-derive", version = "=0.4.0" }
-# x-release-please-end
+# path-only: no version pin so cargo doesn't try to resolve hyperdb-api-derive
+# against crates.io during `cargo publish` (that would create a circular
+# publish dependency since hyperdb-api-derive dev-depends on hyperdb-api).
+hyperdb-api-derive = { path = "../hyperdb-api-derive" }
 tempfile = { workspace = true }
 libc = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

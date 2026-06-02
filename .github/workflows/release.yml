@@ -223,26 +223,24 @@ jobs:
           #   workspace deps).
           # - hyperdb-api-core: depends on hyperdb-api-salesforce
           #   (optional, via salesforce-auth feature).
-          # - hyperdb-api: depends on hyperdb-api-core AND
-          #   hyperdb-api-derive (=X.Y.Z strict pin → derive must be
-          #   on the index when hyperdb-api builds).
-          # - hyperdb-compile-check: depends on hyperdb-api; outside the
-          #   workspace (avoids dep cycle) but published in lockstep.
-          #   Must come BEFORE hyperdb-api-derive (which optionally
-          #   depends on it — cargo verifies the dep on crates.io during
-          #   packaging). Uses --manifest-path since it's not a workspace
-          #   member.
-          # - hyperdb-api-derive: optional dep on hyperdb-compile-check;
-          #   must come after both hyperdb-api and hyperdb-compile-check.
-          # - hyperdb-mcp, hyperdb-bootstrap, sea-query-hyperdb: depend
-          #   on hyperdb-api / hyperdb-api-core; publish last.
+          # Publish order (strict dependency chain):
+          #   hyperdb-api-salesforce: no sibling runtime deps
+          #   hyperdb-api-core: optional runtime dep on hyperdb-api-salesforce
+          #   hyperdb-api-derive: optional runtime dep on hyperdb-compile-check
+          #     (path-only dev-dep on hyperdb-api — no crates.io check needed)
+          #   hyperdb-api: runtime dep on hyperdb-api-core
+          #     (path-only dev-dep on hyperdb-api-derive — no crates.io check)
+          #   hyperdb-compile-check: runtime dep on hyperdb-api; outside the
+          #     workspace (avoids dep cycle) — uses --manifest-path.
+          #     Must come AFTER hyperdb-api-derive (which it optionally
+          #     depends on) and AFTER hyperdb-api (which it depends on).
+          #   hyperdb-mcp, hyperdb-bootstrap, sea-query-hyperdb: last.
           publish hyperdb-api-salesforce
           publish hyperdb-api-core
+          publish hyperdb-api-derive
           publish hyperdb-api
-          # hyperdb-compile-check depends on hyperdb-api; publish before
-          # hyperdb-api-derive (which optionally depends on it — cargo
-          # verifies the dep exists on crates.io during packaging).
-          # Outside the workspace; publish via manifest path.
+          # hyperdb-compile-check depends on hyperdb-api (runtime) and is outside
+          # the workspace; publish via manifest path after hyperdb-api is indexed.
           echo "::group::Publishing hyperdb-compile-check"
           if ! cargo publish --manifest-path hyperdb-compile-check/Cargo.toml 2>&1 | tee /tmp/publish_out; then
             if grep -q "already exists on" /tmp/publish_out; then
@@ -254,7 +252,6 @@ jobs:
           fi
           echo "::endgroup::"
           sleep 45
-          publish hyperdb-api-derive
           publish hyperdb-mcp
           publish hyperdb-bootstrap
           publish sea-query-hyperdb
