@@ -24,7 +24,7 @@
   "devDependencies": {
     "@napi-rs/cli": "^3.6.2",
     "apache-arrow": "^21.1.0",
-    "tsx": "^4.22.0"
+    "tsx": "^4.22.4"
   },
   "keywords": [
     "hyper",
