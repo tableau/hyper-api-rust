@@ -5,7 +5,7 @@
 //!
 //! Run with: `cargo run -p sea-query-hyper --example basic_usage`
 
-use sea_query::{ColumnDef, Expr, Iden, Query, Table};
+use sea_query::{ColumnDef, Expr, ExprTrait, Iden, Query, Table};
 use sea_query_hyperdb::HyperQueryBuilder;
 
 #[derive(Iden)]

@@ -18,7 +18,7 @@
 //! backend is accepted:
 //!
 //! ```rust
-//! use sea_query::{Query, Expr, Iden, PostgresQueryBuilder};
+//! use sea_query::{Query, Expr, ExprTrait, Iden, PostgresQueryBuilder};
 //! use sea_query_hyperdb::HyperQueryBuilder;
 //!
 //! #[derive(Iden)]
@@ -74,9 +74,10 @@ use sea_query::backend::{
     PrecedenceDecider, QueryBuilder, QuotedBuilder, SchemaBuilder, TableBuilder, TableRefBuilder,
 };
 use sea_query::{
-    BinOper, ColumnDef, ColumnType, ForeignKeyCreateStatement, ForeignKeyDropStatement,
-    IndexCreateStatement, IndexDropStatement, Oper, PostgresQueryBuilder, Quote, SimpleExpr,
-    SubQueryStatement, TableAlterStatement, TableRef, TableRenameStatement, Value,
+    BinOper, ColumnDef, ColumnType, ExplainStatement, Expr, ForeignKeyCreateStatement,
+    ForeignKeyDropStatement, IndexCreateStatement, IndexDropStatement, Oper, PostgresQueryBuilder,
+    Quote, SelectInto, SubQueryStatement, TableAlterStatement, TableRef, TableRenameStatement,
+    Value,
 };
 
 /// HyperDB-specific SQL dialect backend for sea-query.
@@ -104,7 +105,7 @@ use sea_query::{
 /// # Examples
 ///
 /// ```rust
-/// use sea_query::{Query, Expr, Iden};
+/// use sea_query::{Query, Expr, ExprTrait, Iden};
 /// use sea_query_hyperdb::HyperQueryBuilder;
 ///
 /// #[derive(Iden)]
@@ -142,11 +143,7 @@ impl OperLeftAssocDecider for HyperQueryBuilder {
 }
 
 impl PrecedenceDecider for HyperQueryBuilder {
-    fn inner_expr_well_known_greater_precedence(
-        &self,
-        inner: &SimpleExpr,
-        outer_oper: &Oper,
-    ) -> bool {
+    fn inner_expr_well_known_greater_precedence(&self, inner: &Expr, outer_oper: &Oper) -> bool {
         PostgresQueryBuilder.inner_expr_well_known_greater_precedence(inner, outer_oper)
     }
 }
@@ -155,29 +152,41 @@ impl QueryBuilder for HyperQueryBuilder {
     fn prepare_query_statement(
         &self,
         query: &SubQueryStatement,
-        sql: &mut dyn sea_query::SqlWriter,
+        sql: &mut impl sea_query::SqlWriter,
     ) {
         PostgresQueryBuilder.prepare_query_statement(query, sql);
     }
 
-    fn prepare_value(&self, value: &Value, sql: &mut dyn sea_query::SqlWriter) {
+    fn prepare_select_into(&self, into_table: &SelectInto, sql: &mut impl sea_query::SqlWriter) {
+        PostgresQueryBuilder.prepare_select_into(into_table, sql);
+    }
+
+    fn prepare_explain_statement(
+        &self,
+        explain: &ExplainStatement,
+        sql: &mut impl sea_query::SqlWriter,
+    ) {
+        PostgresQueryBuilder.prepare_explain_statement(explain, sql);
+    }
+
+    fn prepare_value(&self, value: Value, sql: &mut impl sea_query::SqlWriter) {
         PostgresQueryBuilder.prepare_value(value, sql);
     }
 
-    fn placeholder(&self) -> (&str, bool) {
+    fn placeholder(&self) -> (&'static str, bool) {
         PostgresQueryBuilder.placeholder()
     }
 }
 
 impl ForeignKeyBuilder for HyperQueryBuilder {
-    fn prepare_table_ref_fk_stmt(&self, table_ref: &TableRef, sql: &mut dyn sea_query::SqlWriter) {
+    fn prepare_table_ref_fk_stmt(&self, table_ref: &TableRef, sql: &mut impl sea_query::SqlWriter) {
         PostgresQueryBuilder.prepare_table_ref_fk_stmt(table_ref, sql);
     }
 
     fn prepare_foreign_key_create_statement_internal(
         &self,
         create: &ForeignKeyCreateStatement,
-        sql: &mut dyn sea_query::SqlWriter,
+        sql: &mut impl sea_query::SqlWriter,
         mode: sea_query::backend::Mode,
     ) {
         PostgresQueryBuilder.prepare_foreign_key_create_statement_internal(create, sql, mode);
@@ -186,7 +195,7 @@ impl ForeignKeyBuilder for HyperQueryBuilder {
     fn prepare_foreign_key_drop_statement_internal(
         &self,
         drop: &ForeignKeyDropStatement,
-        sql: &mut dyn sea_query::SqlWriter,
+        sql: &mut impl sea_query::SqlWriter,
         mode: sea_query::backend::Mode,
     ) {
         PostgresQueryBuilder.prepare_foreign_key_drop_statement_internal(drop, sql, mode);
@@ -197,7 +206,7 @@ impl IndexBuilder for HyperQueryBuilder {
     fn prepare_index_create_statement(
         &self,
         create: &IndexCreateStatement,
-        sql: &mut dyn sea_query::SqlWriter,
+        sql: &mut impl sea_query::SqlWriter,
     ) {
         PostgresQueryBuilder.prepare_index_create_statement(create, sql);
     }
@@ -205,7 +214,7 @@ impl IndexBuilder for HyperQueryBuilder {
     fn prepare_table_ref_index_stmt(
         &self,
         table_ref: &TableRef,
-        sql: &mut dyn sea_query::SqlWriter,
+        sql: &mut impl sea_query::SqlWriter,
     ) {
         PostgresQueryBuilder.prepare_table_ref_index_stmt(table_ref, sql);
     }
@@ -213,7 +222,7 @@ impl IndexBuilder for HyperQueryBuilder {
     fn prepare_index_drop_statement(
         &self,
         drop: &IndexDropStatement,
-        sql: &mut dyn sea_query::SqlWriter,
+        sql: &mut impl sea_query::SqlWriter,
     ) {
         PostgresQueryBuilder.prepare_index_drop_statement(drop, sql);
     }
@@ -221,18 +230,18 @@ impl IndexBuilder for HyperQueryBuilder {
     fn prepare_index_prefix(
         &self,
         create: &IndexCreateStatement,
-        sql: &mut dyn sea_query::SqlWriter,
+        sql: &mut impl sea_query::SqlWriter,
     ) {
         PostgresQueryBuilder.prepare_index_prefix(create, sql);
     }
 }
 
 impl TableBuilder for HyperQueryBuilder {
-    fn prepare_column_def(&self, column_def: &ColumnDef, sql: &mut dyn sea_query::SqlWriter) {
+    fn prepare_column_def(&self, column_def: &ColumnDef, sql: &mut impl sea_query::SqlWriter) {
         PostgresQueryBuilder.prepare_column_def(column_def, sql);
     }
 
-    fn prepare_column_type(&self, column_type: &ColumnType, sql: &mut dyn sea_query::SqlWriter) {
+    fn prepare_column_type(&self, column_type: &ColumnType, sql: &mut impl sea_query::SqlWriter) {
         PostgresQueryBuilder.prepare_column_type(column_type, sql);
     }
 
@@ -243,7 +252,7 @@ impl TableBuilder for HyperQueryBuilder {
     fn prepare_table_alter_statement(
         &self,
         alter: &TableAlterStatement,
-        sql: &mut dyn sea_query::SqlWriter,
+        sql: &mut impl sea_query::SqlWriter,
     ) {
         PostgresQueryBuilder.prepare_table_alter_statement(alter, sql);
     }
@@ -251,7 +260,7 @@ impl TableBuilder for HyperQueryBuilder {
     fn prepare_table_rename_statement(
         &self,
         rename: &TableRenameStatement,
-        sql: &mut dyn sea_query::SqlWriter,
+        sql: &mut impl sea_query::SqlWriter,
     ) {
         PostgresQueryBuilder.prepare_table_rename_statement(rename, sql);
     }
@@ -264,7 +273,7 @@ impl GenericBuilder for HyperQueryBuilder {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sea_query::{Expr, Iden, Query};
+    use sea_query::{ExprTrait, Iden, Query};
 
     #[derive(Iden)]
     enum Users {
