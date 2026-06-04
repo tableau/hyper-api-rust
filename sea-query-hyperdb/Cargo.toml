@@ -15,4 +15,4 @@ categories = ["database"]
 workspace = true
 
 [dependencies]
-sea-query = "0.32"
+sea-query = "1.0"
