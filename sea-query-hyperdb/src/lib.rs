@@ -74,7 +74,7 @@ use sea_query::backend::{
     PrecedenceDecider, QueryBuilder, QuotedBuilder, SchemaBuilder, TableBuilder, TableRefBuilder,
 };
 use sea_query::{
-    BinOper, ColumnDef, ColumnType, Expr, ExplainStatement, ForeignKeyCreateStatement,
+    BinOper, ColumnDef, ColumnType, ExplainStatement, Expr, ForeignKeyCreateStatement,
     ForeignKeyDropStatement, IndexCreateStatement, IndexDropStatement, Oper, PostgresQueryBuilder,
     Quote, SelectInto, SubQueryStatement, TableAlterStatement, TableRef, TableRenameStatement,
     Value,
@@ -143,11 +143,7 @@ impl OperLeftAssocDecider for HyperQueryBuilder {
 }
 
 impl PrecedenceDecider for HyperQueryBuilder {
-    fn inner_expr_well_known_greater_precedence(
-        &self,
-        inner: &Expr,
-        outer_oper: &Oper,
-    ) -> bool {
+    fn inner_expr_well_known_greater_precedence(&self, inner: &Expr, outer_oper: &Oper) -> bool {
         PostgresQueryBuilder.inner_expr_well_known_greater_precedence(inner, outer_oper)
     }
 }
@@ -183,11 +179,7 @@ impl QueryBuilder for HyperQueryBuilder {
 }
 
 impl ForeignKeyBuilder for HyperQueryBuilder {
-    fn prepare_table_ref_fk_stmt(
-        &self,
-        table_ref: &TableRef,
-        sql: &mut impl sea_query::SqlWriter,
-    ) {
+    fn prepare_table_ref_fk_stmt(&self, table_ref: &TableRef, sql: &mut impl sea_query::SqlWriter) {
         PostgresQueryBuilder.prepare_table_ref_fk_stmt(table_ref, sql);
     }
 
