@@ -159,6 +159,59 @@ fn restart_history_prunes_entries_older_than_window() {
     );
 }
 
+// ─── Unit tests: DaemonConfig (require ENV_LOCK) ─────────────────────────────
+
+#[test]
+fn daemon_config_from_args_none_when_unset() {
+    let _lock = acquire_env_lock();
+    let _guard = EnvGuard::remove("HYPERDB_DAEMON_IDLE_TIMEOUT");
+
+    let config = hyperdb_mcp::daemon::run::DaemonConfig::from_args(0, None);
+    assert!(
+        config.idle_timeout.is_none(),
+        "idle_timeout should be None when neither flag nor env is set"
+    );
+}
+
+#[test]
+fn daemon_config_from_args_some_when_flag() {
+    let _lock = acquire_env_lock();
+    let _guard = EnvGuard::remove("HYPERDB_DAEMON_IDLE_TIMEOUT");
+
+    let config = hyperdb_mcp::daemon::run::DaemonConfig::from_args(0, Some(120));
+    assert_eq!(
+        config.idle_timeout,
+        Some(Duration::from_secs(120)),
+        "idle_timeout should match the provided flag value"
+    );
+}
+
+#[test]
+fn daemon_config_from_args_some_when_env() {
+    let _lock = acquire_env_lock();
+    let _guard = EnvGuard::set("HYPERDB_DAEMON_IDLE_TIMEOUT", "90");
+
+    let config = hyperdb_mcp::daemon::run::DaemonConfig::from_args(0, None);
+    assert_eq!(
+        config.idle_timeout,
+        Some(Duration::from_secs(90)),
+        "idle_timeout should match the env var value when no flag is provided"
+    );
+}
+
+#[test]
+fn daemon_config_from_args_flag_takes_precedence() {
+    let _lock = acquire_env_lock();
+    let _guard = EnvGuard::set("HYPERDB_DAEMON_IDLE_TIMEOUT", "90");
+
+    let config = hyperdb_mcp::daemon::run::DaemonConfig::from_args(0, Some(120));
+    assert_eq!(
+        config.idle_timeout,
+        Some(Duration::from_secs(120)),
+        "flag value should take precedence over env var"
+    );
+}
+
 // ─── Unit tests: Health protocol (no env vars, safe to run in parallel) ───────
 
 #[test]
@@ -1056,7 +1109,7 @@ impl TestDaemon {
             rt.block_on(async {
                 let config = hyperdb_mcp::daemon::run::DaemonConfig {
                     port: 0,
-                    idle_timeout: Duration::from_secs(300),
+                    idle_timeout: Some(Duration::from_secs(300)),
                 };
                 hyperdb_mcp::daemon::run::run_daemon(config)
                     .await

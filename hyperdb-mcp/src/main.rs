@@ -110,9 +110,11 @@ enum Commands {
         #[command(subcommand)]
         action: Option<DaemonAction>,
 
-        /// TCP port for health listener and single-instance lock
-        #[arg(long, default_value_t = daemon::DEFAULT_DAEMON_BASE_PORT)]
-        port: u16,
+        /// TCP port for health listener and single-instance lock. When omitted,
+        /// the daemon scans from the base port to find a free port. For stop/status
+        /// commands, omitting the port uses discovery + scanning to find the running daemon.
+        #[arg(long)]
+        port: Option<u16>,
 
         /// Idle timeout in seconds before the daemon shuts down
         #[arg(long)]
@@ -152,7 +154,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             action: None,
             port,
             idle_timeout,
-        }) => run_daemon_mode(port, idle_timeout).await,
+        }) => {
+            // Resolve the effective port for daemon startup
+            let effective_port = port.unwrap_or_else(|| discovery::resolve_port_scan().base);
+            run_daemon_mode(effective_port, idle_timeout).await
+        }
         None => run_mcp_mode(cli).await,
     }
 }
@@ -230,20 +236,33 @@ async fn run_mcp_mode(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn daemon_stop(port: u16) {
-    match health::send_command(port, "STOP") {
+fn daemon_stop(port: Option<u16>) {
+    let target_port = match port {
+        Some(p) => p,
+        None => {
+            // No explicit port — discover the running daemon
+            if let Some(info) = discovery::find_running_daemon() {
+                info.health_port
+            } else {
+                eprintln!("No daemon is currently running.");
+                std::process::exit(1);
+            }
+        }
+    };
+
+    match health::send_command(target_port, "STOP") {
         Ok(response) => {
             println!("Daemon responded: {}", response.trim());
         }
         Err(e) => {
-            eprintln!("No daemon running on port {port} (or cannot connect): {e}");
+            eprintln!("No daemon running on port {target_port} (or cannot connect): {e}");
             std::process::exit(1);
         }
     }
 }
 
 fn daemon_status() {
-    if let Some(info) = discovery::discover() {
+    if let Some(info) = discovery::find_running_daemon() {
         println!("Daemon is running:");
         println!("  PID:            {}", info.pid);
         println!("  Hyperd endpoint: {}", info.hyperd_endpoint);

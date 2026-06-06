@@ -17,8 +17,10 @@ pub const DEFAULT_DAEMON_BASE_PORT: u16 = 7485;
 /// a daemon. Used by the later port-scanning stage (not yet implemented).
 pub const DAEMON_PORT_SCAN_SPAN: u16 = 16;
 
-/// Default idle timeout in seconds before the daemon shuts down.
-pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30 * 60; // 30 minutes
+/// Suggested idle timeout value (30 minutes) for use with the `--idle-timeout` flag
+/// or `HYPERDB_DAEMON_IDLE_TIMEOUT` env var. By default (when neither is set), the
+/// daemon never auto-shuts down due to inactivity.
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30 * 60;
 
 /// Environment variable to override the daemon port.
 pub const ENV_DAEMON_PORT: &str = "HYPERDB_DAEMON_PORT";

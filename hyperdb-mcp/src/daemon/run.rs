@@ -1,8 +1,12 @@
 // Copyright (c) 2026, Salesforce, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Daemon main loop: spawns `hyperd`, runs health listener, monitors idle timeout
-//! and hyperd liveness, restarts hyperd if it dies.
+//! Daemon main loop: spawns `hyperd`, runs health listener, monitors hyperd liveness
+//! and optional idle timeout, restarts hyperd if it dies.
+//!
+//! By default, the daemon never auto-shuts down due to inactivity (opt-in via
+//! `--idle-timeout` flag or `HYPERDB_DAEMON_IDLE_TIMEOUT` env var). When enabled,
+//! client HEARTBEAT commands reset the idle timer (see [`DaemonState`]).
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -14,29 +18,35 @@ use hyperdb_api::{HyperProcess, Parameters, TransportMode};
 
 use super::discovery::{self, DaemonInfo};
 use super::health::{DaemonState, HealthListener};
-use super::{DEFAULT_IDLE_TIMEOUT_SECS, ENV_IDLE_TIMEOUT};
+use super::ENV_IDLE_TIMEOUT;
 
 /// Configuration for the daemon process.
 #[derive(Debug)]
 pub struct DaemonConfig {
     pub port: u16,
-    pub idle_timeout: Duration,
+    /// Idle timeout duration. When `None`, the daemon never auto-shuts down due to
+    /// inactivity (default behavior). When `Some`, the daemon shuts down after the
+    /// specified duration without client activity.
+    pub idle_timeout: Option<Duration>,
 }
 
 impl DaemonConfig {
+    /// Construct a `DaemonConfig` from CLI args and environment variables.
+    ///
+    /// Idle-timeout resolution:
+    /// 1. If `idle_timeout_secs` is `Some`, use that value.
+    /// 2. Otherwise, if `HYPERDB_DAEMON_IDLE_TIMEOUT` env var is set and parseable, use it.
+    /// 3. Otherwise, `None` (never auto-shutdown).
     pub fn from_args(port: u16, idle_timeout_secs: Option<u64>) -> Self {
-        let idle_timeout_secs = idle_timeout_secs
+        let idle_timeout = idle_timeout_secs
             .or_else(|| {
                 std::env::var(ENV_IDLE_TIMEOUT)
                     .ok()
                     .and_then(|v| v.parse().ok())
             })
-            .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
+            .map(Duration::from_secs);
 
-        Self {
-            port,
-            idle_timeout: Duration::from_secs(idle_timeout_secs),
-        }
+        Self { port, idle_timeout }
     }
 }
 
@@ -121,10 +131,23 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), Box<dyn std::error::
         listener.run(health_state, health_info);
     });
 
+    // Log idle-timeout status at startup
+    if let Some(d) = config.idle_timeout {
+        info!(idle_timeout_secs = d.as_secs(), "idle shutdown enabled");
+    } else {
+        info!("idle shutdown disabled (daemon will stay resident)");
+    }
+
     // Step 6: Run the three monitors concurrently. Whichever completes first
-    // triggers shutdown.
+    // triggers shutdown. If `idle_timeout` is `None`, the idle monitor never fires.
+    let idle_fut = async {
+        match config.idle_timeout {
+            Some(d) => idle_monitor(Arc::clone(&state), d).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
     tokio::select! {
-        () = idle_monitor(Arc::clone(&state), config.idle_timeout) => {}
+        () = idle_fut => {}
         () = hyperd_monitor(Arc::clone(&state), Arc::clone(&hyper_state), Arc::clone(&info_arc)) => {}
         () = shutdown_signal() => {
             info!("received shutdown signal");
