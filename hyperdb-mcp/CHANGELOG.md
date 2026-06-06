@@ -23,7 +23,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Multiple AI clients (Claude Code, Cursor, VS Code Copilot, etc.) can
   access the same persistent databases simultaneously with reduced
   resource overhead. The daemon auto-spawns on first client connect and
-  shuts down after 30 minutes idle. Pass `--no-daemon` to opt out.
+  stays resident (idle shutdown is opt-in — see below). Pass `--no-daemon`
+  to opt out.
+- **Identity-checked daemon discovery.** Clients verify a daemon by sending
+  `PING` and requiring a `PONG hyperdb-mcp <version>` reply (matched on exact
+  tokens, not a string prefix) before trusting it — a TCP connection alone is
+  no longer sufficient, so an unrelated process occupying the port is no
+  longer mistaken for the daemon.
+- **Port scanning.** The daemon health/lock port now defaults to scanning
+  upward from **7485** (16 ports), using the first free one; the old fixed
+  default 7484 collided with `hyperd`'s conventional gRPC port. Set
+  `HYPERDB_DAEMON_PORT` to pin an exact port (disables scanning). `daemon
+  status` / `daemon stop` locate the daemon via discovery + scan, so they
+  work regardless of which port it landed on.
+- **Newer-client version takeover.** A starting client built from a strictly
+  newer `hyperdb-mcp` version stops and replaces an older running daemon
+  (and its `hyperd`), so upgrades take effect immediately instead of waiting
+  for the old daemon to exit. Equal or older versions reuse the daemon.
+- **Daemon stays resident by default.** Idle shutdown is now opt-in via
+  `--idle-timeout <SECS>` or `HYPERDB_DAEMON_IDLE_TIMEOUT`; with neither set
+  the daemon (and `hyperd`) stay warm, eliminating the connection error and
+  "hyper restarting, please retry" round-trip a client previously hit after
+  a 30-minute idle shutdown.
 - New `daemon` subcommand: `hyperdb-mcp daemon status` / `daemon stop`.
 - New environment variables: `HYPERDB_STATE_DIR`, `HYPERDB_DAEMON_PORT`,
   `HYPERDB_DAEMON_IDLE_TIMEOUT`.

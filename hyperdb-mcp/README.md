@@ -185,7 +185,7 @@ Each session has **two databases**: an ephemeral primary (scratch space — alwa
 
 | Mode | Flag | Behavior |
 |---|---|---|
-| **Shared daemon** *(default)* | *(none)* | One `hyperd` process per user, shared across all MCP clients. The first client auto-spawns the daemon; subsequent clients discover and reuse it. Idle for 30 minutes → daemon shuts itself down; the next client spawns a fresh one. |
+| **Shared daemon** *(default)* | *(none)* | One `hyperd` process per user, shared across all MCP clients. The first client auto-spawns the daemon; subsequent clients discover and reuse it. The daemon stays resident by default (idle shutdown is opt-in — see below), so the next client connects instantly instead of waiting for a fresh `hyperd` to start. A client built from a newer `hyperdb-mcp` version transparently takes over (stops and replaces) an older running daemon. |
 | **Private hyperd** | `--no-daemon` | Each MCP client spawns its own `hyperd` (legacy behavior, one per session). |
 
 The shared daemon is the bigger win for users running multiple AI clients (Claude Code + Cursor + VS Code) — they all share one Hyper engine instead of spawning three.
@@ -240,7 +240,7 @@ CREATE TABLE "persistent"."public"."revenue_2026" AS
 
 ### Daemon management
 
-The daemon is normally invisible — it auto-spawns and idle-times-out on its own. For diagnostics:
+The daemon is normally invisible — it auto-spawns on first use and stays resident. For diagnostics:
 
 ```bash
 hyperdb-mcp daemon status   # Show running daemon (PID, endpoint, started_at, version)
@@ -248,7 +248,13 @@ hyperdb-mcp daemon stop     # Gracefully shut down the daemon
 hyperdb-mcp daemon          # Run as a daemon explicitly (rarely needed)
 ```
 
+`status` and `stop` locate the running daemon automatically (reading `daemon.json`, then scanning the port range), so they work even if the daemon scanned onto a non-default port. Pass `--port <PORT>` to target a specific port explicitly.
+
 State files live at `~/.hyperdb/` by default (override with `HYPERDB_STATE_DIR`).
+
+**Port discovery.** The daemon binds a TCP health/lock port — by default it scans upward from **7485** (16 ports) and uses the first free one; set `HYPERDB_DAEMON_PORT` to pin an exact port (no scan). The health port doubles as a single-instance lock and an identity check: clients send `PING` and require a `PONG hyperdb-mcp <version>` reply before trusting a daemon, so an unrelated process occupying the port is skipped rather than mistaken for the daemon.
+
+**Staying resident.** By default the daemon never idle-shuts-down — keeping `hyperd` warm means the next tool call connects immediately instead of triggering a "restarting, please retry" round-trip. To opt into auto-shutdown (e.g. on CI), pass `--idle-timeout <SECS>` or set `HYPERDB_DAEMON_IDLE_TIMEOUT`.
 
 ### Recovery from hyperd crashes
 
@@ -813,15 +819,17 @@ Daemon subcommand:
   hyperdb-mcp daemon                          Start the daemon (usually auto-spawned)
   hyperdb-mcp daemon stop                     Gracefully stop the running daemon
   hyperdb-mcp daemon status                   Show running daemon info
-  hyperdb-mcp daemon --port <PORT>            Override the health/lock port (default 7484)
-  hyperdb-mcp daemon --idle-timeout <SECS>    Override idle timeout (default 1800 = 30 min)
+  hyperdb-mcp daemon --port <PORT>            Pin the health/lock port. When omitted,
+                                              scans upward from 7485 for a free port.
+  hyperdb-mcp daemon --idle-timeout <SECS>    Opt into idle shutdown after SECS idle.
+                                              When omitted, the daemon stays resident.
 
 Environment:
   HYPERD_PATH                  Path to hyperd binary (auto-detected if on PATH)
   HYPERDB_PERSISTENT_DB        Override the default persistent-db path
   HYPERDB_STATE_DIR            Override daemon state directory (default ~/.hyperdb/)
-  HYPERDB_DAEMON_PORT          Override daemon health/lock port (default 7484)
-  HYPERDB_DAEMON_IDLE_TIMEOUT  Override daemon idle timeout in seconds (default 1800)
+  HYPERDB_DAEMON_PORT          Pin daemon health/lock port (default: scan from 7485)
+  HYPERDB_DAEMON_IDLE_TIMEOUT  Opt into idle shutdown (seconds); default: stay resident
 ```
 
 ---
