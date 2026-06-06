@@ -374,8 +374,7 @@ impl Engine {
         persistent_path: Option<PathBuf>,
         log_dir: &Path,
     ) -> Result<Option<Self>, McpError> {
-        let port = daemon::discovery::resolve_port();
-        let info = match daemon::spawn::ensure_daemon(port) {
+        let info = match daemon::spawn::ensure_daemon(daemon::discovery::resolve_port_scan()) {
             Ok(info) => info,
             Err(e) => {
                 tracing::debug!(error = %e, "daemon unavailable, falling back to local mode");

@@ -11,9 +11,9 @@ use std::io;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-use super::discovery::{self, DaemonInfo};
+use super::discovery::{self, DaemonInfo, PortScan, ScanOutcome};
 
 /// Maximum time to wait for the daemon to write its discovery file after spawning.
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -21,22 +21,36 @@ const SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
 /// Polling interval while waiting for the discovery file.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Ensure a daemon is running and return its info.
-/// If no daemon is detected, spawn one and wait for it to become ready.
+/// Ensure a daemon is running and return its info. If a daemon is found (via
+/// discovery file or port scan), we MAY take it over if the client is newer.
+/// Otherwise we spawn a fresh daemon on the first free port in the scan range.
 ///
 /// # Errors
-/// Returns an error if the daemon cannot be spawned or does not become ready
-/// within the timeout period.
-pub fn ensure_daemon(port: u16) -> io::Result<DaemonInfo> {
-    // Check if already running
+/// Returns an error if no free port is available, the daemon cannot be spawned,
+/// or it does not become ready within the timeout period.
+pub fn ensure_daemon(scan: PortScan) -> io::Result<DaemonInfo> {
+    // Check discovery file first (fast path).
     if let Some(info) = discovery::discover() {
-        debug!(endpoint = %info.hyperd_endpoint, "daemon already running");
-        return Ok(info);
+        return maybe_take_over(info, scan);
     }
 
-    info!("no running daemon detected, spawning one");
-    spawn_detached(port)?;
-    wait_for_daemon()
+    // Scan the port range for a running daemon or a free port.
+    match discovery::scan_for_daemon(scan) {
+        ScanOutcome::Found(info) => maybe_take_over(*info, scan),
+        ScanOutcome::FreePort(port) => {
+            info!(port, "no running daemon detected, spawning on free port");
+            spawn_detached(port)?;
+            wait_for_daemon()
+        }
+        ScanOutcome::AllOccupied => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!(
+                "no free hyperdb daemon port in {}..{}",
+                scan.base,
+                scan.base.saturating_add(scan.span)
+            ),
+        )),
+    }
 }
 
 /// Spawn `hyperdb-mcp daemon` as a fully detached background process.
@@ -101,4 +115,97 @@ fn wait_for_daemon() -> io::Result<DaemonInfo> {
 
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+/// Pure version comparison: returns `true` if the client should take over the daemon.
+/// Only returns `true` when both versions parse successfully AND client > daemon.
+/// Unparseable versions or equal/older client always return `false` (reuse daemon).
+pub fn client_should_take_over(client_ver: &str, daemon_ver: &str) -> bool {
+    let Ok(client) = semver::Version::parse(client_ver) else {
+        return false;
+    };
+    let Ok(daemon) = semver::Version::parse(daemon_ver) else {
+        return false;
+    };
+    client > daemon
+}
+
+/// Decide whether to reuse the running daemon or take it over with a newer version.
+/// If the client is newer, we send STOP to the old daemon, wait for it to release
+/// the port, then spawn a fresh daemon on the same port. Otherwise we reuse the
+/// existing daemon.
+///
+/// The `scan` argument is intentionally unused for *where* to respawn: a takeover
+/// always reuses the port the discovered daemon already holds (`info.health_port`),
+/// because that is the port guaranteed to free up when the old daemon stops. A
+/// mid-session change to `HYPERDB_DAEMON_PORT` (so the pinned `scan.base` differs
+/// from `info.health_port`) is not honored here — spawning on a *different* port
+/// would leave the old daemon alive and create two daemons rather than replace one.
+/// That edge case is pathological (operators don't repin a live daemon) and the
+/// daemon found via discovery is authoritative for its own port.
+fn maybe_take_over(info: DaemonInfo, _scan: PortScan) -> io::Result<DaemonInfo> {
+    let client_ver = crate::version::MCP_VERSION;
+
+    if !client_should_take_over(client_ver, &info.version) {
+        // Client is older or equal, or one/both versions failed to parse → reuse.
+        // Distinguish the two reasons so an unexpected unparseable daemon version
+        // (corrupt daemon.json, foreign writer) is visible when debugging.
+        let parse_failed = semver::Version::parse(client_ver).is_err()
+            || semver::Version::parse(&info.version).is_err();
+        debug!(
+            daemon_version = %info.version,
+            client_version = %client_ver,
+            port = info.health_port,
+            reason = if parse_failed { "version unparseable" } else { "client not newer" },
+            "reusing existing daemon"
+        );
+        return Ok(info);
+    }
+
+    // Client is newer — take over.
+    info!(
+        daemon_version = %info.version,
+        client_version = %client_ver,
+        port = info.health_port,
+        "newer MCP client taking over older daemon"
+    );
+
+    // Send STOP (best-effort; ignore error if daemon is already dying).
+    let _ = super::health::send_command(info.health_port, "STOP");
+
+    // Wait for the old daemon to release the port (confirmed by ping_identified returning None).
+    let deadline = Instant::now() + SPAWN_TIMEOUT;
+    while Instant::now() < deadline {
+        if super::health::ping_identified(
+            info.health_port,
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+        )
+        .is_none()
+        {
+            // Port is free — spawn the new daemon on the same port.
+            //
+            // There is a benign TOCTOU window here: another client could also
+            // observe the freed port and spawn concurrently. That is safe by the
+            // same argument as the FreePort path — `spawn_detached` is
+            // fire-and-forget (it does not itself bind the port; the spawned
+            // daemon's `HealthListener::bind` is the real single-instance lock).
+            // The OS grants the bind to exactly one daemon; the loser exits
+            // without writing the discovery file, and `wait_for_daemon` (which
+            // polls `discover()`) converges on whichever daemon won. No
+            // duplicate daemon survives and no AddrInUse surfaces to the client.
+            spawn_detached(info.health_port)?;
+            return wait_for_daemon();
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    // Old daemon didn't die within the deadline — log a warning and reuse it
+    // rather than fail the client.
+    warn!(
+        port = info.health_port,
+        timeout_secs = SPAWN_TIMEOUT.as_secs(),
+        "old daemon did not stop within timeout, reusing it"
+    );
+    Ok(info)
 }

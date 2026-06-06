@@ -554,6 +554,124 @@ fn resolve_port_uses_default_when_env_unset() {
     );
 }
 
+// ─── Unit tests: Port scanning (require ENV_LOCK + sandbox OFF) ──────────────
+
+#[test]
+fn scan_finds_our_daemon_via_status() {
+    let _lock = acquire_env_lock();
+    let (port, _handle, _state) = start_health_listener();
+
+    let scan = PortScan {
+        base: port,
+        span: 1,
+    };
+    match discovery::scan_for_daemon(scan) {
+        discovery::ScanOutcome::Found(info) => {
+            assert_eq!(info.hyperd_endpoint, "127.0.0.1:54321");
+        }
+        other => panic!("expected Found, got {other:?}"),
+    }
+}
+
+#[test]
+fn scan_skips_camped_returns_free() {
+    let _lock = acquire_env_lock();
+
+    // Start two listeners: one "camped" (accepts TCP but writes garbage),
+    // and one "free" (bound then dropped so it's guaranteed released).
+    let camped_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let camped_port = camped_listener.local_addr().unwrap().port();
+
+    // Get a second free port by binding and immediately dropping.
+    let temp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let free_port = temp_listener.local_addr().unwrap().port();
+    drop(temp_listener);
+
+    // Ensure camped_port < free_port for a predictable scan order.
+    let (base, expected_free) = if camped_port < free_port {
+        (camped_port, free_port)
+    } else {
+        (free_port, camped_port)
+    };
+
+    // Spawn a thread that keeps the camped listener alive and accepts connections.
+    std::thread::spawn(move || loop {
+        if let Ok((mut stream, _)) = camped_listener.accept() {
+            use std::io::Write;
+            let _ = stream.write_all(b"NOPE\n");
+        }
+    });
+
+    // Give the thread a moment to start accepting.
+    std::thread::sleep(Duration::from_millis(50));
+
+    // Scan from base with a range that covers both ports.
+    let port_span = expected_free - base + 1;
+    let scan = PortScan {
+        base,
+        span: port_span,
+    };
+
+    match discovery::scan_for_daemon(scan) {
+        discovery::ScanOutcome::FreePort(port) => {
+            // The scan should return the first free port, which is expected_free.
+            assert_eq!(
+                port, expected_free,
+                "scan should return the first free port in range"
+            );
+        }
+        other => panic!("expected FreePort, got {other:?}"),
+    }
+}
+
+#[test]
+fn scan_all_refused_returns_freeport_base() {
+    // Pick a high port that's almost certainly free.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = listener.local_addr().unwrap().port();
+    drop(listener); // Release the port so it's free again.
+
+    std::thread::sleep(Duration::from_millis(10));
+
+    // Span of 1: probe only the single known-free `base` port. A wider span
+    // would risk colliding with a leaked health listener from another parallel
+    // test (they bind random high ports and leak for the test-process lifetime),
+    // which would be reported as `Found` rather than `FreePort`.
+    let scan = PortScan { base, span: 1 };
+    match discovery::scan_for_daemon(scan) {
+        discovery::ScanOutcome::FreePort(port) => {
+            assert_eq!(port, base, "should return the first free port (base)");
+        }
+        other => panic!("expected FreePort(base), got {other:?}"),
+    }
+}
+
+#[test]
+fn probe_refused_when_closed() {
+    // Bind a listener to get a port, then drop it so the port is closed.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    std::thread::sleep(Duration::from_millis(10));
+
+    // Access the private probe_port via the public scan_for_daemon wrapper.
+    // We know that if the scan returns FreePort, then probe_port returned Refused.
+    let scan = PortScan {
+        base: port,
+        span: 1,
+    };
+    match discovery::scan_for_daemon(scan) {
+        discovery::ScanOutcome::FreePort(p) => {
+            assert_eq!(
+                p, port,
+                "probe_port should have returned Refused for closed port"
+            );
+        }
+        other => panic!("expected FreePort (Refused), got {other:?}"),
+    }
+}
+
 #[test]
 fn discover_finds_live_daemon() {
     let _lock = acquire_env_lock();
@@ -574,6 +692,56 @@ fn discover_finds_live_daemon() {
     let discovered = discovery::discover().expect("should discover live daemon");
     assert_eq!(discovered.pid, 12345);
     assert_eq!(discovered.health_port, port);
+}
+
+// ─── Unit tests: Version takeover decision (no env vars, safe parallel) ─────────
+
+#[test]
+fn takeover_decision_newer_client_takes_over() {
+    assert!(
+        hyperdb_mcp::daemon::spawn::client_should_take_over("0.5.0", "0.4.0"),
+        "0.5.0 client should take over 0.4.0 daemon"
+    );
+}
+
+#[test]
+fn takeover_decision_equal_version_reuses() {
+    assert!(
+        !hyperdb_mcp::daemon::spawn::client_should_take_over("0.4.0", "0.4.0"),
+        "equal versions should reuse daemon"
+    );
+}
+
+#[test]
+fn takeover_decision_older_client_reuses() {
+    assert!(
+        !hyperdb_mcp::daemon::spawn::client_should_take_over("0.4.0", "0.5.0"),
+        "older client should reuse newer daemon"
+    );
+}
+
+#[test]
+fn takeover_decision_client_unparseable_reuses() {
+    assert!(
+        !hyperdb_mcp::daemon::spawn::client_should_take_over("garbage", "0.4.0"),
+        "unparseable client version should reuse daemon"
+    );
+}
+
+#[test]
+fn takeover_decision_daemon_unparseable_reuses() {
+    assert!(
+        !hyperdb_mcp::daemon::spawn::client_should_take_over("0.4.0", "garbage"),
+        "unparseable daemon version should reuse daemon"
+    );
+}
+
+#[test]
+fn takeover_decision_both_unparseable_reuses() {
+    assert!(
+        !hyperdb_mcp::daemon::spawn::client_should_take_over("garbage", "junk"),
+        "both unparseable should reuse daemon"
+    );
 }
 
 // ─── Integration tests: full daemon lifecycle with real hyperd ─────────────────

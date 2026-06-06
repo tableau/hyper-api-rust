@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use super::{DAEMON_PORT_SCAN_SPAN, DEFAULT_DAEMON_BASE_PORT};
 
 /// Information written by the daemon so clients can discover and connect.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonInfo {
     /// OS process ID of the daemon.
     pub pid: u32,
@@ -147,4 +147,106 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
+}
+
+/// Result of probing a single port: either our daemon, something else, or refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeResult {
+    /// A hyperdb-mcp daemon answered with valid STATUS.
+    OurDaemon(Box<DaemonInfo>),
+    /// The port accepted TCP but isn't our daemon (foreign service or broken STATUS).
+    Camped,
+    /// Connection refused (port is free).
+    Refused,
+}
+
+/// Probe a single port to determine if it's occupied by our daemon, a foreign service, or free.
+fn probe_port(port: u16) -> ProbeResult {
+    let ping_timeout = Duration::from_millis(300);
+
+    if let Some(_version) = super::health::ping_identified(port, ping_timeout, ping_timeout) {
+        // PING succeeded — something is answering with our token. Now send STATUS
+        // to retrieve the full daemon info. If STATUS fails we can't trust this
+        // process (might be a test stub or a broken daemon), so treat it as Camped.
+        match super::health::send_command_with_timeout(port, "STATUS", ping_timeout, ping_timeout) {
+            Ok(response) => {
+                if let Ok(info) = serde_json::from_str::<DaemonInfo>(response.trim()) {
+                    ProbeResult::OurDaemon(Box::new(info))
+                } else {
+                    // Parsed PING but STATUS is malformed — treat as Camped.
+                    ProbeResult::Camped
+                }
+            }
+            Err(_) => ProbeResult::Camped,
+        }
+    } else {
+        // PING failed or returned no identifying token. Distinguish "refused"
+        // from "camped non-daemon" via a raw TCP connect attempt.
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        match std::net::TcpStream::connect_timeout(&addr, ping_timeout) {
+            Ok(_) => ProbeResult::Camped, // TCP accepted but PING failed → foreign
+            Err(_) => ProbeResult::Refused, // Connection refused → port is free
+        }
+    }
+}
+
+/// The outcome of scanning a port range for a running daemon or a free port to spawn on.
+#[derive(Debug)]
+pub enum ScanOutcome {
+    /// Found a running hyperdb-mcp daemon.
+    Found(Box<DaemonInfo>),
+    /// No daemon found, but this port is free (can spawn here).
+    FreePort(u16),
+    /// All ports in the range are occupied (either by our daemon, foreign services, or both).
+    AllOccupied,
+}
+
+/// Scan the configured port range to find a running daemon or identify a free port.
+/// If any port in the range answers identified-PING and returns valid STATUS, we return
+/// `Found` immediately (first wins). Otherwise, we return `FreePort` with the first
+/// refused port encountered, or `AllOccupied` if everything is in use.
+///
+/// Product decision: prefer finding an existing daemon anywhere in range over
+/// spawning a new one. Only spawn if no daemon exists.
+pub fn scan_for_daemon(scan: PortScan) -> ScanOutcome {
+    let mut first_free: Option<u16> = None;
+
+    for offset in 0..scan.span {
+        let Some(port) = scan.base.checked_add(offset) else {
+            break; // Overflow guard: stop at u16::MAX
+        };
+
+        match probe_port(port) {
+            ProbeResult::OurDaemon(info) => {
+                // Found a running daemon — return immediately.
+                return ScanOutcome::Found(info);
+            }
+            ProbeResult::Refused => {
+                // Port is free. Remember the first one we see.
+                if first_free.is_none() {
+                    first_free = Some(port);
+                }
+            }
+            ProbeResult::Camped => {
+                // Port is occupied by something else. Keep scanning.
+            }
+        }
+    }
+
+    // No daemon found. Return the first free port, or AllOccupied if none.
+    match first_free {
+        Some(port) => ScanOutcome::FreePort(port),
+        None => ScanOutcome::AllOccupied,
+    }
+}
+
+/// Discover a running daemon via the discovery file, or by scanning the configured
+/// port range. Returns `None` if no daemon is found in either place.
+///
+/// Used by CLI commands (status/stop) that want to find a daemon but not spawn one.
+pub fn find_running_daemon() -> Option<DaemonInfo> {
+    discover().or_else(|| match scan_for_daemon(resolve_port_scan()) {
+        ScanOutcome::Found(info) => Some(*info),
+        _ => None,
+    })
 }
