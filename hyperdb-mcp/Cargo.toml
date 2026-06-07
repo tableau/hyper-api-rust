@@ -21,7 +21,7 @@ path = "src/main.rs"
 
 [dependencies]
 # x-release-please-start-version
-hyperdb-api = { path = "../hyperdb-api", version = "=0.4.0" }
+hyperdb-api = { path = "../hyperdb-api", version = "=0.5.0" }
 # x-release-please-end
 rmcp = { version = "1.7", features = ["server", "transport-io"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "signal", "time"] }

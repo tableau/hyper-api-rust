@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.5.0](https://github.com/tableau/hyper-api-rust/compare/v0.4.0...v0.5.0) (2026-06-07)
+
+
+### Features
+
+* **daemon:** identified PONG handshake + port-scan resolver groundwork ([751fd75](https://github.com/tableau/hyper-api-rust/commit/751fd7576f82aa22c4ac619bcf7a17b89f904bc0))
+* **daemon:** keep daemon resident by default; CLI auto-discovers port ([e123688](https://github.com/tableau/hyper-api-rust/commit/e12368808cc2c6e4f7de6a0a158c914e332299e2))
+* **daemon:** port-scanning locator + newer-client version takeover ([114a155](https://github.com/tableau/hyper-api-rust/commit/114a1551b040084142540c124de27cbdb23cfd59))
+* **mcp:** surface hyperd endpoint + daemon health port in status tool ([293a7a0](https://github.com/tableau/hyper-api-rust/commit/293a7a0fe860d5e3b2a69f7a52e89c2b0530374b))
+
+
+### Bug Fixes
+
+* **mcp:** harden daemon discovery — identified PONG, port scanning, version takeover, resident-by-default ([#115](https://github.com/tableau/hyper-api-rust/issues/115)) ([05019b9](https://github.com/tableau/hyper-api-rust/commit/05019b958fc12f35efe13a47931a50d66496ad80))
+
 ## [0.4.0](https://github.com/tableau/hyper-api-rust/compare/v0.3.1...v0.4.0) (2026-06-02)
 
 
