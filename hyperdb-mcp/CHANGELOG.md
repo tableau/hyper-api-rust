@@ -5,6 +5,20 @@ All notable changes to the `hyperdb-mcp` crate will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **TCP keepalive on the `hyperd` connection.** Connections to `hyperd` now
+  enable TCP keepalive (60s idle, 10s interval, ~90s to declare a dead peer)
+  instead of relying on the OS default 2-hour idle timeout. Without it, a
+  long-lived idle connection that went half-open — laptop sleep, a network
+  blip, or a `hyperd` that vanished without sending a FIN — would make the
+  next query (including the `status` tool) block for up to two hours instead
+  of failing fast and reconnecting. This is most visible since the daemon
+  became resident-by-default in 0.5.0, which made long-lived idle connections
+  the norm. (Fixed in `hyperdb-api-core` for both the sync and async clients.)
+
 ## [0.5.0] - 2026-06-07
 
 ### Fixed
