@@ -630,24 +630,35 @@ fn scan_finds_our_daemon_via_status() {
 fn scan_skips_camped_returns_free() {
     let _lock = acquire_env_lock();
 
-    // Start two listeners: one "camped" (accepts TCP but writes garbage),
-    // and one "free" (bound then dropped so it's guaranteed released).
-    let camped_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let camped_port = camped_listener.local_addr().unwrap().port();
-
-    // Get a second free port by binding and immediately dropping.
-    let temp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let free_port = temp_listener.local_addr().unwrap().port();
-    drop(temp_listener);
-
-    // Ensure camped_port < free_port for a predictable scan order.
-    let (base, expected_free) = if camped_port < free_port {
-        (camped_port, free_port)
-    } else {
-        (free_port, camped_port)
+    // Find a camped port `base` whose immediate successor `base + 1` is free,
+    // so the scan range is exactly the two adjacent ports {base, base+1}.
+    //
+    // We deliberately keep the range to two ports rather than scanning the
+    // (potentially wide) gap between two arbitrary OS-assigned ports: other
+    // tests' `start_health_listener` helpers leak real identity-answering
+    // `HealthListener`s on random high ports for the lifetime of the test
+    // process, and a wide scan can land on one and return `Found` instead of
+    // `FreePort`. With a 2-port window, a leaked listener would have to occupy
+    // exactly `base+1` — which we confirm is free immediately before scanning.
+    let (camped_listener, base) = loop {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        if port < u16::MAX {
+            // `base + 1` is free iff we can bind it right now. Drop the probe
+            // so the port is released for the scan to find as `Refused`.
+            if let Ok(probe) = TcpListener::bind(("127.0.0.1", port + 1)) {
+                drop(probe);
+                break (listener, port);
+            }
+        }
+        // `base+1` was occupied (or base == u16::MAX) — retry with a fresh port.
+        drop(listener);
     };
+    let expected_free = base + 1;
 
-    // Spawn a thread that keeps the camped listener alive and accepts connections.
+    // Spawn a thread that keeps the camped listener alive and accepts
+    // connections, answering with non-protocol garbage so the identity check
+    // classifies it as `Camped`, not `OurDaemon`.
     std::thread::spawn(move || loop {
         if let Ok((mut stream, _)) = camped_listener.accept() {
             use std::io::Write;
@@ -658,19 +669,14 @@ fn scan_skips_camped_returns_free() {
     // Give the thread a moment to start accepting.
     std::thread::sleep(Duration::from_millis(50));
 
-    // Scan from base with a range that covers both ports.
-    let port_span = expected_free - base + 1;
-    let scan = PortScan {
-        base,
-        span: port_span,
-    };
+    // Scan exactly {base (camped), base+1 (free)}.
+    let scan = PortScan { base, span: 2 };
 
     match discovery::scan_for_daemon(scan) {
         discovery::ScanOutcome::FreePort(port) => {
-            // The scan should return the first free port, which is expected_free.
             assert_eq!(
                 port, expected_free,
-                "scan should return the first free port in range"
+                "scan should skip the camped base port and return base+1"
             );
         }
         other => panic!("expected FreePort, got {other:?}"),
