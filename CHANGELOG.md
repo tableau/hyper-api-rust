@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.2](https://github.com/tableau/hyper-api-rust/compare/v0.5.1...v0.5.2) (2026-06-08)
+
+
+### Bug Fixes
+
+* **bootstrap:** download hyperd from the Java API bundle, not C++ ([#121](https://github.com/tableau/hyper-api-rust/issues/121)) ([9ca4f24](https://github.com/tableau/hyper-api-rust/commit/9ca4f240c17ff816f9d2cfb833a344def2c7fbfc))
+
 ## [0.5.1](https://github.com/tableau/hyper-api-rust/compare/v0.5.0...v0.5.1) (2026-06-08)
 
 
