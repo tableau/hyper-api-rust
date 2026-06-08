@@ -36,8 +36,32 @@
 
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use tracing::{debug, info, trace, warn};
+
+/// Enable TCP keepalive on a connection socket so a half-open peer (laptop
+/// sleep, network blip, a hyperd that vanished without a FIN) is detected in
+/// ~90s instead of blocking a blocking `read()` until the OS default idle
+/// timeout (7200s / 2h on macOS and Linux).
+///
+/// This matters most for long-lived idle connections — e.g. an MCP client
+/// holding a connection to a resident daemon's hyperd across a laptop suspend.
+/// Without keepalive, the next query on a silently-dead socket hangs for hours.
+///
+/// Tuning: 60s idle before the first probe, 10s between probes, 3 probes →
+/// the peer is declared dead ~90s after it goes silent. Probe count is only
+/// honored on platforms whose `socket2` build exposes `with_retries`; macOS
+/// honors idle+interval. All calls are best-effort (`.ok()`): a kernel that
+/// rejects a knob leaves the connection working at OS defaults.
+fn apply_tcp_keepalive(sock: &socket2::SockRef<'_>) {
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(60))
+        .with_interval(Duration::from_secs(10));
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let keepalive = keepalive.with_retries(3);
+    sock.set_tcp_keepalive(&keepalive).ok();
+}
 
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
@@ -192,6 +216,7 @@ impl Client {
         let sock = socket2::SockRef::from(&tcp_stream);
         sock.set_recv_buffer_size(4 * 1024 * 1024).ok();
         sock.set_send_buffer_size(4 * 1024 * 1024).ok();
+        apply_tcp_keepalive(&sock);
 
         let stream = SyncStream::tcp(tcp_stream);
         let mut connection = RawConnection::new(stream);

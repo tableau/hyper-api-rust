@@ -130,6 +130,18 @@ impl AsyncClient {
         let sock = socket2::SockRef::from(&tcp_stream);
         sock.set_recv_buffer_size(4 * 1024 * 1024).ok();
         sock.set_send_buffer_size(4 * 1024 * 1024).ok();
+        // TCP keepalive: detect a half-open peer (laptop sleep, network blip,
+        // a hyperd that vanished without a FIN) in ~90s instead of the 2h OS
+        // idle default. See the rationale on `super::client::apply_tcp_keepalive`
+        // (the sync mirror). Best-effort: a rejected knob leaves OS defaults.
+        {
+            let keepalive = socket2::TcpKeepalive::new()
+                .with_time(std::time::Duration::from_secs(60))
+                .with_interval(std::time::Duration::from_secs(10));
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            let keepalive = keepalive.with_retries(3);
+            sock.set_tcp_keepalive(&keepalive).ok();
+        }
 
         let stream = AsyncStream::tcp(tcp_stream);
         let mut connection = AsyncRawConnection::new(stream);

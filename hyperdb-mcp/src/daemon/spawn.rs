@@ -40,7 +40,30 @@ pub fn ensure_daemon(scan: PortScan) -> io::Result<DaemonInfo> {
         ScanOutcome::FreePort(port) => {
             info!(port, "no running daemon detected, spawning on free port");
             spawn_detached(port)?;
-            wait_for_daemon()
+            let info = wait_for_daemon()?;
+            // If the daemon we just spawned bound a port above the scan base (because
+            // concurrent clients raced and one of them grabbed the base port first),
+            // prefer the lower-port daemon so we don't accumulate redundant
+            // daemon+hyperd pairs on adjacent ports. The lower-port daemon wins
+            // because it bound first and is the canonical single instance.
+            if info.health_port > scan.base {
+                let lower_scan = PortScan {
+                    base: scan.base,
+                    span: info.health_port.saturating_sub(scan.base),
+                };
+                if let ScanOutcome::Found(lower_info) = discovery::scan_for_daemon(lower_scan) {
+                    debug!(
+                        prefer_port = lower_info.health_port,
+                        stop_port = info.health_port,
+                        "found lower-port daemon from concurrent spawn; stopping off-base daemon"
+                    );
+                    // Best-effort STOP — if it fails the off-base daemon idles
+                    // harmlessly (it has no clients and will only cost background CPU).
+                    let _ = super::health::send_command(info.health_port, "STOP");
+                    return Ok(*lower_info);
+                }
+            }
+            Ok(info)
         }
         ScanOutcome::AllOccupied => Err(io::Error::new(
             io::ErrorKind::AddrInUse,

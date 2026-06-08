@@ -753,6 +753,40 @@ fn discover_finds_live_daemon() {
     assert_eq!(discovered.health_port, port);
 }
 
+// ─── Unit tests: concurrent-spawn dedup (no env vars, safe parallel) ────────────
+
+#[test]
+fn scan_for_daemon_prefers_lower_port_daemon() {
+    // Simulates the concurrent-spawn race: two daemons ended up on adjacent ports
+    // (base and base+1). The client that landed on base+1 should prefer the
+    // base-port daemon when it re-scans the lower range.
+    //
+    // We model this by starting two real health listeners (which answer PING with
+    // the identifying token), then asserting that scan_for_daemon with a 2-port
+    // range returns the LOWER port's daemon as Found.
+    let (lower_port, _lower_handle, _lower_state) = start_health_listener();
+    let (higher_port, _higher_handle, _higher_state) = start_health_listener();
+
+    // Make sure lower_port < higher_port for a predictable result.
+    let (base, _top) = if lower_port < higher_port {
+        (lower_port, higher_port)
+    } else {
+        (higher_port, lower_port)
+    };
+
+    let scan = PortScan { base, span: 2 };
+
+    match discovery::scan_for_daemon(scan) {
+        discovery::ScanOutcome::Found(info) => {
+            assert_eq!(
+                info.health_port, base,
+                "scan should return the LOWEST-port daemon (the first one bound)"
+            );
+        }
+        other => panic!("expected Found, got {other:?}"),
+    }
+}
+
 // ─── Unit tests: Version takeover decision (no env vars, safe parallel) ─────────
 
 #[test]
