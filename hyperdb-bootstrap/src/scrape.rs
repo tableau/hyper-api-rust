@@ -20,7 +20,7 @@ use crate::Error;
 const RELEASES_URL: &str = "https://tableau.github.io/hyper-db/docs/releases";
 
 /// Fetches the public releases page and returns the newest `PinnedRelease`
-/// that has a C++ download for `platform`.
+/// that has a Java download for `platform`.
 ///
 /// The returned `PinnedRelease` has an empty SHA-256 map — scraping only
 /// recovers the version + build id, never a digest.
@@ -58,10 +58,10 @@ fn parse_latest(html: &str, platform: Platform) -> Result<PinnedRelease, Error> 
             "no <h3>VERSION [DATE]</h3> heading found",
         ))?;
 
-    // For that version, find the C++ zip for the requested platform to
+    // For that version, find the Java zip for the requested platform to
     // recover the build id.
     let href_re = Regex::new(&format!(
-        r"tableauhyperapi-cxx-{plat}-release-main\.{ver}\.(rc[a-z0-9]+)\.zip",
+        r"tableauhyperapi-java-{plat}-release-main\.{ver}\.(rc[a-z0-9]+)\.zip",
         plat = regex::escape(platform.slug()),
         ver = regex::escape(&version),
     ))
@@ -71,7 +71,7 @@ fn parse_latest(html: &str, platform: Platform) -> Result<PinnedRelease, Error> 
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_string())
         .ok_or(Error::ScrapeFailed(
-            "no matching cxx zip href for scraped version",
+            "no matching java zip href for scraped version",
         ))?;
 
     Ok(PinnedRelease {
@@ -90,8 +90,8 @@ mod tests {
         let html = r#"
             <h3>0.0.24457 [February 12 2026]</h3>
             <ul><li>Release notes</li></ul>
-            <a href="https://downloads.tableau.com/tssoftware//tableauhyperapi-cxx-macos-arm64-release-main.0.0.24457.rc36858b6.zip">C++ (macOS arm64)</a>
-            <a href="https://downloads.tableau.com/tssoftware//tableauhyperapi-cxx-linux-x86_64-release-main.0.0.24457.rc36858b6.zip">C++ (Linux)</a>
+            <a href="https://downloads.tableau.com/tssoftware//tableauhyperapi-java-macos-arm64-release-main.0.0.24457.rc36858b6.zip">Java (macOS arm64)</a>
+            <a href="https://downloads.tableau.com/tssoftware//tableauhyperapi-java-linux-x86_64-release-main.0.0.24457.rc36858b6.zip">Java (Linux)</a>
             <h3>0.0.20000 [January 1 2025]</h3>
         "#;
         let release = parse_latest(html, Platform::MacosArm64).unwrap();

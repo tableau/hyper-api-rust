@@ -12,7 +12,7 @@ fn builtin_release_builds_a_valid_url() {
     let r = PinnedRelease::builtin();
     let url = build_download_url(&r, Platform::LinuxX86_64);
     assert!(url.starts_with("https://downloads.tableau.com/tssoftware/"));
-    assert!(url.contains("cxx-linux-x86_64"));
+    assert!(url.contains("java-linux-x86_64"));
     assert!(std::path::Path::new(&url)
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("zip")));

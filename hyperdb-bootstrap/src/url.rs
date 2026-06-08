@@ -1,8 +1,16 @@
 // Copyright (c) 2026, Salesforce, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Builds canonical download URLs for Tableau's public Hyper C++ API
+//! Builds canonical download URLs for Tableau's public Hyper **Java** API
 //! release bundles.
+//!
+//! We deliberately use the Java binding's bundle rather than the C++ one:
+//! the C++ `macos-arm64` zip ships an **x86_64** `hyperd` (an upstream
+//! packaging defect), so on Apple Silicon it would only run under Rosetta.
+//! The Java `macos-arm64` bundle carries a native arm64 `hyperd`. Both
+//! bundles share the identical URL template (only the `java`/`cxx` token
+//! differs) and the identical internal layout (`lib/hyper/hyperd`), so the
+//! switch is confined to this token and the pinned sha256s.
 
 use crate::platform::Platform;
 use crate::release::PinnedRelease;
@@ -13,11 +21,11 @@ const BASE_URL: &str = "https://downloads.tableau.com/tssoftware";
 /// combination.
 ///
 /// The URL template matches
-/// `https://downloads.tableau.com/tssoftware/tableauhyperapi-cxx-<platform>-release-main.<version>.<build_id>.zip`.
+/// `https://downloads.tableau.com/tssoftware/tableauhyperapi-java-<platform>-release-main.<version>.<build_id>.zip`.
 #[must_use]
 pub fn build_download_url(release: &PinnedRelease, platform: Platform) -> String {
     format!(
-        "{base}/tableauhyperapi-cxx-{plat}-release-main.{version}.{build_id}.zip",
+        "{base}/tableauhyperapi-java-{plat}-release-main.{version}.{build_id}.zip",
         base = BASE_URL,
         plat = platform.slug(),
         version = release.version,
@@ -40,7 +48,7 @@ mod tests {
         let url = build_download_url(&r, Platform::MacosArm64);
         assert_eq!(
             url,
-            "https://downloads.tableau.com/tssoftware/tableauhyperapi-cxx-macos-arm64-release-main.0.0.24457.rc36858b6.zip"
+            "https://downloads.tableau.com/tssoftware/tableauhyperapi-java-macos-arm64-release-main.0.0.24457.rc36858b6.zip"
         );
     }
 }

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 //! Host-platform detection and slug encoding for the four targets that
-//! Tableau's Hyper C++ API ships binaries for.
+//! Tableau's Hyper API ships binaries for.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

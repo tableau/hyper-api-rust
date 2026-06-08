@@ -1,14 +1,22 @@
 # hyperdb-bootstrap
 
-Download and install the `hyperd` executable from Tableau's Hyper C++ API
+Download and install the `hyperd` executable from Tableau's Hyper Java API
 release packages. Ships as both a CLI binary and a library.
 
 The `hyperd` server isn't on crates.io — it's a prebuilt binary distributed
-inside Tableau's Hyper C++ API zips at
+inside Tableau's Hyper API zips at
 <https://tableau.github.io/hyper-db/docs/releases>. This crate automates
 the "download the right zip for your platform, extract `hyperd` out of
 `lib/hyper/`, put it somewhere useful" step so contributors and CI can
 bootstrap with a single command.
+
+> **Why the Java bundle, not C++?** Tableau publishes `hyperd` inside both
+> the C++ and Java API zips. The C++ `macos-arm64` zip currently ships an
+> **x86_64** `hyperd` (an upstream packaging defect), so on Apple Silicon it
+> would only run under Rosetta. The Java `macos-arm64` zip carries a native
+> arm64 `hyperd`. The two bundles are otherwise identical for our purposes
+> (same URL template, same `lib/hyper/hyperd` layout), so this crate pulls
+> from the Java bundle on every platform for consistency.
 
 ## Install
 

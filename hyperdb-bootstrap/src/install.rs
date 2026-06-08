@@ -154,7 +154,7 @@ fn download_and_extract(
 
     let url = build_download_url(release, platform);
     let tmp = tempfile::tempdir().map_err(|source| Error::io("creating temp dir", source))?;
-    let zip_path = tmp.path().join("hyperapi-cxx.zip");
+    let zip_path = tmp.path().join("hyperapi-java.zip");
     download_and_verify(&url, release.sha256_for(platform), &zip_path)?;
     extract_hyperd(&zip_path, versioned_dir)?;
     Ok(())

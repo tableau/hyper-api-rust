@@ -1,8 +1,10 @@
 // Copyright (c) 2026, Salesforce, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Download and install the `hyperd` executable from Tableau's Hyper C++
-//! API release packages.
+//! Download and install the `hyperd` executable from Tableau's Hyper Java
+//! API release packages. (The Java bundle is used rather than the C++ one
+//! because the C++ `macos-arm64` zip ships an x86_64 `hyperd`; see the
+//! `url` module for the full rationale.)
 //!
 //! The crate ships both a CLI binary (`hyperd-bootstrap`) and a small
 //! library. The library is blocking (no async runtime required) and has
