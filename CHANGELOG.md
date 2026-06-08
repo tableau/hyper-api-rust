@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.1](https://github.com/tableau/hyper-api-rust/compare/v0.5.0...v0.5.1) (2026-06-08)
+
+
+### Bug Fixes
+
+* **client:** enable TCP keepalive on hyperd connections ([8de3b0e](https://github.com/tableau/hyper-api-rust/commit/8de3b0e8c2ec23eeae15477cf6731877dc3d074f))
+* **daemon:** stop redundant off-base daemon after concurrent cold-start ([655560e](https://github.com/tableau/hyper-api-rust/commit/655560e2e561c41a6ec98a08d4c99da55ed5a717))
+
 ## [0.5.0](https://github.com/tableau/hyper-api-rust/compare/v0.4.0...v0.5.0) (2026-06-07)
 
 
