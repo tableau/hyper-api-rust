@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.5.3](https://github.com/tableau/hyper-api-rust/compare/v0.5.2...v0.5.3) (2026-06-09)
+
+
+### Bug Fixes
+
+* **mcp:** avoid deadlock in heartbeat by passing health port directly ([26fd046](https://github.com/tableau/hyper-api-rust/commit/26fd046fb1c6df246f5059d2242839db1d2ed951))
+* **mcp:** default chart inline to true for immediate display ([8792ef3](https://github.com/tableau/hyper-api-rust/commit/8792ef37d6c0114be7c10e0a322b0614c6a64bb7))
+* **mcp:** heartbeat deadlock, chart inline default, lock-free status fast path ([#118](https://github.com/tableau/hyper-api-rust/issues/118)) ([#126](https://github.com/tableau/hyper-api-rust/issues/126)) ([8115109](https://github.com/tableau/hyper-api-rust/commit/81151096391bd07c51c257e91b8486b8f9679ae5))
+* **mcp:** lock-free status fast path so diagnostics never hang ([#118](https://github.com/tableau/hyper-api-rust/issues/118)) ([0f8fa5a](https://github.com/tableau/hyper-api-rust/commit/0f8fa5a4e2f56deb2ed808a20777d541c5d07b9e))
+* remove redundant Duration import in connect_named_pipe ([02feadc](https://github.com/tableau/hyper-api-rust/commit/02feadc71536259cee2d26a4818bc28d8b374d91))
+
 ## [0.5.2](https://github.com/tableau/hyper-api-rust/compare/v0.5.1...v0.5.2) (2026-06-08)
 
 
