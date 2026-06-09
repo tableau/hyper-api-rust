@@ -490,8 +490,8 @@ pub struct ChartParams {
     /// When true, include the PNG/SVG bytes inline in the tool result.
     /// Without `output_path` this also skips the disk write entirely
     /// (pure inline). With `output_path` the file is written *and* the
-    /// image is returned inline. Defaults to false — i.e. disk write
-    /// only, with a short stats blob that carries the path.
+    /// image is returned inline. Defaults to true so MCP clients can
+    /// display the chart without a separate file-read round-trip.
     pub inline: Option<bool>,
     /// When false, refuse to overwrite an existing file at `output_path`
     /// and return `PERMISSION_DENIED` without touching it. Defaults to
@@ -1238,8 +1238,10 @@ impl HyperMcpServer {
         self.ensure_catalog_ready(engine);
         // In daemon mode, send a heartbeat so the daemon knows we're still active.
         // Debounced to avoid per-call TCP overhead (only sends if >60s since last).
+        // Pass the health port from the engine we already hold — calling
+        // self.engine.lock() here would deadlock (we already hold that mutex).
         if !self.no_daemon {
-            self.maybe_send_heartbeat();
+            self.maybe_send_heartbeat(engine.daemon_health_port());
         }
         let result = f(engine);
         if let Err(e) = &result {
@@ -1274,31 +1276,90 @@ impl HyperMcpServer {
     /// Best-effort heartbeat to keep the daemon alive while this client is active.
     /// Debounced: only sends if more than 60 seconds have elapsed since the last heartbeat,
     /// avoiding a new TCP connection on every tool call.
-    fn maybe_send_heartbeat(&self) {
+    ///
+    /// Accepts the daemon health port directly (from the caller's already-held
+    /// engine reference) to avoid re-locking `self.engine` — which would deadlock
+    /// since `with_engine` holds that mutex when calling us.
+    fn maybe_send_heartbeat(&self, daemon_health_port: Option<u16>) {
         const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
         let should_send = self
             .last_heartbeat
             .lock()
             .is_ok_and(|guard| guard.elapsed() >= HEARTBEAT_INTERVAL);
         if should_send {
-            // Use the daemon's discovered health port (recorded on the engine at
-            // connect time), NOT `resolve_port()`: with port scanning the daemon
-            // may have bound a non-base port (e.g. 7492 when 7485 was taken), and
-            // re-resolving would return the base port — the heartbeat would then
-            // target the wrong address and silently fail to keep the daemon warm.
-            // Skip if local mode (no daemon) or if the engine lock is poisoned.
-            let port = self
-                .engine
-                .lock()
-                .ok()
-                .and_then(|guard| guard.as_ref().and_then(Engine::daemon_health_port));
-            if let Some(port) = port {
+            if let Some(port) = daemon_health_port {
                 let _ = crate::daemon::health::send_command(port, "HEARTBEAT");
                 if let Ok(mut guard) = self.last_heartbeat.lock() {
                     *guard = std::time::Instant::now();
                 }
             }
         }
+    }
+
+    /// Build a degraded `status` response that answers instantly without the
+    /// engine lock. Used when `try_lock` fails because another tool call holds
+    /// the mutex — so diagnostics never hang behind a stalled data-plane op.
+    ///
+    /// Includes everything answerable from `self` fields + a fast daemon-health
+    /// check (read `daemon.json` + one PING to the known health port, max
+    /// ~300ms). Omits `table_count`, `total_rows`, `disk_usage_bytes`,
+    /// `ephemeral_path`, and `logs` (which require the engine / SQL against
+    /// hyperd).
+    ///
+    /// Clients should check `engine_busy: true` and retry `status` later if
+    /// they need the full stats, or wait for the in-progress operation to finish.
+    fn status_degraded(&self) -> Value {
+        // Use discover() — NOT find_running_daemon(). discover() reads the
+        // daemon.json file + one PING to the known health port (~1ms if alive,
+        // 300ms timeout if dead). find_running_daemon() adds a 16-port scan on
+        // failure (up to 4.8s), which would defeat the "instant response" goal.
+        let (hyperd_running, engine_block) = if let Some(info) =
+            crate::daemon::discovery::discover()
+        {
+            (
+                true,
+                json!({
+                    "mode": "daemon",
+                    "hyperd_endpoint": info.hyperd_endpoint,
+                    "daemon_health_port": info.health_port,
+                }),
+            )
+        } else if self.no_daemon {
+            // Local mode; can't determine hyperd state without the engine.
+            (
+                false,
+                json!({ "mode": "local", "hyperd_endpoint": null, "daemon_health_port": null }),
+            )
+        } else {
+            (
+                false,
+                json!({ "mode": "daemon", "hyperd_endpoint": null, "daemon_health_port": null }),
+            )
+        };
+
+        let persistent_path = self
+            .workspace_path
+            .as_ref()
+            .map_or(Value::Null, |p| Value::String(p.clone()));
+
+        let attachments: Vec<Value> = self
+            .attachments
+            .list()
+            .iter()
+            .map(super::attach::AttachedDb::to_json)
+            .collect();
+
+        json!({
+            "engine_busy": true,
+            "hyperd_running": hyperd_running,
+            "persistent_path": persistent_path,
+            "has_persistent": self.workspace_path.is_some(),
+            "engine": engine_block,
+            "hyper_rust_api_version": crate::version::mcp_version_string(),
+            "watchers": self.watchers.to_json(),
+            "read_only": self.read_only,
+            "attachments": attachments,
+        })
     }
 
     /// Run a closure that accesses the saved-query store.
@@ -2393,7 +2454,7 @@ impl HyperMcpServer {
 
     /// Render a chart (PNG or SVG) from a SQL query.
     #[tool(
-        description = "Render a chart (bar, line, scatter, or histogram) from a SQL query. Writes the image to disk by default and returns a short stats blob with the path — use `Read(path)` to display it (this keeps the MCP transcript small). Set `inline=true` to also receive the PNG/SVG bytes inline in the tool result; combine with `output_path` to get both.\n\n**Data shape:** The query must return long-format data with one numeric `y` column. For multi-series charts, use a `series` column to split by category. If your data is wide-format (multiple value columns), reshape it with `UNION ALL` into (label, series, value) tuples before charting.\n\n**DATE/TIMESTAMP x-axis:** Line and scatter charts auto-detect non-numeric x columns. DATE, TIMESTAMP, and TIMESTAMPTZ values render with a **proportional time axis** — gaps between data points reflect real wall-clock time (4.5 h gap and 17 h gap don't look the same). Tick labels are formatted in the input kind: `%Y-%m-%d` for DATE, `%Y-%m-%d %H:%M:%S` for TIMESTAMP, with the originating timezone offset preserved for TIMESTAMPTZ. TEXT x columns fall back to evenly-spaced categorical mode. Set `x_as_category: true` to force categorical layout on temporal data (useful when even spacing reads better than proportional gaps).\n\n- `output_path`: explicit destination file path. Parent directory is created automatically (no need to pre-create it). If omitted, a file is auto-generated under the system temp dir as `hyperdb-charts/chart-<ts>-<pid>-<n>.<ext>`.\n- `inline`: when true, return the image bytes inline. Without `output_path`, suppresses the disk write entirely. With `output_path`, writes to disk AND returns inline. Defaults to false.\n- `format`: \"png\" (default) or \"svg\". Auto-derived from `output_path` extension when omitted. A mismatch between `format` and the path extension returns `INVALID_ARGUMENT`.\n- `overwrite`: default true. Set false to refuse overwriting an existing file (returns `PERMISSION_DENIED`).\n- `x_range` / `y_range`: fix axis extents across multiple charts (e.g. x_range=[0,1500], y_range=[0,1]).\n- `color_map`: stable per-series hex colors (e.g. {\"India\":\"#e41a1c\",\"China\":\"#ff7f0e\"}).\n- `label_points=true`: annotate each point with its series name instead of showing a legend — best when each series has exactly one point."
+        description = "Render a chart (bar, line, scatter, or histogram) from a SQL query. Returns the PNG/SVG image inline by default so MCP clients can display it directly. Set `inline=false` to skip the inline bytes and write to disk only (keeps the MCP transcript small for batch workflows). Combine `inline=true` with `output_path` to get both.\n\n**Data shape:** The query must return long-format data with one numeric `y` column. For multi-series charts, use a `series` column to split by category. If your data is wide-format (multiple value columns), reshape it with `UNION ALL` into (label, series, value) tuples before charting.\n\n**DATE/TIMESTAMP x-axis:** Line and scatter charts auto-detect non-numeric x columns. DATE, TIMESTAMP, and TIMESTAMPTZ values render with a **proportional time axis** — gaps between data points reflect real wall-clock time (4.5 h gap and 17 h gap don't look the same). Tick labels are formatted in the input kind: `%Y-%m-%d` for DATE, `%Y-%m-%d %H:%M:%S` for TIMESTAMP, with the originating timezone offset preserved for TIMESTAMPTZ. TEXT x columns fall back to evenly-spaced categorical mode. Set `x_as_category: true` to force categorical layout on temporal data (useful when even spacing reads better than proportional gaps).\n\n- `output_path`: explicit destination file path. Parent directory is created automatically (no need to pre-create it). If omitted and `inline=true` (default), no file is written. If omitted and `inline=false`, a file is auto-generated under the system temp dir as `hyperdb-charts/chart-<ts>-<pid>-<n>.<ext>`.\n- `inline`: when true (default), return the image bytes inline. Without `output_path`, suppresses the disk write entirely. With `output_path`, writes to disk AND returns inline. Set to false for disk-only output.\n- `format`: \"png\" (default) or \"svg\". Auto-derived from `output_path` extension when omitted. A mismatch between `format` and the path extension returns `INVALID_ARGUMENT`.\n- `overwrite`: default true. Set false to refuse overwriting an existing file (returns `PERMISSION_DENIED`).\n- `x_range` / `y_range`: fix axis extents across multiple charts (e.g. x_range=[0,1500], y_range=[0,1]).\n- `color_map`: stable per-series hex colors (e.g. {\"India\":\"#e41a1c\",\"China\":\"#ff7f0e\"}).\n- `label_points=true`: annotate each point with its series name instead of showing a legend — best when each series has exactly one point."
     )]
     fn chart(
         &self,
@@ -2468,7 +2529,7 @@ impl HyperMcpServer {
             // building the content vec so an I/O failure surfaces as a
             // tool error instead of a half-delivered response.
             let disposition = crate::chart::resolve_chart_disposition(
-                params.inline.unwrap_or(false),
+                params.inline.unwrap_or(true),
                 params.output_path.as_deref(),
                 opts.format,
             );
@@ -2886,11 +2947,30 @@ impl HyperMcpServer {
         description = "Returns plugin health, workspace info, table count, total rows, disk usage, the backing hyperd connection (engine.mode, engine.hyperd_endpoint, engine.daemon_health_port), and active directory watchers."
     )]
     fn status(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        let result = self.with_engine(super::engine::Engine::status);
+        // Use try_lock so `status` never hangs behind a stalled/slow data-plane
+        // operation on the same session (issue #118). If the engine lock is held
+        // by another tool call, return a degraded-but-instant response with the
+        // metadata available without the engine (daemon health, paths, watchers).
+        let Ok(guard) = self.engine.try_lock() else {
+            // Engine is locked by another tool call — return a degraded
+            // response rather than blocking. The caller sees `engine_busy:
+            // true` and knows table/disk stats are unavailable this call.
+            return Self::ok_content(self.status_degraded());
+        };
+        let Some(engine) = guard.as_ref() else {
+            // Engine not yet initialized (first call after server start, or
+            // after a ConnectionLost drop). Return the degraded response rather
+            // than an error — the first data-plane call will init the engine,
+            // and subsequent `status` calls will get the full response.
+            return Self::ok_content(self.status_degraded());
+        };
+        self.ensure_catalog_ready(engine);
+        let result = engine.status();
 
         match result {
             Ok(mut val) => {
                 if let Some(obj) = val.as_object_mut() {
+                    obj.insert("engine_busy".into(), json!(false));
                     obj.insert("watchers".into(), self.watchers.to_json());
                     obj.insert("read_only".into(), json!(self.read_only));
                     let attachments: Vec<Value> = self
