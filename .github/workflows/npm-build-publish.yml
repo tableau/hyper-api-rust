@@ -93,7 +93,7 @@ jobs:
             os: macos-14
             target: aarch64-apple-darwin
             hyperd-slug: macos-arm64
-            hyperd-sha256: "6cec0a90c7e8ddae2b0a623d551cdab4f085b0c6e4655713d6ce164ec20dabc7"
+            hyperd-sha256: "2b0fa3fefcf4eba60f052e1cb51abfc32d8c84354274513763760f9549b45991"
           # TODO: re-enable when macos-13 runners are more available
           # - platform: darwin-x64
           #   os: macos-13
@@ -104,12 +104,12 @@ jobs:
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             hyperd-slug: linux-x86_64
-            hyperd-sha256: "50f015ea2991afb9440fc93df0520c1b3a077dab609b010cbe1ce17685f44e20"
+            hyperd-sha256: "3d3fd2104f55f7fad832470592394dc78f350a03d52e89d36c5288b202dd0bc0"
           - platform: win32-x64-msvc
             os: windows-latest
             target: x86_64-pc-windows-msvc
             hyperd-slug: windows-x86_64
-            hyperd-sha256: "918709daae78effa67bac804f8f6f45deea11056272577b73591590e11019f17"
+            hyperd-sha256: "9dc4851d416e0e6e00f0367ee6b45fcd676e7ba3a110d4644e3bec871b9aa1de"
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -154,7 +154,7 @@ jobs:
           EXPECTED_SHA256: ${{ matrix.hyperd-sha256 }}
         run: |
           set -euo pipefail
-          URL="https://downloads.tableau.com/tssoftware/tableauhyperapi-cxx-${SLUG}-release-main.${HYPERD_VERSION}.${HYPERD_BUILD_ID}.zip"
+          URL="https://downloads.tableau.com/tssoftware/tableauhyperapi-java-${SLUG}-release-main.${HYPERD_VERSION}.${HYPERD_BUILD_ID}.zip"
           echo "Downloading: $URL"
           curl --fail --silent --show-error --location --output hyperd-archive.zip "$URL"
           if command -v sha256sum &>/dev/null; then
