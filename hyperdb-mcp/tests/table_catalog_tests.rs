@@ -548,3 +548,51 @@ fn rename_table_preserves_catalog_metadata() {
         "last_refreshed_at should be anchored to the original load time, not bumped on rename"
     );
 }
+
+#[test]
+fn set_metadata_data_url_roundtrip() {
+    let (engine, _dir) = workspace_engine();
+    engine
+        .execute_command("CREATE TABLE \"persistent\".\"public\".widgets (id INT)")
+        .unwrap();
+    table_catalog::upsert_stub(&engine, "widgets", "load_file", None, Some(10), true).unwrap();
+
+    let entry = table_catalog::set_metadata(
+        &engine,
+        "widgets",
+        &MetadataFields {
+            data_url: Some("https://example.com/widgets.csv?v=2".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        entry.data_url.as_deref(),
+        Some("https://example.com/widgets.csv?v=2"),
+        "data_url should round-trip through set_metadata"
+    );
+
+    // Read it back fresh to confirm persistence.
+    let fresh = table_catalog::get(&engine, "widgets").unwrap().unwrap();
+    assert_eq!(
+        fresh.data_url.as_deref(),
+        Some("https://example.com/widgets.csv?v=2")
+    );
+
+    // Clear it with an empty string.
+    table_catalog::set_metadata(
+        &engine,
+        "widgets",
+        &MetadataFields {
+            data_url: Some(String::new()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let cleared = table_catalog::get(&engine, "widgets").unwrap().unwrap();
+    assert!(
+        cleared.data_url.is_none(),
+        "empty string should clear data_url"
+    );
+}

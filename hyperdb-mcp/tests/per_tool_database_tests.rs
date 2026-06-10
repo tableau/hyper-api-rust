@@ -784,8 +784,7 @@ fn set_metadata_in_routes_to_user_attached_db() {
         source_url: Some("s3://bucket/events.parquet".into()),
         source_description: Some("Tracking events".into()),
         purpose: Some("daily reports".into()),
-        license: None,
-        notes: None,
+        ..Default::default()
     };
     let entry =
         hyperdb_mcp::table_catalog::set_metadata_in(&engine, "events", &fields, Some("user_db"))
