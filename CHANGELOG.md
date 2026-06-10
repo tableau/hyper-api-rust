@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.5.4](https://github.com/tableau/hyper-api-rust/compare/v0.5.3...v0.5.4) (2026-06-10)
+
+
+### Bug Fixes
+
+* **api:** IntoValue + Inserter::add_geography for Geography ([#65](https://github.com/tableau/hyper-api-rust/issues/65)) ([c26242e](https://github.com/tableau/hyper-api-rust/commit/c26242e448055816ef5e01ef5e5a7509e06f2a77))
+* **api:** ToSqlParam for Numeric (scale=0), Interval, and JSON ([#65](https://github.com/tableau/hyper-api-rust/issues/65)) ([2e4a4d7](https://github.com/tableau/hyper-api-rust/commit/2e4a4d7ddf3d037a9e8068a1c97ecc7206aea3ed))
+* catalog rename metadata, data_url field, and ToSqlParam/IntoValue type coverage ([#134](https://github.com/tableau/hyper-api-rust/issues/134)) ([00fd333](https://github.com/tableau/hyper-api-rust/commit/00fd333ccc62c060707ed8d5105cdf9b7277a330))
+* **mcp:** add data_url field to _table_catalog for mechanical refresh ([#60](https://github.com/tableau/hyper-api-rust/issues/60)) ([50cdb25](https://github.com/tableau/hyper-api-rust/commit/50cdb25be7c4a57fe20490eeb1c83c21295d7146))
+* **mcp:** preserve catalog metadata on ALTER TABLE RENAME ([#59](https://github.com/tableau/hyper-api-rust/issues/59)) ([e979bba](https://github.com/tableau/hyper-api-rust/commit/e979bba606737c8ce46d97fa495278cd6a51ed9e))
+
 ## [0.5.3](https://github.com/tableau/hyper-api-rust/compare/v0.5.2...v0.5.3) (2026-06-09)
 
 
