@@ -25,7 +25,9 @@ use std::time::Instant;
 use hyperdb_api_core::client::client::CopyInWriter;
 use hyperdb_api_core::protocol::copy;
 use hyperdb_api_core::types::bytes::BytesMut;
-use hyperdb_api_core::types::{Date, Interval, Numeric, OffsetTimestamp, Time, Timestamp};
+use hyperdb_api_core::types::{
+    Date, Geography, Interval, Numeric, OffsetTimestamp, Time, Timestamp,
+};
 use tracing::{debug, info};
 
 use crate::catalog::Catalog;
@@ -609,6 +611,16 @@ impl<'conn> Inserter<'conn> {
         self.chunk.add_interval(value)
     }
 
+    /// Adds a Geography value.
+    ///
+    /// # Errors
+    ///
+    /// See [`add_bool`](Self::add_bool).
+    #[inline]
+    pub fn add_geography(&mut self, value: &Geography) -> Result<()> {
+        self.chunk.add_geography(value)
+    }
+
     /// Adds a Numeric value.
     ///
     /// For NUMERIC(precision, scale) where precision ≤ [`Numeric::SMALL_NUMERIC_MAX_PRECISION`]
@@ -867,7 +879,7 @@ impl ColumnMapping {
 /// - `&str`, `String`
 /// - `Option<T>` where `T: IntoValue` (for nullable columns)
 /// - Date/time types: `Date`, `Time`, `Timestamp`, `Interval`
-/// - `Numeric`, `Geography`, `Oid`, `Vec<u8>` (bytes)
+/// - `Numeric`, `Geography`, `Vec<u8>` (bytes)
 ///
 /// # Example
 ///
@@ -1004,6 +1016,12 @@ impl IntoValue for Numeric {
     }
 }
 
+impl IntoValue for Geography {
+    fn add_to_inserter(&self, inserter: &mut Inserter<'_>) -> Result<()> {
+        inserter.add_geography(self)
+    }
+}
+
 // Option<T> for nullable values
 impl<T: IntoValue> IntoValue for Option<T> {
     fn add_to_inserter(&self, inserter: &mut Inserter<'_>) -> Result<()> {
@@ -1109,6 +1127,12 @@ impl IntoValue for &Interval {
 impl IntoValue for &Numeric {
     fn add_to_inserter(&self, inserter: &mut Inserter<'_>) -> Result<()> {
         inserter.add_numeric(**self)
+    }
+}
+
+impl IntoValue for &Geography {
+    fn add_to_inserter(&self, inserter: &mut Inserter<'_>) -> Result<()> {
+        inserter.add_geography(self)
     }
 }
 
@@ -1795,6 +1819,16 @@ impl InsertChunk {
         }
         self.column_index += 1;
         Ok(())
+    }
+
+    /// Adds a Geography value.
+    ///
+    /// # Errors
+    ///
+    /// See [`add_bool`](Self::add_bool).
+    pub fn add_geography(&mut self, value: &Geography) -> Result<()> {
+        // Geography uses the same varbinary path as add_bytes
+        self.add_bytes(value.as_bytes())
     }
 
     /// Ends the current row.

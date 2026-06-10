@@ -18,6 +18,7 @@
 //! | `purpose`          | User / LLM |
 //! | `license`          | User / LLM |
 //! | `notes`            | User / LLM |
+//! | `data_url`         | User / LLM via `set_table_metadata` |
 //!
 //! The backing table is `_table_catalog`. Each writable database that
 //! receives an ingest gets its own catalog, lazily seeded on first
@@ -137,6 +138,7 @@ pub struct CatalogEntry {
     pub notes: Option<String>,
     pub created_by: Option<String>,
     pub last_modified_by: Option<String>,
+    pub data_url: Option<String>,
 }
 
 impl CatalogEntry {
@@ -159,6 +161,7 @@ impl CatalogEntry {
             "notes": self.notes,
             "created_by": self.created_by,
             "last_modified_by": self.last_modified_by,
+            "data_url": self.data_url,
         })
     }
 }
@@ -172,6 +175,7 @@ pub struct MetadataFields {
     pub purpose: Option<String>,
     pub license: Option<String>,
     pub notes: Option<String>,
+    pub data_url: Option<String>,
 }
 
 impl MetadataFields {
@@ -185,6 +189,7 @@ impl MetadataFields {
             && self.purpose.is_none()
             && self.license.is_none()
             && self.notes.is_none()
+            && self.data_url.is_none()
     }
 }
 
@@ -206,7 +211,8 @@ const CATALOG_COLUMNS: &str = "(\
      row_count          BIGINT, \
      notes              TEXT, \
      created_by         TEXT, \
-     last_modified_by   TEXT\
+     last_modified_by   TEXT, \
+     data_url           TEXT\
  )";
 
 /// Idempotently create the backing table in `target_db`. Safe to call
@@ -236,7 +242,7 @@ pub fn ensure_exists_in(engine: &Engine, target_db: Option<&str>) -> Result<(), 
     // Migrate pre-existing catalogs: add columns introduced after the
     // initial schema. Each ALTER is idempotent — if the column already
     // exists Hyper returns an error that we swallow.
-    for col in ["created_by TEXT", "last_modified_by TEXT"] {
+    for col in ["created_by TEXT", "last_modified_by TEXT", "data_url TEXT"] {
         let alter = format!("ALTER TABLE {qualified} ADD COLUMN {col}");
         let _ = engine.execute_command(&alter);
     }
@@ -296,7 +302,7 @@ pub fn list_in(engine: &Engine, target_db: Option<&str>) -> Result<Vec<CatalogEn
     let sql = format!(
         "SELECT table_name, source_url, source_description, purpose, \
                 load_tool, load_params, license, loaded_at, last_refreshed_at, \
-                row_count, notes, created_by, last_modified_by \
+                row_count, notes, created_by, last_modified_by, data_url \
          FROM {qualified} ORDER BY table_name"
     );
     let rows = engine.execute_query_to_json(&sql)?;
@@ -332,7 +338,7 @@ pub fn get_in(
     let sql = format!(
         "SELECT table_name, source_url, source_description, purpose, \
                 load_tool, load_params, license, loaded_at, last_refreshed_at, \
-                row_count, notes, created_by, last_modified_by \
+                row_count, notes, created_by, last_modified_by, data_url \
          FROM {qualified} WHERE table_name = {}",
         sql_literal(table_name)
     );
@@ -444,10 +450,10 @@ pub fn upsert_stub_in(
             "INSERT INTO {qualified} \
              (table_name, source_url, source_description, purpose, load_tool, \
               load_params, license, loaded_at, last_refreshed_at, row_count, notes, \
-              created_by, last_modified_by) \
+              created_by, last_modified_by, data_url) \
              SELECT {name}, NULL, NULL, NULL, {load_tool}, \
                     {load_params}, NULL, TIMESTAMP {loaded_at}, TIMESTAMP {last_refreshed_at}, \
-                    {row_count}, NULL, {created_by}, {modified_by} \
+                    {row_count}, NULL, {created_by}, {modified_by}, NULL \
              WHERE NOT EXISTS (SELECT 1 FROM {qualified} WHERE table_name = {name})",
             name = sql_literal(table_name),
             load_tool = sql_literal(load_tool),
@@ -519,7 +525,7 @@ pub fn set_metadata_in(
         return Err(McpError::new(
             ErrorCode::EmptyData,
             "set_table_metadata requires at least one of source_url, \
-             source_description, purpose, license, notes",
+             source_description, purpose, license, notes, data_url",
         ));
     }
 
@@ -566,6 +572,9 @@ pub fn set_metadata_in(
     }
     if let Some(v) = &fields.notes {
         assignments.push(format!("notes = {}", sql_literal_or_null_if_empty(v)));
+    }
+    if let Some(v) = &fields.data_url {
+        assignments.push(format!("data_url = {}", sql_literal_or_null_if_empty(v)));
     }
 
     let qualified = qualified_catalog_in(engine, target_db).ok_or_else(|| {
@@ -668,22 +677,119 @@ pub fn reconcile_in(engine: &Engine, target_db: Option<&str>) -> Result<(), McpE
         .collect();
     let live_tables: std::collections::HashSet<String> = tables.iter().cloned().collect();
 
-    for entry in &catalog_entries {
-        if !live_tables.contains(&entry.table_name) {
+    // Detect renames: a catalog entry whose table disappeared + a live table
+    // with no catalog entry + matching row count ⇒ likely a RENAME rather
+    // than a DROP+CREATE. Rename the catalog row in place so all prose
+    // metadata (source_url, purpose, notes, etc.) is preserved.
+    let disappeared: Vec<&CatalogEntry> = catalog_entries
+        .iter()
+        .filter(|e| !live_tables.contains(&e.table_name))
+        .collect();
+    let new_tables: Vec<&String> = tables
+        .iter()
+        .filter(|t| !catalog_names.contains(*t))
+        .collect();
+
+    // Build a set of renamed pairs by matching on row count. A match is only
+    // accepted when exactly one disappeared entry shares a row count with
+    // exactly one new table — ambiguous multi-matches fall through to the
+    // normal delete+stub path (safe: we lose metadata rather than mis-assign).
+    let mut renamed_old: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut renamed_new: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    if !disappeared.is_empty() && !new_tables.is_empty() {
+        // Collect row counts for new tables (cheap: one COUNT per table).
+        let new_with_counts: Vec<(&String, Option<i64>)> = new_tables
+            .iter()
+            .map(|t| (*t, row_count_of_in(engine, t, target_db).ok()))
+            .collect();
+
+        // For a match to be accepted, BOTH sides must be unambiguous:
+        // - exactly one disappeared entry has this row count, AND
+        // - exactly one new table has this row count.
+        // This prevents false-positive metadata assignment when multiple
+        // tables share the same row count (e.g. two empty tables).
+        // Additionally, require the row count to be `Some` — `None == None`
+        // would match entries that were never counted with tables whose
+        // count query failed, producing a meaningless coincidence.
+        for entry in &disappeared {
+            let Some(entry_rc) = entry.row_count else {
+                continue;
+            };
+            // How many disappeared entries share this row count?
+            let disappeared_with_same_rc = disappeared
+                .iter()
+                .filter(|e| e.row_count == Some(entry_rc))
+                .count();
+            if disappeared_with_same_rc != 1 {
+                continue;
+            }
+            // How many new tables share this row count?
+            let candidates: Vec<&&String> = new_with_counts
+                .iter()
+                .filter(|(t, rc)| *rc == Some(entry_rc) && !renamed_new.contains(t.as_str()))
+                .map(|(t, _)| t)
+                .collect();
+            if candidates.len() == 1 {
+                let new_name = candidates[0];
+                if rename_catalog_entry(engine, &entry.table_name, new_name, target_db).is_ok() {
+                    renamed_old.insert(entry.table_name.clone());
+                    renamed_new.insert((*new_name).clone());
+                }
+            }
+        }
+    }
+
+    // Delete remaining disappeared entries (those NOT matched as renames).
+    for entry in &disappeared {
+        if !renamed_old.contains(&entry.table_name) {
             delete_for_in(engine, &entry.table_name, target_db)?;
         }
     }
 
-    for table in &tables {
-        let row_count = row_count_of_in(engine, table, target_db).ok();
-        if catalog_names.contains(table) {
-            refresh_row_count_in(engine, table, row_count, target_db)?;
-        } else {
+    // Stub remaining new tables (those NOT matched as rename targets).
+    for table in &new_tables {
+        if !renamed_new.contains(table.as_str()) {
+            let row_count = row_count_of_in(engine, table, target_db).ok();
             upsert_stub_in(
                 engine, table, "unknown", None, row_count, false, target_db, None,
             )?;
         }
     }
+
+    // Refresh row counts for tables that already had catalog entries.
+    for table in &tables {
+        if catalog_names.contains(table) {
+            let row_count = row_count_of_in(engine, table, target_db).ok();
+            refresh_row_count_in(engine, table, row_count, target_db)?;
+        }
+    }
+    Ok(())
+}
+
+/// Rename a catalog entry's `table_name` in place, preserving all metadata.
+fn rename_catalog_entry(
+    engine: &Engine,
+    old_name: &str,
+    new_name: &str,
+    target_db: Option<&str>,
+) -> Result<(), McpError> {
+    let Some(qualified) = qualified_catalog_in(engine, target_db) else {
+        return Ok(());
+    };
+    // Only update table_name — a rename is not a data refresh, so loaded_at
+    // and last_refreshed_at must stay anchored to the original load time.
+    let sql = format!(
+        "UPDATE {qualified} SET table_name = {new} WHERE table_name = {old}",
+        new = sql_literal(new_name),
+        old = sql_literal(old_name),
+    );
+    engine.execute_command(&sql)?;
+    tracing::debug!(
+        old_name,
+        new_name,
+        "catalog entry renamed (metadata preserved)"
+    );
     Ok(())
 }
 
@@ -873,6 +979,7 @@ fn row_to_entry(row: &Value) -> Result<CatalogEntry, McpError> {
         last_refreshed_at,
         row_count,
         notes: str_field("notes"),
+        data_url: str_field("data_url"),
         created_by: str_field("created_by"),
         last_modified_by: str_field("last_modified_by"),
     })

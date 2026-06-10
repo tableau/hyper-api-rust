@@ -3,7 +3,7 @@
 
 //! Tests for the Inserter API.
 
-use hyperdb_api::{Catalog, Date, Inserter, SqlType, TableDefinition};
+use hyperdb_api::{Catalog, Date, Geography, Inserter, SqlType, TableDefinition};
 
 mod common;
 use common::TestConnection;
@@ -276,4 +276,101 @@ fn test_inserter_from_table() {
     // Verify
     let count = test.count_tuples("products").expect("Failed to count");
     assert_eq!(count, 2);
+}
+
+#[test]
+fn test_inserter_geography_round_trip() {
+    let test = TestConnection::new().expect("Failed to create test connection");
+
+    let table_def = TableDefinition::new("geo_test")
+        .add_required_column("id", SqlType::int())
+        .add_nullable_column("location", SqlType::geography());
+
+    Catalog::new(&test.connection)
+        .create_table(&table_def)
+        .expect("Failed to create table");
+
+    let mut inserter =
+        Inserter::new(&test.connection, &table_def).expect("Failed to create inserter");
+
+    // Create a Geography from WKT (San Francisco coordinates)
+    let geo = Geography::from_wkt("POINT(-122.4194 37.7749)")
+        .expect("Failed to create geography from WKT");
+    let original_bytes = geo.as_bytes().to_vec();
+
+    // Insert using IntoValue trait
+    inserter.add_row(&[&1i32, &geo]).expect("Failed to add row");
+
+    inserter.execute().expect("Failed to execute inserter");
+
+    // Read back and verify byte-identical
+    let mut result = test
+        .connection
+        .execute_query("SELECT id, location FROM geo_test")
+        .expect("Failed to query");
+
+    let chunk = result
+        .next_chunk()
+        .expect("Failed to get chunk")
+        .expect("Expected chunk");
+    let row = chunk.first().expect("Expected row");
+
+    let id = row.get_i32(0).expect("NULL id");
+    assert_eq!(id, 1);
+
+    // Geography does NOT implement RowValue yet, so read as Vec<u8>
+    let geo_bytes = row.get::<Vec<u8>>(1).expect("NULL geography");
+    assert_eq!(
+        geo_bytes, original_bytes,
+        "Geography bytes should be byte-identical after round-trip"
+    );
+}
+
+#[test]
+fn test_inserter_geography_nullable() {
+    let test = TestConnection::new().expect("Failed to create test connection");
+
+    let table_def = TableDefinition::new("geo_nullable_test")
+        .add_required_column("id", SqlType::int())
+        .add_nullable_column("location", SqlType::geography());
+
+    Catalog::new(&test.connection)
+        .create_table(&table_def)
+        .expect("Failed to create table");
+
+    let mut inserter =
+        Inserter::new(&test.connection, &table_def).expect("Failed to create inserter");
+
+    // Insert a row with a Geography value
+    let geo1 = Geography::from_wkt("POINT(-122.4194 37.7749)")
+        .expect("Failed to create geography from WKT");
+    inserter
+        .add_row(&[&1i32, &Some(geo1)])
+        .expect("Failed to add row with geography");
+
+    // Insert a row with NULL
+    inserter
+        .add_row(&[&2i32, &None::<Geography>])
+        .expect("Failed to add row with NULL");
+
+    inserter.execute().expect("Failed to execute inserter");
+
+    // Verify rows
+    let mut result = test
+        .connection
+        .execute_query("SELECT id, location FROM geo_nullable_test ORDER BY id")
+        .expect("Failed to query table");
+
+    let mut rows: Vec<(i32, Option<Vec<u8>>)> = Vec::new();
+    while let Some(chunk) = result.next_chunk().expect("Failed to get chunk") {
+        for row in &chunk {
+            let id = row.get_i32(0).expect("NULL id");
+            let location = row.get::<Vec<u8>>(1);
+            rows.push((id, location));
+        }
+    }
+
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].1.is_some(), "First row should have a geography");
+    assert!(rows[1].1.is_none(), "Second row should have NULL");
 }

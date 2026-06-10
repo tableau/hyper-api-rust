@@ -434,3 +434,165 @@ fn backfill_stubs_preexisting_tables_on_reopen() {
         "backfilled rows are tagged as unknown origin"
     );
 }
+
+#[test]
+fn rename_table_preserves_catalog_metadata() {
+    let tmp = TempDir::new().unwrap();
+    let path_str = tmp
+        .path()
+        .join("workspace.hyper")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let engine = Engine::new_no_daemon(Some(path_str.clone())).unwrap();
+
+    // Create a table and load data so it has a non-zero row count.
+    engine
+        .execute_command(
+            "CREATE TABLE \"persistent\".\"public\".population (id INT, name TEXT NOT NULL)",
+        )
+        .unwrap();
+    engine
+        .execute_command(
+            "INSERT INTO \"persistent\".\"public\".population VALUES (1, 'Earth'), (2, 'Mars'), (3, 'Venus')"
+        )
+        .unwrap();
+
+    // Stub the catalog entry (simulates what the server does after ingest).
+    table_catalog::upsert_stub(
+        &engine,
+        "population",
+        "load_file",
+        Some("{\"path\":\"/tmp/population.csv\"}"),
+        Some(3),
+        false,
+    )
+    .unwrap();
+
+    // Set prose metadata that should survive the rename.
+    table_catalog::set_metadata(
+        &engine,
+        "population",
+        &MetadataFields {
+            source_url: Some("https://example.com/population".into()),
+            purpose: Some("Test rename metadata preservation".into()),
+            notes: Some("Refresh: curl ...".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // Verify metadata is set before rename.
+    let before = table_catalog::get(&engine, "population").unwrap().unwrap();
+    assert_eq!(
+        before.source_url.as_deref(),
+        Some("https://example.com/population")
+    );
+    assert_eq!(
+        before.purpose.as_deref(),
+        Some("Test rename metadata preservation")
+    );
+    assert_eq!(before.notes.as_deref(), Some("Refresh: curl ..."));
+    assert_eq!(before.load_tool.as_deref(), Some("load_file"));
+    assert_eq!(before.row_count, Some(3));
+
+    // Rename the table (same as a user running execute(sql=["ALTER TABLE..."]))
+    engine
+        .execute_command(
+            "ALTER TABLE \"persistent\".\"public\".population RENAME TO owid_population",
+        )
+        .unwrap();
+
+    // Run reconcile (same as after_execute_catalog_update does post-execute).
+    table_catalog::reconcile(&engine).unwrap();
+
+    // The old name should be gone.
+    assert!(
+        table_catalog::get(&engine, "population").unwrap().is_none(),
+        "old table name should not exist in catalog after rename"
+    );
+
+    // The new name should exist with ALL the original metadata preserved.
+    let after = table_catalog::get(&engine, "owid_population")
+        .unwrap()
+        .expect("renamed table should have a catalog entry");
+    assert_eq!(
+        after.source_url.as_deref(),
+        Some("https://example.com/population"),
+        "source_url must survive rename"
+    );
+    assert_eq!(
+        after.purpose.as_deref(),
+        Some("Test rename metadata preservation"),
+        "purpose must survive rename"
+    );
+    assert_eq!(
+        after.notes.as_deref(),
+        Some("Refresh: curl ..."),
+        "notes must survive rename"
+    );
+    assert_eq!(
+        after.load_tool.as_deref(),
+        Some("load_file"),
+        "load_tool must survive rename"
+    );
+    assert_eq!(after.row_count, Some(3), "row_count must survive rename");
+    // Both timestamps should be preserved — a rename is not a refresh.
+    assert_eq!(
+        after.loaded_at, before.loaded_at,
+        "loaded_at should be anchored to the original load time, not the rename time"
+    );
+    assert_eq!(
+        after.last_refreshed_at, before.last_refreshed_at,
+        "last_refreshed_at should be anchored to the original load time, not bumped on rename"
+    );
+}
+
+#[test]
+fn set_metadata_data_url_roundtrip() {
+    let (engine, _dir) = workspace_engine();
+    engine
+        .execute_command("CREATE TABLE \"persistent\".\"public\".widgets (id INT)")
+        .unwrap();
+    table_catalog::upsert_stub(&engine, "widgets", "load_file", None, Some(10), true).unwrap();
+
+    let entry = table_catalog::set_metadata(
+        &engine,
+        "widgets",
+        &MetadataFields {
+            data_url: Some("https://example.com/widgets.csv?v=2".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        entry.data_url.as_deref(),
+        Some("https://example.com/widgets.csv?v=2"),
+        "data_url should round-trip through set_metadata"
+    );
+
+    // Read it back fresh to confirm persistence.
+    let fresh = table_catalog::get(&engine, "widgets").unwrap().unwrap();
+    assert_eq!(
+        fresh.data_url.as_deref(),
+        Some("https://example.com/widgets.csv?v=2")
+    );
+
+    // Clear it with an empty string.
+    table_catalog::set_metadata(
+        &engine,
+        "widgets",
+        &MetadataFields {
+            data_url: Some(String::new()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let cleared = table_catalog::get(&engine, "widgets").unwrap().unwrap();
+    assert!(
+        cleared.data_url.is_none(),
+        "empty string should clear data_url"
+    );
+}

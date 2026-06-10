@@ -30,8 +30,19 @@
 //! - Floats: `f32`, `f64`
 //! - `bool`
 //! - `&str`, `String`
-//! - `Option<T>` where `T: ToSqlParam` (for nullable parameters)
+//! - Bytes: `&[u8]`, `Vec<u8>`
 //! - Date/time types: `Date`, `Time`, `Timestamp`, `OffsetTimestamp`
+//! - `Interval`
+//! - `Numeric` — **whole numbers only (`scale == 0`)**; Hyper rejects
+//!   scaled binary NUMERIC params (see the `Numeric` impl and issue #132)
+//! - `serde_json::Value` (binds as PostgreSQL `json`)
+//! - `Option<T>` where `T: ToSqlParam` (for nullable parameters)
+//! - `&T` where `T: ToSqlParam`
+//!
+//! Note: `Geography` does **not** implement `ToSqlParam` — Hyper has no
+//! PostgreSQL-binary input function for the geography type (issue #133).
+//! Use the [`Inserter`](crate::Inserter) (`IntoValue`) path to write
+//! geography values instead.
 //!
 //! # Example
 //!
@@ -48,7 +59,9 @@
 //! }
 //! ```
 
-use hyperdb_api_core::types::{oids, Date, OffsetTimestamp, Oid, Time, Timestamp};
+use hyperdb_api_core::types::{
+    oids, Date, Interval, Numeric, OffsetTimestamp, Oid, Time, Timestamp,
+};
 
 /// Trait for types that can be used as parameters in parameterized SQL queries.
 ///
@@ -432,6 +445,140 @@ impl ToSqlParam for Vec<u8> {
     }
 }
 
+// =============================================================================
+// Numeric implementation
+// =============================================================================
+
+/// Encode a whole-number (`scale == 0`) `Numeric` as PostgreSQL binary NUMERIC.
+///
+/// Header (i16 BE): `ndigits`, `weight`, `sign` (0x0000 pos / 0x4000 neg),
+/// `dscale = 0`; then `ndigits` base-10000 groups (i16 BE, most-significant
+/// first). The `weight` of the most-significant group is `ndigits - 1` (it
+/// sits at base-10000 position `ndigits-1`), and `dscale` is 0 because there
+/// are no fractional digits.
+///
+/// This handles ONLY `scale == 0`. Correctly encoding a scaled NUMERIC
+/// requires decomposing the *decimal* representation into base-10000 groups
+/// aligned on the decimal point (not decomposing the unscaled integer) — that
+/// is out of scope here because Hyper rejects scaled binary NUMERIC params
+/// regardless (see [`ToSqlParam for Numeric`] and #132). The caller is
+/// responsible for only invoking this with `scale == 0`.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "an i128 spans at most ~39 decimal digits → ≤10 base-10000 groups; \
+              ndigits and weight always fit in i16"
+)]
+fn pg_numeric_encode_unscaled(unscaled: i128) -> Vec<u8> {
+    let sign_neg = unscaled < 0;
+    let mut mag = unscaled.unsigned_abs();
+
+    // Decompose the integer magnitude into base-10000 groups, least-significant
+    // first, then reverse to most-significant first.
+    let mut groups: Vec<i16> = Vec::new();
+    while mag > 0 {
+        groups.push((mag % 10000) as i16);
+        mag /= 10000;
+    }
+    groups.reverse(); // empty when unscaled == 0
+
+    let ndigits = groups.len() as i16;
+    let weight = if groups.is_empty() { 0 } else { ndigits - 1 };
+
+    let mut buf = Vec::with_capacity(8 + groups.len() * 2);
+    buf.extend_from_slice(&ndigits.to_be_bytes());
+    buf.extend_from_slice(&weight.to_be_bytes());
+    buf.extend_from_slice(&(if sign_neg { 0x4000_i16 } else { 0 }).to_be_bytes());
+    buf.extend_from_slice(&0_i16.to_be_bytes()); // dscale = 0 (whole number)
+    for g in groups {
+        buf.extend_from_slice(&g.to_be_bytes());
+    }
+    buf
+}
+
+impl ToSqlParam for Numeric {
+    /// Binds as PostgreSQL binary NUMERIC. **Only `scale() == 0` (whole
+    /// numbers) is supported.**
+    ///
+    /// Hyper rejects scaled binary NUMERIC params at query time with SQLSTATE
+    /// `0A000` ("cannot handle truncation when reading numerics") — verified
+    /// empirically, and regardless of an explicit `CAST`. So a faithful scaled
+    /// encoder would never succeed anyway; full scaled support is tracked in
+    /// #132.
+    ///
+    /// For `scale() > 0` this returns a header whose `dscale` is set to the
+    /// true scale. The byte payload is therefore NOT a correct PostgreSQL
+    /// NUMERIC for the value (correct scaled encoding requires decimal-aligned
+    /// base-10000 grouping, deferred to #132) — but because `dscale > 0`, Hyper
+    /// rejects it server-side before it can be misinterpreted. The net effect
+    /// is fail-fast: a scaled param errors clearly instead of silently binding
+    /// a wrong whole number.
+    fn encode_param(&self) -> Option<Vec<u8>> {
+        if self.scale() == 0 {
+            return Some(pg_numeric_encode_unscaled(self.unscaled_value()));
+        }
+        // scale > 0: emit the unscaled digits but with dscale = scale so the
+        // server rejects it (0A000) rather than reading a mis-scaled integer.
+        // These bytes are intentionally server-rejected, not a valid value;
+        // see the doc comment and #132.
+        let mut buf = pg_numeric_encode_unscaled(self.unscaled_value());
+        // Overwrite the dscale field (bytes 6..8) with the true scale.
+        let dscale = i16::from(self.scale()).to_be_bytes();
+        buf[6] = dscale[0];
+        buf[7] = dscale[1];
+        Some(buf)
+    }
+    fn sql_oid(&self) -> Oid {
+        oids::NUMERIC
+    }
+    fn to_sql_literal(&self) -> String {
+        self.to_string()
+    } // Display = decimal string
+}
+
+// =============================================================================
+// Interval implementation
+// =============================================================================
+
+impl ToSqlParam for Interval {
+    fn encode_param(&self) -> Option<Vec<u8>> {
+        // PG interval binary (Bind format code 1): i64 microseconds, i32 days,
+        // i32 months — all BIG-endian. NB this differs from Hyper's HyperBinary
+        // `Interval::encode()` which is the same field order but LITTLE-endian.
+        let mut buf = Vec::with_capacity(16);
+        buf.extend_from_slice(&self.microseconds().to_be_bytes());
+        buf.extend_from_slice(&self.days().to_be_bytes());
+        buf.extend_from_slice(&self.months().to_be_bytes());
+        Some(buf)
+    }
+    fn sql_oid(&self) -> Oid {
+        oids::INTERVAL
+    }
+    fn to_sql_literal(&self) -> String {
+        format!("INTERVAL '{self}'")
+    }
+}
+
+// =============================================================================
+// JSON implementation
+// =============================================================================
+
+impl ToSqlParam for serde_json::Value {
+    fn encode_param(&self) -> Option<Vec<u8>> {
+        // PG `json` binary form == the UTF-8 text. (jsonb has a leading
+        // version byte; `json` does not, and oids::JSON is `json`.)
+        // Value::to_string() is compact (no whitespace, no trailing newline)
+        // and correctly escapes embedded quotes — exactly the wire form needed.
+        Some(self.to_string().into_bytes())
+    }
+    fn sql_oid(&self) -> Oid {
+        oids::JSON
+    }
+    fn to_sql_literal(&self) -> String {
+        format!("'{}'", self.to_string().replace('\'', "''"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,5 +622,81 @@ mod tests {
         let value = 42i32;
         assert_eq!(value.encode_param(), Some(vec![0, 0, 0, 42]));
         assert_eq!((&&value).encode_param(), Some(vec![0, 0, 0, 42]));
+    }
+
+    #[test]
+    fn test_pg_numeric_encode_unscaled() {
+        // 42 → ndigits=1, weight=0, sign=0, dscale=0, group=42
+        assert_eq!(
+            pg_numeric_encode_unscaled(42),
+            vec![0, 1, 0, 0, 0, 0, 0, 0, 0, 42]
+        );
+
+        // 0 → ndigits=0, weight=0, sign=0, dscale=0 (empty digit list)
+        assert_eq!(pg_numeric_encode_unscaled(0), vec![0, 0, 0, 0, 0, 0, 0, 0]);
+
+        // -1 → ndigits=1, weight=0, sign=0x4000, dscale=0, group=1
+        assert_eq!(
+            pg_numeric_encode_unscaled(-1),
+            vec![0, 1, 0, 0, 0x40, 0, 0, 0, 0, 1]
+        );
+
+        // 123456789 = 1*10000^2 + 2345*10000 + 6789
+        // → ndigits=3, weight=2, sign=0, dscale=0, groups=[1, 2345, 6789]
+        assert_eq!(
+            pg_numeric_encode_unscaled(123_456_789),
+            vec![
+                0, 3, // ndigits=3
+                0, 2, // weight=2
+                0, 0, // sign=0
+                0, 0, // dscale=0
+                0, 1, // group 1
+                9, 41, // group 2345 (0x0929)
+                26, 133 // group 6789 (0x1A85)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_numeric_scale0_encode_param() {
+        // The scale=0 ToSqlParam path produces the canonical whole-number form.
+        assert_eq!(
+            Numeric::new(42, 0).encode_param(),
+            Some(vec![0, 1, 0, 0, 0, 0, 0, 0, 0, 42])
+        );
+    }
+
+    #[test]
+    fn test_numeric_scaled_sets_dscale_for_rejection() {
+        // For scale>0, encode_param sets dscale = true scale so the server
+        // REJECTS the param (0A000). These bytes are intentionally NOT a valid
+        // representation of 1.23 — correct scaled encoding is #132. We only
+        // assert the dscale field (bytes 6..8) carries the scale, which is what
+        // triggers Hyper's fail-fast rejection.
+        let bytes = Numeric::new(123, 2).encode_param().expect("some");
+        assert_eq!(&bytes[6..8], &[0, 2], "dscale must equal the true scale");
+        assert_ne!(&bytes[6..8], &[0, 0], "must not look like a whole number");
+    }
+
+    #[test]
+    fn test_interval_encoding() {
+        // Interval::new(months, days, microseconds)
+        let interval = Interval::new(2, 5, 0);
+        // PG binary: [us:i64 BE][days:i32 BE][months:i32 BE]
+        assert_eq!(
+            interval.encode_param(),
+            Some(vec![
+                0, 0, 0, 0, 0, 0, 0, 0, // us = 0
+                0, 0, 0, 5, // days = 5
+                0, 0, 0, 2 // months = 2
+            ])
+        );
+    }
+
+    #[test]
+    fn test_json_encoding() {
+        let json = serde_json::json!({"a": 1});
+        // UTF-8 bytes of compact JSON string
+        assert_eq!(json.encode_param(), Some(br#"{"a":1}"#.to_vec()));
     }
 }

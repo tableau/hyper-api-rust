@@ -765,6 +765,11 @@ pub struct SetTableMetadataParams {
     pub license: Option<String>,
     /// Free-form notes: refresh instructions, known gotchas, caveats.
     pub notes: Option<String>,
+    /// Machine-actionable download URL for the raw data file. Distinct
+    /// from `source_url` (which is a human-readable page/reference).
+    /// Enables mechanical refresh: the server can re-ingest the table
+    /// from this URL + `load_params` without prose parsing.
+    pub data_url: Option<String>,
     /// Target database alias for the catalog write. Omit (or pass
     /// `"local"` / `"persistent"`) to update the persistent catalog —
     /// matches the default for the ephemeral primary's tables.
@@ -2903,7 +2908,7 @@ impl HyperMcpServer {
 
     /// Update prose metadata for a table in the `_table_catalog`.
     #[tool(
-        description = "Update prose metadata for a table in the `_table_catalog`: source_url, source_description, purpose, license, notes. Fields you omit stay unchanged; pass an explicit empty string (\"\") to clear a field. Mechanical fields (load_tool, load_params, loaded_at, last_refreshed_at, row_count) are managed by the server. Requires an existing catalog entry — load the table first (load_file / load_data / execute CREATE TABLE) so the stub row is created automatically. Use `database` to target the metadata for a table in a non-primary writable database; read-only attachments are rejected with a clear re-attach-with-writable message. Disabled in read-only mode."
+        description = "Update prose metadata for a table in the `_table_catalog`: source_url, source_description, purpose, license, notes, data_url. Fields you omit stay unchanged; pass an explicit empty string (\"\") to clear a field. `data_url` is the machine-actionable download URL for the raw data file (distinct from `source_url`, which is a human-readable reference page). Mechanical fields (load_tool, load_params, loaded_at, last_refreshed_at, row_count) are managed by the server. Requires an existing catalog entry — load the table first (load_file / load_data / execute CREATE TABLE) so the stub row is created automatically. Use `database` to target the metadata for a table in a non-primary writable database; read-only attachments are rejected with a clear re-attach-with-writable message. Disabled in read-only mode."
     )]
     fn set_table_metadata(
         &self,
@@ -2918,6 +2923,7 @@ impl HyperMcpServer {
             purpose: params.purpose,
             license: params.license,
             notes: params.notes,
+            data_url: params.data_url,
         };
         let table_name = params.table.clone();
         let result = self.with_engine(|engine| {
