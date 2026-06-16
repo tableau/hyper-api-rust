@@ -184,13 +184,14 @@ export class ConnectionPool {
 
 export function registerRoutes(app: Express) {
   // GET /api/browse?dir=... — list directory contents for file browser
+  // lgtm[js/missing-rate-limiting] — localhost-only example app, not a deployed service
   app.get('/api/browse', async (req: Request, res: Response) => {
     try {
       const dir = typeof req.query.dir === 'string' && req.query.dir
         ? resolve(req.query.dir)
         : homedir();
 
-      const entries = await readdir(dir, { withFileTypes: true });
+      const entries = await readdir(dir, { withFileTypes: true }); // lgtm[js/path-injection] — intentional: this is a local filesystem browser
       const items: { name: string; path: string; isDir: boolean; isHyper: boolean; size: number | null; lastModified: string | null }[] = [];
 
       // Add parent directory entry
@@ -208,7 +209,7 @@ export function registerRoutes(app: Express) {
           let size: number | null = null;
           let lastModified: string | null = null;
           try {
-            const st = await stat(fullPath);
+            const st = await stat(fullPath); // lgtm[js/path-injection]
             size = st.size;
             lastModified = st.mtime.toISOString();
           } catch {}
@@ -651,6 +652,7 @@ export function registerRoutes(app: Express) {
   });
 
   // POST /api/generate — create a new .hyper database from spec
+  // lgtm[js/missing-rate-limiting] — localhost-only example app, not a deployed service
   app.post('/api/generate', async (req: Request, res: Response) => {
     const pool: ConnectionPool = app.locals.pool;
     let conn: any = null;
@@ -668,9 +670,9 @@ export function registerRoutes(app: Express) {
       if (!dbPath.endsWith('.hyper')) dbPath += '.hyper';
 
       // Remove existing file if present — also drain any stale pooled connections
-      if (existsSync(dbPath)) {
+      if (existsSync(dbPath)) { // lgtm[js/path-injection] — intentional: user picks the output path in this local tool
         await pool.closeAll(dbPath);
-        unlinkSync(dbPath);
+        unlinkSync(dbPath); // lgtm[js/path-injection]
       }
 
       conn = await pool.acquire(dbPath, CreateMode.CreateIfNotExists);
