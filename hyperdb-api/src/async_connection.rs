@@ -701,11 +701,12 @@ impl AsyncConnection {
     // Parameterized Queries
     // =========================================================================
 
-    /// Executes a parameterized query with safely escaped parameters (async).
+    /// Executes a parameterized query with binary-encoded parameters (async).
     ///
     /// Mirrors the sync [`Connection::query_params`](crate::Connection::query_params);
-    /// see that method for the design rationale around text-mode escaping
-    /// vs. future native Bind/Execute support.
+    /// see that method for the design rationale. Parameters travel through the
+    /// extended query protocol (Parse/Bind/Execute) in HyperBinary format — no
+    /// SQL escaping, full SQL-injection safety regardless of parameter content.
     ///
     /// # Errors
     ///

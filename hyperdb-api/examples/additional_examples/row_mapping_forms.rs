@@ -13,10 +13,13 @@
 //! - **Form 3** — hand-written `FromRow` impl + `fetch_all_as`.
 //! - **Form 4** — `#[derive(FromRow)]` + `fetch_all_as`.
 //! - **Form 5** — streaming `FromRow`: `stream_as`, constant memory.
+//! - **Form 6** — parameterized `FromRow`: `fetch_all_as_params` /
+//!   `stream_as_params`, combining `$1` parameter binding with struct mapping.
 //!
-//! Every form prints the same four products, so you can see they are
-//! equivalent. Form 5 is shown on both the sync `Connection` and the async
+//! Forms 1–5 print the same four products, so you can see they are equivalent.
+//! Form 5 is shown on both the sync `Connection` and the async
 //! `AsyncConnection` (which returns an `impl Stream` instead of an iterator).
+//! Form 6 binds a `$1` price filter, so it prints only the matching subset.
 //! Run with:
 //!
 //!   cargo run -p hyperdb-api --example row_mapping_forms
@@ -51,6 +54,7 @@ fn main() -> Result<()> {
     form3_manual_from_row(&conn)?;
     form4_derive_from_row(&conn)?;
     form5_streaming_from_row(&conn)?;
+    form6_parameterized_from_row(&conn)?;
 
     // Form 5 also has an async flavor. Drop the sync connection first so the
     // async one reopens the same database file cleanly, then drive the stream
@@ -209,6 +213,42 @@ fn form5_streaming_from_row(conn: &Connection) -> Result<()> {
     println!("== Form 5 — streaming FromRow (stream_as, constant memory) ==");
 
     for row_result in conn.stream_as::<ProductDerived>(QUERY)? {
+        let p = row_result?;
+        print_row(p.id, &p.name, p.price, p.in_stock);
+    }
+    println!();
+    Ok(())
+}
+
+/// Form 6 — parameterized `FromRow`. The `_as_params` methods combine `$1`
+/// parameter binding (via `ToSqlParam`, exactly as `query_params`) with the
+/// automatic struct mapping of Forms 3–5. This closes the last gap: a
+/// parameterized `SELECT` whose rows you want as structs, in one call, with no
+/// manual `RowAccessor` loop and no SQL-injection risk.
+///
+/// `fetch_all_as_params` collects the matches; `stream_as_params` is the
+/// constant-memory streaming variant (shown here returning the same rows). Both
+/// have async equivalents on `AsyncConnection`.
+fn form6_parameterized_from_row(conn: &Connection) -> Result<()> {
+    println!("== Form 6 — parameterized FromRow (fetch_all_as_params / stream_as_params) ==");
+
+    // Bind a price ceiling as $1 — only products cheaper than $15 come back.
+    let max_price = 15.0f64;
+    let affordable: Vec<ProductDerived> = conn.fetch_all_as_params(
+        "SELECT id, name, price, in_stock FROM products WHERE price < $1 ORDER BY id",
+        &[&max_price],
+    )?;
+    println!("fetch_all_as_params (price < ${max_price:.2}):");
+    for p in &affordable {
+        print_row(p.id, &p.name, p.price, p.in_stock);
+    }
+
+    // Same query, streamed one chunk at a time via stream_as_params.
+    println!("stream_as_params (same filter, constant memory):");
+    for row_result in conn.stream_as_params::<ProductDerived>(
+        "SELECT id, name, price, in_stock FROM products WHERE price < $1 ORDER BY id",
+        &[&max_price],
+    )? {
         let p = row_result?;
         print_row(p.id, &p.name, p.price, p.in_stock);
     }

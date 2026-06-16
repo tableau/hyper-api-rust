@@ -58,6 +58,16 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! # Mapping parameterized results into structs
+//!
+//! [`query_params`](crate::Connection::query_params) returns raw
+//! [`Row`](crate::Row)s. To map a parameterized query's results straight into
+//! a [`FromRow`](crate::FromRow) struct in one call, use the `_as_params`
+//! variants — [`fetch_one_as_params`](crate::Connection::fetch_one_as_params),
+//! [`fetch_all_as_params`](crate::Connection::fetch_all_as_params), and
+//! [`stream_as_params`](crate::Connection::stream_as_params) (and their
+//! [`AsyncConnection`](crate::AsyncConnection) equivalents).
 
 use hyperdb_api_core::types::{
     oids, Date, Interval, Numeric, OffsetTimestamp, Oid, Time, Timestamp,
@@ -67,7 +77,11 @@ use hyperdb_api_core::types::{
 ///
 /// This trait enables type-safe parameter encoding for use with
 /// [`Connection::query_params`](crate::Connection::query_params) and
-/// [`Connection::command_params`](crate::Connection::command_params).
+/// [`Connection::command_params`](crate::Connection::command_params), and with
+/// the struct-mapping variants
+/// [`fetch_one_as_params`](crate::Connection::fetch_one_as_params),
+/// [`fetch_all_as_params`](crate::Connection::fetch_all_as_params), and
+/// [`stream_as_params`](crate::Connection::stream_as_params).
 ///
 /// # Implementing for Custom Types
 ///

@@ -1,10 +1,10 @@
-# Row Mapping: Five Forms
+# Row Mapping: Six Forms
 
-When querying Hyper, there are five ways to map result rows into Rust values —
-from fully manual to fully automatic. Forms 1–4 trade manual control for
+When querying Hyper, there are several ways to map result rows into Rust values
+— from fully manual to fully automatic. Forms 1–4 trade manual control for
 convenience; Form 5 combines the automatic struct mapping of Form 4 with the
-constant-memory streaming of Form 1. Start with the simplest that fits your
-situation.
+constant-memory streaming of Form 1; Form 6 adds `$1` parameter binding to the
+struct mapping. Start with the simplest that fits your situation.
 
 All five forms are demonstrated end-to-end in one runnable example:
 
@@ -307,6 +307,57 @@ async fn print_products(conn: &hyperdb_api::AsyncConnection) -> hyperdb_api::Res
 
 ---
 
+## Form 6 — Parameterized struct mapping
+
+Forms 3–5 map rows into structs but take a plain `&str` query — no parameter
+binding. [`query_params`](https://docs.rs/hyperdb-api/latest/hyperdb_api/struct.Connection.html#method.query_params)
+binds `$1`, `$2`, … placeholders safely but returns raw `Row`s. The `_as_params`
+methods are the intersection: they bind parameters via `ToSqlParam` *and* map
+each result row into a `FromRow` struct, in a single call — no manual
+`RowAccessor` loop and no SQL-injection risk.
+
+There are three, mirroring the non-param trio:
+
+- `fetch_one_as_params::<T>(query, params)` → `Result<T>`
+- `fetch_all_as_params::<T>(query, params)` → `Result<Vec<T>>`
+- `stream_as_params::<T>(query, params)` → `Result<impl Iterator<Item = Result<T>>>`
+  (constant memory, like Form 5)
+
+```rust
+use hyperdb_api::{Connection, CreateMode, FromRow, HyperProcess, Result};
+
+fn main() -> Result<()> {
+    let hyper = HyperProcess::new(None, None)?;
+    let conn = Connection::new(&hyper, "products.hyper", CreateMode::DoNotCreate)?;
+
+    // Product derives FromRow (see Form 4); $1 is bound from `params`.
+    let max_price = 15.0f64;
+    let affordable: Vec<Product> = conn.fetch_all_as_params(
+        "SELECT id, name, price, in_stock FROM products WHERE price < $1 ORDER BY id",
+        &[&max_price],
+    )?;
+    for p in &affordable {
+        println!("{:>2}  {:<10}  ${:.2}  in_stock={}", p.id, p.name, p.price, p.in_stock);
+    }
+    Ok(())
+}
+```
+
+Error handling matches the underlying methods: `fetch_one_as_params` /
+`fetch_all_as_params` return their errors on the `Result`; `stream_as_params`
+(sync) reports stream-open errors — including `FeatureNotSupported` on the gRPC
+transport, since prepared statements are TCP-only — on the outer `Result`, and
+per-row mapping errors as each item's `Result`. The async `stream_as_params`
+returns an `impl Stream` with no outer `Result`, so submission failures surface
+as the first yielded `Err` item (as with the async Form 5 above).
+
+### Async
+
+Each `_as_params` method has an `AsyncConnection` equivalent — `await` the
+`fetch_*` variants, and pin the `stream_as_params` stream just like Form 5.
+
+---
+
 ## Choosing a form
 
 | Need | Use |
@@ -316,6 +367,7 @@ async fn print_products(conn: &hyperdb_api::AsyncConnection) -> hyperdb_api::Res
 | Named struct, custom mapping logic | Form 3 (`impl FromRow` manually) |
 | Named struct, fields match columns | Form 4 (`#[derive(FromRow)]`) |
 | Streaming + named struct (constant memory) | Form 5 (`stream_as`) |
+| Named struct from a parameterized (`$1`) query | Form 6 (`fetch_*_as_params` / `stream_as_params`) |
 
 For scalar values (a single `COUNT(*)`, `MAX`, etc.), use
 [`fetch_scalar`](https://docs.rs/hyperdb-api/latest/hyperdb_api/struct.Connection.html#method.fetch_scalar)
