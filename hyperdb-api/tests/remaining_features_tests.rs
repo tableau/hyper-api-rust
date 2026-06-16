@@ -676,3 +676,127 @@ fn test_ping_after_operations() {
     // Ping should still work after operations
     test.connection.ping().expect("ping after operations");
 }
+
+// =============================================================================
+// #137: Parameterized FromRow mapping
+// (fetch_one_as_params / fetch_all_as_params / stream_as_params)
+//
+// Round-trips a parameterized SELECT — `$1` bound via ToSqlParam — through
+// FromRow into a #[derive(FromRow)] struct, the intersection #137 adds.
+// =============================================================================
+
+#[derive(Debug, PartialEq, FromRow)]
+struct ParamUser {
+    id: i32,
+    name: Option<String>,
+    score: Option<f64>,
+}
+
+fn seed_param_users(test: &TestConnection) {
+    test.execute_command(
+        "CREATE TABLE param_users (id INT NOT NULL, org_id INT NOT NULL, \
+         name TEXT, score DOUBLE PRECISION)",
+    )
+    .expect("create");
+    test.execute_command(
+        "INSERT INTO param_users VALUES \
+            (1, 10, 'Alice', 95.5), \
+            (2, 10, 'Bob', 87.0), \
+            (3, 20, 'Carol', 92.3)",
+    )
+    .expect("insert");
+}
+
+#[test]
+fn test_fetch_one_as_params() {
+    let test = TestConnection::new().expect("Failed to create test connection");
+    seed_param_users(&test);
+
+    let user: ParamUser = test
+        .connection
+        .fetch_one_as_params(
+            "SELECT id, name, score FROM param_users WHERE id = $1",
+            &[&2i32],
+        )
+        .expect("fetch_one_as_params");
+
+    assert_eq!(user.id, 2);
+    assert_eq!(user.name, Some("Bob".to_string()));
+    assert_eq!(user.score, Some(87.0));
+}
+
+#[test]
+fn test_fetch_all_as_params() {
+    let test = TestConnection::new().expect("Failed to create test connection");
+    seed_param_users(&test);
+
+    // Bind org_id = 10 → exactly Alice and Bob.
+    let users: Vec<ParamUser> = test
+        .connection
+        .fetch_all_as_params(
+            "SELECT id, name, score FROM param_users WHERE org_id = $1 ORDER BY id",
+            &[&10i32],
+        )
+        .expect("fetch_all_as_params");
+
+    assert_eq!(users.len(), 2);
+    assert_eq!(users[0].id, 1);
+    assert_eq!(users[0].name, Some("Alice".to_string()));
+    assert_eq!(users[1].id, 2);
+    assert_eq!(users[1].name, Some("Bob".to_string()));
+}
+
+#[test]
+fn test_stream_as_params() {
+    let test = TestConnection::new().expect("Failed to create test connection");
+    seed_param_users(&test);
+
+    let users: Vec<ParamUser> = test
+        .connection
+        .stream_as_params::<ParamUser>(
+            "SELECT id, name, score FROM param_users WHERE org_id = $1 ORDER BY id",
+            &[&10i32],
+        )
+        .expect("stream_as_params open")
+        .collect::<hyperdb_api::Result<Vec<_>>>()
+        .expect("stream_as_params collect");
+
+    assert_eq!(users.len(), 2);
+    assert_eq!(users[0].id, 1);
+    assert_eq!(users[1].id, 2);
+}
+
+#[test]
+fn test_fetch_one_as_params_no_rows_errors() {
+    // Mirrors fetch_one_as semantics: zero rows → "Query returned no rows".
+    let test = TestConnection::new().expect("Failed to create test connection");
+    seed_param_users(&test);
+
+    let result: hyperdb_api::Result<ParamUser> = test.connection.fetch_one_as_params(
+        "SELECT id, name, score FROM param_users WHERE id = $1",
+        &[&999i32],
+    );
+
+    assert!(result.is_err(), "expected an error for an empty result set");
+}
+
+#[test]
+fn test_fetch_all_as_params_multiple_params() {
+    // Two params of different types bound in one call.
+    let test = TestConnection::new().expect("Failed to create test connection");
+    seed_param_users(&test);
+
+    let users: Vec<ParamUser> = test
+        .connection
+        .fetch_all_as_params(
+            "SELECT id, name, score FROM param_users \
+             WHERE org_id = $1 AND score > $2 ORDER BY id",
+            &[&10i32, &90.0f64],
+        )
+        .expect("fetch_all_as_params");
+
+    // org_id = 10 and score > 90 → only Alice (95.5).
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].id, 1);
+    assert_eq!(users[0].name, Some("Alice".to_string()));
+}

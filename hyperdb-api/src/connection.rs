@@ -845,6 +845,174 @@ impl Connection {
         Ok(crate::result::TypedRowIterator::<T>::new(rowset))
     }
 
+    /// Fetches a single row from a **parameterized** query and maps it to a
+    /// struct using [`FromRow`](crate::FromRow).
+    ///
+    /// This is the parameterized counterpart to
+    /// [`fetch_one_as`](Self::fetch_one_as): it binds `$1`, `$2`, … placeholders
+    /// from `params` (via [`ToSqlParam`](crate::params::ToSqlParam), exactly as
+    /// [`query_params`](Self::query_params) does) and maps the first result row
+    /// into `T`. Use it when a parameterized `SELECT` should yield a typed
+    /// struct rather than a raw [`Row`](crate::Row).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use hyperdb_api::{Connection, FromRow, RowAccessor, Result};
+    /// # struct User { id: i32, name: String }
+    /// # impl FromRow for User {
+    /// #     fn from_row(row: RowAccessor<'_>) -> Result<Self> {
+    /// #         Ok(User { id: row.get("id")?, name: row.get("name")? })
+    /// #     }
+    /// # }
+    /// # fn example(conn: &Connection) -> Result<()> {
+    /// let user: User = conn.fetch_one_as_params(
+    ///     "SELECT id, name FROM users WHERE id = $1",
+    ///     &[&1i32],
+    /// )?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// - Returns [`Error::FeatureNotSupported`] if the connection is using gRPC
+    ///   transport (prepared statements are TCP-only).
+    /// - Returns the error from [`query_params`](Self::query_params) if the
+    ///   server rejects the statement at `Parse`, `Bind`, or `Execute` time, or
+    ///   on transport-level I/O failures.
+    /// - Returns [`Error::Conversion`] with message `"Query returned no rows"`
+    ///   if the query produced zero rows.
+    /// - Returns whatever [`FromRow::from_row`](crate::FromRow::from_row)
+    ///   produces when the row cannot be mapped into `T`.
+    pub fn fetch_one_as_params<T: crate::FromRow>(
+        &self,
+        query: &str,
+        params: &[&dyn crate::params::ToSqlParam],
+    ) -> Result<T> {
+        let row = self.query_params(query, params)?.require_first_row()?;
+        let indices = row
+            .schema()
+            .map(crate::row_accessor::RowAccessor::build_indices)
+            .unwrap_or_default();
+        T::from_row(crate::RowAccessor::new(&row, &indices))
+    }
+
+    /// Fetches all rows from a **parameterized** query and maps them to structs
+    /// using [`FromRow`](crate::FromRow).
+    ///
+    /// This is the parameterized counterpart to
+    /// [`fetch_all_as`](Self::fetch_all_as): it binds `$1`, `$2`, … placeholders
+    /// from `params` (see [`query_params`](Self::query_params)) and maps every
+    /// result row into `T`.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use hyperdb_api::{Connection, FromRow, RowAccessor, Result};
+    /// # struct User { id: i32, name: String }
+    /// # impl FromRow for User {
+    /// #     fn from_row(row: RowAccessor<'_>) -> Result<Self> {
+    /// #         Ok(User { id: row.get("id")?, name: row.get("name")? })
+    /// #     }
+    /// # }
+    /// # fn example(conn: &Connection) -> Result<()> {
+    /// let users: Vec<User> = conn.fetch_all_as_params(
+    ///     "SELECT id, name FROM users WHERE org_id = $1",
+    ///     &[&42i32],
+    /// )?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// - Returns [`Error::FeatureNotSupported`] if the connection is using gRPC
+    ///   transport.
+    /// - Returns the error from [`query_params`](Self::query_params) if the
+    ///   server rejects the statement, or on transport-level I/O failures.
+    /// - Returns the first error produced by
+    ///   [`FromRow::from_row`](crate::FromRow::from_row) on any of the rows.
+    pub fn fetch_all_as_params<T: crate::FromRow>(
+        &self,
+        query: &str,
+        params: &[&dyn crate::params::ToSqlParam],
+    ) -> Result<Vec<T>> {
+        let rows = self.query_params(query, params)?.collect_rows()?;
+        // Build the column-name → index lookup once from the first row's
+        // schema; reuse for every row. See `fetch_all_as`.
+        let indices = rows
+            .first()
+            .and_then(crate::result::Row::schema)
+            .map(crate::row_accessor::RowAccessor::build_indices)
+            .unwrap_or_default();
+        rows.iter()
+            .map(|r| T::from_row(crate::RowAccessor::new(r, &indices)))
+            .collect()
+    }
+
+    /// Returns a lazy iterator over the rows of a **parameterized** query,
+    /// mapping each to `T` via [`FromRow`].
+    ///
+    /// This is the parameterized counterpart to
+    /// [`stream_as`](Self::stream_as): it binds `$1`, `$2`, … placeholders from
+    /// `params` (see [`query_params`](Self::query_params)) and streams the
+    /// result, mapping each row into `T` while holding only one transport chunk
+    /// in memory at a time. The column-index map is built once on the first
+    /// chunk and reused, so per-row mapping is O(1) in the column count.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use hyperdb_api::{Connection, FromRow, RowAccessor, Result};
+    /// # struct User { id: i32, name: String }
+    /// # impl FromRow for User {
+    /// #     fn from_row(row: RowAccessor<'_>) -> Result<Self> {
+    /// #         Ok(User { id: row.get("id")?, name: row.get("name")? })
+    /// #     }
+    /// # }
+    /// # fn example(conn: &Connection) -> Result<()> {
+    /// for row_result in conn.stream_as_params::<User>(
+    ///     "SELECT id, name FROM users WHERE org_id = $1",
+    ///     &[&42i32],
+    /// )? {
+    ///     let user = row_result?;
+    ///     println!("{}: {}", user.id, user.name);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// - The returned outer `Result` wraps errors detected while *opening* the
+    ///   stream: [`Error::FeatureNotSupported`] on gRPC transport, and any
+    ///   `Parse`/`Bind` rejection or transport failure surfaced by
+    ///   [`query_params`](Self::query_params).
+    /// - Each yielded item is itself a `Result<T>`: `Ok(T)` when the row mapped
+    ///   cleanly, or `Err(e)` for a per-row mapping failure (missing column,
+    ///   type mismatch, NULL in a non-optional field) or a server/transport
+    ///   error hit while streaming a later chunk.
+    ///
+    /// As with [`stream_as`](Self::stream_as), always handle errors *both* on
+    /// the outer `Result` and on each item.
+    ///
+    /// [`FromRow`]: crate::FromRow
+    pub fn stream_as_params<'a, T>(
+        &'a self,
+        query: &str,
+        params: &[&dyn crate::params::ToSqlParam],
+    ) -> Result<impl Iterator<Item = Result<T>> + 'a>
+    where
+        T: crate::FromRow + 'a,
+    {
+        // `query_params` returns a Rowset that already carries the prepared
+        // statement guard, so Drop ordering (close_statement after the rowset
+        // releases its connection lock) is preserved with no extra work here.
+        let rowset = self.query_params(query, params)?;
+        Ok(crate::result::TypedRowIterator::<T>::new(rowset))
+    }
+
     /// Fetches a single scalar value from a query.
     ///
     /// Returns an error if the query returns no rows or NULL.
