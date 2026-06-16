@@ -2963,11 +2963,24 @@ impl HyperMcpServer {
             // true` and knows table/disk stats are unavailable this call.
             return Self::ok_content(self.status_degraded());
         };
+        if guard.is_none() {
+            // Engine not yet initialized. Drop the try_lock guard and use
+            // ensure_engine() (blocking lock) to initialize it now. Without
+            // this, sessions that never make a data-plane call would never
+            // trigger initialization and `status` would return engine_busy:true
+            // indefinitely — a hang visible in clients like Windsurf that call
+            // `status` before any other tool.
+            drop(guard);
+            if let Err(e) = self.ensure_engine() {
+                return Self::err_content(e);
+            }
+        }
+        // Re-acquire after initialization (or if guard was already Some).
+        let guard = match self.engine.try_lock() {
+            Ok(g) => g,
+            Err(_) => return Self::ok_content(self.status_degraded()),
+        };
         let Some(engine) = guard.as_ref() else {
-            // Engine not yet initialized (first call after server start, or
-            // after a ConnectionLost drop). Return the degraded response rather
-            // than an error — the first data-plane call will init the engine,
-            // and subsequent `status` calls will get the full response.
             return Self::ok_content(self.status_degraded());
         };
         self.ensure_catalog_ready(engine);
