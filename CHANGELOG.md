@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.5.6](https://github.com/tableau/hyper-api-rust/compare/v0.5.5...v0.5.6) (2026-06-16)
+
+
+### Bug Fixes
+
+* **api:** parameterized FromRow methods (fetch_*_as_params / stream_as_params) ([#152](https://github.com/tableau/hyper-api-rust/issues/152)) ([c576945](https://github.com/tableau/hyper-api-rust/commit/c5769454c3f9e69d3b8f7ee3265c12353bc3bceb))
+* **api:** point query_as!/query_scalar! param comments at [#137](https://github.com/tableau/hyper-api-rust/issues/137) ([#153](https://github.com/tableau/hyper-api-rust/issues/153)) ([926019d](https://github.com/tableau/hyper-api-rust/commit/926019da364c9c9c4f40334e3113021697b70985))
+* **ci:** grant contents:write to release publish job ([5160975](https://github.com/tableau/hyper-api-rust/commit/5160975aa024ff35297a44148ca34eb5b0612764))
+
 ## [0.5.5](https://github.com/tableau/hyper-api-rust/compare/v0.5.4...v0.5.5) (2026-06-16)
 
 

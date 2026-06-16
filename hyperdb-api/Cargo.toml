@@ -14,7 +14,7 @@ autobenches = false
 
 [dependencies]
 # x-release-please-start-version
-hyperdb-api-core = { path = "../hyperdb-api-core", version = "=0.5.5" }
+hyperdb-api-core = { path = "../hyperdb-api-core", version = "=0.5.6" }
 # x-release-please-end
 # NOTE: hyperdb-api-derive is intentionally NOT a dep of hyperdb-api.
 # Adding it creates a cycle:
