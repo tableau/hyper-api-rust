@@ -1894,11 +1894,11 @@ fn probe_endpoint_alive(endpoint: &str) -> bool {
     use std::net::ToSocketAddrs;
     const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
     match endpoint.to_socket_addrs() {
-        Ok(addrs) => {
-            let addrs: Vec<_> = addrs.collect();
-            addrs
-                .iter()
-                .any(|addr| std::net::TcpStream::connect_timeout(addr, PROBE_TIMEOUT).is_ok())
+        // Probe each resolved address, short-circuiting on the first that
+        // accepts a connection. `daemon_endpoint` is normally a single
+        // `127.0.0.1:PORT`, so this is one connect in the common case.
+        Ok(mut addrs) => {
+            addrs.any(|addr| std::net::TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).is_ok())
         }
         Err(_) => false,
     }
