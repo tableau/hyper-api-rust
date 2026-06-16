@@ -6,7 +6,7 @@ convenience; Form 5 combines the automatic struct mapping of Form 4 with the
 constant-memory streaming of Form 1; Form 6 adds `$1` parameter binding to the
 struct mapping. Start with the simplest that fits your situation.
 
-All five forms are demonstrated end-to-end in one runnable example:
+All six forms are demonstrated end-to-end in one runnable example:
 
 ```
 cargo run -p hyperdb-api --example row_mapping_forms
