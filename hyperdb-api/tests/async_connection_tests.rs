@@ -427,3 +427,81 @@ async fn stream_as_lenient_extra_column() {
 
     conn.close().await.unwrap();
 }
+
+// =============================================================================
+// #137: Parameterized FromRow mapping (async)
+// fetch_one_as_params / fetch_all_as_params / stream_as_params
+// =============================================================================
+
+async fn seed_param_users(conn: &AsyncConnection) {
+    conn.execute_command(
+        "CREATE TABLE param_users (id INT NOT NULL, org_id INT NOT NULL, name TEXT)",
+    )
+    .await
+    .unwrap();
+    conn.execute_command(
+        "INSERT INTO param_users VALUES (1, 10, 'alice'), (2, 10, 'bob'), (3, 20, 'carol')",
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fetch_one_as_params_async() {
+    let (_hyper, conn) = fresh_async_conn("async_fetch_one_as_params").await.unwrap();
+    seed_param_users(&conn).await;
+
+    let user: User = conn
+        .fetch_one_as_params("SELECT id, name FROM param_users WHERE id = $1", &[&2i32])
+        .await
+        .unwrap();
+    assert_eq!(
+        user,
+        User {
+            id: 2,
+            name: Some("bob".to_string())
+        }
+    );
+
+    conn.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fetch_all_as_params_async() {
+    let (_hyper, conn) = fresh_async_conn("async_fetch_all_as_params").await.unwrap();
+    seed_param_users(&conn).await;
+
+    let users: Vec<User> = conn
+        .fetch_all_as_params(
+            "SELECT id, name FROM param_users WHERE org_id = $1 ORDER BY id",
+            &[&10i32],
+        )
+        .await
+        .unwrap();
+    assert_eq!(users.len(), 2);
+    assert_eq!(users[0].id, 1);
+    assert_eq!(users[1].id, 2);
+
+    conn.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stream_as_params_async() {
+    let (_hyper, conn) = fresh_async_conn("async_stream_as_params").await.unwrap();
+    seed_param_users(&conn).await;
+
+    let users = {
+        let stream = conn.stream_as_params::<User>(
+            "SELECT id, name FROM param_users WHERE org_id = $1 ORDER BY id",
+            &[&10i32],
+        );
+        tokio::pin!(stream);
+        stream.try_collect::<Vec<User>>().await.unwrap()
+    };
+
+    assert_eq!(users.len(), 2);
+    assert_eq!(users[0].id, 1);
+    assert_eq!(users[1].id, 2);
+
+    conn.close().await.unwrap();
+}

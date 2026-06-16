@@ -465,6 +465,149 @@ impl AsyncConnection {
         }
     }
 
+    /// Fetches a single row from a **parameterized** query and maps it to a
+    /// struct using [`FromRow`](crate::FromRow) (async).
+    ///
+    /// Parameterized counterpart to [`fetch_one_as`](Self::fetch_one_as): binds
+    /// `$1`, `$2`, … placeholders from `params` (via
+    /// [`ToSqlParam`](crate::params::ToSqlParam), exactly as
+    /// [`query_params`](Self::query_params)) and maps the first result row into
+    /// `T`.
+    ///
+    /// # Errors
+    ///
+    /// - Returns [`Error::FeatureNotSupported`] on gRPC transports (prepared
+    ///   statements are TCP-only).
+    /// - Returns the error from [`query_params`](Self::query_params) if the
+    ///   server rejects the statement, or on transport-level I/O failures.
+    /// - Returns [`Error::Conversion`] with message `"Query returned no rows"`
+    ///   if the query produced zero rows.
+    /// - Returns whatever [`FromRow::from_row`](crate::FromRow::from_row)
+    ///   produces when the row cannot be mapped.
+    pub async fn fetch_one_as_params<T: crate::FromRow>(
+        &self,
+        query: &str,
+        params: &[&dyn crate::params::ToSqlParam],
+    ) -> Result<T> {
+        let row = self
+            .query_params(query, params)
+            .await?
+            .require_first_row()
+            .await?;
+        let indices = row
+            .schema()
+            .map(crate::row_accessor::RowAccessor::build_indices)
+            .unwrap_or_default();
+        T::from_row(crate::RowAccessor::new(&row, &indices))
+    }
+
+    /// Fetches all rows from a **parameterized** query and maps them to structs
+    /// using [`FromRow`](crate::FromRow) (async).
+    ///
+    /// Parameterized counterpart to [`fetch_all_as`](Self::fetch_all_as): binds
+    /// `$1`, `$2`, … placeholders from `params` (see
+    /// [`query_params`](Self::query_params)) and maps every result row into `T`.
+    ///
+    /// # Errors
+    ///
+    /// - Returns [`Error::FeatureNotSupported`] on gRPC transports.
+    /// - Returns the error from [`query_params`](Self::query_params) if the
+    ///   server rejects the statement, or on transport-level I/O failures.
+    /// - Returns the first error produced by
+    ///   [`FromRow::from_row`](crate::FromRow::from_row) on any row.
+    pub async fn fetch_all_as_params<T: crate::FromRow>(
+        &self,
+        query: &str,
+        params: &[&dyn crate::params::ToSqlParam],
+    ) -> Result<Vec<T>> {
+        let rows = self
+            .query_params(query, params)
+            .await?
+            .collect_rows()
+            .await?;
+        // Build the column-name → index lookup once from the first row's
+        // schema; reuse for every row. See `fetch_all_as`.
+        let indices = rows
+            .first()
+            .and_then(crate::result::Row::schema)
+            .map(crate::row_accessor::RowAccessor::build_indices)
+            .unwrap_or_default();
+        rows.iter()
+            .map(|r| T::from_row(crate::RowAccessor::new(r, &indices)))
+            .collect()
+    }
+
+    /// Returns a lazy `Stream` over the rows of a **parameterized** query,
+    /// mapping each to `T` via [`FromRow`] (async).
+    ///
+    /// Parameterized counterpart to [`stream_as`](Self::stream_as): binds `$1`,
+    /// `$2`, … placeholders from `params` and streams the result with O(chunk)
+    /// memory, mapping each row into `T`. The column-index map is built once on
+    /// the first chunk and reused.
+    ///
+    /// # Errors
+    ///
+    /// Like [`stream_as`](Self::stream_as), this returns the `Stream` directly
+    /// (no outer `Result`) — the query is lazy and does not execute until first
+    /// polled. Each yielded item is a `Result<T>`:
+    /// - The **first** item is `Err(e)` if statement submission fails:
+    ///   [`Error::FeatureNotSupported`] on gRPC transport, a `Parse`/`Bind`
+    ///   rejection, or a transport failure. These surface as the first item,
+    ///   *not* eagerly.
+    /// - Subsequent items are `Ok(T)` on a clean per-row mapping, or `Err(e)`
+    ///   for a mapping failure (missing column, type mismatch, NULL in a
+    ///   non-`Option` field) or a transport error hit on a later chunk.
+    ///
+    /// [`FromRow`]: crate::FromRow
+    pub fn stream_as_params<'a, T: crate::FromRow + 'a>(
+        &'a self,
+        query: &str,
+        params: &[&dyn crate::params::ToSqlParam],
+    ) -> impl futures_core::Stream<Item = Result<T>> + 'a {
+        // `&[&dyn ToSqlParam]` can't cross the `try_stream!` await points, so
+        // own the query string and encode params up front (encoding needs no
+        // connection). The prepare+execute sequence below mirrors
+        // `query_params` (see that method) — keep the two in sync if its
+        // Parse/Bind/Execute handling ever changes.
+        let query = query.to_owned();
+        let oids: Vec<crate::Oid> = params.iter().map(|p| p.sql_oid()).collect();
+        let encoded: Vec<Option<Vec<u8>>> = params.iter().map(|p| p.encode_param()).collect();
+        async_stream::try_stream! {
+            let client = match &self.transport {
+                AsyncTransport::Tcp(tcp) => &tcp.client,
+                AsyncTransport::Grpc(_) => {
+                    // `?` inside try_stream! yields Err(e) and terminates the
+                    // generator, so `unreachable!()` is dead code — its `!`
+                    // type just satisfies the arm's need for a `&AsyncClient`
+                    // (same type the Tcp arm produces).
+                    Err(Error::feature_not_supported(
+                        "prepared statements are not supported over gRPC transport",
+                    ))?;
+                    unreachable!()
+                }
+            };
+            let stmt = client.prepare_typed(&query, &oids).await?;
+            let stream = client
+                .execute_prepared_streaming(&stmt, encoded, crate::result::DEFAULT_BINARY_CHUNK_SIZE)
+                .await?;
+            let mut rs = AsyncRowset::from_prepared(stream).with_statement_guard(stmt);
+            // The Prepared path captures the schema at prepare time, so the
+            // column-name → index map is available immediately — build it once
+            // up front rather than deferring to the first chunk (the empty-map
+            // fallback matches `stream_as` / `fetch_all_as` if it is somehow
+            // unavailable, surfacing a per-row `Missing` error).
+            let idx = rs
+                .schema()
+                .map(|schema| crate::RowAccessor::build_owned_indices(&schema))
+                .unwrap_or_default();
+            while let Some(chunk) = rs.next_chunk().await? {
+                for row in &chunk {
+                    yield T::from_row(crate::RowAccessor::new_owned(row, &idx))?;
+                }
+            }
+        }
+    }
+
     /// Fetches a single non-NULL scalar value. Errors on empty / NULL.
     ///
     /// # Errors
@@ -558,11 +701,12 @@ impl AsyncConnection {
     // Parameterized Queries
     // =========================================================================
 
-    /// Executes a parameterized query with safely escaped parameters (async).
+    /// Executes a parameterized query with binary-encoded parameters (async).
     ///
     /// Mirrors the sync [`Connection::query_params`](crate::Connection::query_params);
-    /// see that method for the design rationale around text-mode escaping
-    /// vs. future native Bind/Execute support.
+    /// see that method for the design rationale. Parameters travel through the
+    /// extended query protocol (Parse/Bind/Execute) in HyperBinary format — no
+    /// SQL escaping, full SQL-injection safety regardless of parameter content.
     ///
     /// # Errors
     ///

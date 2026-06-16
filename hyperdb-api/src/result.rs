@@ -751,6 +751,15 @@ impl RowValue for hyperdb_api_core::types::Numeric {
 /// a [`RowAccessor`](crate::RowAccessor), which provides name-based
 /// access via a column-name → index lookup built once per query.
 ///
+/// To map the results of a **parameterized** query (`$1` placeholders
+/// bound via [`ToSqlParam`](crate::params::ToSqlParam)) directly into a
+/// struct, use the `_as_params` variants —
+/// [`fetch_one_as_params`](crate::Connection::fetch_one_as_params),
+/// [`fetch_all_as_params`](crate::Connection::fetch_all_as_params), and
+/// [`stream_as_params`](crate::Connection::stream_as_params) — which combine
+/// this trait with parameter binding in one call (also on
+/// [`AsyncConnection`](crate::AsyncConnection)).
+///
 /// # Recommended: derive
 ///
 /// In most cases the `#[derive(FromRow)]` macro handles the mapping

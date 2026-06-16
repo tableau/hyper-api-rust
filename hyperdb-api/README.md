@@ -196,6 +196,22 @@ let rows_affected = conn.command_params(
 Supported parameter types: `i16`, `i32`, `i64`, `f32`, `f64`, `bool`, `&str`, `String`,
 `Option<T>`, `Date`, `Time`, `Timestamp`, `OffsetTimestamp`, `Vec<u8>`, `&[u8]`.
 
+To map a parameterized query's results straight into a `FromRow` struct (instead
+of raw rows), use the `_as_params` variants — `fetch_one_as_params`,
+`fetch_all_as_params`, and `stream_as_params` (sync and async). They combine the
+`$1` binding above with the struct mapping of `fetch_*_as` / `stream_as` in one
+call:
+
+```rust
+#[derive(hyperdb_api_derive::FromRow)]
+struct User { id: i32, name: String }
+
+let users: Vec<User> = conn.fetch_all_as_params(
+    "SELECT id, name FROM users WHERE org_id = $1",
+    &[&42i32],
+)?;
+```
+
 #### Compile-time SQL validation (opt-in)
 
 With the `hyperdb-api-derive` crate's `compile-time` feature, the `query_as!`
