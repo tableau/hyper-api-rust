@@ -426,28 +426,27 @@ impl Engine {
         }))
     }
 
-    /// Whether the backing `hyperd` process is still alive.
+    /// Whether the backing `hyperd` is currently reachable.
     ///
     /// In local mode, delegates to the owned `HyperProcess`. In daemon mode,
-    /// a cached `daemon_endpoint` is treated as authoritative — the engine
-    /// only holds that endpoint after a successful connection, so its presence
-    /// means `hyperd` was reachable when this session started. Discovery
-    /// (`daemon.json` + health-port PING) is used as a fallback only when no
-    /// cached endpoint exists (e.g. before the first connection attempt).
+    /// probes the cached libpq `daemon_endpoint` directly with a short-timeout
+    /// TCP connect — the same endpoint queries run against. This reflects
+    /// *current* liveness of the resource the engine actually depends on, and
+    /// is robust to two failure modes the health-port PING is not:
+    ///   - the health port being unreachable (stale `daemon.json`,
+    ///     port-scan-adopted daemon, firewall) while the libpq endpoint serves;
+    ///   - the daemon restarting `hyperd` on a new port, leaving the cached
+    ///     endpoint stale (the probe then correctly reports `false`).
     ///
-    /// This avoids a false negative where the health port is unreachable
-    /// (stale `daemon.json`, port-scan-adopted daemon, firewall rule) while
-    /// the engine is actively serving queries over its live libpq connection.
+    /// Falls back to discovery (`daemon.json` + health-port PING) only when no
+    /// endpoint has been cached yet (before the first connection attempt).
     pub fn is_running(&self) -> bool {
         if let Some(ref hyper) = self.hyper {
             hyper.is_running()
-        } else if self.daemon_endpoint.is_some() {
-            // Daemon mode with a live cached endpoint: treat it as running.
-            // The engine only stores this endpoint after a successful connect,
-            // so its presence is strong evidence the daemon is up.
-            true
+        } else if let Some(ref endpoint) = self.daemon_endpoint {
+            probe_endpoint_alive(endpoint)
         } else {
-            // Daemon mode but no cached endpoint yet — fall back to discovery.
+            // No cached endpoint yet — fall back to discovery.
             daemon::discovery::discover().is_some()
         }
     }
@@ -1883,6 +1882,25 @@ impl Drop for Engine {
         if let Some(parent) = self.ephemeral_path.parent() {
             let _ = std::fs::remove_dir_all(parent);
         }
+    }
+}
+
+/// Cheap liveness probe for a daemon-mode `hyperd`: attempt a short-timeout
+/// TCP connect to `endpoint` (`host:port`). Returns `true` if the connect
+/// succeeds (something is listening). A bare connect is sufficient here — we
+/// only need to know the port the engine's libpq connection targets is still
+/// accepting connections, not to perform a full protocol round-trip.
+fn probe_endpoint_alive(endpoint: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
+    match endpoint.to_socket_addrs() {
+        Ok(addrs) => {
+            let addrs: Vec<_> = addrs.collect();
+            addrs
+                .iter()
+                .any(|addr| std::net::TcpStream::connect_timeout(addr, PROBE_TIMEOUT).is_ok())
+        }
+        Err(_) => false,
     }
 }
 

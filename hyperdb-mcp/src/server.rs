@@ -1122,6 +1122,30 @@ impl HyperMcpServer {
         Ok(guard)
     }
 
+    /// Eagerly initialize the engine at server startup, before any tool call
+    /// arrives. This makes read-only observer tools like `status` able to
+    /// report full stats on the very first call without having to trigger
+    /// initialization themselves — `status` stays a pure, non-blocking
+    /// observer (honoring issue #118).
+    ///
+    /// Errors are logged and swallowed rather than propagated: if `hyperd` is
+    /// unreachable at startup the server still comes up, and the first
+    /// data-plane tool call will retry initialization via `with_engine`.
+    pub fn warm_up_engine(&self) {
+        match self.ensure_engine() {
+            Ok(_guard) => {
+                tracing::info!("engine initialized eagerly at startup");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    err = %e.message,
+                    "eager engine initialization failed at startup; \
+                     will retry on first data-plane tool call"
+                );
+            }
+        }
+    }
+
     /// Idempotently create and reconcile `_table_catalog` on first call
     /// per engine. No-op in bare or read-only mode (read-only can't
     /// mutate; bare callers never wanted the catalog in the first place).
@@ -2957,28 +2981,16 @@ impl HyperMcpServer {
         // operation on the same session (issue #118). If the engine lock is held
         // by another tool call, return a degraded-but-instant response with the
         // metadata available without the engine (daemon health, paths, watchers).
+        //
+        // `status` is a pure observer: it never initializes the engine. The
+        // engine is initialized eagerly at server startup (see
+        // `warm_up_engine`) and lazily by data-plane tools via `with_engine`,
+        // so by the time a client can call any tool the engine is normally
+        // already `Some`. If it is still `None` here (eager init failed because
+        // hyperd was down at startup, or a ConnectionLost just dropped it), we
+        // report the degraded response honestly rather than blocking to init.
         let Ok(guard) = self.engine.try_lock() else {
-            // Engine is locked by another tool call — return a degraded
-            // response rather than blocking. The caller sees `engine_busy:
-            // true` and knows table/disk stats are unavailable this call.
             return Self::ok_content(self.status_degraded());
-        };
-        if guard.is_none() {
-            // Engine not yet initialized. Drop the try_lock guard and use
-            // ensure_engine() (blocking lock) to initialize it now. Without
-            // this, sessions that never make a data-plane call would never
-            // trigger initialization and `status` would return engine_busy:true
-            // indefinitely — a hang visible in clients like Windsurf that call
-            // `status` before any other tool.
-            drop(guard);
-            if let Err(e) = self.ensure_engine() {
-                return Self::err_content(e);
-            }
-        }
-        // Re-acquire after initialization (or if guard was already Some).
-        let guard = match self.engine.try_lock() {
-            Ok(g) => g,
-            Err(_) => return Self::ok_content(self.status_degraded()),
         };
         let Some(engine) = guard.as_ref() else {
             return Self::ok_content(self.status_degraded());
