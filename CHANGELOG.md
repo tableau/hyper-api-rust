@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.5](https://github.com/tableau/hyper-api-rust/compare/v0.5.4...v0.5.5) (2026-06-16)
+
+
+### Bug Fixes
+
+* **deps:** bump npm dependencies to resolve Dependabot alerts ([f37c2d7](https://github.com/tableau/hyper-api-rust/commit/f37c2d7f79ba7f0864fea0416ff45b38d00ec932))
+
 ## [0.5.4](https://github.com/tableau/hyper-api-rust/compare/v0.5.3...v0.5.4) (2026-06-10)
 
 
