@@ -14,9 +14,17 @@ use crate::{Connection, FromRow, Result, RowValue};
 #[derive(Debug)]
 pub struct QueryAs<T> {
     sql: String,
-    // Bind parameters are stored as formatted strings for now. Full typed
-    // parameter support (ToSqlParam) is wired in Milestone B.
-    #[allow(dead_code, reason = "full parameter binding wired in Milestone B (W3)")]
+    // Bind parameters are stored as formatted strings for now — the macro
+    // accepts `$N` args and validates the SQL, but binding is not yet wired
+    // (the `fetch_*` methods below forward to the NON-param `fetch_*_as`).
+    //
+    // To finish this: change `params` to hold `ToSqlParam` values and route
+    // through `Connection::fetch_*_as_params` (added in issue #137 — the
+    // parameterized FromRow methods are exactly the primitive this needs).
+    #[allow(
+        dead_code,
+        reason = "typed parameter binding not yet wired — see issue #137"
+    )]
     params: Vec<String>,
     _phantom: PhantomData<fn() -> T>,
 }
@@ -26,7 +34,8 @@ impl<T: FromRow> QueryAs<T> {
     /// for direct use.
     ///
     /// `params` accepts `&dyn std::fmt::Debug` so the macro can pass any bind
-    /// arguments through — the actual typed binding will be tightened in W3.
+    /// arguments through — typed binding via `ToSqlParam` is not yet wired
+    /// (see the `TODO(#137)` on `fetch_all` below).
     pub fn new(sql: &str, params: &[&dyn std::fmt::Debug]) -> Self {
         Self {
             sql: sql.to_owned(),
@@ -42,6 +51,8 @@ impl<T: FromRow> QueryAs<T> {
     /// Returns a `hyperdb_api::Error` on connection failure, SQL error, or
     /// row-mapping failure.
     pub fn fetch_all(self, conn: &Connection) -> Result<Vec<T>> {
+        // TODO(#137): forward to `conn.fetch_all_as_params(&self.sql, &params)`
+        // once `params` holds `ToSqlParam` values, to actually bind `$N` args.
         conn.fetch_all_as(&self.sql)
     }
 
@@ -81,9 +92,12 @@ impl<T: FromRow> QueryAs<T> {
 #[derive(Debug)]
 pub struct QueryScalar<T> {
     sql: String,
+    // Same gap as `QueryAs::params` — the macro validates the SQL and
+    // accepts args, but binding isn't wired yet. Route through
+    // `fetch_scalar_params` (or equivalent) once it exists.
     #[allow(
         dead_code,
-        reason = "typed parameter binding wired in a future milestone"
+        reason = "typed parameter binding not yet wired — see issue #137"
     )]
     params: Vec<String>,
     _phantom: PhantomData<fn() -> T>,
