@@ -633,54 +633,56 @@ fn scan_skips_camped_returns_free() {
     // Find a camped port `base` whose immediate successor `base + 1` is free,
     // so the scan range is exactly the two adjacent ports {base, base+1}.
     //
-    // We deliberately keep the range to two ports rather than scanning the
-    // (potentially wide) gap between two arbitrary OS-assigned ports: other
-    // tests' `start_health_listener` helpers leak real identity-answering
-    // `HealthListener`s on random high ports for the lifetime of the test
-    // process, and a wide scan can land on one and return `Found` instead of
-    // `FreePort`. With a 2-port window, a leaked listener would have to occupy
-    // exactly `base+1` — which we confirm is free immediately before scanning.
-    let (camped_listener, base) = loop {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        if port < u16::MAX {
-            // `base + 1` is free iff we can bind it right now. Drop the probe
-            // so the port is released for the scan to find as `Refused`.
-            if let Ok(probe) = TcpListener::bind(("127.0.0.1", port + 1)) {
-                drop(probe);
-                break (listener, port);
+    // TOCTOU mitigation: other tests' `start_health_listener` helpers leak
+    // identity-answering listeners on random high ports for the test-process
+    // lifetime. If one steals `base+1` between our probe-drop and the scan,
+    // the scan returns `Found` instead of `FreePort`. We retry with a fresh
+    // port pair up to 5 times to tolerate this race on busy CI runners.
+    for _attempt in 0..5 {
+        let (camped_listener, base) = loop {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            if port < u16::MAX {
+                if let Ok(probe) = TcpListener::bind(("127.0.0.1", port + 1)) {
+                    drop(probe);
+                    break (listener, port);
+                }
             }
+            drop(listener);
+        };
+        let expected_free = base + 1;
+
+        // Spawn a thread that keeps the camped listener alive and accepts
+        // connections, answering with non-protocol garbage so the identity
+        // check classifies it as `Camped`, not `OurDaemon`.
+        std::thread::spawn(move || loop {
+            if let Ok((mut stream, _)) = camped_listener.accept() {
+                use std::io::Write;
+                let _ = stream.write_all(b"NOPE\n");
+            }
+        });
+
+        // Give the thread a moment to start accepting.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Scan exactly {base (camped), base+1 (free)}.
+        let scan = PortScan { base, span: 2 };
+
+        match discovery::scan_for_daemon(scan) {
+            discovery::ScanOutcome::FreePort(port) => {
+                assert_eq!(
+                    port, expected_free,
+                    "scan should skip the camped base port and return base+1"
+                );
+                return; // Success
+            }
+            discovery::ScanOutcome::Found(_) => {
+                // Another test's leaked health listener stole base+1 — retry.
+            }
+            other => panic!("expected FreePort, got {other:?}"),
         }
-        // `base+1` was occupied (or base == u16::MAX) — retry with a fresh port.
-        drop(listener);
-    };
-    let expected_free = base + 1;
-
-    // Spawn a thread that keeps the camped listener alive and accepts
-    // connections, answering with non-protocol garbage so the identity check
-    // classifies it as `Camped`, not `OurDaemon`.
-    std::thread::spawn(move || loop {
-        if let Ok((mut stream, _)) = camped_listener.accept() {
-            use std::io::Write;
-            let _ = stream.write_all(b"NOPE\n");
-        }
-    });
-
-    // Give the thread a moment to start accepting.
-    std::thread::sleep(Duration::from_millis(50));
-
-    // Scan exactly {base (camped), base+1 (free)}.
-    let scan = PortScan { base, span: 2 };
-
-    match discovery::scan_for_daemon(scan) {
-        discovery::ScanOutcome::FreePort(port) => {
-            assert_eq!(
-                port, expected_free,
-                "scan should skip the camped base port and return base+1"
-            );
-        }
-        other => panic!("expected FreePort, got {other:?}"),
     }
+    panic!("scan_skips_camped_returns_free: failed after 5 attempts (port stolen each time)");
 }
 
 #[test]
