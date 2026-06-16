@@ -427,12 +427,27 @@ impl Engine {
     }
 
     /// Whether the backing `hyperd` process is still alive.
-    /// In daemon mode, checks the daemon health port.
+    ///
+    /// In local mode, delegates to the owned `HyperProcess`. In daemon mode,
+    /// a cached `daemon_endpoint` is treated as authoritative — the engine
+    /// only holds that endpoint after a successful connection, so its presence
+    /// means `hyperd` was reachable when this session started. Discovery
+    /// (`daemon.json` + health-port PING) is used as a fallback only when no
+    /// cached endpoint exists (e.g. before the first connection attempt).
+    ///
+    /// This avoids a false negative where the health port is unreachable
+    /// (stale `daemon.json`, port-scan-adopted daemon, firewall rule) while
+    /// the engine is actively serving queries over its live libpq connection.
     pub fn is_running(&self) -> bool {
         if let Some(ref hyper) = self.hyper {
             hyper.is_running()
+        } else if self.daemon_endpoint.is_some() {
+            // Daemon mode with a live cached endpoint: treat it as running.
+            // The engine only stores this endpoint after a successful connect,
+            // so its presence is strong evidence the daemon is up.
+            true
         } else {
-            // Daemon mode: check if daemon is still reachable
+            // Daemon mode but no cached endpoint yet — fall back to discovery.
             daemon::discovery::discover().is_some()
         }
     }
