@@ -85,7 +85,7 @@ jobs:
         # embedded Hyper instance inside the proc-macro host during clippy.
         # hyperd must be present or the proc-macro panics.
         id: hyperd-cache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: .hyperd
           key: hyperd-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('hyperdb-bootstrap/hyperd-version.toml') }}
@@ -141,7 +141,7 @@ jobs:
         # (hyperdb-bootstrap/hyperd-version.toml) invalidates the cache
         # automatically and the next run re-downloads.
         id: hyperd-cache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: .hyperd
           key: hyperd-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('hyperdb-bootstrap/hyperd-version.toml') }}
@@ -195,7 +195,7 @@ jobs:
           node-version: 20
       - name: Cache hyperd binary
         id: hyperd-cache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: .hyperd
           key: hyperd-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('hyperdb-bootstrap/hyperd-version.toml') }}
