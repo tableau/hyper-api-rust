@@ -347,6 +347,7 @@ See [hyperdb-api-node/README.md](hyperdb-api-node/README.md) for full documentat
 | **[hyperdb-api-derive/README.md](hyperdb-api-derive/README.md)** | `#[derive(FromRow)]`, `#[derive(Table)]`, and compile-time SQL validation |
 | **[DEVELOPMENT.md](DEVELOPMENT.md)** | Architecture, building, testing, benchmarks — for contributors |
 | **[CONTRIBUTING.md](CONTRIBUTING.md)** | How to contribute |
+| **[docs/GITHUB_OPERATIONS.md](docs/GITHUB_OPERATIONS.md)** | CI/release workflows and how maintainers cut a release |
 | **[docs/TRANSACTIONS.md](docs/TRANSACTIONS.md)** | Transaction API design |
 | **[docs/BENCHMARK_GUIDE.md](docs/BENCHMARK_GUIDE.md)** | How to run benchmarks |
 

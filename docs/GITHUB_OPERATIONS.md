@@ -225,6 +225,82 @@ steps are automated based on [Conventional Commits](https://www.conventionalcomm
    ```
    Already-published crates are skipped gracefully on re-run.
 
+### Manual tag step (after release-please PR merge)
+
+In practice the tag is created **by hand**, not by release-please. Merging
+the `chore(main): release X.Y.Z` PR bumps the manifest, `Cargo.toml`
+versions, and `CHANGELOG.md` on `main` — but a maintainer then inspects
+the merged commit and creates the `vX.Y.Z` tag + GitHub Release
+themselves. This is a deliberate human checkpoint: once the tag exists,
+`release.yml` fires automatically and publishes to crates.io, where
+versions are permanent (`cargo yank` only hides a version — it never
+frees the number), and npm is effectively the same. The manual tag is
+the last point at which a bad release can be stopped; everything before
+it is reversible, everything after it is not.
+
+```bash
+# 1. Fetch and confirm main is at the expected merge SHA.
+git fetch upstream main
+git log -1 upstream/main --format="%H %s"
+# Should show: <merge-sha> chore(main): release X.Y.Z (#NN)
+
+# 2. Sanity-check the manifest matches what you expect to release.
+gh api repos/tableau/hyper-api-rust/contents/.release-please-manifest.json?ref=<merge-sha> \
+  --jq '.content' | base64 -d
+# Should show: { ".": "X.Y.Z" }
+
+# 3. Extract the release notes from the new CHANGELOG.md section.
+#    awk between the two H2 anchors, then drop the H2 line and the blank
+#    line under it (tail -n +3) and the trailing blank that abuts the
+#    next section (sed '$d').
+awk '/^## \[X\.Y\.Z\]/,/^## \[<previous>\]/' CHANGELOG.md \
+  | sed '$d' | tail -n +3 > /tmp/vX.Y.Z-notes.md
+
+# 4. Create the tag + GitHub Release. --target accepts the merge SHA;
+#    the positional arg is the tag name. release.yml fires on the
+#    resulting `release: published` event and publishes to crates.io.
+gh release create vX.Y.Z \
+  -R tableau/hyper-api-rust \
+  --target <merge-sha> \
+  --title "vX.Y.Z" \
+  --notes-file /tmp/vX.Y.Z-notes.md \
+  --latest    # OR --prerelease for -rc / -alpha / -beta tags
+
+# 5. Promote the release PR's label so future release-please runs don't
+#    abort with "untagged, merged release PRs outstanding".
+gh pr edit <release-pr-number> -R tableau/hyper-api-rust \
+  --remove-label "autorelease: pending" \
+  --add-label "autorelease: tagged"
+```
+
+After the tag is created:
+
+1. Watch [`release.yml`](https://github.com/tableau/hyper-api-rust/actions/workflows/release.yml) —
+   it re-runs the verify suite on the tagged SHA, then publishes the
+   crates to crates.io in dependency order.
+2. Watch [`npm-build-publish.yml`](https://github.com/tableau/hyper-api-rust/actions/workflows/npm-build-publish.yml)
+   in parallel.
+3. Confirm the new version landed (see [Verifying a release](#verifying-a-release)).
+
+**To stop a release after the PR merges but before tagging.** If you find
+a problem in the merged release PR before creating the tag, nothing has
+shipped yet — you have options:
+
+- **Land a fix on `main`.** release-please opens a fresh
+  `chore(main): release X.Y.Z` PR rolling the fix into the next version.
+  Promote the old PR's label to `autorelease: snooze` so the original
+  version isn't re-proposed (only when the new release will carry a
+  different version number).
+- **Force a `Release-As` bump** to skip the bad version with an empty
+  commit on `main`:
+  ```bash
+  git commit --allow-empty -m "chore: release X.Y.(Z+1)" -m "Release-As: X.Y.(Z+1)"
+  ```
+  release-please then opens a fresh PR for that version.
+- **Revert the release PR's commit on `main`** if the bump itself is
+  wrong, fix the manifest by hand if needed, and let release-please
+  reconcile on the next run.
+
 ### How commits drive version bumps
 
 release-please reads the [Conventional Commits](https://www.conventionalcommits.org/)
