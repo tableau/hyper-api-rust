@@ -254,6 +254,14 @@ jobs:
     name: cargo-deny
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # The cargo-deny-action image ships a pre-installed `stable` toolchain,
+    # but its `rustup show` step honors `rust-toolchain.toml`'s override
+    # before that toolchain is registered, emitting an alarming (but
+    # non-fatal) "override toolchain ... is not installed" stack trace.
+    # Pinning RUSTUP_TOOLCHAIN bypasses the override probe so the log is
+    # clean. See issue #81.
+    env:
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
