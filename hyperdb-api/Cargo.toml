@@ -28,8 +28,11 @@ tracing = { workspace = true }
 arrow = { version = "58", default-features = false, features = ["ipc"] }
 # SmallVec for memory-efficient collections that are typically small
 smallvec = "1.15"
-# Deadpool - async connection pool
-deadpool = { version = "0.13" }
+# Deadpool - async connection pool.
+# `rt_tokio_1` enables deadpool's Tokio-backed timeout enforcement, required by
+# `create_pool` whenever a wait/create/recycle timeout is configured. The sync
+# `ConnectionPool` path uses std primitives only and never touches this runtime.
+deadpool = { version = "0.13", features = ["rt_tokio_1"] }
 # tokio sync primitives — already present transitively via hyperdb-api-core's
 # async TCP client; declared here for the pool's first-connection mutex.
 tokio = { workspace = true, features = ["sync"] }
