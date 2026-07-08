@@ -330,6 +330,82 @@ One design doc (this) covers both. The implementation plan written next covers
 **M1 only**; M2 gets its own plan later. M1 must land and publish before M2 can
 consume the new API.
 
+## Conventions & Guidelines Compliance
+
+All work follows [`docs/RUST_GUIDELINES.md`](../../RUST_GUIDELINES.md) (Microsoft
+Pragmatic Rust) and [`docs/RUST_DOCUMENTATION_STYLE.md`](../../RUST_DOCUMENTATION_STYLE.md).
+The load-bearing rules for this feature, and how the design already honors them:
+
+**Machine-enforced (CI gates — a PR cannot merge while any fails):**
+
+- `cargo fmt`, `cargo clippy -- -D warnings`, `cargo doc -D warnings` clean.
+- **M-PUBLIC-DEBUG** — `KvStore`, `AsyncKvStore`, and any new public type derive
+  `Debug` (`missing_debug_implementations = "warn"` + `-D warnings`).
+- **M-CANONICAL-DOCS** — every `pub` item has a `///` summary (`missing_docs`).
+- **Integer cast discipline** — `size()` returns the `COUNT(*)` `i64` directly;
+  no narrowing `as`. Any width conversion uses `TryFrom` or a justified
+  `#[expect(clippy::cast_*, reason = "...")]`. (Repo rule #7.)
+- **M-UNSAFE** — no `unsafe` is expected in this feature; if any appears it
+  carries a `// SAFETY:` comment.
+- Supply-chain: `serde`/`serde_json` are permissively licensed and already in
+  the lockfile — `cargo deny` / `cargo audit` stay green.
+
+**Human-review (reviewer checklist):**
+
+- **M-ESSENTIAL-FN-INHERENT / M-REGULAR-FN** — KV behavior lives as **inherent
+  methods** on `KvStore` (and `kv_store`/`kv_list_stores` inherent on
+  `Connection`), *not* a `use`-required extension trait. This is a deliberate
+  improvement over Gemini's `HyperKv` trait sketch, which would have forced a
+  trait import to call the methods.
+- **M-CONCISE-NAMES** — `KvStore`, `get`, `set`, `pop`, `clear` describe what they
+  do; no `Manager`/`Helper`/`Service` weasel words.
+- **M-APP-ERROR / M-ERRORS-CANONICAL-STRUCTS** — `hyperdb-api` keeps its single
+  canonical `Error` enum; the new `Serialization` variant gets a public
+  constructor `Error::serialization(...)`, matching every other variant.
+- **M-DONT-LEAK-TYPES** — public signatures use `std` types (`String`, `Option`,
+  `Vec`, tuples). `serde` appears only as generic bounds on `get_as`/`set_as`
+  (`T: Serialize` / `T: DeserializeOwned`), never as a concrete leaked type.
+- **M-DOCUMENTED-MAGIC** — the key/name max-length (512) is a documented `const`,
+  not an inline literal; the validation charset is a documented `const`.
+- **String-arg convention** — methods take `&str` for keys/values, matching the
+  crate's established `execute_command(&self, &str)` / `query_params` style
+  (the crate uses `TryInto<TableName>` only for schema/table *names*). Reviewer
+  confirms consistency with siblings rather than importing `impl AsRef<str>`
+  wholesale.
+
+**Documentation (M-FIRST-DOC-SENTENCE + doc-style):**
+
+- Every public item's first doc sentence is < 15 words, on one line.
+- `# Examples` (as `no_run`, since they need a live `hyperd`), `# Errors`, and
+  `# Panics` sections on all public methods; intra-doc links (`[`KvStore`]`).
+- Doc examples compile under `cargo test --doc`.
+- `hyperdb-api/README.md` gets a KV overview entry + sub-section (two-level
+  structure per the doc-style guide); implementation internals stay in rustdoc
+  / `DEVELOPMENT.md`, not the README. New behavior is captured in code comments
+  over prose docs (per user preference [[feedback_code_comments_over_docs]]).
+
+## Adversarial review (Harness)
+
+This feature is built with the **Harness** agent-team workflow — offline,
+operator-gated, role-separated (`doer ≠ validator ≠ merger`). Every phase is
+reviewed by independent adversarial agents that do not see the conversation
+history:
+
+- **Phase 2 — plan review:** BOTH `feature-dev:code-reviewer` (fast, line-level)
+  and `system-agents:code-review` (deeper, architectural) run in parallel against
+  the M1 plan file before any code is written.
+- **Phase 4 — per-iteration review:** `feature-dev:code-reviewer` audits each
+  committed iteration against an explicit acceptance checklist that includes the
+  guideline rules above (cast discipline, `Debug`, doc sections, inherent-method
+  design, canonical error).
+- **Phase 5 — final pre-merge sweep:** BOTH reviewers in parallel against the
+  integrated branch, plus full E2E verification (real `hyperd`, `cargo
+  test`/`clippy`/`fmt`/`doc`, doc tests).
+
+Reviewer briefs cite concrete acceptance criteria (e.g. "`size()` must return
+`i64` with no `as` cast"; "`KvStore` must derive `Debug`"; "no method requires a
+trait import").
+
 ## Risks
 
 - **PK enforcement unknown until probed.** Mitigated: first implementation step
