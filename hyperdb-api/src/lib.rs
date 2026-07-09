@@ -165,7 +165,6 @@ mod async_transport;
 mod catalog;
 mod connection;
 mod connection_builder;
-/// CSV/text export and import via COPY protocol.
 pub mod copy;
 mod data_format;
 mod error;
@@ -173,7 +172,6 @@ mod inserter;
 mod kv_store;
 mod names;
 mod params;
-/// Connection pooling support.
 pub mod pool;
 mod prepared;
 mod process;
