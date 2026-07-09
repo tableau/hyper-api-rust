@@ -3,6 +3,16 @@
 
 //! Common test utilities and helpers.
 
+// This module is compiled into every integration-test binary via `mod common;`,
+// but each binary calls only a subset of these helpers, so any given helper is
+// dead code in the binaries that don't reference it. `allow` (not `expect`)
+// because the same item is live in other binaries — an `expect` would be
+// unfulfilled there and trip `unfulfilled_lint_expectations` under `-D warnings`.
+#![allow(
+    dead_code,
+    reason = "shared test helpers; each test binary uses only a subset"
+)]
+
 use hyperdb_api::{Catalog, Connection, CreateMode, HyperProcess, Parameters, Result};
 use std::path::PathBuf;
 
@@ -34,10 +44,6 @@ pub(crate) fn test_hyper_params(_test_name: &str) -> Result<Parameters> {
 ///
 /// Similar to the C++ `SingleConnectionTest` class, this provides a convenient
 /// way to set up a test environment with a Hyper instance and database connection.
-#[expect(
-    dead_code,
-    reason = "test helper; referenced by subset of test binaries in this crate"
-)]
 pub(crate) struct TestConnection {
     pub hyper: HyperProcess,
     pub connection: Connection,
@@ -83,19 +89,11 @@ impl TestConnection {
     }
 
     /// Executes a SQL command.
-    #[allow(
-        dead_code,
-        reason = "test helper; referenced by subset of test binaries in this crate"
-    )]
     pub(crate) fn execute_command(&self, sql: &str) -> Result<u64> {
         self.connection.execute_command(sql)
     }
 
     /// Executes a SQL query and returns the result.
-    #[allow(
-        dead_code,
-        reason = "test helper; referenced by subset of test binaries in this crate"
-    )]
     pub(crate) fn execute_query(&self, sql: &str) -> Result<hyperdb_api::Rowset<'_>> {
         self.connection.execute_query(sql)
     }
@@ -106,10 +104,6 @@ impl TestConnection {
     /// code duplication and improve maintainability.
     ///
     /// Executes a scalar query and returns a single i32 value.
-    #[allow(
-        dead_code,
-        reason = "test helper; referenced by subset of test binaries in this crate"
-    )]
     pub(crate) fn execute_scalar_i32(&self, sql: &str) -> Result<i32> {
         self.connection
             .execute_scalar_query::<i32>(sql)?
@@ -117,10 +111,6 @@ impl TestConnection {
     }
 
     /// Executes a scalar query and returns a single i64 value.
-    #[allow(
-        dead_code,
-        reason = "test helper; referenced by subset of test binaries in this crate"
-    )]
     pub(crate) fn execute_scalar_i64(&self, sql: &str) -> Result<i64> {
         self.connection
             .execute_scalar_query::<i64>(sql)?
@@ -128,10 +118,6 @@ impl TestConnection {
     }
 
     /// Executes a scalar query and returns a single String value.
-    #[allow(
-        dead_code,
-        reason = "test helper; referenced by subset of test binaries in this crate"
-    )]
     pub(crate) fn execute_scalar_string(&self, sql: &str) -> Result<String> {
         self.connection
             .execute_scalar_query::<String>(sql)?
@@ -139,10 +125,6 @@ impl TestConnection {
     }
 
     /// Executes a scalar query and returns a single bool value.
-    #[allow(
-        dead_code,
-        reason = "test helper; referenced by subset of test binaries in this crate"
-    )]
     pub(crate) fn execute_scalar_bool(&self, sql: &str) -> Result<bool> {
         self.connection
             .execute_scalar_query::<bool>(sql)?
@@ -150,19 +132,11 @@ impl TestConnection {
     }
 
     /// Counts the number of tuples in a table.
-    #[allow(
-        dead_code,
-        reason = "test helper; referenced by subset of test binaries in this crate"
-    )]
     pub(crate) fn count_tuples(&self, table_name: &str) -> Result<i64> {
         self.execute_scalar_i64(&format!("SELECT COUNT(*) FROM {table_name}"))
     }
 
     /// Gets a reference to the connection's catalog.
-    #[allow(
-        dead_code,
-        reason = "test helper; referenced by subset of test binaries in this crate"
-    )]
     pub(crate) fn catalog(&self) -> Catalog<'_> {
         Catalog::new(&self.connection)
     }
