@@ -198,6 +198,7 @@ pub use prepared::PreparedStatement;
 pub use async_transaction::AsyncTransaction;
 pub use hyperdb_api_core::client::{Notice, NoticeReceiver};
 pub use inserter::{ChunkSender, ColumnMapping, InsertChunk, Inserter, IntoValue, MappedInserter};
+pub use kv_store::KvStore;
 pub use names::{
     escape_name, escape_sql_path, escape_string_literal, DatabaseName, Name, SchemaName, TableName,
 };

@@ -74,6 +74,127 @@ pub(crate) fn kv_create_table_sql(table_ref: &str) -> String {
     )
 }
 
+use crate::connection::Connection;
+
+/// A handle to one named key-value store, backed by [`KV_TABLE`].
+///
+/// Borrows its [`Connection`] for the handle's lifetime (`'conn`), matching
+/// the crate's [`Catalog`](crate::Catalog)/[`Inserter`](crate::Inserter)
+/// borrow convention. Open one with
+/// [`Connection::kv_store`](crate::Connection::kv_store).
+///
+/// # Examples
+///
+/// ```no_run
+/// use hyperdb_api::{Connection, CreateMode, Result};
+///
+/// fn main() -> Result<()> {
+///     let conn = Connection::connect("localhost:7483", "app.hyper", CreateMode::CreateIfNotExists)?;
+///     let kv = conn.kv_store("settings")?;
+///     kv.set("theme", "dark")?;
+///     assert_eq!(kv.get("theme")?, Some("dark".to_string()));
+///     Ok(())
+/// }
+/// ```
+#[derive(Debug)]
+pub struct KvStore<'conn> {
+    connection: &'conn Connection,
+    store_name: String,
+    table_ref: String,
+}
+
+impl<'conn> KvStore<'conn> {
+    /// Opens a handle to `name`, creating [`KV_TABLE`] if needed.
+    fn open(connection: &'conn Connection, name: &str, table_ref: String) -> Result<Self> {
+        validate_kv_name(name, "store name")?;
+        connection.execute_command(&kv_create_table_sql(&table_ref))?;
+        Ok(KvStore {
+            connection,
+            store_name: name.to_string(),
+            table_ref,
+        })
+    }
+
+    /// Opens a handle to a store in the default location.
+    pub(crate) fn new(connection: &'conn Connection, name: &str) -> Result<Self> {
+        Self::open(connection, name, KV_TABLE.to_string())
+    }
+
+    /// Opens a handle targeting an explicit, already-escaped table reference.
+    ///
+    /// Crate-internal seam for the MCP milestone (routes into an attached
+    /// database). `target` is interpolated directly into SQL, so the **caller
+    /// must supply a pre-validated / identifier-escaped, SQL-safe qualifier**
+    /// (M2 must escape it via the crate's identifier-quoting before calling —
+    /// `store_name`/`key`/`value` are always bound params, but `target` is not).
+    #[allow(
+        dead_code,
+        reason = "M2 (hyperdb-mcp) consumer; kept here so M1 needs no later API change"
+    )]
+    pub(crate) fn with_target(
+        connection: &'conn Connection,
+        name: &str,
+        target: &str,
+    ) -> Result<Self> {
+        Self::open(connection, name, format!("{target}.{KV_TABLE}"))
+    }
+
+    /// Returns this store's validated name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.store_name
+    }
+}
+
+impl Connection {
+    /// Opens a handle to a named key-value store, creating the table if needed.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use hyperdb_api::{Connection, CreateMode, Result};
+    /// # fn example(conn: &Connection) -> Result<()> {
+    /// let kv = conn.kv_store("session")?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidName`] if `name` is empty, too long, or has invalid characters.
+    /// - [`Error::FeatureNotSupported`] on gRPC transport.
+    /// - [`Error::Server`] if the `CREATE TABLE IF NOT EXISTS` fails.
+    pub fn kv_store(&self, name: &str) -> Result<KvStore<'_>> {
+        KvStore::new(self, name)
+    }
+
+    /// Lists the names of every KV store that currently holds at least one key.
+    ///
+    /// Creates the backing table first (via [`kv_create_table_sql`]) so calling
+    /// this on a fresh database returns an empty list rather than erroring on a
+    /// missing table.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::FeatureNotSupported`] on gRPC transport.
+    /// - [`Error::Server`] if the query fails.
+    pub fn kv_list_stores(&self) -> Result<Vec<String>> {
+        self.execute_command(&kv_create_table_sql(KV_TABLE))?;
+        let mut result = self.execute_query(&format!(
+            "SELECT DISTINCT store_name FROM {KV_TABLE} ORDER BY store_name ASC"
+        ))?;
+        let mut names = Vec::new();
+        while let Some(chunk) = result.next_chunk()? {
+            for row in &chunk {
+                if let Some(name) = row.get::<String>(0) {
+                    names.push(name);
+                }
+            }
+        }
+        Ok(names)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
