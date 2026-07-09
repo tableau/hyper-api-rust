@@ -107,6 +107,7 @@
 //! - [`Catalog`] — Schema/table introspection
 //! - [`TableDefinition`] — Define table schemas
 //! - [`Transaction`] / [`AsyncTransaction`] — RAII transaction guards
+//! - [`KvStore`] / [`AsyncKvStore`] — String-native key-value store over a shared backing table
 //!
 //! # Public Modules
 //!

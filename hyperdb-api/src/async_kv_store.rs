@@ -88,6 +88,8 @@ impl<'conn> AsyncKvStore<'conn> {
             "SELECT value FROM {} WHERE store_name = $1 AND key = $2",
             self.table_ref
         );
+        // Bind store_name/key as `&str` params (never interpolated) — uniform
+        // `&str` element types coerce cleanly to `&[&dyn ToSqlParam]`.
         let row = self
             .connection
             .query_params(&sql, &[&self.store_name.as_str(), &key])
