@@ -56,6 +56,7 @@
 //! ├── Inserter<'conn>
 //! │   └── CopyInWriter<'conn>
 //! ├── Catalog<'conn>
+//! ├── KvStore<'conn>
 //! ├── Rowset<'conn>
 //! └── Transaction<'conn>
 //! ```
@@ -75,6 +76,20 @@
 //! let conn = Connection::connect("localhost:7483", "test.hyper", CreateMode::CreateIfNotExists)?;
 //! let inserter = Inserter::new(&conn, /* ... */)?;
 //! drop(conn);  // ERROR: cannot move `conn` because it is borrowed by `inserter`
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The same guarantee holds for a [`KvStore`], which borrows its `Connection`
+//! for the handle's lifetime:
+//!
+//! ```compile_fail
+//! # use hyperdb_api::{Connection, CreateMode};
+//! # fn example() -> hyperdb_api::Result<()> {
+//! let conn = Connection::connect("localhost:7483", "test.hyper", CreateMode::CreateIfNotExists)?;
+//! let kv = conn.kv_store("s")?;
+//! drop(conn);  // ERROR: cannot move `conn` because it is borrowed by `kv`
+//! let _ = kv.get("k")?;
 //! # Ok(())
 //! # }
 //! ```
