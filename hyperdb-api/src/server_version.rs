@@ -262,7 +262,7 @@ mod tests {
         assert!(v1 < v2);
         assert!(v2 < v3);
         assert!(v3 < v4);
-        assert!(v1 == ServerVersion::new(1, 0, 0));
+        assert_eq!(v1, ServerVersion::new(1, 0, 0));
     }
 
     #[test]

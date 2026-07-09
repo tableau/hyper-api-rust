@@ -123,19 +123,19 @@ fn test_hyper_process_logs_startup() {
     assert!(
         logs_contain(&logs, "hyperd-starting"),
         "Expected hyperd-starting log event. Got: {:?}",
-        &*logs
+        *logs
     );
 
     // Verify hyperd-started event was logged with endpoint
     assert!(
         logs_contain(&logs, "hyperd-started"),
         "Expected hyperd-started log event. Got: {:?}",
-        &*logs
+        *logs
     );
     assert!(
         logs_contain(&logs, "endpoint"),
         "Expected endpoint in log. Got: {:?}",
-        &*logs
+        *logs
     );
 }
 
@@ -153,17 +153,17 @@ fn test_connection_logs_parameters() {
     assert!(
         logs_contain(&logs, "connection-parameters"),
         "Expected connection-parameters log event. Got: {:?}",
-        &*logs
+        *logs
     );
     assert!(
         logs_contain(&logs, "host"),
         "Expected host in connection params. Got: {:?}",
-        &*logs
+        *logs
     );
     assert!(
         logs_contain(&logs, "port"),
         "Expected port in connection params. Got: {:?}",
-        &*logs
+        *logs
     );
 }
 
@@ -181,7 +181,7 @@ fn test_connection_logs_auth_success() {
     assert!(
         logs_contain(&logs, "connection-auth-success"),
         "Expected connection-auth-success log event. Got: {:?}",
-        &*logs
+        *logs
     );
 }
 
@@ -218,17 +218,17 @@ fn test_inserter_logs_completion() -> Result<()> {
     assert!(
         logs_contain(&logs, "inserter-end"),
         "Expected inserter-end log event. Got: {:?}",
-        &*logs
+        *logs
     );
     assert!(
         logs_contain(&logs, "rows=100"),
         "Expected rows=100 in log. Got: {:?}",
-        &*logs
+        *logs
     );
     assert!(
         logs_contain(&logs, "log_test"),
         "Expected table name in log. Got: {:?}",
-        &*logs
+        *logs
     );
 
     Ok(())
@@ -250,12 +250,12 @@ fn test_logging_sequence() -> Result<()> {
         assert!(
             logs_contain(&logs, "hyperd-starting"),
             "Expected hyperd-starting. Got: {:?}",
-            &*logs
+            *logs
         );
         assert!(
             logs_contain(&logs, "hyperd-started"),
             "Expected hyperd-started. Got: {:?}",
-            &*logs
+            *logs
         );
     }
 
@@ -270,7 +270,7 @@ fn test_logging_sequence() -> Result<()> {
         assert!(
             logs_contain(&logs, "connection-parameters"),
             "Expected connection-parameters. Got: {:?}",
-            &*logs
+            *logs
         );
     }
 
@@ -294,12 +294,12 @@ fn test_logging_sequence() -> Result<()> {
         assert!(
             logs_contain(&logs, "inserter-end"),
             "Expected inserter-end. Got: {:?}",
-            &*logs
+            *logs
         );
         assert!(
             logs_contain(&logs, "rows=50"),
             "Expected rows=50. Got: {:?}",
-            &*logs
+            *logs
         );
     }
 
@@ -331,7 +331,7 @@ fn test_logging_does_not_leak_sensitive_data() {
     assert!(
         !logs_contain(&logs, "secret"),
         "Logs should not contain 'secret'. Got: {:?}",
-        &*logs
+        *logs
     );
 }
 
@@ -365,14 +365,14 @@ fn test_debug_level_logging() -> Result<()> {
     assert!(
         logs_contain(&logs, "connection-established"),
         "Expected connection-established at DEBUG level. Got: {:?}",
-        &*logs
+        *logs
     );
 
     // We should also see the inserter-end event
     assert!(
         logs_contain(&logs, "inserter-end"),
         "Expected inserter-end. Got: {:?}",
-        &*logs
+        *logs
     );
 
     Ok(())
@@ -403,6 +403,6 @@ fn test_logging_connection_failure() {
     assert!(
         logs_contain(&logs, "connection-parameters"),
         "Expected connection-parameters. Got: {:?}",
-        &*logs
+        *logs
     );
 }
