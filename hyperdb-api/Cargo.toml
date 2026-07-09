@@ -131,3 +131,7 @@ path = "benches/async_parallel_benchmark.rs"
 [[example]]
 name = "benchmark_suite"
 path = "benches/benchmark_suite.rs"
+
+[[example]]
+name = "kv_benchmark"
+path = "benches/kv_benchmark.rs"
