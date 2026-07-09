@@ -145,6 +145,12 @@ pub enum Error {
     #[error("conversion error: {0}")]
     Conversion(String),
 
+    /// Serialization or deserialization of a value failed (e.g. a
+    /// `get_as`/`set_as` JSON conversion). Distinct from
+    /// [`Self::Conversion`], which covers SQL type/binary decoding.
+    #[error("serialization error: {0}")]
+    Serialization(String),
+
     /// Configuration error (invalid endpoint, missing env var, bad
     /// option combination).
     #[error("configuration error: {0}")]
@@ -394,6 +400,11 @@ impl Error {
     /// Constructs an [`Self::Conversion`] error.
     pub fn conversion(message: impl Into<String>) -> Self {
         Error::Conversion(message.into())
+    }
+
+    /// Constructs an [`Self::Serialization`] error.
+    pub fn serialization(message: impl Into<String>) -> Self {
+        Error::Serialization(message.into())
     }
 
     /// Constructs an [`Self::Config`] error.
@@ -732,5 +743,15 @@ mod tests {
             "invalid operation: cannot mix insert_data with insert_batch"
         );
         assert!(matches!(err, Error::InvalidOperation(_)));
+    }
+
+    #[test]
+    fn serialization_constructor_round_trip() {
+        let err = Error::serialization("expected value at line 1 column 1");
+        assert_eq!(
+            err.to_string(),
+            "serialization error: expected value at line 1 column 1"
+        );
+        assert!(matches!(err, Error::Serialization(_)));
     }
 }
