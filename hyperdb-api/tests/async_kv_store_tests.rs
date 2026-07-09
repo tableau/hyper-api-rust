@@ -59,9 +59,12 @@ async fn async_kv_full_surface() -> Result<()> {
 
     assert_eq!(kv.pop().await?, Some(("b".to_string(), "2".to_string())));
 
+    // After delete("a") + pop() removed "b", exactly "k" and "p" remain.
     let removed = kv.clear().await?;
-    assert!(removed >= 1);
+    assert_eq!(removed, 2);
     assert_eq!(kv.size().await?, 0);
+    // pop on an empty store yields None (mirrors the sync contract).
+    assert_eq!(kv.pop().await?, None);
     Ok(())
 }
 
@@ -78,5 +81,51 @@ async fn async_list_stores_and_validation() -> Result<()> {
         conn.kv_store("bad name").await,
         Err(Error::InvalidName(_))
     ));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_validates_key_on_every_entry_point() -> Result<()> {
+    let (_hyper, conn) = fresh_async_conn("async_kv_validate").await?;
+    let kv = conn.kv_store("cfg").await?;
+    // Every key-taking async method must reject an invalid key with
+    // `InvalidName` before touching the wire (mirrors the sync contract).
+    assert!(matches!(
+        kv.set("bad key", "v").await,
+        Err(Error::InvalidName(_))
+    ));
+    assert!(matches!(
+        kv.get("bad key").await,
+        Err(Error::InvalidName(_))
+    ));
+    assert!(matches!(
+        kv.delete("bad key").await,
+        Err(Error::InvalidName(_))
+    ));
+    assert!(matches!(
+        kv.exists("bad key").await,
+        Err(Error::InvalidName(_))
+    ));
+    assert!(matches!(
+        kv.get_as::<Profile>("bad key").await,
+        Err(Error::InvalidName(_))
+    ));
+    assert!(matches!(
+        kv.set_as("bad key", &3u32).await,
+        Err(Error::InvalidName(_))
+    ));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_store_isolation() -> Result<()> {
+    let (_hyper, conn) = fresh_async_conn("async_kv_isolation").await?;
+    let a = conn.kv_store("alpha").await?;
+    let b = conn.kv_store("beta").await?;
+    // Same key in two stores resolves to each store's own value.
+    a.set("k", "from_alpha").await?;
+    b.set("k", "from_beta").await?;
+    assert_eq!(a.get("k").await?, Some("from_alpha".to_string()));
+    assert_eq!(b.get("k").await?, Some("from_beta".to_string()));
     Ok(())
 }

@@ -102,11 +102,23 @@ fn get_as_malformed_json_is_serialization_error() -> Result<()> {
 }
 
 #[test]
-fn set_rejects_invalid_key() {
+fn validates_key_on_every_entry_point() {
     let tc = TestConnection::new().unwrap();
     let kv = tc.connection.kv_store("cfg").unwrap();
+    // Every key-taking method must reject an invalid key with `InvalidName`
+    // before touching the wire — validation is not gated behind `set`/`get`.
     assert!(matches!(kv.set("bad key", "v"), Err(Error::InvalidName(_))));
     assert!(matches!(kv.get("bad key"), Err(Error::InvalidName(_))));
+    assert!(matches!(kv.delete("bad key"), Err(Error::InvalidName(_))));
+    assert!(matches!(kv.exists("bad key"), Err(Error::InvalidName(_))));
+    assert!(matches!(
+        kv.get_as::<Profile>("bad key"),
+        Err(Error::InvalidName(_))
+    ));
+    assert!(matches!(
+        kv.set_as("bad key", &3u32),
+        Err(Error::InvalidName(_))
+    ));
 }
 
 #[test]
