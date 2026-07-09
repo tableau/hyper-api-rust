@@ -13,17 +13,26 @@
 Every task's requirements implicitly include this section. Values copied verbatim from `docs/superpowers/specs/2026-07-08-kv-store-design.md`, adjusted by two corrections verified against source (noted below).
 
 - **PR title uses a `feat:` prefix** — this is the real feature (M1). M2 (MCP) is a separate branch/plan with a `fix:` prefix; **do not touch `hyperdb-mcp` in M1.**
-- **Backing table (fixed, static):**
+- **Backing table (fixed, static) — NO `PRIMARY KEY`:**
   ```sql
   CREATE TABLE IF NOT EXISTS _hyperdb_kv_store (
       store_name TEXT NOT NULL,
       key        TEXT NOT NULL,
-      value      TEXT,
-      PRIMARY KEY (store_name, key)
+      value      TEXT
   );
   ```
   Table name is `_hyperdb_kv_store` (the `_hyperdb_` prefix so M2's `is_internal_table()` auto-hides it).
-- **Name validation:** `store_name` and `key` must be **non-empty**, match `[A-Za-z0-9_.-]+` (ASCII alphanumeric, `_`, `.`, `-`), and be **at most 512 bytes**. Violations → `Error::invalid_name`. Applied to `store_name` at `kv_store(name)`, to `key` on every keyed call. Max length is a documented `const` (M-DOCUMENTED-MAGIC); charset is a documented `const`.
+
+  **⚠️ CRITICAL — verified empirically (2026-07-08).** Hyper **rejects** a `PRIMARY KEY`
+  clause at `CREATE TABLE` time with `0A000: Index support is disabled` — the exact behavior
+  documented in `hyperdb-mcp/src/table_catalog.rs:54-58`, which the plan mirrors and which
+  therefore declares **no** PK. A probe against the pinned `hyperd` confirmed: `CREATE TABLE …
+  PRIMARY KEY (…)` fails; the same table without a PK creates cleanly; and the
+  UPDATE-then-conditional-`INSERT … WHERE NOT EXISTS` idiom enforces per-`(store_name, key)`
+  uniqueness application-side (duplicate conditional INSERT affected **0 rows**). **Uniqueness is
+  an application-side invariant, not an engine constraint.** Every `CREATE TABLE` in this plan
+  (both twins, plus the `kv_list_stores` guards) omits the `PRIMARY KEY` clause.
+- **Name validation:** `store_name` and `key` must be **non-empty**, match ASCII `[A-Za-z0-9_.-]+` (ASCII alphanumeric, `_`, `.`, `-`), and be **at most 512 bytes**. Violations → `Error::invalid_name`. Applied to `store_name` at `kv_store(name)`, to `key` on every keyed call. Both the max length (`KV_MAX_NAME_BYTES`) and the human-readable charset (`KV_CHARSET`) are named `const`s per M-DOCUMENTED-MAGIC.
 - **New error variant:** `Error::Serialization(String)` with a public constructor `Error::serialization(...)`, for `get_as`/`set_as` JSON failures. Reuse existing variants otherwise (`invalid_name`, `feature_not_supported`, `Server`). Do **not** introduce a separate error enum (M-APP-ERROR / M-ERRORS-CANONICAL-STRUCTS).
 - **Transport gating:** all KV methods use parameterized queries (`query_params`/`command_params`), which already return `Error::feature_not_supported` on gRPC. No extra gating code is required; document it in `# Errors`.
 - **No narrowing `as` casts on integers** (repo rule #7). `size()` returns the `COUNT(*)` `i64` directly. Any width conversion uses `TryFrom` or a justified `#[expect(clippy::cast_*, reason = "...")]`.
@@ -34,7 +43,20 @@ Every task's requirements implicitly include this section. Values copied verbati
 ### Two spec corrections (verified against source — supersede the spec where they conflict)
 
 1. **`serde` + `serde_json` are already direct deps** of `hyperdb-api` (`Cargo.toml:47-48`, used by `query_stats`). The spec's "add dependencies" step is a **no-op** — do not add them again. `serde` has the `derive` feature at the workspace level (`Cargo.toml:65`).
-2. **Parameters are NOT an "escaped-literal facade."** `command_params`/`query_params` use the **real** PostgreSQL extended-query protocol (Parse/Bind/Execute with binary `HyperBinary` params — `connection.rs:1204-1230`, `async_connection.rs:718-769`). Repeated `$N` placeholders are therefore protocol-safe, but to remove **all** doubt this plan uses **distinct** placeholders in the conditional INSERT (`$4`/`$5` instead of reusing `$1`/`$2`), passing the repeated values positionally. Task 1's empirical probe confirms this against the pinned `hyperd`.
+2. **Parameters are NOT an "escaped-literal facade."** The spec (§136-146) claims `query_params`
+   "convert positional params to safely-escaped SQL literals before sending" — **this is wrong.**
+   `command_params`/`query_params` use the **real** PostgreSQL extended-query protocol (Parse/Bind/
+   Execute with binary `HyperBinary` params — `connection.rs:1204-1230`, `async_connection.rs:718-769`).
+   The plan's correction supersedes the spec on this point. Repeated `$N` placeholders are therefore
+   protocol-safe, but to remove **all** doubt this plan uses **distinct** placeholders in the
+   conditional INSERT (`$4`/`$5` instead of reusing `$1`/`$2`), passing the repeated values
+   positionally. Both reviewers independently verified this against source.
+
+3. **`PRIMARY KEY` at `CREATE TABLE` is rejected by Hyper** (`0A000: Index support is disabled`),
+   verified empirically against the pinned `hyperd` on 2026-07-08 and documented in
+   `hyperdb-mcp/src/table_catalog.rs:54-58`. The spec's backing-table DDL (which included a PK) and
+   this plan's earlier draft are both corrected: the table has **no** `PRIMARY KEY`, and uniqueness
+   is enforced application-side by the conditional-INSERT idiom (probe: duplicate insert → 0 rows).
 
 ### Verified building blocks (call these; do not invent APIs)
 
@@ -154,7 +176,9 @@ git commit -m "feat(kv): add Error::Serialization variant for get_as/set_as"
 - Produces:
   - `pub(crate) const KV_TABLE: &str = "_hyperdb_kv_store";`
   - `pub(crate) const KV_MAX_NAME_BYTES: usize = 512;`
+  - `pub(crate) const KV_CHARSET: &str = "A-Z a-z 0-9 _ . -";`
   - `pub(crate) fn validate_kv_name(name: &str, kind: &str) -> Result<()>` — used by both sync and async KV code.
+  - `pub(crate) fn kv_create_table_sql(table_ref: &str) -> String` — the single source of truth for the backing-table DDL (no `PRIMARY KEY`), used by both sync/async `open` and both `kv_list_stores` guards so the twins can never diverge on the DDL.
 
 - [ ] **Step 1: Create the file with constants, validator, and failing unit tests**
 
@@ -186,15 +210,21 @@ pub(crate) const KV_TABLE: &str = "_hyperdb_kv_store";
 /// Maximum length, in bytes, of a store name or key.
 pub(crate) const KV_MAX_NAME_BYTES: usize = 512;
 
-/// Validates a store name or key: non-empty, `[A-Za-z0-9_.-]+`, `<= 512` bytes.
+/// Human-readable description of the allowed store-name/key charset.
+///
+/// Used in validation error messages so the allowed set is stated in one
+/// place (M-DOCUMENTED-MAGIC) rather than duplicated as a string literal.
+pub(crate) const KV_CHARSET: &str = "A-Z a-z 0-9 _ . -";
+
+/// Validates a store name or key: non-empty, ASCII `[A-Za-z0-9_.-]+`, `<= 512` bytes.
 ///
 /// `kind` labels the value in the error message (`"store name"` / `"key"`).
 ///
 /// # Errors
 ///
 /// Returns [`Error::InvalidName`] if `name` is empty, exceeds
-/// [`KV_MAX_NAME_BYTES`], or contains a character outside
-/// `[A-Za-z0-9_.-]`.
+/// [`KV_MAX_NAME_BYTES`] bytes, or contains a byte outside the ASCII
+/// [`KV_CHARSET`] (`A-Z a-z 0-9 _ . -`).
 pub(crate) fn validate_kv_name(name: &str, kind: &str) -> Result<()> {
     if name.is_empty() {
         return Err(Error::invalid_name(format!("KV {kind} must not be empty")));
@@ -210,10 +240,25 @@ pub(crate) fn validate_kv_name(name: &str, kind: &str) -> Result<()> {
         .find(|&b| !(b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-'))
     {
         return Err(Error::invalid_name(format!(
-            "KV {kind} contains an invalid byte {bad:#04x}; allowed: A-Z a-z 0-9 _ . -"
+            "KV {kind} contains an invalid byte {bad:#04x}; allowed: {KV_CHARSET}"
         )));
     }
     Ok(())
+}
+
+/// Builds the `CREATE TABLE IF NOT EXISTS` DDL for the KV backing table.
+///
+/// Single source of truth for the schema, shared by the sync and async
+/// constructors and both `kv_list_stores` guards. The table has **no**
+/// `PRIMARY KEY`: Hyper rejects one at create time (`0A000: Index support is
+/// disabled`, see `hyperdb-mcp/src/table_catalog.rs`), so per-`(store_name,
+/// key)` uniqueness is an application-side invariant enforced by the
+/// UPDATE-then-conditional-INSERT upsert, not an engine constraint.
+pub(crate) fn kv_create_table_sql(table_ref: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {table_ref} \
+         (store_name TEXT NOT NULL, key TEXT NOT NULL, value TEXT)"
+    )
 }
 
 #[cfg(test)]
@@ -317,8 +362,14 @@ fn open_store_creates_backing_table() -> Result<()> {
     let tc = TestConnection::new()?;
     let kv = tc.connection.kv_store("cfg")?;
     assert_eq!(kv.name(), "cfg");
-    // Backing table exists and is initially empty for this store.
-    assert_eq!(kv.size()?, 0);
+    // Backing table exists and is initially empty for this store. Checked via a
+    // direct COUNT (not `size()`, which arrives in Task 5) so Task 3 is
+    // self-contained and compiles on its own.
+    let count = tc
+        .connection
+        .execute_query("SELECT COUNT(*) FROM _hyperdb_kv_store WHERE store_name = 'cfg'")?
+        .scalar::<i64>()?;
+    assert_eq!(count, Some(0));
     Ok(())
 }
 
@@ -329,23 +380,28 @@ fn rejects_invalid_store_name() {
     assert!(matches!(err, Error::InvalidName(_)));
 }
 
-/// Documents the engine's PRIMARY KEY enforcement behavior. The KV upsert
-/// guarantees single-row-per-key application-side regardless of the outcome;
-/// this test only records what the pinned `hyperd` does so expectations stay
-/// honest (see spec "PRIMARY KEY enforcement — verify empirically").
+/// Documents the engine's duplicate-row behavior on the (PK-less) backing table.
+/// The KV upsert guarantees single-row-per-key application-side; this test
+/// records what the pinned `hyperd` does with a raw duplicate `INSERT` so
+/// expectations stay honest and prove why the app-side upsert is required.
+///
+/// Empirically (2026-07-08) the table has NO `PRIMARY KEY` (Hyper rejects one:
+/// `0A000: Index support is disabled`), so a raw duplicate insert is ACCEPTED —
+/// which is exactly why `set` must use the conditional-INSERT idiom, not a bare
+/// `INSERT`.
 #[test]
-fn documents_primary_key_enforcement() -> Result<()> {
+fn documents_duplicate_insert_behavior() -> Result<()> {
     let tc = TestConnection::new()?;
-    let _ = tc.connection.kv_store("pk_probe")?; // ensure table exists
+    let _ = tc.connection.kv_store("dup_probe")?; // ensure table exists
     tc.connection.execute_command(
-        "INSERT INTO _hyperdb_kv_store (store_name, key, value) VALUES ('pk_probe', 'k', 'v1')",
+        "INSERT INTO _hyperdb_kv_store (store_name, key, value) VALUES ('dup_probe', 'k', 'v1')",
     )?;
     let dup = tc.connection.execute_command(
-        "INSERT INTO _hyperdb_kv_store (store_name, key, value) VALUES ('pk_probe', 'k', 'v2')",
+        "INSERT INTO _hyperdb_kv_store (store_name, key, value) VALUES ('dup_probe', 'k', 'v2')",
     );
     match dup {
-        Err(e) => eprintln!("PK enforced: duplicate rejected -> {e}"),
-        Ok(_) => eprintln!("PK NOT enforced: duplicate (store_name,key) accepted"),
+        Err(e) => eprintln!("duplicate raw INSERT rejected -> {e}"),
+        Ok(n) => eprintln!("duplicate raw INSERT accepted ({n} row); app-side upsert required"),
     }
     Ok(())
 }
@@ -354,7 +410,9 @@ fn documents_primary_key_enforcement() -> Result<()> {
 - [ ] **Step 2: Run to verify failure**
 
 Run: `HYPERD_PATH=~/dev/bin/hyperd cargo test -p hyperdb-api --test kv_store_tests`
-Expected: FAIL — `no method named kv_store` / `no method named size`. (`size` arrives in Task 5; for now the `open_store_creates_backing_table` test fails to compile — that is expected; it will pass after Task 5. To keep Task 3 self-contained, temporarily assert only `kv.name()` and table existence via a direct COUNT; see Step 4.)
+Expected: FAIL — `no method named kv_store` on `Connection`. (The test uses only `kv_store`,
+`name`, `execute_command`, and `execute_query().scalar()`, all of which exist except `kv_store`
+itself — so once Step 3 adds `kv_store`, Task 3 compiles and passes with no later edits.)
 
 - [ ] **Step 3: Implement the struct and constructors in `kv_store.rs`**
 
@@ -394,11 +452,7 @@ impl<'conn> KvStore<'conn> {
     /// Opens a handle to `name`, creating [`KV_TABLE`] if needed.
     fn open(connection: &'conn Connection, name: &str, table_ref: String) -> Result<Self> {
         validate_kv_name(name, "store name")?;
-        connection.execute_command(&format!(
-            "CREATE TABLE IF NOT EXISTS {table_ref} (\
-             store_name TEXT NOT NULL, key TEXT NOT NULL, value TEXT, \
-             PRIMARY KEY (store_name, key))"
-        ))?;
+        connection.execute_command(&kv_create_table_sql(&table_ref))?;
         Ok(KvStore {
             connection,
             store_name: name.to_string(),
@@ -414,7 +468,10 @@ impl<'conn> KvStore<'conn> {
     /// Opens a handle targeting an explicit, already-escaped table reference.
     ///
     /// Crate-internal seam for the MCP milestone (routes into an attached
-    /// database). `target` must be a caller-trusted, SQL-safe qualifier.
+    /// database). `target` is interpolated directly into SQL, so the **caller
+    /// must supply a pre-validated / identifier-escaped, SQL-safe qualifier**
+    /// (M2 must escape it via the crate's identifier-quoting before calling —
+    /// `store_name`/`key`/`value` are always bound params, but `target` is not).
     #[allow(
         dead_code,
         reason = "M2 (hyperdb-mcp) consumer; kept here so M1 needs no later API change"
@@ -462,11 +519,16 @@ impl Connection {
 
     /// Lists the names of every KV store that currently holds at least one key.
     ///
+    /// Creates the backing table first (via [`kv_create_table_sql`]) so calling
+    /// this on a fresh database returns an empty list rather than erroring on a
+    /// missing table.
+    ///
     /// # Errors
     ///
     /// - [`Error::FeatureNotSupported`] on gRPC transport.
     /// - [`Error::Server`] if the query fails.
     pub fn kv_list_stores(&self) -> Result<Vec<String>> {
+        self.execute_command(&kv_create_table_sql(KV_TABLE))?;
         let mut result = self.execute_query(&format!(
             "SELECT DISTINCT store_name FROM {KV_TABLE} ORDER BY store_name ASC"
         ))?;
@@ -483,19 +545,7 @@ impl Connection {
 }
 ```
 
-> **Note on `kv_list_stores`:** it uses `execute_query` (no params — the SQL is fully static) and assumes `KV_TABLE` exists. Because the table is created on the first `kv_store(...)` open, `kv_list_stores` may error if called before any store is opened. Guard it by creating the table first: change the body to open nothing but run `CREATE TABLE IF NOT EXISTS ...` before the `SELECT DISTINCT`. Use the same DDL string as `KvStore::open`. (Add this in Step 3; the test in Task 5 covers the empty case.)
-
-Apply that guard now — prepend to `kv_list_stores`:
-
-```rust
-        self.execute_command(&format!(
-            "CREATE TABLE IF NOT EXISTS {KV_TABLE} (\
-             store_name TEXT NOT NULL, key TEXT NOT NULL, value TEXT, \
-             PRIMARY KEY (store_name, key))"
-        ))?;
-```
-
-- [ ] **Step 4: Add `pub use` and a temporary `size` stand-in for the Task-3 test**
+- [ ] **Step 4: Add `pub use` for `KvStore`**
 
 In `lib.rs`, add near the other `pub use`s:
 
@@ -503,20 +553,15 @@ In `lib.rs`, add near the other `pub use`s:
 pub use kv_store::KvStore;
 ```
 
-To let `open_store_creates_backing_table` compile before Task 5 adds `size`, edit that test to check emptiness via a direct query instead:
-
-```rust
-    // (temporary until Task 5 adds `size`)
-    let count = tc
-        .connection
-        .query_count("SELECT COUNT(*) FROM _hyperdb_kv_store WHERE store_name = 'cfg'")?;
-    assert_eq!(count, 0);
-```
+(No test edit is needed — the Task-3 test in Step 1 never calls `size()`; it checks emptiness
+via `execute_query` + `scalar::<i64>()`, so Task 3 compiles and passes on its own. `size()` gets
+its own dedicated test in Task 5. This removes the fragile "stand-in then restore" churn the plan
+review flagged.)
 
 - [ ] **Step 5: Run the tests**
 
 Run: `HYPERD_PATH=~/dev/bin/hyperd cargo test -p hyperdb-api --test kv_store_tests -- --nocapture`
-Expected: PASS (3 tests). Read the `--nocapture` output for the PK-probe `eprintln!` line and record the observed behavior in the commit message.
+Expected: PASS (3 tests). Read the `--nocapture` output for the PK-probe `eprintln!` line and record the observed behavior in the commit message. (Empirically, the pinned `hyperd` accepts a duplicate raw `INSERT` because the table has no PK — the probe documents this and proves why the app-side conditional-INSERT upsert is required.)
 
 - [ ] **Step 6: Clippy + fmt, then commit**
 
@@ -618,9 +663,11 @@ Expected: FAIL — `no method named get`/`set`/`get_as`/`set_as`.
             "SELECT value FROM {} WHERE store_name = $1 AND key = $2",
             self.table_ref
         );
+        // Bind store_name/key as `&str` params (never interpolated) — uniform
+        // `&str` element types coerce cleanly to `&[&dyn ToSqlParam]`.
         let row = self
             .connection
-            .query_params(&sql, &[&self.store_name, &key])?
+            .query_params(&sql, &[&self.store_name.as_str(), &key])?
             .first_row()?;
         Ok(row.and_then(|r| r.get::<String>(0)))
     }
@@ -643,12 +690,13 @@ Expected: FAIL — `no method named get`/`set`/`get_as`/`set_as`.
     /// idiom. The conditional INSERT uses distinct placeholders (`$4`/`$5`)
     /// so it is unambiguous under the extended-query protocol.
     fn upsert(&self, key: &str, value: &str) -> Result<()> {
+        let store = self.store_name.as_str();
         let updated = self.connection.command_params(
             &format!(
                 "UPDATE {} SET value = $3 WHERE store_name = $1 AND key = $2",
                 self.table_ref
             ),
-            &[&self.store_name, &key, &value],
+            &[&store, &key, &value],
         )?;
         if updated == 0 {
             self.connection.command_params(
@@ -658,7 +706,7 @@ Expected: FAIL — `no method named get`/`set`/`get_as`/`set_as`.
                      WHERE NOT EXISTS (SELECT 1 FROM {t} WHERE store_name = $4 AND key = $5)",
                     t = self.table_ref
                 ),
-                &[&self.store_name, &key, &value, &self.store_name, &key],
+                &[&store, &key, &value, &store, &key],
             )?;
         }
         Ok(())
@@ -795,7 +843,7 @@ Expected: FAIL — missing methods.
                 "DELETE FROM {} WHERE store_name = $1 AND key = $2",
                 self.table_ref
             ),
-            &[&self.store_name, &key],
+            &[&self.store_name.as_str(), &key],
         )?;
         Ok(affected > 0)
     }
@@ -814,7 +862,7 @@ Expected: FAIL — missing methods.
         );
         Ok(self
             .connection
-            .query_params(&sql, &[&self.store_name, &key])?
+            .query_params(&sql, &[&self.store_name.as_str(), &key])?
             .first_row()?
             .is_some())
     }
@@ -829,9 +877,11 @@ Expected: FAIL — missing methods.
             "SELECT COUNT(*) FROM {} WHERE store_name = $1",
             self.table_ref
         );
+        // `scalar()` errors on zero rows, but COUNT(*) always returns exactly
+        // one non-NULL row, so `unwrap_or(0)` is unreachable-but-defensive.
         Ok(self
             .connection
-            .query_params(&sql, &[&self.store_name])?
+            .query_params(&sql, &[&self.store_name.as_str()])?
             .scalar::<i64>()?
             .unwrap_or(0))
     }
@@ -846,7 +896,9 @@ Expected: FAIL — missing methods.
             "SELECT key FROM {} WHERE store_name = $1 ORDER BY key ASC",
             self.table_ref
         );
-        let mut result = self.connection.query_params(&sql, &[&self.store_name])?;
+        let mut result = self
+            .connection
+            .query_params(&sql, &[&self.store_name.as_str()])?;
         let mut keys = Vec::new();
         while let Some(chunk) = result.next_chunk()? {
             for row in &chunk {
@@ -868,7 +920,7 @@ Expected: FAIL — missing methods.
     pub fn clear(&self) -> Result<u64> {
         self.connection.command_params(
             &format!("DELETE FROM {} WHERE store_name = $1", self.table_ref),
-            &[&self.store_name],
+            &[&self.store_name.as_str()],
         )
     }
 ```
@@ -876,7 +928,8 @@ Expected: FAIL — missing methods.
 - [ ] **Step 4: Run the tests**
 
 Run: `HYPERD_PATH=~/dev/bin/hyperd cargo test -p hyperdb-api --test kv_store_tests`
-Expected: PASS (all sync tests). Also restore the Task-3 `open_store_creates_backing_table` test to use `kv.size()?` now that it exists.
+Expected: PASS (all sync tests, including the new `size()`-based `delete_exists_size_keys_clear`).
+No edit to the Task-3 test is needed — it deliberately never used `size()`.
 
 - [ ] **Step 5: Clippy + fmt, then commit**
 
@@ -957,9 +1010,10 @@ Expected: FAIL — missing `pop`/`set_batch`.
 ```rust
     /// Removes and returns the lowest-ordered key/value pair, or `None` if empty.
     ///
-    /// The peek and delete run in one transaction so the pair cannot be
-    /// removed by a concurrent caller between the read and the delete. A
-    /// SQL-NULL value is returned as an empty string.
+    /// The peek and delete run in one transaction, so they apply atomically —
+    /// either both the read and the delete commit, or neither does (on error
+    /// the transaction is rolled back). A SQL-NULL value is returned as an
+    /// empty string.
     ///
     /// # Errors
     ///
@@ -977,17 +1031,19 @@ Expected: FAIL — missing `pop`/`set_batch`.
         result
     }
 
-    /// Transaction body for [`pop`](Self::pop). Consumes the `Rowset` (via
-    /// `first_row`) before issuing the `DELETE` so the statement guard is
-    /// released on the shared connection first.
+    /// Transaction body for [`pop`](Self::pop).
     fn pop_inner(&self) -> Result<Option<(String, String)>> {
+        let store = self.store_name.as_str();
         let select = format!(
             "SELECT key, value FROM {} WHERE store_name = $1 ORDER BY key ASC LIMIT 1",
             self.table_ref
         );
+        // `first_row()` consumes the `Rowset`, dropping it (and releasing its
+        // statement guard on the shared connection) BEFORE the DELETE runs —
+        // the two statements never overlap on the connection.
         let Some(row) = self
             .connection
-            .query_params(&select, &[&self.store_name])?
+            .query_params(&select, &[&store])?
             .first_row()?
         else {
             return Ok(None);
@@ -1001,7 +1057,7 @@ Expected: FAIL — missing `pop`/`set_batch`.
                 "DELETE FROM {} WHERE store_name = $1 AND key = $2",
                 self.table_ref
             ),
-            &[&self.store_name, &key],
+            &[&store, &key.as_str()],
         )?;
         Ok(Some((key, value)))
     }
@@ -1214,7 +1270,7 @@ Create `hyperdb-api/src/async_kv_store.rs`. Mirror `kv_store.rs` exactly, substi
 
 use crate::async_connection::AsyncConnection;
 use crate::error::{Error, Result};
-use crate::kv_store::{validate_kv_name, KV_TABLE};
+use crate::kv_store::{kv_create_table_sql, validate_kv_name, KV_TABLE};
 
 /// A handle to one named key-value store over an [`AsyncConnection`].
 ///
@@ -1248,11 +1304,7 @@ impl<'conn> AsyncKvStore<'conn> {
     ) -> Result<Self> {
         validate_kv_name(name, "store name")?;
         connection
-            .execute_command(&format!(
-                "CREATE TABLE IF NOT EXISTS {table_ref} (\
-                 store_name TEXT NOT NULL, key TEXT NOT NULL, value TEXT, \
-                 PRIMARY KEY (store_name, key))"
-            ))
+            .execute_command(&kv_create_table_sql(&table_ref))
             .await?;
         Ok(AsyncKvStore {
             connection,
@@ -1265,6 +1317,11 @@ impl<'conn> AsyncKvStore<'conn> {
         Self::open(connection, name, KV_TABLE.to_string()).await
     }
 
+    /// Async twin of [`KvStore::with_target`](crate::KvStore::with_target).
+    ///
+    /// `target` is interpolated into SQL — the caller must supply a
+    /// pre-validated / identifier-escaped, SQL-safe qualifier (M2 must escape
+    /// it before calling).
     #[allow(
         dead_code,
         reason = "M2 (hyperdb-mcp) consumer; kept here so M1 needs no later API change"
@@ -1296,7 +1353,7 @@ impl<'conn> AsyncKvStore<'conn> {
         );
         let row = self
             .connection
-            .query_params(&sql, &[&self.store_name, &key])
+            .query_params(&sql, &[&self.store_name.as_str(), &key])
             .await?
             .first_row()
             .await?;
@@ -1321,7 +1378,7 @@ impl<'conn> AsyncKvStore<'conn> {
                     "UPDATE {} SET value = $3 WHERE store_name = $1 AND key = $2",
                     self.table_ref
                 ),
-                &[&self.store_name, &key, &value],
+                &[&self.store_name.as_str(), &key, &value],
             )
             .await?;
         if updated == 0 {
@@ -1333,7 +1390,13 @@ impl<'conn> AsyncKvStore<'conn> {
                          WHERE NOT EXISTS (SELECT 1 FROM {t} WHERE store_name = $4 AND key = $5)",
                         t = self.table_ref
                     ),
-                    &[&self.store_name, &key, &value, &self.store_name, &key],
+                    &[
+                        &self.store_name.as_str(),
+                        &key,
+                        &value,
+                        &self.store_name.as_str(),
+                        &key,
+                    ],
                 )
                 .await?;
         }
@@ -1379,7 +1442,7 @@ impl<'conn> AsyncKvStore<'conn> {
                     "DELETE FROM {} WHERE store_name = $1 AND key = $2",
                     self.table_ref
                 ),
-                &[&self.store_name, &key],
+                &[&self.store_name.as_str(), &key],
             )
             .await?;
         Ok(affected > 0)
@@ -1398,7 +1461,7 @@ impl<'conn> AsyncKvStore<'conn> {
         );
         Ok(self
             .connection
-            .query_params(&sql, &[&self.store_name, &key])
+            .query_params(&sql, &[&self.store_name.as_str(), &key])
             .await?
             .first_row()
             .await?
@@ -1417,7 +1480,7 @@ impl<'conn> AsyncKvStore<'conn> {
         );
         Ok(self
             .connection
-            .query_params(&sql, &[&self.store_name])
+            .query_params(&sql, &[&self.store_name.as_str()])
             .await?
             .scalar::<i64>()
             .await?
@@ -1436,7 +1499,7 @@ impl<'conn> AsyncKvStore<'conn> {
         );
         let mut result = self
             .connection
-            .query_params(&sql, &[&self.store_name])
+            .query_params(&sql, &[&self.store_name.as_str()])
             .await?;
         let mut keys = Vec::new();
         while let Some(chunk) = result.next_chunk().await? {
@@ -1458,7 +1521,7 @@ impl<'conn> AsyncKvStore<'conn> {
         self.connection
             .command_params(
                 &format!("DELETE FROM {} WHERE store_name = $1", self.table_ref),
-                &[&self.store_name],
+                &[&self.store_name.as_str()],
             )
             .await
     }
@@ -1487,7 +1550,7 @@ impl<'conn> AsyncKvStore<'conn> {
         );
         let Some(row) = self
             .connection
-            .query_params(&select, &[&self.store_name])
+            .query_params(&select, &[&self.store_name.as_str()])
             .await?
             .first_row()
             .await?
@@ -1504,7 +1567,7 @@ impl<'conn> AsyncKvStore<'conn> {
                     "DELETE FROM {} WHERE store_name = $1 AND key = $2",
                     self.table_ref
                 ),
-                &[&self.store_name, &key],
+                &[&self.store_name.as_str(), &key],
             )
             .await?;
         Ok(Some((key, value)))
@@ -1553,12 +1616,7 @@ impl AsyncConnection {
     ///
     /// See [`Connection::kv_list_stores`](crate::Connection::kv_list_stores).
     pub async fn kv_list_stores(&self) -> Result<Vec<String>> {
-        self.execute_command(&format!(
-            "CREATE TABLE IF NOT EXISTS {KV_TABLE} (\
-             store_name TEXT NOT NULL, key TEXT NOT NULL, value TEXT, \
-             PRIMARY KEY (store_name, key))"
-        ))
-        .await?;
+        self.execute_command(&kv_create_table_sql(KV_TABLE)).await?;
         let mut result = self
             .execute_query(&format!(
                 "SELECT DISTINCT store_name FROM {KV_TABLE} ORDER BY store_name ASC"
@@ -1603,7 +1661,7 @@ git commit -m "feat(kv): add AsyncKvStore async twin"
 - Modify: `hyperdb-api/Cargo.toml` (register the example)
 
 **Interfaces:**
-- Consumes: `Connection::kv_store`, `KvStore::{set, set_batch}`; the `benches/common.rs` helpers (`ResourceMonitor`, timing).
+- Consumes: `Connection::kv_store`, `KvStore::{clear, set, set_batch}`, `HyperProcess`, `Connection::new`. Standalone — does not use `benches/common.rs`.
 
 **Design:** A plain-`main()` example (matching `benches/benchmark.rs`), run via `cargo run -p hyperdb-api --release --example kv_benchmark [N]`. It measures two write strategies for the KV store:
 1. **Single-commit-per-set:** N calls to `kv.set(key, value)` (each an implicit upsert/commit).
@@ -1629,16 +1687,14 @@ Create `hyperdb-api/benches/kv_benchmark.rs`:
 //!   cargo run -p hyperdb-api --release --example kv_benchmark            # default 50k keys
 //!   cargo run -p hyperdb-api --release --example kv_benchmark 200000     # 200k keys
 
-// Benchmark harness: wide->narrow conversions for count display and
-// throughput math are bounded by the benchmark's own inputs.
-#![expect(
-    clippy::cast_possible_truncation,
+// Throughput math converts a `usize` key count to `f64`; the resulting
+// precision loss is irrelevant for a keys/sec figure. `allow` (not `expect`)
+// because this is the only pedantic cast lint that fires here — an `expect`
+// listing others would trip `unfulfilled_lint_expectations` under `-D warnings`.
+#![allow(
     clippy::cast_precision_loss,
-    reason = "benchmark harness: counts are bench-bounded; throughput math needs f64"
+    reason = "benchmark throughput math needs usize -> f64; precision loss is cosmetic"
 )]
-
-#[path = "common.rs"]
-mod common;
 
 use hyperdb_api::{Connection, CreateMode, HyperProcess, Result};
 use std::env;
@@ -1708,7 +1764,7 @@ fn main() -> Result<()> {
 }
 ```
 
-> **Note:** `common.rs` is imported via `#[path = "common.rs"] mod common;` for consistency with the other benches, even though this benchmark's minimal version does not use `ResourceMonitor`. If clippy flags the unused import, either drop the `mod common;` line or add a `ResourceMonitor` sampling wrapper around each phase (optional enhancement). Keep the file warning-clean before committing.
+> **Note:** Unlike the other benches, this one does **not** import `benches/common.rs` — its `ResourceMonitor` and other helpers are unused here, and an unused `mod common;` would trip `dead_code`/`unused` under `-D warnings`. Keep the file dependency-free and warning-clean. If you later want per-phase resource sampling, add `#[path = "common.rs"] mod common;` *and* actually call `ResourceMonitor` so nothing is dead.
 
 - [ ] **Step 2: Register the example in `Cargo.toml`**
 
