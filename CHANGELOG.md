@@ -5,8 +5,7 @@
 
 ### Bug Fixes
 
-* **mcp:** release KV README docs + INVALID_ARGUMENT error mapping ([#188](https://github.com/tableau/hyper-api-rust/issues/188)) ([a5993d5](https://github.com/tableau/hyper-api-rust/commit/a5993d5e9901a5bcc02bb9d7fbfe850ad36fe272))
-* **mcp:** release KV README docs + INVALID_ARGUMENT error mapping from [#188](https://github.com/tableau/hyper-api-rust/issues/188) ([#189](https://github.com/tableau/hyper-api-rust/issues/189)) ([a5993d5](https://github.com/tableau/hyper-api-rust/commit/a5993d5e9901a5bcc02bb9d7fbfe850ad36fe272))
+* **mcp:** surface the KV store in the crates.io README and map caller-fixable identifier errors to INVALID_ARGUMENT ([#188](https://github.com/tableau/hyper-api-rust/issues/188)) ([a5993d5](https://github.com/tableau/hyper-api-rust/commit/a5993d5e9901a5bcc02bb9d7fbfe850ad36fe272))
 
 ## [0.6.0](https://github.com/tableau/hyper-api-rust/compare/v0.5.6...v0.6.0) (2026-07-10)
 
