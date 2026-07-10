@@ -207,6 +207,22 @@ impl From<hyperdb_api::Error> for McpError {
             // Configuration errors are caller-visible setup mistakes.
             hyperdb_api::Error::Config(_) => McpError::new(ErrorCode::InvalidArgument, msg),
 
+            // Caller-fixable argument errors: an invalid identifier (e.g. a
+            // KV store/key with a disallowed byte or over the length limit)
+            // or a malformed table definition (zero columns, conflicting
+            // attributes). These are triggered by the tool arguments an LLM
+            // supplies, and the message names what's wrong, so they are
+            // InvalidArgument, not an opaque InternalError.
+            //
+            // NOTE: `InvalidOperation` is deliberately NOT included — it is
+            // hyperdb-api "caller-API misuse" where the *caller* is this
+            // MCP's own Rust code (e.g. mixing inserter modes), not the LLM.
+            // If it ever fired it would signal an MCP bug the model can't fix
+            // by changing arguments, so it correctly stays InternalError.
+            hyperdb_api::Error::InvalidName(_) | hyperdb_api::Error::InvalidTableDefinition(_) => {
+                McpError::new(ErrorCode::InvalidArgument, msg)
+            }
+
             // Connection / Closed / Timeout — surface as ConnectionLost
             // so the engine recycles. is_connection_lost above already
             // catches most of these via message; this is a fallback.

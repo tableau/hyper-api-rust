@@ -3185,7 +3185,7 @@ impl HyperMcpServer {
 
     /// List all scratchpad store namespaces that hold data in a database.
     #[tool(
-        description = "List all KV scratchpad store namespaces that currently hold data in a database. Omit `database` for the ephemeral store, or route with \"persistent\"/persist=true/an attached alias. Each database has its own isolated set of stores."
+        description = "List all KV scratchpad store namespaces that currently hold data in a database. Omit `database` for the ephemeral store, or route with \"persistent\"/persist=true/an attached alias. Each database has its own isolated set of stores. A store drops off this list once its last key is removed — there is no separate registry."
     )]
     fn kv_list_stores(
         &self,
@@ -3224,9 +3224,10 @@ impl HyperMcpServer {
         }
     }
 
-    /// Destructively read-and-remove the lowest-keyed entry (atomic).
+    /// Destructively read-and-remove the lowest-keyed entry in lexicographic
+    /// key order (atomic).
     #[tool(
-        description = "Destructively read-and-remove the lowest-keyed entry from a KV store (peek+delete in one transaction, atomic within a single server process — useful as a work queue for one session; two separate server processes popping a shared persistent store could double-serve an entry). Returns {found, key, value}; {found: false} on an empty store. Omit `database` for the ephemeral store, or route with \"persistent\"/persist=true/an attached alias."
+        description = "Destructively read-and-remove the lowest-keyed entry (lexicographic key order, not insertion order) from a KV store (peek+delete in one transaction, atomic within a single server process — useful as a work queue for one session; two separate server processes popping a shared persistent store could double-serve an entry). Returns {found, key, value}; {found: false} on an empty store. Omit `database` for the ephemeral store, or route with \"persistent\"/persist=true/an attached alias."
     )]
     fn kv_pop(
         &self,

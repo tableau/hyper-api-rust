@@ -176,3 +176,65 @@ fn connection_lost_suggestion_mentions_both_triggers() {
         "suggestion should tell the caller the server will recover; got: {suggestion}",
     );
 }
+
+/// A caller-supplied bad identifier — the shape the KV tools hit when a
+/// `store`/`key` has a disallowed byte or exceeds the 512-byte limit —
+/// arrives as `hyperdb_api::Error::InvalidName`. It must map to
+/// `InvalidArgument`, not `InternalError`: the caller supplied something
+/// wrong and can fix it, and the message already names the offending byte
+/// or the length. Before this mapping the variant fell through to the
+/// catch-all `InternalError` arm, mislabeling a validation failure as a
+/// server-side bug (caught during the KV MCP smoke run).
+#[test]
+fn maps_invalid_name_to_invalid_argument() {
+    for upstream in [
+        // The exact messages `validate_kv_name` produces for the KV tools.
+        hyperdb_api::Error::invalid_name(
+            "KV key contains an invalid byte 0x20; allowed: A-Z a-z 0-9 _ . -",
+        ),
+        hyperdb_api::Error::invalid_name("KV store name must not be empty"),
+        hyperdb_api::Error::invalid_name("KV key exceeds 512-byte limit (630 bytes)"),
+    ] {
+        let original = upstream.to_string();
+        let mcp: McpError = upstream.into();
+        assert_eq!(
+            mcp.code,
+            ErrorCode::InvalidArgument,
+            "invalid name must be InvalidArgument, not InternalError: {original}",
+        );
+        // The message must survive so the caller learns what to fix.
+        assert!(
+            mcp.message.contains("invalid name"),
+            "message should carry the validation detail; got: {}",
+            mcp.message,
+        );
+        assert!(
+            mcp.suggestion.is_some(),
+            "InvalidArgument carries a self-correction suggestion",
+        );
+    }
+}
+
+/// `InvalidTableDefinition` shares the `InvalidName` reasoning — a
+/// malformed table definition is something the caller (the LLM's tool
+/// arguments) supplied and can correct — so it maps to `InvalidArgument`,
+/// not the opaque `InternalError` the catch-all arm used to assign.
+#[test]
+fn maps_invalid_table_definition_to_invalid_argument() {
+    let def: McpError =
+        hyperdb_api::Error::invalid_table_definition("table must have at least one column").into();
+    assert_eq!(def.code, ErrorCode::InvalidArgument);
+}
+
+/// `InvalidOperation` is deliberately NOT mapped to `InvalidArgument`. It
+/// is hyperdb-api "caller-API misuse" where the caller is this MCP's own
+/// Rust code (e.g. an inserter used out of sequence), not the LLM — an
+/// occurrence signals an MCP bug the model cannot fix by changing tool
+/// arguments, so it stays `InternalError`. This guards against a naive
+/// "group it with the other caller-fixable variants" regression that
+/// would hand the model a misleading "check your arguments" suggestion.
+#[test]
+fn keeps_invalid_operation_as_internal_error() {
+    let op: McpError = hyperdb_api::Error::invalid_operation("inserter already finalized").into();
+    assert_eq!(op.code, ErrorCode::InternalError);
+}

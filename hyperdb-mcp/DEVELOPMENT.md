@@ -128,6 +128,10 @@ cargo test -p hyperdb-mcp
 
 Most tests require a running `hyperd`. Set `HYPERD_PATH` before running.
 
+For manual, tool-driven checks against a **live** MCP server (useful after a
+build or before a release — they exercise real session state the unit tests
+don't), see [SMOKE_TESTS.md](SMOKE_TESTS.md).
+
 ### Lint
 
 ```bash
