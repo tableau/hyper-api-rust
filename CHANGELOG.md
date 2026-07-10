@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/tableau/hyper-api-rust/compare/v0.5.6...v0.6.0) (2026-07-10)
+
+
+### Features
+
+* **mcp:** key-value scratchpad tools + database-targeted KV API ([#185](https://github.com/tableau/hyper-api-rust/issues/185)) ([c24e291](https://github.com/tableau/hyper-api-rust/commit/c24e2918f60792e693b6b40f583562648233f7ac))
+
 ## [0.5.6](https://github.com/tableau/hyper-api-rust/compare/v0.5.5...v0.5.6) (2026-06-16)
 
 
