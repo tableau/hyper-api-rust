@@ -25,6 +25,8 @@ This means an LLM can:
 
 The ephemeral database is scratch space (think: a whiteboard). The persistent database is long-term memory (think: a filing cabinet you can query). Multiple AI clients sharing the same daemon see the same persistent data — so Claude Code, Cursor, and VS Code Copilot can all read from and contribute to the same knowledge base.
 
+**Table or key-value store?** For a handful of small facts, notes, or flags, prefer the built-in key-value store (`kv_set` with `persist: true`) over `CREATE TABLE` + `load_data` — it needs no schema and no DDL. Reach for a real table when you need typed columns, JOINs, or aggregation. See [Working with both databases](#working-with-both-databases) for the `persist` / `database` mechanics that apply to both paths.
+
 ---
 
 ## Features
@@ -48,6 +50,7 @@ The ephemeral database is scratch space (think: a whiteboard). The persistent da
 - **Partial schema overrides** — supply just the columns you want to correct (e.g. `{"population":"BIGINT"}`) — the rest keep their inferred type
 - **Rich resource surface** — workspace readme, per-table JSON and CSV samples, and one JSON + one CSV resource per table so LLMs can orient themselves via `resources/list` without any tool calls
 - **Saved queries** — register named read-only SQL with `save_query`; each query becomes `hyper://queries/{name}/definition` (metadata) + `hyper://queries/{name}/result` (live re-run). Persisted in the persistent attachment, session-only when `--ephemeral-only`
+- **Key-value scratchpad** — lightweight `kv_set` / `kv_get` / `kv_list` / `kv_delete` / `kv_pop` / `kv_size` / `kv_clear` / `kv_list_stores` store for small notes and state without a `CREATE TABLE`. Ephemeral by default (lost on restart); pass `persist: true` (or `database: "persistent"`) to make a store durable across sessions
 - **Live resource-update notifications** — MCP clients can `resources/subscribe` to any `hyper://...` URI; the server fires `notifications/resources/updated` after every ingest, DDL, watcher event, or saved-query mutation
 
 ---
@@ -270,7 +273,7 @@ If hyperd repeatedly fails to start (3 attempts within 60 seconds — e.g., misc
 
 | Flag | Behavior |
 |---|---|
-| `--read-only` | Disables `execute`, `load_data`, `load_file`, `watch_directory`, `save_query`, `delete_query`, and Hyper-format export. See [Read-Only Mode](#read-only-mode). |
+| `--read-only` | Disables `execute`, `load_data`, `load_file`, `watch_directory`, `save_query`, `delete_query`, and the KV mutators (`kv_set`, `kv_delete`, `kv_pop`, `kv_clear`). Export (including `.hyper`) stays allowed — it's a read-only file copy. See [Read-Only Mode](#read-only-mode). |
 
 ---
 
@@ -507,6 +510,42 @@ delete_query(name: 'top_5_customers')
 Returns `{ "deleted": true }` when the query existed, `{ "deleted": false }`
 when it did not (no error on unknown names). Disabled in read-only mode.
 
+### Key-Value Store
+
+Lightweight named scratchpad for stashing a value under `store` + `key` and
+recalling it later — remember a variable, a summary, a JSON config, or a
+work-queue entry without creating a table or running `load_data`.
+
+> **Stores default to the EPHEMERAL database and are LOST on server restart.**
+> Pass `database="persistent"` (or `persist=true`) to make a store durable
+> across restarts, or an attached alias to target that database. Each database
+> has its own isolated set of stores; a store in one database is invisible from
+> another.
+
+Eight tools cover the surface:
+
+| Tool | Purpose | Parameters |
+|---|---|---|
+| `kv_set` | Write/overwrite a value (upsert) | `store`, `key`, `value`, `database`, `persist` |
+| `kv_get` | Read a value by store + key (`value` is null when absent, not an error) | `store`, `key`, `database`, `persist` |
+| `kv_delete` | Remove one key (`{deleted: true/false}`, no error on unknown key) | `store`, `key`, `database`, `persist` |
+| `kv_list` | List all keys in a store, sorted ascending | `store`, `database`, `persist` |
+| `kv_list_stores` | List store namespaces that currently hold data | `database`, `persist` |
+| `kv_size` | Count keys in a store | `store`, `database`, `persist` |
+| `kv_pop` | Destructively read-and-remove the lowest-keyed entry (atomic) | `store`, `database`, `persist` |
+| `kv_clear` | Delete all keys in a store (returns count removed) | `store`, `database`, `persist` |
+
+```
+kv_set(store: 'session', key: 'last_report', value: '{"rows": 4210}', database: 'persistent')
+kv_get(store: 'session', key: 'last_report')
+```
+
+Key properties:
+- **Read-only mode** — the four mutators (`kv_set`, `kv_delete`, `kv_pop`, `kv_clear`) are disabled and return `READ_ONLY_VIOLATION`; the four readers (`kv_get`, `kv_list`, `kv_size`, `kv_list_stores`) always work.
+- **Pop order** — `kv_pop` removes and returns the **lowest-keyed** entry in lexicographic key order (not insertion order), making a store usable as a simple work queue.
+- **No store registry** — a store that becomes empty simply **drops out** of `kv_list_stores`; there is no separate registry of store names.
+- **Backing table** — values live in `_hyperdb_kv_store(store_name, key, value)`, which is indexless (Hyper has no indexes) and hidden from `describe` by its `_hyperdb_` prefix, but is directly queryable — e.g. `LEFT JOIN` it to enrich an analytical table (always filter on `kv.store_name`). Uniqueness of `(store_name, key)` is enforced by the tool layer's upsert, atomic within a single server process. See the `hyper://schema/kv` resource for the schema and join pattern.
+
 ### Export Tools
 
 #### `export`
@@ -601,6 +640,7 @@ can route it appropriately (LLM context vs. file download vs. chart).
 | `hyper://tables/{name}/csv-sample` | `text/csv` | First 20 rows of a table as CSV, header-first |
 | `hyper://queries/{name}/definition` | `application/json` | Stored SQL + metadata for a saved query |
 | `hyper://queries/{name}/result` | `application/json` | Live result of a saved query — re-runs on every read |
+| `hyper://schema/kv` | `text/plain` | KV scratchpad schema: the `_hyperdb_kv_store(store_name, key, value)` backing table, its indexless shape, the ephemeral-vs-persistent durability rule, and the `LEFT JOIN` enrichment pattern |
 
 Resource templates (discoverable via `resources/templates/list`):
 
@@ -666,8 +706,8 @@ Four guided analytical workflows registered as MCP **Prompts**.
 hyperdb-mcp --persistent-db ~/analytics.hyper --read-only
 ```
 
-- **Allowed:** `query`, `query_data`, `query_file`, `describe`, `sample`, `inspect_file`, `status`, `export`
-- **Blocked:** `execute`, `load_data`, `load_file`, `watch_directory`, `save_query`, `delete_query` — return `READ_ONLY_VIOLATION`
+- **Allowed:** `query`, `query_data`, `query_file`, `describe`, `sample`, `inspect_file`, `status`, `export`, and the KV readers `kv_get`, `kv_list`, `kv_size`, `kv_list_stores`
+- **Blocked:** `execute`, `load_data`, `load_file`, `watch_directory`, `save_query`, `delete_query`, and the KV mutators `kv_set`, `kv_delete`, `kv_pop`, `kv_clear` — return `READ_ONLY_VIOLATION`
 - **Resources, prompts, and resource subscriptions** work normally — read-only clients can still subscribe to `hyper://...` URIs and receive notifications when other (non-read-only) connections mutate state
 
 The `query` tool also enforces read-only at the SQL level — only `SELECT`/`WITH`/`EXPLAIN`/`SHOW`/`VALUES` are accepted.

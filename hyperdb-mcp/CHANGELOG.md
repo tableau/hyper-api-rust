@@ -36,6 +36,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `INVALID_ARGUMENT`, which carries a self-correction suggestion. The
   human-readable message (naming the offending byte or the length) is
   unchanged.
+- **README `--read-only` flag table no longer claims Hyper-format export is
+  disabled.** The `--read-only` row wrongly listed "Hyper-format export" among
+  the disabled operations, contradicting both the actual behavior (`export`
+  has no read-only gate — a `.hyper` export is a harmless read-only file copy
+  and stays allowed) and the same document's Read-Only Mode "Allowed" list.
+  Docs-only correction; no behavior change.
 - **TCP keepalive on the `hyperd` connection.** Connections to `hyperd` now
   enable TCP keepalive (60s idle, 10s interval, ~90s to declare a dead peer)
   instead of relying on the OS default 2-hour idle timeout. Without it, a

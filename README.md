@@ -33,6 +33,7 @@ database files (`.hyper`) without any C library dependencies.
 - **Typed Row Mapping** — `#[derive(FromRow)]` structs, including streaming `stream_as` for constant-memory typed queries
 - **Compile-time SQL Validation** — opt-in `query_as!` macro checks SQL against your schema at build time (red squigglies in VS Code)
 - **Connection Pooling** — async pooling via `deadpool` for high-concurrency applications
+- **Key-Value Store** — string-native `KvStore` / `AsyncKvStore` backed by a single fixed table
 - **Arrow Integration** — insert and read data in Arrow IPC stream format
 - **gRPC Transport** — read-only access with Arrow IPC and load balancing support
 - **Full Type Support** — all Hyper types including Numeric, Geography, Intervals

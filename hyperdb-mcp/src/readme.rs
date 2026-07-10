@@ -72,6 +72,22 @@ query({ sql: \"SELECT s.*, p.decision FROM scratch_analysis s \
               ON s.topic = p.topic\" })
 ```
 
+### KV store vs. a custom table — which to remember with
+
+When you need to remember something, pick the lighter tool:
+
+- **A few scraps** — a variable, a flag, a summary, a JSON blob, a
+  work-queue entry — use the key-value store (`kv_set` / `kv_get`). No
+  schema, no DDL, no `load_data`. See `Tool index → Key-value store`.
+- **Structured rows** you'll filter, JOIN, or aggregate — use a real
+  table (`load_data` / `execute CREATE TABLE`), so SQL can reason over
+  typed columns.
+
+Both persist the same way: default is the EPHEMERAL database (lost on
+restart); pass `database: \"persistent\"` to keep either one across
+sessions. The KV and `load_*` tools also accept the `persist: true`
+shorthand; `execute` takes `database` only.
+
 ### Routing data to a destination
 
 - **`database` parameter** (preferred for tools that build their own
@@ -124,6 +140,10 @@ watcher targets the alias; call `unwatch_directory` first.
 ### Inspect
 - `describe` — list workspace tables (no args) or describe one table
   (`table` arg) with columns, types, row count, and prose metadata.
+  **Defaults to the ephemeral primary** — pass `database: \"persistent\"`
+  (or an attached alias) to list/inspect durable tables. `status` reports
+  table *counts* only, never names, so check the right database here
+  before assuming a persistent table is missing.
 - `sample` — return schema + first N rows of a table. Use this before
   writing a non-trivial query.
 - `inspect_file` — dry-run schema inference on a CSV / Parquet / Arrow
@@ -172,7 +192,8 @@ watcher targets the alias; call `unwatch_directory` first.
 - `kv_list` — list keys in a store.
 - `kv_list_stores` — list store namespaces that hold data in a database.
 - `kv_size` — count keys in a store.
-- `kv_pop` — destructively read-and-remove the lowest-keyed entry.
+- `kv_pop` — destructively read-and-remove the lowest-keyed entry
+  (lexicographic key order, not insertion order).
 - `kv_clear` — delete all keys in a store.
 
 Every kv_* tool takes the same optional `database` parameter as the data
@@ -183,7 +204,8 @@ has its own isolated set of stores. Enrich analytical tables with KV
 metadata via LEFT JOIN — always filter `kv.store_name = '<namespace>'`
 to avoid row multiplication, and keep the KV table in the same database
 as the joined table. See the `hyper://schema/kv` resource for the join
-template.
+template, and `KV store vs. a custom table` above for when to reach for
+this instead of a real table.
 
 ### Introspection
 - `get_readme` — this document. Call once at the start of a session.
