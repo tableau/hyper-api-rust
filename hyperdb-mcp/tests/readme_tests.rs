@@ -53,6 +53,14 @@ fn readme_mentions_every_tool() {
         "list_attached_databases",
         "watch_directory",
         "unwatch_directory",
+        "kv_get",
+        "kv_set",
+        "kv_delete",
+        "kv_list",
+        "kv_list_stores",
+        "kv_size",
+        "kv_pop",
+        "kv_clear",
         "get_readme",
     ];
     for tool in tools {

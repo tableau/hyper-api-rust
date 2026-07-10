@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Key-value scratchpad tools** — eight new MCP tools (`kv_set`, `kv_get`,
+  `kv_delete`, `kv_list`, `kv_list_stores`, `kv_size`, `kv_pop`, `kv_clear`)
+  let an LLM stash variables, state, summaries, or JSON strings under a
+  `store`/`key` namespace without creating a table. Each takes the same
+  optional `database`/`persist` routing as the data tools; **stores are
+  ephemeral by default** (lost on server restart) and persist only when
+  routed to `"persistent"` (or `persist: true`) or an attached alias. Each
+  database keeps its own isolated set of stores. The mutating tools
+  (`kv_set`, `kv_delete`, `kv_pop`, `kv_clear`) are disabled in read-only
+  mode; the readers (`kv_get`, `kv_list`, `kv_size`, `kv_list_stores`)
+  always work.
+- **`hyper://schema/kv` resource** describing the `_hyperdb_kv_store`
+  backing table, its indexless shape, the ephemeral-vs-persistent
+  durability rule, per-database isolation, and the `LEFT JOIN` pattern for
+  enriching analytical tables with KV metadata.
+
 ### Fixed
 
 - **TCP keepalive on the `hyperd` connection.** Connections to `hyperd` now

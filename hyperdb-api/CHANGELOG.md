@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `KvStore` / `AsyncKvStore` handles over a fixed `_hyperdb_kv_store` table, with
   `get`/`set`/`get_as`/`set_as`/`delete`/`exists`/`size`/`keys`/`pop`/`clear`/`set_batch`,
   plus `kv_list_stores`. Adds the `Error::Serialization` variant.
+- `Connection::kv_store_in(database, name)` / `kv_list_stores_in(database)` (plus the
+  `AsyncConnection` twins) to open and enumerate KV stores in a specific attached
+  database. The database name is identifier-escaped internally.
 
 ## [0.1.1] - 2026-05-13
 

@@ -67,6 +67,47 @@ const TABLE_SAMPLE_ROWS: u64 = 5;
 /// more compact wire format and the extra rows help LLMs see patterns.
 const TABLE_CSV_SAMPLE_ROWS: u64 = 20;
 
+/// Body of the `hyper://schema/kv` resource: describes the `_hyperdb_kv_store`
+/// backing table behind the `kv_*` tools, its (indexless) shape, the
+/// ephemeral-vs-persistent durability rule, per-database isolation, and the
+/// LEFT JOIN enrichment pattern. Served verbatim as `text/plain`.
+const KV_SCHEMA_RESOURCE: &str = "\
+KV store backing table (managed by the kv_* tools):
+
+  CREATE TABLE _hyperdb_kv_store (
+      store_name TEXT NOT NULL,   -- namespace (the `store` tool argument)
+      key        TEXT NOT NULL,   -- key within the store
+      value      TEXT             -- value (nullable); may hold JSON
+  );
+
+There is NO PRIMARY KEY (Hyper disables indexes); (store_name, key) uniqueness is
+enforced by the tool layer's upsert, which is atomic within a single server
+process. Two DIFFERENT server processes writing the same key in a shared
+persistent database concurrently could still create duplicate rows (there is no
+DB-level constraint to catch it). Do not INSERT into this table directly — use
+the kv_* tools, which guarantee uniqueness within a session.
+
+DATABASE / DURABILITY: each database has its own _hyperdb_kv_store table. Every
+kv_* tool takes the same optional `database` parameter as the other tools. Omit it
+and the store lives in the EPHEMERAL database — convenient, but LOST when the
+server restarts. Pass \"persistent\" (or persist=true) to survive restarts, or any
+attached alias to target that database. A store in one database is invisible from
+another.
+
+Enrich an analytical table with KV metadata without ALTER TABLE. The KV table must
+be in the SAME database as the joined table (or fully qualify both) — a LEFT JOIN
+cannot span databases implicitly:
+
+  SELECT t.*, kv.value AS metadata
+  FROM my_table t
+  LEFT JOIN _hyperdb_kv_store kv
+         ON t.id = kv.key AND kv.store_name = 'your_namespace'
+  WHERE t.status = 'active';
+
+ALWAYS include the `kv.store_name = '...'` filter: omitting it fans out any key
+present in multiple stores (row multiplication).
+";
+
 // --- Parameter structs ---
 // Field-level doc comments become JSON Schema `description` fields in the
 // MCP `tools/list` response, so they are written for the LLM caller.
@@ -780,6 +821,72 @@ pub struct SetTableMetadataParams {
     pub database: Option<String>,
 }
 
+/// Parameters for the key-scoped KV tools (`kv_get`, `kv_delete`).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct KvKeyParams {
+    /// Namespace of the KV store (like a named bag of settings). Created on
+    /// first write; no need to declare it up front.
+    pub store: String,
+    /// Key to look up or delete within the store.
+    pub key: String,
+    /// Target database alias. Omit (or pass `"local"`) to use the ephemeral
+    /// primary. Pass `"persistent"` to use the durable database that survives
+    /// across sessions. Other values target a user-attached database (must be
+    /// writable). Each database has its own isolated set of KV stores.
+    pub database: Option<String>,
+    /// Shorthand for `database: "persistent"`. When true, the store lives in
+    /// the persistent database. If both `database` and `persist` are set,
+    /// `database` wins.
+    pub persist: Option<bool>,
+}
+
+/// Parameters for `kv_set` (write a value under store + key).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct KvSetParams {
+    /// Namespace of the KV store. Created on first write.
+    pub store: String,
+    /// Key to write. Overwrites any existing value for this key (upsert).
+    pub key: String,
+    /// Value to store. Any string, including a JSON document.
+    pub value: String,
+    /// Target database alias. Omit (or pass `"local"`) to write to the
+    /// ephemeral primary. Pass `"persistent"` to write to the durable database
+    /// that survives across sessions. Other values target a user-attached
+    /// database (must be writable). Each database has its own isolated stores.
+    pub database: Option<String>,
+    /// Shorthand for `database: "persistent"`. When true, the value is written
+    /// to the persistent database. If both `database` and `persist` are set,
+    /// `database` wins.
+    pub persist: Option<bool>,
+}
+
+/// Parameters for store-scoped KV tools (`kv_list`, `kv_size`, `kv_pop`,
+/// `kv_clear`).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct KvStoreParams {
+    /// Namespace of the KV store to operate on.
+    pub store: String,
+    /// Target database alias. Omit (or pass `"local"`) for the ephemeral
+    /// primary. Pass `"persistent"` for the durable database, or a
+    /// user-attached alias. Each database has its own isolated stores.
+    pub database: Option<String>,
+    /// Shorthand for `database: "persistent"`. If both `database` and
+    /// `persist` are set, `database` wins.
+    pub persist: Option<bool>,
+}
+
+/// Parameters for `kv_list_stores` (enumerate every store in a database).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct KvListStoresParams {
+    /// Target database alias. Omit (or pass `"local"`) for the ephemeral
+    /// primary. Pass `"persistent"` for the durable database, or a
+    /// user-attached alias. Each database has its own isolated stores.
+    pub database: Option<String>,
+    /// Shorthand for `database: "persistent"`. If both `database` and
+    /// `persist` are set, `database` wins.
+    pub persist: Option<bool>,
+}
+
 // --- Prompt argument structs ---
 
 /// Arguments for the `analyze-table` prompt.
@@ -1068,6 +1175,26 @@ impl HyperMcpServer {
         }
 
         Ok(Some(resolved))
+    }
+
+    /// Opens a KV store handle on the engine's connection, targeting the
+    /// resolved `database` (`None` = the ephemeral primary's default location,
+    /// `Some(alias)` = the persistent DB or an attached alias).
+    ///
+    /// `alias` comes straight from [`resolve_db`](Self::resolve_db); it is not
+    /// escaped here — [`Connection::kv_store_in`](hyperdb_api::Connection::kv_store_in)
+    /// escapes the database name internally. The returned handle borrows
+    /// `engine`, so it must be used inside the same `with_engine` closure.
+    fn kv_open<'e>(
+        engine: &'e Engine,
+        database: Option<&str>,
+        store: &str,
+    ) -> Result<hyperdb_api::KvStore<'e>, McpError> {
+        match database {
+            Some(alias) => engine.connection().kv_store_in(alias, store),
+            None => engine.connection().kv_store(store),
+        }
+        .map_err(McpError::from)
     }
 
     /// Lazily start the Hyper engine on first use, returning a mutex guard
@@ -2970,6 +3097,180 @@ impl HyperMcpServer {
         }
     }
 
+    /// Read a value from the KV scratchpad by store + key.
+    #[tool(
+        description = "Read a value from the KV scratchpad by store + key. Returns {found, value}; `value` is null when the key is absent (not an error). Omit `database` to read the ephemeral store; pass \"persistent\" (or persist=true) or an attached alias to read elsewhere."
+    )]
+    fn kv_get(
+        &self,
+        Parameters(p): Parameters<KvKeyParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self.with_engine(|engine| {
+            let db = self.resolve_db(engine, p.database.as_deref(), p.persist, true)?;
+            let kv = Self::kv_open(engine, db.as_deref(), &p.store)?;
+            kv.get(&p.key).map_err(McpError::from)
+        });
+        match result {
+            Ok(value) => Self::ok_content(json!({ "found": value.is_some(), "value": value })),
+            Err(e) => Self::err_content(e),
+        }
+    }
+
+    /// Save a value under store + key (upsert). Ephemeral unless routed.
+    #[tool(
+        description = "KV scratchpad. Save a variable, state, summary, or JSON config under store + key to remember later without creating a database table. Overwrites any existing value (upsert). IMPORTANT: without `database` the value is written to the EPHEMERAL database and is LOST when the server restarts. To persist across restarts, pass database=\"persistent\" (or persist=true)."
+    )]
+    fn kv_set(
+        &self,
+        Parameters(p): Parameters<KvSetParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if let Err(e) = self.check_writable("kv_set") {
+            return Self::err_content(e);
+        }
+        let result = self.with_engine(|engine| {
+            let db = self.resolve_db(engine, p.database.as_deref(), p.persist, true)?;
+            let kv = Self::kv_open(engine, db.as_deref(), &p.store)?;
+            kv.set(&p.key, &p.value).map_err(McpError::from)
+        });
+        match result {
+            Ok(()) => Self::ok_content(json!({ "stored": true, "store": p.store, "key": p.key })),
+            Err(e) => Self::err_content(e),
+        }
+    }
+
+    /// Delete a key from the scratchpad.
+    #[tool(
+        description = "Delete a key from the KV scratchpad. Returns {deleted: true} when the key existed, {deleted: false} otherwise (no error). Omit `database` for the ephemeral store, or route with \"persistent\"/persist=true/an attached alias."
+    )]
+    fn kv_delete(
+        &self,
+        Parameters(p): Parameters<KvKeyParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if let Err(e) = self.check_writable("kv_delete") {
+            return Self::err_content(e);
+        }
+        let result = self.with_engine(|engine| {
+            let db = self.resolve_db(engine, p.database.as_deref(), p.persist, true)?;
+            let kv = Self::kv_open(engine, db.as_deref(), &p.store)?;
+            kv.delete(&p.key).map_err(McpError::from)
+        });
+        match result {
+            Ok(deleted) => {
+                Self::ok_content(json!({ "deleted": deleted, "store": p.store, "key": p.key }))
+            }
+            Err(e) => Self::err_content(e),
+        }
+    }
+
+    /// List all keys in a scratchpad store, sorted ascending.
+    #[tool(
+        description = "List all keys in a KV scratchpad store, sorted ascending. Omit `database` for the ephemeral store, or route with \"persistent\"/persist=true/an attached alias."
+    )]
+    fn kv_list(
+        &self,
+        Parameters(p): Parameters<KvStoreParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self.with_engine(|engine| {
+            let db = self.resolve_db(engine, p.database.as_deref(), p.persist, true)?;
+            let kv = Self::kv_open(engine, db.as_deref(), &p.store)?;
+            kv.keys().map_err(McpError::from)
+        });
+        match result {
+            Ok(keys) => {
+                Self::ok_content(json!({ "store": p.store, "count": keys.len(), "keys": keys }))
+            }
+            Err(e) => Self::err_content(e),
+        }
+    }
+
+    /// List all scratchpad store namespaces that hold data in a database.
+    #[tool(
+        description = "List all KV scratchpad store namespaces that currently hold data in a database. Omit `database` for the ephemeral store, or route with \"persistent\"/persist=true/an attached alias. Each database has its own isolated set of stores."
+    )]
+    fn kv_list_stores(
+        &self,
+        Parameters(p): Parameters<KvListStoresParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self.with_engine(|engine| {
+            let db = self.resolve_db(engine, p.database.as_deref(), p.persist, true)?;
+            match db.as_deref() {
+                Some(alias) => engine.connection().kv_list_stores_in(alias),
+                None => engine.connection().kv_list_stores(),
+            }
+            .map_err(McpError::from)
+        });
+        match result {
+            Ok(stores) => Self::ok_content(json!({ "count": stores.len(), "stores": stores })),
+            Err(e) => Self::err_content(e),
+        }
+    }
+
+    /// Count the keys in a scratchpad store.
+    #[tool(
+        description = "Return the number of keys in a KV scratchpad store. Omit `database` for the ephemeral store, or route with \"persistent\"/persist=true/an attached alias."
+    )]
+    fn kv_size(
+        &self,
+        Parameters(p): Parameters<KvStoreParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self.with_engine(|engine| {
+            let db = self.resolve_db(engine, p.database.as_deref(), p.persist, true)?;
+            let kv = Self::kv_open(engine, db.as_deref(), &p.store)?;
+            kv.size().map_err(McpError::from)
+        });
+        match result {
+            Ok(size) => Self::ok_content(json!({ "store": p.store, "size": size })),
+            Err(e) => Self::err_content(e),
+        }
+    }
+
+    /// Destructively read-and-remove the lowest-keyed entry (atomic).
+    #[tool(
+        description = "Destructively read-and-remove the lowest-keyed entry from a KV store (peek+delete in one transaction, atomic within a single server process — useful as a work queue for one session; two separate server processes popping a shared persistent store could double-serve an entry). Returns {found, key, value}; {found: false} on an empty store. Omit `database` for the ephemeral store, or route with \"persistent\"/persist=true/an attached alias."
+    )]
+    fn kv_pop(
+        &self,
+        Parameters(p): Parameters<KvStoreParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if let Err(e) = self.check_writable("kv_pop") {
+            return Self::err_content(e);
+        }
+        let result = self.with_engine(|engine| {
+            let db = self.resolve_db(engine, p.database.as_deref(), p.persist, true)?;
+            let kv = Self::kv_open(engine, db.as_deref(), &p.store)?;
+            kv.pop().map_err(McpError::from)
+        });
+        match result {
+            Ok(Some((key, value))) => {
+                Self::ok_content(json!({ "found": true, "key": key, "value": value }))
+            }
+            Ok(None) => Self::ok_content(json!({ "found": false })),
+            Err(e) => Self::err_content(e),
+        }
+    }
+
+    /// Delete all keys in a scratchpad store.
+    #[tool(
+        description = "Delete all keys in a KV scratchpad store. Returns the number of keys removed. Omit `database` for the ephemeral store, or route with \"persistent\"/persist=true/an attached alias."
+    )]
+    fn kv_clear(
+        &self,
+        Parameters(p): Parameters<KvStoreParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if let Err(e) = self.check_writable("kv_clear") {
+            return Self::err_content(e);
+        }
+        let result = self.with_engine(|engine| {
+            let db = self.resolve_db(engine, p.database.as_deref(), p.persist, true)?;
+            let kv = Self::kv_open(engine, db.as_deref(), &p.store)?;
+            kv.clear().map_err(McpError::from)
+        });
+        match result {
+            Ok(removed) => Self::ok_content(json!({ "store": p.store, "removed": removed })),
+            Err(e) => Self::err_content(e),
+        }
+    }
+
     /// Returns plugin health, workspace info, table count, total rows, disk
     /// usage, the backing `hyperd` connection (mode, endpoint, daemon health
     /// port), and the list of active directory watchers with their stats.
@@ -3610,6 +3911,12 @@ impl HyperMcpServer {
         if uri == "hyper://readme" {
             return self.build_readme_body().map(Some);
         }
+        if uri == "hyper://schema/kv" {
+            return Ok(Some(ResourceBody::Text {
+                mime_type: "text/plain".into(),
+                content: KV_SCHEMA_RESOURCE.to_string(),
+            }));
+        }
         if let Some(name) = uri
             .strip_prefix("hyper://tables/")
             .and_then(|rest| rest.strip_suffix("/schema"))
@@ -3720,14 +4027,16 @@ impl HyperMcpServer {
     /// `RequestContext`. Factored out of [`Self::list_resources`] for tests.
     ///
     /// Returns one URI for the workspace, one for the full tables list, one
-    /// for the workspace readme, three per existing table (schema, sample,
-    /// csv-sample), and two per saved query (definition, result).
+    /// for the workspace readme, one for the KV store schema, three per
+    /// existing table (schema, sample, csv-sample), and two per saved query
+    /// (definition, result).
     #[must_use]
     pub fn list_resource_uris(&self) -> Vec<String> {
         let mut uris = vec![
             "hyper://workspace".to_string(),
             "hyper://tables".to_string(),
             "hyper://readme".to_string(),
+            "hyper://schema/kv".to_string(),
         ];
         if let Ok(tables) = self.with_engine(super::engine::Engine::describe_tables) {
             // `describe_tables` already filters out `_hyperdb_*` meta-
@@ -4103,10 +4412,10 @@ Full SQL reference: https://developer.salesforce.com/docs/data/data-cloud-query-
     }
 
     /// List MCP resources: the workspace, the tables list, a markdown
-    /// readme, and three entries per existing table (schema, JSON sample,
-    /// CSV sample). Calling this lazily starts the engine, so it doubles
-    /// as a "wake up" signal for MCP clients that pre-fetch resources at
-    /// connection time.
+    /// readme, the KV store schema, and three entries per existing table
+    /// (schema, JSON sample, CSV sample). Calling this lazily starts the
+    /// engine, so it doubles as a "wake up" signal for MCP clients that
+    /// pre-fetch resources at connection time.
     async fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,
@@ -4145,6 +4454,22 @@ Full SQL reference: https://developer.salesforce.com/docs/data/data-cloud-query-
                         .into(),
                 ),
                 mime_type: Some("text/markdown".into()),
+                size: None,
+                icons: None,
+                meta: None,
+            }
+            .no_annotation(),
+            RawResource {
+                uri: "hyper://schema/kv".into(),
+                name: "KV store schema".into(),
+                title: Some("Key-value scratchpad schema".into()),
+                description: Some(
+                    "Schema of the _hyperdb_kv_store table backing the kv_* tools, the \
+                     ephemeral-vs-persistent durability rule, and the LEFT JOIN enrichment \
+                     pattern for joining KV metadata onto analytical tables."
+                        .into(),
+                ),
+                mime_type: Some("text/plain".into()),
                 size: None,
                 icons: None,
                 meta: None,

@@ -164,6 +164,27 @@ watcher targets the alias; call `unwatch_directory` first.
 - `unwatch_directory` — stop watching a previously registered
   directory.
 
+### Key-value store (scratchpad)
+- `kv_set` — save a variable / state / summary / JSON string under a
+  store + key (upsert).
+- `kv_get` — read a value by store + key.
+- `kv_delete` — delete a key.
+- `kv_list` — list keys in a store.
+- `kv_list_stores` — list store namespaces that hold data in a database.
+- `kv_size` — count keys in a store.
+- `kv_pop` — destructively read-and-remove the lowest-keyed entry.
+- `kv_clear` — delete all keys in a store.
+
+Every kv_* tool takes the same optional `database` parameter as the data
+tools. Omit it and the store lives in the EPHEMERAL database (lost on
+restart); pass `\"persistent\"` (or `persist: true`) to persist across
+restarts, or any attached alias to target that database. Each database
+has its own isolated set of stores. Enrich analytical tables with KV
+metadata via LEFT JOIN — always filter `kv.store_name = '<namespace>'`
+to avoid row multiplication, and keep the KV table in the same database
+as the joined table. See the `hyper://schema/kv` resource for the join
+template.
+
 ### Introspection
 - `get_readme` — this document. Call once at the start of a session.
 
@@ -177,7 +198,8 @@ watcher targets the alias; call `unwatch_directory` first.
 - **Read-only mode** (`--read-only` flag on the server) disables:
   `execute`, all `load_*`, writable `attach_database`, `save_query`,
   `delete_query`, `set_table_metadata`, `copy_query`, `watch_directory`,
-  `unwatch_directory`. `query`, `describe`, `sample`, `inspect_file`,
+  `unwatch_directory`, and the mutating KV tools (`kv_set`, `kv_delete`,
+  `kv_pop`, `kv_clear`). `query`, `describe`, `sample`, `inspect_file`,
   `export`, `chart`, `status`, `list_attached_databases`, and
   `get_readme` always work.
 - **Table names** in `load_*` and `query_data` / `query_file` accept

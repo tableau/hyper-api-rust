@@ -74,6 +74,23 @@ pub(crate) fn kv_create_table_sql(table_ref: &str) -> String {
     )
 }
 
+/// Builds the escaped `"<database>"."public"` qualifier prefix for the KV table.
+///
+/// Single source of truth for the location shape used by
+/// [`Connection::kv_store_in`](crate::Connection::kv_store_in) and
+/// [`Connection::kv_list_stores_in`](crate::Connection::kv_list_stores_in) (and
+/// their async twins): the KV table always lives in the target database's
+/// `public` schema. `database` is identifier-escaped via
+/// [`escape_name`](crate::escape_name); the fixed `public` schema name is
+/// escaped identically for symmetry.
+pub(crate) fn kv_target_prefix(database: &str) -> Result<String> {
+    Ok(format!(
+        "{}.{}",
+        crate::escape_name(database)?,
+        crate::escape_name("public")?
+    ))
+}
+
 use crate::connection::Connection;
 
 /// A handle to one named key-value store, backed by `KV_TABLE`.
@@ -120,17 +137,14 @@ impl<'conn> KvStore<'conn> {
         Self::open(connection, name, KV_TABLE.to_string())
     }
 
-    /// Opens a handle targeting an explicit, already-escaped table reference.
+    /// Opens a handle targeting an explicit, already-escaped table-qualifier prefix.
     ///
-    /// Crate-internal seam for the MCP milestone (routes into an attached
-    /// database). `target` is interpolated directly into SQL, so the **caller
-    /// must supply a pre-validated / identifier-escaped, SQL-safe qualifier**
-    /// (M2 must escape it via the crate's identifier-quoting before calling —
-    /// `store_name`/`key`/`value` are always bound params, but `target` is not).
-    #[allow(
-        dead_code,
-        reason = "M2 (hyperdb-mcp) consumer; kept here so M1 needs no later API change"
-    )]
+    /// Crate-internal low-level constructor behind
+    /// [`Connection::kv_store_in`](crate::Connection::kv_store_in). `target` is
+    /// interpolated directly into SQL, so the **caller must supply a pre-escaped,
+    /// SQL-safe qualifier** — public callers go through `kv_store_in`, which
+    /// escapes for them (`store_name` / `key` / `value` are always bound params,
+    /// but `target` is not).
     pub(crate) fn with_target(
         connection: &'conn Connection,
         name: &str,
@@ -438,6 +452,35 @@ impl Connection {
         KvStore::new(self, name)
     }
 
+    /// Opens a handle to a KV store in a specific database, rather than the
+    /// default (search-path) location.
+    ///
+    /// `database` is the **unescaped** name of an attached database; the store's
+    /// backing table is created (if absent) in that database's `public` schema.
+    /// The name is identifier-escaped internally, so it is safe to pass an
+    /// arbitrary attachment alias. The store name, keys, and values are always
+    /// bound parameters.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use hyperdb_api::{Connection, CreateMode, Result};
+    /// # fn example(conn: &Connection) -> Result<()> {
+    /// let kv = conn.kv_store_in("persistent", "settings")?;
+    /// kv.set("theme", "dark")?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidName`] if `database` or `name` is invalid.
+    /// - [`Error::FeatureNotSupported`] on gRPC transport.
+    /// - [`Error::Server`] if creating the backing table fails.
+    pub fn kv_store_in(&self, database: &str, name: &str) -> Result<KvStore<'_>> {
+        KvStore::with_target(self, name, &kv_target_prefix(database)?)
+    }
+
     /// Lists the names of every KV store that currently holds at least one key.
     ///
     /// Creates the backing table first (via `kv_create_table_sql`) so calling
@@ -449,9 +492,35 @@ impl Connection {
     /// - [`Error::FeatureNotSupported`] on gRPC transport.
     /// - [`Error::Server`] if the query fails.
     pub fn kv_list_stores(&self) -> Result<Vec<String>> {
-        self.execute_command(&kv_create_table_sql(KV_TABLE))?;
+        self.kv_list_stores_impl(KV_TABLE)
+    }
+
+    /// Lists the KV stores that hold at least one key in a specific database.
+    ///
+    /// The location-aware companion to [`kv_list_stores`](Self::kv_list_stores):
+    /// `database` is the unescaped name of an attached database (escaped
+    /// internally). Creates the backing table in that database's `public` schema
+    /// first, so an empty database returns `[]` rather than erroring.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidName`] if `database` is invalid.
+    /// - [`Error::FeatureNotSupported`] on gRPC transport.
+    /// - [`Error::Server`] if the query fails.
+    pub fn kv_list_stores_in(&self, database: &str) -> Result<Vec<String>> {
+        let table_ref = format!("{}.{KV_TABLE}", kv_target_prefix(database)?);
+        self.kv_list_stores_impl(&table_ref)
+    }
+
+    /// Shared body for [`kv_list_stores`](Self::kv_list_stores) /
+    /// [`kv_list_stores_in`](Self::kv_list_stores_in): create the backing table
+    /// at `table_ref` (so a fresh location returns `[]`), then list the distinct
+    /// store names there. Factored out so the default and location-aware paths
+    /// cannot drift.
+    fn kv_list_stores_impl(&self, table_ref: &str) -> Result<Vec<String>> {
+        self.execute_command(&kv_create_table_sql(table_ref))?;
         let mut result = self.execute_query(&format!(
-            "SELECT DISTINCT store_name FROM {KV_TABLE} ORDER BY store_name ASC"
+            "SELECT DISTINCT store_name FROM {table_ref} ORDER BY store_name ASC"
         ))?;
         let mut names = Vec::new();
         while let Some(chunk) = result.next_chunk()? {

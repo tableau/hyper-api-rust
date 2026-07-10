@@ -4,6 +4,21 @@
 **Date:** 2026-07-08
 **Author:** Stefan Steiner (with Claude)
 
+> **Superseded (2026-07-09):** two design points below were settled differently
+> during implementation and are retained here only as historical record — the
+> authoritative sources are the M1/M2 plans
+> (`docs/superpowers/plans/2026-07-08-kv-store-m1-api.md`,
+> `docs/superpowers/plans/2026-07-09-kv-store-m2-mcp.md`):
+>
+> 1. **No PRIMARY KEY.** The PK-enforcement probe found Hyper *rejects* an
+>    index-backed `PRIMARY KEY` on this table (`0A000`), so the shipped
+>    `_hyperdb_kv_store` has **no PK/index** at all; `(store_name, key)`
+>    uniqueness is enforced entirely by the tool layer's UPDATE-then-INSERT
+>    upsert. Every "composite PK" reference below is stale.
+> 2. **M2 PR title uses `feat:`, not `fix:`.** M1 (retitled `chore:`) and M2
+>    bundle into a single `v0.6.0` minor release, so the MCP milestone ships
+>    under `feat:`.
+
 ## Context
 
 The `hyperdb-api` crate is a pure-Rust client for the Hyper database (PostgreSQL
@@ -99,6 +114,10 @@ scratchpad — thousands of rows). The single-table win is operational: fully
 static SQL, no runtime DDL, no `format!`-built table names.
 
 ### PRIMARY KEY enforcement — verify empirically
+
+> **Superseded:** the probe found Hyper *rejects* the index-backed `PRIMARY KEY`
+> (`0A000`); the shipped table has no PK at all. See the note at the top of this
+> doc. The section below is the original, pre-probe reasoning.
 
 The Hyper grammar supports enforced, index-backed `PRIMARY KEY` (default index
 is an Adaptive Radix Tree; see `hyper/cts/infra/RelationOptions.hpp`). However, a
@@ -363,6 +382,9 @@ stretch goal for M2, not required.
 Add a bullet under `## [Unreleased]` in `hyperdb-mcp/CHANGELOG.md`.
 
 ## Milestones, branches, PR titles
+
+> **Superseded:** M2 ships under **`feat:`**, not `fix:` — M1 and M2 bundle into a
+> single `v0.6.0` minor release. See the note at the top of this doc.
 
 | Milestone | Crate | Branch | PR title prefix |
 |---|---|---|---|

@@ -5,7 +5,7 @@
 
 use crate::async_connection::AsyncConnection;
 use crate::error::{Error, Result};
-use crate::kv_store::{kv_create_table_sql, validate_kv_name, KV_TABLE};
+use crate::kv_store::{kv_create_table_sql, kv_target_prefix, validate_kv_name, KV_TABLE};
 
 /// A handle to one named key-value store over an [`AsyncConnection`].
 ///
@@ -56,13 +56,11 @@ impl<'conn> AsyncKvStore<'conn> {
 
     /// Async twin of [`KvStore::with_target`](crate::KvStore::with_target).
     ///
-    /// `target` is interpolated into SQL — the caller must supply a
-    /// pre-validated / identifier-escaped, SQL-safe qualifier (M2 must escape
-    /// it before calling).
-    #[allow(
-        dead_code,
-        reason = "M2 (hyperdb-mcp) consumer; kept here so M1 needs no later API change"
-    )]
+    /// Crate-internal low-level constructor behind
+    /// [`AsyncConnection::kv_store_in`](crate::AsyncConnection::kv_store_in).
+    /// `target` is interpolated into SQL — the caller must supply a pre-escaped,
+    /// SQL-safe qualifier (public callers go through `kv_store_in`, which
+    /// escapes for them).
     pub(crate) async fn with_target(
         connection: &'conn AsyncConnection,
         name: &str,
@@ -370,16 +368,45 @@ impl AsyncConnection {
         AsyncKvStore::new(self, name).await
     }
 
+    /// Async twin of [`Connection::kv_store_in`](crate::Connection::kv_store_in).
+    ///
+    /// # Errors
+    ///
+    /// See [`Connection::kv_store_in`](crate::Connection::kv_store_in).
+    pub async fn kv_store_in(&self, database: &str, name: &str) -> Result<AsyncKvStore<'_>> {
+        AsyncKvStore::with_target(self, name, &kv_target_prefix(database)?).await
+    }
+
     /// Lists the names of every KV store that currently holds at least one key.
     ///
     /// # Errors
     ///
     /// See [`Connection::kv_list_stores`](crate::Connection::kv_list_stores).
     pub async fn kv_list_stores(&self) -> Result<Vec<String>> {
-        self.execute_command(&kv_create_table_sql(KV_TABLE)).await?;
+        self.kv_list_stores_impl(KV_TABLE).await
+    }
+
+    /// Async twin of
+    /// [`Connection::kv_list_stores_in`](crate::Connection::kv_list_stores_in).
+    ///
+    /// # Errors
+    ///
+    /// See [`Connection::kv_list_stores_in`](crate::Connection::kv_list_stores_in).
+    pub async fn kv_list_stores_in(&self, database: &str) -> Result<Vec<String>> {
+        let table_ref = format!("{}.{KV_TABLE}", kv_target_prefix(database)?);
+        self.kv_list_stores_impl(&table_ref).await
+    }
+
+    /// Shared body for [`kv_list_stores`](Self::kv_list_stores) /
+    /// [`kv_list_stores_in`](Self::kv_list_stores_in): the async twin of the sync
+    /// `kv_list_stores_impl`. Factored out so the default and location-aware
+    /// paths cannot drift.
+    async fn kv_list_stores_impl(&self, table_ref: &str) -> Result<Vec<String>> {
+        self.execute_command(&kv_create_table_sql(table_ref))
+            .await?;
         let mut result = self
             .execute_query(&format!(
-                "SELECT DISTINCT store_name FROM {KV_TABLE} ORDER BY store_name ASC"
+                "SELECT DISTINCT store_name FROM {table_ref} ORDER BY store_name ASC"
             ))
             .await?;
         let mut names = Vec::new();
