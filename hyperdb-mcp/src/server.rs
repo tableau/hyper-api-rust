@@ -67,6 +67,44 @@ const TABLE_SAMPLE_ROWS: u64 = 5;
 /// more compact wire format and the extra rows help LLMs see patterns.
 const TABLE_CSV_SAMPLE_ROWS: u64 = 20;
 
+/// Body of the `hyper://schema/kv` resource: describes the `_hyperdb_kv_store`
+/// backing table behind the `kv_*` tools, its (indexless) shape, the
+/// ephemeral-vs-persistent durability rule, per-database isolation, and the
+/// LEFT JOIN enrichment pattern. Served verbatim as `text/plain`.
+const KV_SCHEMA_RESOURCE: &str = "\
+KV store backing table (managed by the kv_* tools):
+
+  CREATE TABLE _hyperdb_kv_store (
+      store_name TEXT NOT NULL,   -- namespace (the `store` tool argument)
+      key        TEXT NOT NULL,   -- key within the store
+      value      TEXT             -- value (nullable); may hold JSON
+  );
+
+There is NO PRIMARY KEY (Hyper disables indexes); (store_name, key) uniqueness is
+enforced by the tool layer's upsert. Do not INSERT into this table directly — use
+the kv_* tools, which guarantee uniqueness.
+
+DATABASE / DURABILITY: each database has its own _hyperdb_kv_store table. Every
+kv_* tool takes the same optional `database` parameter as the other tools. Omit it
+and the store lives in the EPHEMERAL database — convenient, but LOST when the
+server restarts. Pass \"persistent\" (or persist=true) to survive restarts, or any
+attached alias to target that database. A store in one database is invisible from
+another.
+
+Enrich an analytical table with KV metadata without ALTER TABLE. The KV table must
+be in the SAME database as the joined table (or fully qualify both) — a LEFT JOIN
+cannot span databases implicitly:
+
+  SELECT t.*, kv.value AS metadata
+  FROM my_table t
+  LEFT JOIN _hyperdb_kv_store kv
+         ON t.id = kv.key AND kv.store_name = 'your_namespace'
+  WHERE t.status = 'active';
+
+ALWAYS include the `kv.store_name = '...'` filter: omitting it fans out any key
+present in multiple stores (row multiplication).
+";
+
 // --- Parameter structs ---
 // Field-level doc comments become JSON Schema `description` fields in the
 // MCP `tools/list` response, so they are written for the LLM caller.
@@ -3870,6 +3908,12 @@ impl HyperMcpServer {
         if uri == "hyper://readme" {
             return self.build_readme_body().map(Some);
         }
+        if uri == "hyper://schema/kv" {
+            return Ok(Some(ResourceBody::Text {
+                mime_type: "text/plain".into(),
+                content: KV_SCHEMA_RESOURCE.to_string(),
+            }));
+        }
         if let Some(name) = uri
             .strip_prefix("hyper://tables/")
             .and_then(|rest| rest.strip_suffix("/schema"))
@@ -3980,14 +4024,16 @@ impl HyperMcpServer {
     /// `RequestContext`. Factored out of [`Self::list_resources`] for tests.
     ///
     /// Returns one URI for the workspace, one for the full tables list, one
-    /// for the workspace readme, three per existing table (schema, sample,
-    /// csv-sample), and two per saved query (definition, result).
+    /// for the workspace readme, one for the KV store schema, three per
+    /// existing table (schema, sample, csv-sample), and two per saved query
+    /// (definition, result).
     #[must_use]
     pub fn list_resource_uris(&self) -> Vec<String> {
         let mut uris = vec![
             "hyper://workspace".to_string(),
             "hyper://tables".to_string(),
             "hyper://readme".to_string(),
+            "hyper://schema/kv".to_string(),
         ];
         if let Ok(tables) = self.with_engine(super::engine::Engine::describe_tables) {
             // `describe_tables` already filters out `_hyperdb_*` meta-
@@ -4363,10 +4409,10 @@ Full SQL reference: https://developer.salesforce.com/docs/data/data-cloud-query-
     }
 
     /// List MCP resources: the workspace, the tables list, a markdown
-    /// readme, and three entries per existing table (schema, JSON sample,
-    /// CSV sample). Calling this lazily starts the engine, so it doubles
-    /// as a "wake up" signal for MCP clients that pre-fetch resources at
-    /// connection time.
+    /// readme, the KV store schema, and three entries per existing table
+    /// (schema, JSON sample, CSV sample). Calling this lazily starts the
+    /// engine, so it doubles as a "wake up" signal for MCP clients that
+    /// pre-fetch resources at connection time.
     async fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,
@@ -4405,6 +4451,22 @@ Full SQL reference: https://developer.salesforce.com/docs/data/data-cloud-query-
                         .into(),
                 ),
                 mime_type: Some("text/markdown".into()),
+                size: None,
+                icons: None,
+                meta: None,
+            }
+            .no_annotation(),
+            RawResource {
+                uri: "hyper://schema/kv".into(),
+                name: "KV store schema".into(),
+                title: Some("Key-value scratchpad schema".into()),
+                description: Some(
+                    "Schema of the _hyperdb_kv_store table backing the kv_* tools, the \
+                     ephemeral-vs-persistent durability rule, and the LEFT JOIN enrichment \
+                     pattern for joining KV metadata onto analytical tables."
+                        .into(),
+                ),
+                mime_type: Some("text/plain".into()),
                 size: None,
                 icons: None,
                 meta: None,
