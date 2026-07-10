@@ -81,8 +81,11 @@ KV store backing table (managed by the kv_* tools):
   );
 
 There is NO PRIMARY KEY (Hyper disables indexes); (store_name, key) uniqueness is
-enforced by the tool layer's upsert. Do not INSERT into this table directly — use
-the kv_* tools, which guarantee uniqueness.
+enforced by the tool layer's upsert, which is atomic within a single server
+process. Two DIFFERENT server processes writing the same key in a shared
+persistent database concurrently could still create duplicate rows (there is no
+DB-level constraint to catch it). Do not INSERT into this table directly — use
+the kv_* tools, which guarantee uniqueness within a session.
 
 DATABASE / DURABILITY: each database has its own _hyperdb_kv_store table. Every
 kv_* tool takes the same optional `database` parameter as the other tools. Omit it
@@ -3223,7 +3226,7 @@ impl HyperMcpServer {
 
     /// Destructively read-and-remove the lowest-keyed entry (atomic).
     #[tool(
-        description = "Destructively read-and-remove the lowest-keyed entry from a KV store (atomic peek+delete, useful as a work queue). Returns {found, key, value}; {found: false} on an empty store. Omit `database` for the ephemeral store, or route with \"persistent\"/persist=true/an attached alias."
+        description = "Destructively read-and-remove the lowest-keyed entry from a KV store (peek+delete in one transaction, atomic within a single server process — useful as a work queue for one session; two separate server processes popping a shared persistent store could double-serve an entry). Returns {found, key, value}; {found: false} on an empty store. Omit `database` for the ephemeral store, or route with \"persistent\"/persist=true/an attached alias."
     )]
     fn kv_pop(
         &self,
