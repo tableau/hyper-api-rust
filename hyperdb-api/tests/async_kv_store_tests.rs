@@ -162,3 +162,28 @@ async fn async_byte_size_and_entries() -> Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_guard_size_and_entries() -> Result<()> {
+    let (_hyper, conn) = fresh_async_conn("async_kv_guard").await?;
+    let kv = conn.kv_store("g").await?;
+    assert!(kv.set_if_absent("k", "first").await?);
+    assert!(!kv.set_if_absent("k", "second").await?);
+    assert_eq!(kv.get("k").await?, Some("first".to_string()));
+
+    assert_eq!(kv.byte_size().await?, 5); // "first"
+    kv.set("z", "hello").await?; // 5 more
+    assert_eq!(kv.byte_size().await?, 10);
+    assert_eq!(
+        kv.entries().await?,
+        vec![
+            ("k".to_string(), "first".to_string()),
+            ("z".to_string(), "hello".to_string()),
+        ]
+    );
+
+    let out = kv.set_batch_if_absent(&[("k", "x"), ("new", "n1")]).await?;
+    assert_eq!(out.written, 1);
+    assert_eq!(out.skipped, 1);
+    Ok(())
+}

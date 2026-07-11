@@ -466,28 +466,35 @@ impl<'conn> AsyncKvStore<'conn> {
             validate_kv_name(key, "key")?;
         }
         self.connection.begin_transaction_raw().await?;
-        let result = async {
-            let mut outcome = BatchGuardOutcome {
-                written: 0,
-                skipped: 0,
-            };
-            for (key, value) in entries {
-                if self.set_if_absent(key, value).await? {
-                    outcome.written += 1;
-                } else {
-                    outcome.skipped += 1;
+        let mut inner: Result<BatchGuardOutcome> = Ok(BatchGuardOutcome {
+            written: 0,
+            skipped: 0,
+        });
+        for (key, value) in entries {
+            match self.set_if_absent(key, value).await {
+                Ok(true) => {
+                    if let Ok(o) = inner.as_mut() {
+                        o.written += 1;
+                    }
+                }
+                Ok(false) => {
+                    if let Ok(o) = inner.as_mut() {
+                        o.skipped += 1;
+                    }
+                }
+                Err(e) => {
+                    inner = Err(e);
+                    break;
                 }
             }
-            Ok(outcome)
         }
-        .await;
-        match &result {
+        match &inner {
             Ok(_) => self.connection.commit_raw().await?,
             Err(_) => {
                 let _ = self.connection.rollback_raw().await;
             }
         }
-        result
+        inner
     }
 }
 
