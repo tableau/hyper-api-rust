@@ -6,7 +6,8 @@
 use crate::async_connection::AsyncConnection;
 use crate::error::{Error, Result};
 use crate::kv_store::{
-    kv_create_table_sql, kv_target_prefix, validate_kv_name, BatchSetOutcome, SetOutcome, KV_TABLE,
+    kv_create_table_sql, kv_target_prefix, validate_kv_name, BatchGuardOutcome, BatchSetOutcome,
+    SetOutcome, KV_TABLE,
 };
 
 /// A handle to one named key-value store over an [`AsyncConnection`].
@@ -178,6 +179,35 @@ impl<'conn> AsyncKvStore<'conn> {
         Ok(SetOutcome {
             created: self.upsert(key, &json).await?,
         })
+    }
+
+    /// Inserts `value` under `key` only if `key` is absent.
+    ///
+    /// Returns `true` if a row was written, `false` if the key already existed
+    /// (in which case nothing is written). A single `INSERT ... WHERE NOT
+    /// EXISTS` statement decides, so there is no check-then-write race.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidName`] if `key` is invalid.
+    /// - [`Error::FeatureNotSupported`] on gRPC transport.
+    /// - [`Error::Server`] if the `INSERT` fails.
+    pub async fn set_if_absent(&self, key: &str, value: &str) -> Result<bool> {
+        validate_kv_name(key, "key")?;
+        let store = self.store_name.as_str();
+        let inserted = self
+            .connection
+            .command_params(
+                &format!(
+                    "INSERT INTO {t} (store_name, key, value) \
+                     SELECT $1, $2, $3 \
+                     WHERE NOT EXISTS (SELECT 1 FROM {t} WHERE store_name = $4 AND key = $5)",
+                    t = self.table_ref
+                ),
+                &[&store, &key, &value, &store, &key],
+            )
+            .await?;
+        Ok(inserted > 0)
     }
 
     /// Deletes `key`; returns `true` if a row was removed.
@@ -409,6 +439,43 @@ impl<'conn> AsyncKvStore<'conn> {
                     outcome.created += 1;
                 } else {
                     outcome.overwritten += 1;
+                }
+            }
+            Ok(outcome)
+        }
+        .await;
+        match &result {
+            Ok(_) => self.connection.commit_raw().await?,
+            Err(_) => {
+                let _ = self.connection.rollback_raw().await;
+            }
+        }
+        result
+    }
+
+    /// Inserts every absent `(key, value)` pair in one transaction, skipping
+    /// keys that already exist. All keys are validated before the transaction
+    /// opens, so an invalid key aborts the whole batch without writing anything.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidName`] if any key is invalid (checked before writing).
+    /// - [`Error::FeatureNotSupported`] / [`Error::Server`].
+    pub async fn set_batch_if_absent(&self, entries: &[(&str, &str)]) -> Result<BatchGuardOutcome> {
+        for (key, _) in entries {
+            validate_kv_name(key, "key")?;
+        }
+        self.connection.begin_transaction_raw().await?;
+        let result = async {
+            let mut outcome = BatchGuardOutcome {
+                written: 0,
+                skipped: 0,
+            };
+            for (key, value) in entries {
+                if self.set_if_absent(key, value).await? {
+                    outcome.written += 1;
+                } else {
+                    outcome.skipped += 1;
                 }
             }
             Ok(outcome)
