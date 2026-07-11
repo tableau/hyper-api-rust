@@ -275,9 +275,16 @@ struct KvSetManyParams {
   { "stored": 5, "created": 3, "overwritten": 2, "total_bytes": 1234 }
   ```
   (Under `overwrite:false`, `overwritten` is replaced by `skipped`.)
-- `total_bytes` = sum of `value_bytes` for the entries actually written; the
-  soft-size warning fires per oversized entry (collected into a `warnings` array
-  keyed by offending key).
+- `total_bytes` = sum of `value_bytes` over **all submitted entries** (the UTF-8
+  byte length of every `value` in the request), computed at the MCP layer before
+  the batch runs. Under `overwrite:false` this is an **upper bound** on the bytes
+  actually persisted, because `set_batch_if_absent` returns only aggregate counts
+  (`written`/`skipped`), not which keys were written — the MCP layer cannot know
+  which specific values were skipped, so it reports the total of what was
+  submitted rather than a figure it cannot compute. Under the default
+  (`overwrite:true`) every submitted entry is written, so `total_bytes` is exact.
+  The soft-size warning fires per oversized entry (collected into a `warnings`
+  array keyed by offending key).
 
 #### Read-all: `values` flag on `kv_list`
 

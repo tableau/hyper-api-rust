@@ -218,19 +218,40 @@ to:
 pub use kv_store::{BatchSetOutcome, KvStore, SetOutcome};
 ```
 
-- [ ] **Step 7: Fix in-crate `set()` callers (compile break)**
+- [ ] **Step 7: Fix cross-crate `set()` callers (compile break — MUST be in this commit)**
 
-The only in-crate consumers are tests. `hyperdb-api/tests/kv_store_tests.rs:67-69` calls `kv.set("k","v1")?;` in statement position — these still compile (the `Result` is just `?`-unwrapped and the `SetOutcome` dropped). No change needed unless a test binds the return. Confirm with the build in Step 8.
+In-workspace consumers of the reshaped methods are: the two KV test files, `hyperdb-api/tests/kv_store_in_tests.rs`, the `[[example]]` bench `hyperdb-api/benches/kv_benchmark.rs`, `hyperdb-api/README.md`, and — critically — the **`hyperdb-mcp` crate**. All the API-crate callers use `set`/`set_batch` in statement position, so they still compile (the `Result` is `?`-unwrapped and the outcome dropped); the bench and `kv_store_in_tests.rs` are covered by Task 6 Step 5's `--all-targets`/`cargo test -p hyperdb-api` gate; the README refresh is folded into Step 7b below.
+
+**The one caller that breaks compilation is the MCP `kv_set` handler** (`hyperdb-mcp/src/server.rs:3133-3136`), which today does `kv.set(...).map_err(McpError::from)` as the closure tail and then `match result { Ok(()) => ... }`. The instant `set()` returns `Result<SetOutcome>`, `with_engine`'s inferred `R` becomes `SetOutcome` and the `Ok(())` arm is a hard type error (E0308) — breaking the whole `hyperdb-mcp` crate until Task 8. Because this is a `feat(kv)!` break, the caller fix belongs in **this** commit (an API break must leave every in-workspace caller compiling). Make the minimal one-arm edit now; Task 8 does the full handler overhaul:
+
+```rust
+        match result {
+            Ok(_) => Self::ok_content(json!({ "stored": true, "store": p.store, "key": p.key })),
+            Err(e) => Self::err_content(e),
+        }
+```
+
+(Change only `Ok(())` → `Ok(_)` on `server.rs:3136`; leave the response body as-is for now. There is no `set_batch`/`set_as`/`set_if_absent` caller in `hyperdb-mcp`, so this is the only site.)
+
+- [ ] **Step 7b: Refresh the README usage example**
+
+`hyperdb-api/README.md` (KV example, ~lines 409-417) calls `kv.set(...)` / `kv.set_as(...)` / `kv.set_batch(...)` in statement position. The blocks are NOT doctested (`lib.rs` does not `include_str!` the README), so they still compile — but they no longer showcase the new return values the whole change is about. Update the example to bind the outcome, e.g. `let outcome = kv.set("theme", "dark")?; assert!(outcome.created);` and a `set_batch` line reading `BatchSetOutcome { created, overwritten }`. This is the one consumer no gate compiles, so it must be updated by hand.
 
 - [ ] **Step 8: Run tests to verify they pass**
 
 Run: `HYPERD_PATH=~/dev/bin/hyperd cargo test -p hyperdb-api --test kv_store_tests`
 Expected: PASS (new tests green; existing `set_then_get_and_overwrite` still green).
 
+Then confirm the cross-crate caller fix kept `hyperdb-mcp` compiling:
+
+Run: `cargo build -p hyperdb-mcp`
+Expected: SUCCESS (the `Ok(_)` arm from Step 7 resolves the `SetOutcome` return; no E0308).
+
 - [ ] **Step 9: Commit**
 
 ```bash
-git add hyperdb-api/src/kv_store.rs hyperdb-api/src/lib.rs hyperdb-api/tests/kv_store_tests.rs
+git add hyperdb-api/src/kv_store.rs hyperdb-api/src/lib.rs hyperdb-api/tests/kv_store_tests.rs \
+        hyperdb-api/README.md hyperdb-mcp/src/server.rs
 git commit -m "feat(kv)!: sync set/set_as/set_batch return SetOutcome/BatchSetOutcome"
 ```
 
@@ -882,7 +903,9 @@ mod tests {
     fn json_value_error_suggests_cast_not_split() {
         let err = hyperdb_api::Error::server(
             Some("0A000".to_string()),
-            "function JSON_VALUE is not implemented yet".to_string(),
+            "function JSON_VALUE is not implemented yet",
+            None,
+            None,
         );
         let mapped = McpError::from(err);
         let s = mapped.suggestion.unwrap_or_default();
@@ -894,7 +917,9 @@ mod tests {
     fn structured_type_error_suggests_cast() {
         let err = hyperdb_api::Error::server(
             Some("42601".to_string()),
-            "operator ->> requires a structured data type".to_string(),
+            "operator ->> requires a structured data type",
+            None,
+            None,
         );
         let s = McpError::from(err).suggestion.unwrap_or_default();
         assert!(s.contains("::json"), "expected a ::json cast hint, got: {s}");
@@ -904,7 +929,9 @@ mod tests {
     fn multi_statement_error_still_suggests_split() {
         let err = hyperdb_api::Error::server(
             Some("0A000".to_string()),
-            "multi-statement queries are not supported".to_string(),
+            "multi-statement queries are not supported",
+            None,
+            None,
         );
         let s = McpError::from(err).suggestion.unwrap_or_default();
         assert!(s.to_lowercase().contains("one sql statement"), "got: {s}");
@@ -912,7 +939,7 @@ mod tests {
 }
 ```
 
-> Confirm the exact `Error::server` constructor arity/signature against `hyperdb-api/src/error.rs` (surface map: `Error::server(sqlstate: Option<String>, ...)` at `error.rs:306`). If it takes more args, adjust the test constructor calls to match — the assertions on `.code`/`.suggestion` are what matter.
+> The `Error::server` constructor is the confirmed 4-arg form `server(sqlstate: Option<String>, message: impl Into<String>, detail: Option<String>, hint: Option<String>)` (`error.rs:306`) — the three calls above already match it (`&str` message via `impl Into<String>`; `detail`/`hint` = `None`). The assertions on `.code`/`.suggestion` are what the test verifies.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -1281,7 +1308,7 @@ Replace the `kv_size` handler body in `hyperdb-mcp/src/server.rs:3189-3204` (the
         Parameters(p): Parameters<KvStoreParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self.with_engine(|engine| {
-            let db = self.resolve_db(engine, p.database.as_deref(), p.persist, false)?;
+            let db = self.resolve_db(engine, p.database.as_deref(), p.persist, true)?;
             let kv = Self::kv_open(engine, db.as_deref(), &p.store)?;
             let key_count = kv.size().map_err(McpError::from)?;
             let value_bytes = kv.byte_size().map_err(McpError::from)?;
@@ -1649,7 +1676,7 @@ Replace the `kv_list` handler (`server.rs:3169-3184`) to accept `KvListParams` a
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let with_values = p.values.unwrap_or(false);
         let result = self.with_engine(|engine| {
-            let db = self.resolve_db(engine, p.database.as_deref(), p.persist, false)?;
+            let db = self.resolve_db(engine, p.database.as_deref(), p.persist, true)?;
             let kv = Self::kv_open(engine, db.as_deref(), &p.store)?;
             if with_values {
                 kv.entries().map(|pairs| (Some(pairs), None))
@@ -1880,7 +1907,7 @@ The existing KV bullets (lines 12–18 in the current file) are appended at the 
 
 - [ ] **Step 3: Append to `hyperdb-mcp/CHANGELOG.md`**
 
-Replace the `## [Unreleased]` section (currently lines 8–26) with:
+Replace the `## [Unreleased]` section (currently lines 8–53 — the entire section, running from the `## [Unreleased]` heading through the last TCP-keepalive `### Fixed` bullet, ending just before the blank line preceding `## [0.5.0]`) with:
 
 ```markdown
 ## [Unreleased]
@@ -1940,7 +1967,7 @@ Replace the `## [Unreleased]` section (currently lines 8–26) with:
   the norm. (Fixed in `hyperdb-api-core` for both the sync and async clients.)
 ```
 
-The existing KV bullets (lines 12–26) are kept at the end because they already shipped in 0.6.0/0.6.1 and correctly describe the base surface. The new bullets prepended above them document the 0.7.0 additions.
+This replaces the *entire* current `## [Unreleased]` section (lines 8–53), so the block above reproduces everything that must survive: the existing KV `### Added` bullets (current lines 12–26) AND all three existing `### Fixed` bullets (current lines 28–53 — caller-fixable argument errors, README `--read-only` correction, TCP keepalive). Those are kept verbatim because they already shipped/were staged and correctly describe the base surface; the new 0.7.0 bullets are prepended within each heading. Because the replacement spans the whole section (not just lines 8–26), the existing `### Fixed` block is *moved into* the new block rather than orphaned below it — replacing only 8–26 would duplicate the three Fixed bullets.
 
 - [ ] **Step 4: Verify the edits**
 
