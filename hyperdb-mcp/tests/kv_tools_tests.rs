@@ -622,3 +622,97 @@ async fn kv_persistent_value_survives_server_restart() -> TestResult {
 
     h2.shutdown().await
 }
+
+/// kv_set reports `created` (insert vs overwrite) and `value_bytes`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kv_set_reports_created_and_bytes() -> TestResult {
+    let h = TestHarness::start(false, false).await?;
+    let first = call_tool(
+        &h.client,
+        "kv_set",
+        serde_json::json!({ "store": "s", "key": "k", "value": "hello" }),
+    )
+    .await?;
+    assert_eq!(structured(&first)["created"], serde_json::json!(true));
+    assert_eq!(structured(&first)["value_bytes"], serde_json::json!(5));
+
+    let second = call_tool(
+        &h.client,
+        "kv_set",
+        serde_json::json!({ "store": "s", "key": "k", "value": "hi" }),
+    )
+    .await?;
+    assert_eq!(structured(&second)["created"], serde_json::json!(false));
+    h.shutdown().await
+}
+
+/// overwrite:false skips an existing key without clobbering it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kv_set_overwrite_false_guards() -> TestResult {
+    let h = TestHarness::start(false, false).await?;
+    call_tool(
+        &h.client,
+        "kv_set",
+        serde_json::json!({ "store": "s", "key": "k", "value": "orig" }),
+    )
+    .await?;
+    let guard = call_tool(
+        &h.client,
+        "kv_set",
+        serde_json::json!({ "store": "s", "key": "k", "value": "new", "overwrite": false }),
+    )
+    .await?;
+    assert_eq!(structured(&guard)["stored"], serde_json::json!(false));
+    assert_eq!(structured(&guard)["existed"], serde_json::json!(true));
+    let got = call_tool(
+        &h.client,
+        "kv_get",
+        serde_json::json!({ "store": "s", "key": "k" }),
+    )
+    .await?;
+    assert_eq!(structured(&got)["value"], serde_json::json!("orig"));
+    h.shutdown().await
+}
+
+/// value_path reads a file's contents; neither/both value+value_path errors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kv_set_value_path_reads_file() -> TestResult {
+    let h = TestHarness::start(false, false).await?;
+    let dir = tempfile::TempDir::new()?;
+    let path = dir.path().join("payload.txt");
+    std::fs::write(&path, "from-file")?;
+    let abs = std::fs::canonicalize(&path)?;
+
+    let set = call_tool(
+        &h.client,
+        "kv_set",
+        serde_json::json!({ "store": "s", "key": "f", "value_path": abs.to_string_lossy() }),
+    )
+    .await?;
+    assert!(
+        !is_error(&set),
+        "value_path set failed: {:?}",
+        first_text(&set)
+    );
+    let got = call_tool(
+        &h.client,
+        "kv_get",
+        serde_json::json!({ "store": "s", "key": "f" }),
+    )
+    .await?;
+    assert_eq!(structured(&got)["value"], serde_json::json!("from-file"));
+
+    // Neither value nor value_path → INVALID_ARGUMENT.
+    let neither = call_tool(
+        &h.client,
+        "kv_set",
+        serde_json::json!({ "store": "s", "key": "x" }),
+    )
+    .await?;
+    assert!(is_error(&neither));
+    // Both → INVALID_ARGUMENT.
+    let both = call_tool(&h.client, "kv_set",
+        serde_json::json!({ "store": "s", "key": "y", "value": "v", "value_path": abs.to_string_lossy() })).await?;
+    assert!(is_error(&both));
+    h.shutdown().await
+}

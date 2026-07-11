@@ -845,10 +845,19 @@ pub struct KvKeyParams {
 pub struct KvSetParams {
     /// Namespace of the KV store. Created on first write.
     pub store: String,
-    /// Key to write. Overwrites any existing value for this key (upsert).
+    /// Key to write.
     pub key: String,
-    /// Value to store. Any string, including a JSON document.
-    pub value: String,
+    /// Value to store. Any string, including a JSON document. Provide exactly
+    /// one of `value` or `value_path`.
+    pub value: Option<String>,
+    /// Absolute path to a file whose contents become the value (read
+    /// server-side). Provide exactly one of `value` or `value_path`. Reads any
+    /// path the server process can read — no sandbox.
+    pub value_path: Option<String>,
+    /// When false, do not overwrite an existing key: if the key already exists
+    /// the write is skipped and the response reports `stored:false,
+    /// existed:true`. Defaults to true (upsert).
+    pub overwrite: Option<bool>,
     /// Target database alias. Omit (or pass `"local"`) to write to the
     /// ephemeral primary. Pass `"persistent"` to write to the durable database
     /// that survives across sessions. Other values target a user-attached
@@ -1175,6 +1184,23 @@ impl HyperMcpServer {
         }
 
         Ok(Some(resolved))
+    }
+
+    /// Soft threshold (bytes) above which a single KV value triggers a non-fatal
+    /// `warning` in the write response. The write always succeeds.
+    const KV_SOFT_SIZE_WARN_BYTES: usize = 1_048_576;
+
+    /// Returns a soft-size advisory when `bytes` exceeds the KV scratchpad
+    /// threshold, else `None`. Reports the raw byte count (no float division, to
+    /// stay clear of `cast_precision_loss` under the pedantic lint gate).
+    fn kv_size_warning(bytes: usize) -> Option<String> {
+        (bytes > Self::KV_SOFT_SIZE_WARN_BYTES).then(|| {
+            format!(
+                "value is {bytes} bytes (> {} soft limit); the KV \
+                 store is for small scraps — consider load_data or a real table for large payloads",
+                Self::KV_SOFT_SIZE_WARN_BYTES
+            )
+        })
     }
 
     /// Opens a KV store handle on the engine's connection, targeting the
@@ -1667,12 +1693,8 @@ impl HyperMcpServer {
             };
 
             let ingest_result = if let Some(ref json_path) = params.json_extract_path {
-                let raw = std::fs::read_to_string(&params.path).map_err(|e| {
-                    McpError::new(
-                        ErrorCode::FileNotFound,
-                        format!("Cannot read file '{}': {e}", params.path),
-                    )
-                })?;
+                let raw = std::fs::read_to_string(&params.path)
+                    .map_err(|e| McpError::from_io_error(&e, "load_file"))?;
                 let extracted = crate::ingest::extract_json_path(&raw, json_path)?;
                 let array_text = crate::ingest::normalize_json_or_jsonl(&extracted)?;
                 let mut result = ingest_json(engine, &array_text, &opts)?;
@@ -1837,12 +1859,8 @@ impl HyperMcpServer {
             };
 
             let ingest_result = if let Some(ref json_path) = params.json_extract_path {
-                let raw = std::fs::read_to_string(&params.path).map_err(|e| {
-                    McpError::new(
-                        ErrorCode::FileNotFound,
-                        format!("Cannot read file '{}': {e}", params.path),
-                    )
-                })?;
+                let raw = std::fs::read_to_string(&params.path)
+                    .map_err(|e| McpError::from_io_error(&e, "load_file"))?;
                 let extracted = crate::ingest::extract_json_path(&raw, json_path)?;
                 let array_text = crate::ingest::normalize_json_or_jsonl(&extracted)?;
                 let mut result = ingest_json(engine, &array_text, &opts)?;
@@ -2864,12 +2882,8 @@ impl HyperMcpServer {
         let sample_rows = params.sample_rows.unwrap_or(5).clamp(1, 50) as usize;
         let result = if let Some(ref json_path) = params.json_extract_path {
             (|| -> Result<_, McpError> {
-                let raw = std::fs::read_to_string(&params.path).map_err(|e| {
-                    McpError::new(
-                        ErrorCode::FileNotFound,
-                        format!("Cannot read file '{}': {e}", params.path),
-                    )
-                })?;
+                let raw = std::fs::read_to_string(&params.path)
+                    .map_err(|e| McpError::from_io_error(&e, "load_file"))?;
                 let file_size = std::fs::metadata(&params.path).map_or(0, |m| m.len());
                 let extracted = crate::ingest::extract_json_path(&raw, json_path)?;
                 crate::inspect::inspect_json_from_text(&extracted, file_size, sample_rows)
@@ -3118,7 +3132,7 @@ impl HyperMcpServer {
 
     /// Save a value under store + key (upsert). Ephemeral unless routed.
     #[tool(
-        description = "KV scratchpad. Save a variable, state, summary, or JSON config under store + key to remember later without creating a database table. Overwrites any existing value (upsert). IMPORTANT: without `database` the value is written to the EPHEMERAL database and is LOST when the server restarts. To persist across restarts, pass database=\"persistent\" (or persist=true)."
+        description = "KV scratchpad. Save a variable, state, summary, or JSON config under store + key to remember later without creating a database table. IMPORTANT: without `database` the value is written to the EPHEMERAL database and is LOST when the server restarts. To persist across restarts, pass database=\"persistent\" (or persist=true). Returns {stored, created, value_bytes}; `created:false` means an existing value was overwritten. Pass overwrite=false to avoid clobbering (skips + returns stored:false, existed:true). Pass value_path=<absolute path> to store a file's contents server-side instead of `value` (exactly one of value/value_path; reads any server-readable path — no sandbox)."
     )]
     fn kv_set(
         &self,
@@ -3127,13 +3141,65 @@ impl HyperMcpServer {
         if let Err(e) = self.check_writable("kv_set") {
             return Self::err_content(e);
         }
+        // Exactly one of value / value_path.
+        let value = match (p.value.as_deref(), p.value_path.as_deref()) {
+            (Some(v), None) => v.to_string(),
+            (None, Some(path)) => {
+                let canonical = match crate::attach::validate_input_path(path, "value_path") {
+                    Ok(c) => c,
+                    Err(e) => return Self::err_content(e),
+                };
+                match std::fs::read_to_string(&canonical) {
+                    Ok(s) => s,
+                    Err(e) => return Self::err_content(McpError::from_io_error(&e, "value_path")),
+                }
+            }
+            (Some(_), Some(_)) => {
+                return Self::err_content(McpError::new(
+                    ErrorCode::InvalidArgument,
+                    "provide exactly one of `value` or `value_path`, not both",
+                ));
+            }
+            (None, None) => {
+                return Self::err_content(McpError::new(
+                    ErrorCode::InvalidArgument,
+                    "provide either `value` or `value_path`",
+                ));
+            }
+        };
+        let value_bytes = value.len();
+        let overwrite = p.overwrite.unwrap_or(true);
+
         let result = self.with_engine(|engine| {
             let db = self.resolve_db(engine, p.database.as_deref(), p.persist, true)?;
             let kv = Self::kv_open(engine, db.as_deref(), &p.store)?;
-            kv.set(&p.key, &p.value).map_err(McpError::from)
+            if overwrite {
+                kv.set(&p.key, &value)
+                    .map(|o| (true, o.created))
+                    .map_err(McpError::from)
+            } else {
+                kv.set_if_absent(&p.key, &value)
+                    .map(|written| (written, written))
+                    .map_err(McpError::from)
+            }
         });
         match result {
-            Ok(_) => Self::ok_content(json!({ "stored": true, "store": p.store, "key": p.key })),
+            Ok((stored, created)) => {
+                let mut body = json!({
+                    "stored": stored,
+                    "created": created,
+                    "store": p.store,
+                    "key": p.key,
+                    "value_bytes": value_bytes,
+                });
+                if !stored {
+                    body["existed"] = json!(true);
+                }
+                if let Some(w) = Self::kv_size_warning(value_bytes) {
+                    body["warning"] = json!(w);
+                }
+                Self::ok_content(body)
+            }
             Err(e) => Self::err_content(e),
         }
     }
