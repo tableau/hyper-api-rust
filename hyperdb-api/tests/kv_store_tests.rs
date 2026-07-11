@@ -231,3 +231,23 @@ fn set_batch_reports_created_and_overwritten() -> Result<()> {
     assert_eq!(kv.get("a")?, Some("10".to_string()));
     Ok(())
 }
+
+#[test]
+fn set_if_absent_guards_existing_key() -> Result<()> {
+    let tc = TestConnection::new()?;
+    let kv = tc.connection.kv_store("guard")?;
+    assert!(
+        kv.set_if_absent("k", "first")?,
+        "absent key must be written"
+    );
+    assert!(
+        !kv.set_if_absent("k", "second")?,
+        "present key must be skipped"
+    );
+    assert_eq!(
+        kv.get("k")?,
+        Some("first".to_string()),
+        "value must be unchanged"
+    );
+    Ok(())
+}

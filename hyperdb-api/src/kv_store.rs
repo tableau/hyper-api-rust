@@ -277,6 +277,32 @@ impl<'conn> KvStore<'conn> {
         })
     }
 
+    /// Inserts `value` under `key` only if `key` is absent.
+    ///
+    /// Returns `true` if a row was written, `false` if the key already existed
+    /// (in which case nothing is written). A single `INSERT ... WHERE NOT
+    /// EXISTS` statement decides, so there is no check-then-write race.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidName`] if `key` is invalid.
+    /// - [`Error::FeatureNotSupported`] on gRPC transport.
+    /// - [`Error::Server`] if the `INSERT` fails.
+    pub fn set_if_absent(&self, key: &str, value: &str) -> Result<bool> {
+        validate_kv_name(key, "key")?;
+        let store = self.store_name.as_str();
+        let inserted = self.connection.command_params(
+            &format!(
+                "INSERT INTO {t} (store_name, key, value) \
+                 SELECT $1, $2, $3 \
+                 WHERE NOT EXISTS (SELECT 1 FROM {t} WHERE store_name = $4 AND key = $5)",
+                t = self.table_ref
+            ),
+            &[&store, &key, &value, &store, &key],
+        )?;
+        Ok(inserted > 0)
+    }
+
     /// Deletes `key`; returns `true` if a row was removed.
     ///
     /// # Errors
