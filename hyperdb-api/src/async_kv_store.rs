@@ -353,7 +353,7 @@ impl<'conn> AsyncKvStore<'conn> {
             validate_kv_name(key, "key")?;
         }
         self.connection.begin_transaction_raw().await?;
-        let inner: Result<BatchSetOutcome> = async {
+        let result = async {
             let mut outcome = BatchSetOutcome {
                 created: 0,
                 overwritten: 0,
@@ -368,13 +368,13 @@ impl<'conn> AsyncKvStore<'conn> {
             Ok(outcome)
         }
         .await;
-        match &inner {
+        match &result {
             Ok(_) => self.connection.commit_raw().await?,
             Err(_) => {
                 let _ = self.connection.rollback_raw().await;
             }
         }
-        inner
+        result
     }
 }
 
