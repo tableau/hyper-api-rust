@@ -270,3 +270,20 @@ fn byte_size_and_entries() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn set_batch_if_absent_skips_existing() -> Result<()> {
+    let tc = TestConnection::new()?;
+    let kv = tc.connection.kv_store("batch_guard")?;
+    kv.set("a", "orig")?; // pre-existing → must be skipped
+    let out = kv.set_batch_if_absent(&[("a", "new"), ("b", "b1"), ("c", "c1")])?;
+    assert_eq!(out.written, 2, "b and c are new");
+    assert_eq!(out.skipped, 1, "a existed");
+    assert_eq!(
+        kv.get("a")?,
+        Some("orig".to_string()),
+        "existing value untouched"
+    );
+    assert_eq!(kv.get("b")?, Some("b1".to_string()));
+    Ok(())
+}

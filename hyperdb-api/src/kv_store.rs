@@ -110,6 +110,15 @@ pub struct BatchSetOutcome {
     pub overwritten: usize,
 }
 
+/// Outcome of a guarded batch write (`set_batch_if_absent`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchGuardOutcome {
+    /// Number of keys newly inserted.
+    pub written: usize,
+    /// Number of keys skipped because they already existed.
+    pub skipped: usize,
+}
+
 /// A handle to one named key-value store, backed by `KV_TABLE`.
 ///
 /// Borrows its [`Connection`] for the handle's lifetime (`'conn`), matching
@@ -522,6 +531,42 @@ impl<'conn> KvStore<'conn> {
                     outcome.created += 1;
                 } else {
                     outcome.overwritten += 1;
+                }
+            }
+            Ok(outcome)
+        })();
+        match &result {
+            Ok(_) => self.connection.commit_raw()?,
+            Err(_) => {
+                let _ = self.connection.rollback_raw();
+            }
+        }
+        result
+    }
+
+    /// Inserts every absent `(key, value)` pair in one transaction, skipping
+    /// keys that already exist. All keys are validated before the transaction
+    /// opens, so an invalid key aborts the whole batch without writing anything.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidName`] if any key is invalid (checked before writing).
+    /// - [`Error::FeatureNotSupported`] / [`Error::Server`].
+    pub fn set_batch_if_absent(&self, entries: &[(&str, &str)]) -> Result<BatchGuardOutcome> {
+        for (key, _) in entries {
+            validate_kv_name(key, "key")?;
+        }
+        self.connection.begin_transaction_raw()?;
+        let result = (|| {
+            let mut outcome = BatchGuardOutcome {
+                written: 0,
+                skipped: 0,
+            };
+            for (key, value) in entries {
+                if self.set_if_absent(key, value)? {
+                    outcome.written += 1;
+                } else {
+                    outcome.skipped += 1;
                 }
             }
             Ok(outcome)
