@@ -55,6 +55,7 @@ fn readme_mentions_every_tool() {
         "unwatch_directory",
         "kv_get",
         "kv_set",
+        "kv_set_many",
         "kv_delete",
         "kv_list",
         "kv_list_stores",

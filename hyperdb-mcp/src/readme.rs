@@ -186,12 +186,26 @@ watcher targets the alias; call `unwatch_directory` first.
 
 ### Key-value store (scratchpad)
 - `kv_set` — save a variable / state / summary / JSON string under a
-  store + key (upsert).
+  store + key. Returns `{stored, created, value_bytes}`. Pass
+  `overwrite: false` to skip writes that would clobber an existing key
+  (response: `{stored: false, existed: true}`). Pass
+  `value_path: <absolute path>` to store a file's contents server-side
+  instead of inlining `value` (exactly one of `value` / `value_path`;
+  reads any path the server process can read — no sandbox).
+- `kv_set_many` — atomic batch write. Pass an `entries` array of
+  `{key, value}` objects. All keys validated up front; an invalid key
+  aborts the whole batch without writing anything. `overwrite: false`
+  skips existing keys within the batch. Returns
+  `{stored, created, overwritten, total_bytes}` (or `skipped` instead
+  of `overwritten` under `overwrite: false`).
 - `kv_get` — read a value by store + key.
 - `kv_delete` — delete a key.
-- `kv_list` — list keys in a store.
+- `kv_list` — list keys in a store. Pass `values: true` to return
+  `{entries: [{key, value}, ...]}` instead of `{keys: [...]}` — reads
+  the whole store in one call (eliminates N×`kv_get`).
 - `kv_list_stores` — list store namespaces that hold data in a database.
-- `kv_size` — count keys in a store.
+- `kv_size` — count keys and total value bytes in a store. Returns
+  `{size, bytes}`.
 - `kv_pop` — destructively read-and-remove the lowest-keyed entry
   (lexicographic key order, not insertion order).
 - `kv_clear` — delete all keys in a store.
@@ -206,6 +220,18 @@ to avoid row multiplication, and keep the KV table in the same database
 as the joined table. See the `hyper://schema/kv` resource for the join
 template, and `KV store vs. a custom table` above for when to reach for
 this instead of a real table.
+
+**Querying JSON in a KV value:** Values are TEXT. To query JSON
+structure, cast first: `SELECT value::json ->> 'field' FROM
+_hyperdb_kv_store WHERE store_name = '...'`. The `->` / `->>` /
+`JSON_EACH(...)` operators work AFTER the `::json` cast. Applying `->`
+or `->>` to raw TEXT fails with SQLSTATE 42601 (\"requires a structured
+data type\"). `JSON_VALUE(...)` is not implemented in this engine — use
+the `::json` cast instead.
+
+**::numeric truncation gotcha:** A bare `::numeric` cast defaults to
+scale 0 and truncates decimal places. Example: `41.54178215::numeric`
+→ `42`. Always specify precision and scale: `::numeric(20,10)`.
 
 ### Introspection
 - `get_readme` — this document. Call once at the start of a session.
