@@ -735,6 +735,94 @@ fn reconcile_in_per_db_does_not_touch_persistent_catalog() {
     );
 }
 
+/// A rename inside a user-attached DB (`execute(database="user_db",
+/// "ALTER TABLE foo RENAME TO bar")` → `reconcile_in(Some("user_db"))`)
+/// must preserve the catalog row's prose, exactly as the same operation
+/// does for the shared persistent catalog. Regression guard for the
+/// #195 deep-review Finding 1: restricting the rename-target pool to a
+/// literal `PERSISTENT_ALIAS` silently emptied the candidate pool for
+/// user DBs, so the row was deleted + re-stubbed and prose was lost.
+#[test]
+fn reconcile_in_user_db_preserves_metadata_on_rename() {
+    use hyperdb_mcp::attach::{AttachRegistry, AttachRequest, AttachSource, OnMissing};
+    use hyperdb_mcp::table_catalog::MetadataFields;
+
+    let dir = TempDir::new().unwrap();
+    let primary = dir.path().join("primary.hyper");
+    let attached = dir.path().join("attached.hyper");
+
+    let engine = Engine::new_no_daemon(Some(primary.to_string_lossy().into())).unwrap();
+    let reg = AttachRegistry::new();
+    reg.attach(
+        &engine,
+        AttachRequest {
+            alias: "user_db".into(),
+            source: AttachSource::LocalFile { path: attached },
+            writable: true,
+            on_missing: OnMissing::Create,
+        },
+    )
+    .unwrap();
+
+    // A table in user_db with a distinctive, unambiguous row count so the
+    // rename heuristic can match old→new by count.
+    engine
+        .execute_command("CREATE TABLE \"user_db\".\"public\".\"foo\" (id INT)")
+        .unwrap();
+    engine
+        .execute_command("INSERT INTO \"user_db\".\"public\".\"foo\" VALUES (1), (2), (3)")
+        .unwrap();
+    hyperdb_mcp::table_catalog::upsert_stub_in(
+        &engine,
+        "foo",
+        "load_data",
+        None,
+        Some(3),
+        true,
+        Some("user_db"),
+        None,
+    )
+    .unwrap();
+    hyperdb_mcp::table_catalog::set_metadata_in(
+        &engine,
+        "foo",
+        &MetadataFields {
+            purpose: Some("quarterly figures".into()),
+            source_url: Some("s3://bucket/foo.parquet".into()),
+            ..Default::default()
+        },
+        Some("user_db"),
+    )
+    .unwrap();
+
+    // Rename foo → bar inside the user DB, then reconcile that DB's catalog
+    // (mirrors after_execute_catalog_update's per-target reconcile).
+    engine
+        .execute_command("ALTER TABLE \"user_db\".\"public\".\"foo\" RENAME TO \"bar\"")
+        .unwrap();
+    hyperdb_mcp::table_catalog::reconcile_in(&engine, Some("user_db")).unwrap();
+
+    assert!(
+        hyperdb_mcp::table_catalog::get_in(&engine, "foo", Some("user_db"))
+            .unwrap()
+            .is_none(),
+        "old name must be gone from the user_db catalog after rename"
+    );
+    let after = hyperdb_mcp::table_catalog::get_in(&engine, "bar", Some("user_db"))
+        .unwrap()
+        .expect("renamed table must have a catalog entry in user_db");
+    assert_eq!(
+        after.purpose.as_deref(),
+        Some("quarterly figures"),
+        "purpose must survive a rename in a user-attached DB"
+    );
+    assert_eq!(
+        after.source_url.as_deref(),
+        Some("s3://bucket/foo.parquet"),
+        "source_url must survive a rename in a user-attached DB"
+    );
+}
+
 // --- set_table_metadata + database (Iter 5) --------------------------------
 
 /// `set_metadata_in(target_db=Some("user_db"))` updates prose fields

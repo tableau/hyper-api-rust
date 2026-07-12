@@ -670,16 +670,21 @@ pub fn delete_for(engine: &Engine, table_name: &str) -> Result<bool, McpError> {
 /// tables — see [`reconcile_live_tables`]. Enumerating only the persistent
 /// attachment would (a) never stub an `execute`-created primary table and
 /// (b) silently reap the catalog rows of primary tables registered by the
-/// ingest path. The rename heuristic's TARGET pool is deliberately kept to
-/// persistent-origin tables only, so a disappeared persistent row can never
-/// be false-renamed onto an unrelated new ephemeral table by coincident
-/// row count.
+/// ingest path. The rename heuristic's TARGET pool is restricted to new
+/// tables living in the catalog's OWN database (persistent for the shared
+/// catalog, or the user alias for a per-DB reconcile), so a disappeared row
+/// can never be false-renamed onto an unrelated new table in a different DB
+/// by coincident row count — for the shared catalog this excludes the
+/// ephemeral primary (fixes #195 C1); for a user-attached DB it keeps that
+/// DB's own tables so renames there still preserve prose.
 ///
 /// **Known limitation:** the catalog is name-keyed with no origin-DB column,
 /// and each MCP process owns a distinct ephemeral primary while sharing one
 /// persistent catalog. This is correct for a single MCP process per
 /// persistent workspace; with multiple concurrent processes, a peer's
-/// ephemeral-table rows can still be reaped. A principled fix needs an
+/// ephemeral-table rows are invisible to this process's live set, so they
+/// can be reaped — or, on a coincident row count, mis-migrated onto a local
+/// persistent table by the rename heuristic. A principled fix needs an
 /// `origin_db` column and is out of scope here.
 ///
 /// # Errors
@@ -722,27 +727,30 @@ pub fn reconcile_in(engine: &Engine, target_db: Option<&str>) -> Result<(), McpE
     let mut renamed_old: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut renamed_new: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // Rename TARGET candidates are restricted to persistent-origin new tables.
-    // The catalog rows we might rename all live in (and describe) the shared
-    // persistent catalog, so matching a disappeared persistent row against a
-    // brand-new EPHEMERAL table on a coincident row count would migrate
-    // persistent prose onto an unrelated scratch table (fixes #195 C1). This
-    // restores the pre-union candidate pool (persistent tables only).
+    // Rename TARGET candidates are restricted to new tables living in the
+    // catalog's OWN database — persistent for the shared catalog, or the
+    // user alias for a per-DB reconcile. The catalog rows we might rename all
+    // describe tables in that DB, so matching a disappeared row against a
+    // brand-new table in a DIFFERENT DB on a coincident row count would
+    // migrate its prose onto an unrelated scratch table. For the shared
+    // catalog this excludes ephemeral-primary tables (fixes #195 C1); for a
+    // user-attached DB it keeps the full same-DB pool so renames there still
+    // preserve metadata (#195 deep-review Finding 1). `catalog_alias` is
+    // `Some` whenever `live` is non-empty (both derive from
+    // `resolve_catalog_alias`), so a non-empty candidate pool is never
+    // counted against a missing alias.
+    let catalog_alias = resolve_catalog_alias(engine, target_db);
     let rename_candidates: Vec<&&String> = new_tables
         .iter()
-        .filter(|t| live.get(**t).map(String::as_str) == Some(Engine::PERSISTENT_ALIAS))
+        .filter(|t| live.get(**t) == catalog_alias.as_ref())
         .collect();
 
     if !disappeared.is_empty() && !rename_candidates.is_empty() {
-        // Collect row counts for candidate new tables (cheap: one COUNT each).
+        // Collect row counts for candidate new tables (cheap: one COUNT each),
+        // counting each against the catalog's own DB (== live[t] here).
         let new_with_counts: Vec<(&String, Option<i64>)> = rename_candidates
             .iter()
-            .map(|t| {
-                (
-                    **t,
-                    row_count_qualified(engine, Engine::PERSISTENT_ALIAS, t).ok(),
-                )
-            })
+            .map(|t| (**t, row_count_qualified(engine, &live[**t], t).ok()))
             .collect();
 
         // For a match to be accepted, BOTH sides must be unambiguous:
