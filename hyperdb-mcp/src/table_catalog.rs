@@ -647,35 +647,65 @@ pub fn delete_for(engine: &Engine, table_name: &str) -> Result<bool, McpError> {
 }
 
 /// Synchronize the catalog in `target_db` against the current set of
-/// user tables in that DB.
+/// live user tables.
 ///
-/// * Insert a stub row for every user table missing from the catalog.
+/// * Insert a stub row for every live user table missing from the catalog.
 ///   These stubs use `load_tool = "unknown"` so callers can later tell
 ///   the difference between "loaded via a tool and we tracked it" and
 ///   "found during reconciliation".
-/// * Delete catalog rows whose table no longer exists in `target_db`.
+/// * Delete catalog rows whose table no longer exists.
 /// * Refresh `row_count` on every remaining row.
 ///
 /// Does *not* bump `last_refreshed_at` — reconciliation is a housekeeping
 /// pass, not a data refresh.
 ///
+/// # The shared persistent catalog is a union (fixes #195)
+///
+/// The persistent `_table_catalog` is the single store for BOTH persistent
+/// tables and ephemeral-primary tables (unqualified DDL — e.g. an `execute`
+/// tool call on the default workspace — lands on the ephemeral primary,
+/// whose stub still lives in the persistent catalog). So when reconciling
+/// the shared catalog (`target_db` is `None` or `"persistent"`), the live
+/// set is the UNION of persistent-attachment tables ∪ ephemeral-primary
+/// tables — see [`reconcile_live_tables`]. Enumerating only the persistent
+/// attachment would (a) never stub an `execute`-created primary table and
+/// (b) silently reap the catalog rows of primary tables registered by the
+/// ingest path. The rename heuristic's TARGET pool is restricted to new
+/// tables living in the catalog's OWN database (persistent for the shared
+/// catalog, or the user alias for a per-DB reconcile), so a disappeared row
+/// can never be false-renamed onto an unrelated new table in a different DB
+/// by coincident row count — for the shared catalog this excludes the
+/// ephemeral primary (fixes #195 C1); for a user-attached DB it keeps that
+/// DB's own tables so renames there still preserve prose.
+///
+/// **Known limitation:** the catalog is name-keyed with no origin-DB column,
+/// and each MCP process owns a distinct ephemeral primary while sharing one
+/// persistent catalog. This is correct for a single MCP process per
+/// persistent workspace; with multiple concurrent processes, a peer's
+/// ephemeral-table rows are invisible to this process's live set, so they
+/// can be reaped — or, on a coincident row count, mis-migrated onto a local
+/// persistent table by the rename heuristic. A principled fix needs an
+/// `origin_db` column and is out of scope here.
+///
 /// # Errors
 ///
-/// - Propagates any error from [`ensure_exists_in`], `user_tables_in`,
+/// - Propagates any error from [`ensure_exists_in`], [`reconcile_live_tables`],
 ///   [`list_in`], [`delete_for_in`], `refresh_row_count_in`, or
 ///   [`upsert_stub_in`].
-/// - `row_count_of_in` failures are swallowed (the row count falls
+/// - `row_count_qualified` failures are swallowed (the row count falls
 ///   back to `None`).
 pub fn reconcile_in(engine: &Engine, target_db: Option<&str>) -> Result<(), McpError> {
     ensure_exists_in(engine, target_db)?;
 
-    let tables = user_tables_in(engine, target_db)?;
+    // Live user tables, mapped to the alias each one should be counted
+    // against. For the shared persistent catalog this is the union of
+    // persistent + ephemeral-primary tables (fixes #195).
+    let live = reconcile_live_tables(engine, target_db)?;
     let catalog_entries = list_in(engine, target_db)?;
     let catalog_names: std::collections::HashSet<String> = catalog_entries
         .iter()
         .map(|e| e.table_name.clone())
         .collect();
-    let live_tables: std::collections::HashSet<String> = tables.iter().cloned().collect();
 
     // Detect renames: a catalog entry whose table disappeared + a live table
     // with no catalog entry + matching row count ⇒ likely a RENAME rather
@@ -683,10 +713,10 @@ pub fn reconcile_in(engine: &Engine, target_db: Option<&str>) -> Result<(), McpE
     // metadata (source_url, purpose, notes, etc.) is preserved.
     let disappeared: Vec<&CatalogEntry> = catalog_entries
         .iter()
-        .filter(|e| !live_tables.contains(&e.table_name))
+        .filter(|e| !live.contains_key(&e.table_name))
         .collect();
-    let new_tables: Vec<&String> = tables
-        .iter()
+    let new_tables: Vec<&String> = live
+        .keys()
         .filter(|t| !catalog_names.contains(*t))
         .collect();
 
@@ -697,11 +727,30 @@ pub fn reconcile_in(engine: &Engine, target_db: Option<&str>) -> Result<(), McpE
     let mut renamed_old: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut renamed_new: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    if !disappeared.is_empty() && !new_tables.is_empty() {
-        // Collect row counts for new tables (cheap: one COUNT per table).
-        let new_with_counts: Vec<(&String, Option<i64>)> = new_tables
+    // Rename TARGET candidates are restricted to new tables living in the
+    // catalog's OWN database — persistent for the shared catalog, or the
+    // user alias for a per-DB reconcile. The catalog rows we might rename all
+    // describe tables in that DB, so matching a disappeared row against a
+    // brand-new table in a DIFFERENT DB on a coincident row count would
+    // migrate its prose onto an unrelated scratch table. For the shared
+    // catalog this excludes ephemeral-primary tables (fixes #195 C1); for a
+    // user-attached DB it keeps the full same-DB pool so renames there still
+    // preserve metadata (#195 deep-review Finding 1). `catalog_alias` is
+    // `Some` whenever `live` is non-empty (both derive from
+    // `resolve_catalog_alias`), so a non-empty candidate pool is never
+    // counted against a missing alias.
+    let catalog_alias = resolve_catalog_alias(engine, target_db);
+    let rename_candidates: Vec<&&String> = new_tables
+        .iter()
+        .filter(|t| live.get(**t) == catalog_alias.as_ref())
+        .collect();
+
+    if !disappeared.is_empty() && !rename_candidates.is_empty() {
+        // Collect row counts for candidate new tables (cheap: one COUNT each),
+        // counting each against the catalog's own DB (== live[t] here).
+        let new_with_counts: Vec<(&String, Option<i64>)> = rename_candidates
             .iter()
-            .map(|t| (*t, row_count_of_in(engine, t, target_db).ok()))
+            .map(|t| (**t, row_count_qualified(engine, &live[**t], t).ok()))
             .collect();
 
         // For a match to be accepted, BOTH sides must be unambiguous:
@@ -747,20 +796,22 @@ pub fn reconcile_in(engine: &Engine, target_db: Option<&str>) -> Result<(), McpE
         }
     }
 
-    // Stub remaining new tables (those NOT matched as rename targets).
+    // Stub remaining new tables (those NOT matched as rename targets),
+    // counting each against its origin DB.
     for table in &new_tables {
         if !renamed_new.contains(table.as_str()) {
-            let row_count = row_count_of_in(engine, table, target_db).ok();
+            let row_count = row_count_qualified(engine, &live[*table], table).ok();
             upsert_stub_in(
                 engine, table, "unknown", None, row_count, false, target_db, None,
             )?;
         }
     }
 
-    // Refresh row counts for tables that already had catalog entries.
-    for table in &tables {
+    // Refresh row counts for tables that already had catalog entries,
+    // counting each against its origin DB.
+    for (table, alias) in &live {
         if catalog_names.contains(table) {
-            let row_count = row_count_of_in(engine, table, target_db).ok();
+            let row_count = row_count_qualified(engine, alias, table).ok();
             refresh_row_count_in(engine, table, row_count, target_db)?;
         }
     }
@@ -804,19 +855,12 @@ pub fn reconcile(engine: &Engine) -> Result<(), McpError> {
 
 // --- Internals --------------------------------------------------------------
 
-/// List user-facing tables in the **persistent** attachment (excludes
-/// `_hyperdb_*` internals and the catalog itself). Returns an empty Vec
-/// when no persistent attachment is present. Uses a fully-qualified
-/// `pg_catalog.pg_tables` probe so it sees inside the attachment;
-/// `Catalog::get_table_names` would target the connection's primary
-/// (ephemeral) by default.
-/// List user-facing tables in `target_db` (excludes `_hyperdb_*`
-/// internals and the catalog itself). Returns an empty Vec when no
-/// catalog destination exists for the target.
-fn user_tables_in(engine: &Engine, target_db: Option<&str>) -> Result<Vec<String>, McpError> {
-    let Some(alias) = resolve_catalog_alias(engine, target_db) else {
-        return Ok(Vec::new());
-    };
+/// List user-facing tables in the `public` schema of ONE explicit
+/// attachment alias (excludes `_hyperdb_*` internals and the catalog
+/// itself). Uses a fully-qualified `pg_catalog.pg_tables` probe so it
+/// sees inside the given attachment; `Catalog::get_table_names` would
+/// target the connection's primary (ephemeral) by default.
+fn public_tables_in(engine: &Engine, alias: &str) -> Result<Vec<String>, McpError> {
     let alias_esc = alias.replace('"', "\"\"");
     let sql = format!(
         "SELECT tablename FROM \"{alias_esc}\".pg_catalog.pg_tables \
@@ -832,6 +876,50 @@ fn user_tables_in(engine: &Engine, target_db: Option<&str>) -> Result<Vec<String
         })
         .filter(|name| name != TABLE_CATALOG_TABLE && !is_internal_table(name))
         .collect())
+}
+
+/// Map each live user table to the attachment alias its `row_count`
+/// should be computed against, for a reconcile targeting `target_db`.
+///
+/// * No catalog destination (`--ephemeral-only`, or an unknown/empty
+///   target with no persistent attachment) → empty map, so reconcile is
+///   a no-op (preserves prior behavior).
+/// * Shared persistent catalog (`target_db` is `None` or `"persistent"`)
+///   → the UNION of the ephemeral primary's tables and the persistent
+///   attachment's tables (fixes #195). The persistent tables are inserted
+///   last so that on a name collision the durable persistent table wins
+///   the count-alias — it is the authoritative row for a name-keyed
+///   catalog with no origin-DB column.
+/// * A user-attached alias → just that alias's tables (single-DB,
+///   unchanged semantics).
+///
+/// # Errors
+///
+/// Propagates errors from [`public_tables_in`].
+fn reconcile_live_tables(
+    engine: &Engine,
+    target_db: Option<&str>,
+) -> Result<std::collections::BTreeMap<String, String>, McpError> {
+    let Some(alias) = resolve_catalog_alias(engine, target_db) else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    let mut live = std::collections::BTreeMap::new();
+    if alias == Engine::PERSISTENT_ALIAS {
+        // Ephemeral primary first, persistent second → persistent wins a
+        // name collision (inserted last, overwrites the alias).
+        let primary = engine.primary_db_name();
+        for t in public_tables_in(engine, &primary)? {
+            live.insert(t, primary.clone());
+        }
+        for t in public_tables_in(engine, Engine::PERSISTENT_ALIAS)? {
+            live.insert(t, Engine::PERSISTENT_ALIAS.to_string());
+        }
+    } else {
+        for t in public_tables_in(engine, &alias)? {
+            live.insert(t, alias.clone());
+        }
+    }
+    Ok(live)
 }
 
 /// `true` when `_table_catalog` is present inside `target_db`.
@@ -858,17 +946,9 @@ fn table_present_in(engine: &Engine, target_db: Option<&str>) -> Result<bool, Mc
     })
 }
 
-/// Return `COUNT(*)` for a user table inside `target_db`. Quoted to
-/// handle mixed-case or keyword-like names. Returns 0 if no catalog
-/// destination exists.
-fn row_count_of_in(
-    engine: &Engine,
-    table_name: &str,
-    target_db: Option<&str>,
-) -> Result<i64, McpError> {
-    let Some(alias) = resolve_catalog_alias(engine, target_db) else {
-        return Ok(0);
-    };
+/// Return `COUNT(*)` for a user table inside an explicit attachment
+/// `alias`. Quoted to handle mixed-case or keyword-like names.
+fn row_count_qualified(engine: &Engine, alias: &str, table_name: &str) -> Result<i64, McpError> {
     let alias_esc = alias.replace('"', "\"\"");
     let quoted = table_name.replace('"', "\"\"");
     let sql = format!("SELECT COUNT(*) AS cnt FROM \"{alias_esc}\".\"public\".\"{quoted}\"");

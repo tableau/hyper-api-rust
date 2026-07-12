@@ -383,6 +383,11 @@ Documentation is split by audience:
 - **DEVELOPMENT.md** — contributor-facing: internal architecture, design decisions, how to extend, testing
 - **Source code** (`///` and `//!`) — implementation details co-located with code
 - **`docs/`** — cross-cutting topics: performance, benchmarks, transactions, comparisons
+- **`docs/superpowers/`** — planning artifacts kept in-repo and committed: design specs
+  under `docs/superpowers/specs/YYYY-MM-DD-<topic>-design.md` and their implementation
+  plans under `docs/superpowers/plans/YYYY-MM-DD-<feature>.md`. Non-trivial features are
+  brainstormed into a spec, then a plan, before code; keeping both in the repo makes the
+  design rationale reviewable alongside the change that implements it.
 
 All public items have `///` doc comments. Module-level docs (`//!`) explain architecture and patterns. Examples are in `hyperdb-api/examples/` and tested via `run_all_examples.sh`. Companion crate examples in `hyperdb-api-salesforce/examples/` and `sea-query-hyperdb/examples/`. API docs are generated via `make doc`.
 
