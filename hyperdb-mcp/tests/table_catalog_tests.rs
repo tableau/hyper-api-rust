@@ -612,7 +612,9 @@ fn set_metadata_data_url_roundtrip() {
 #[test]
 fn set_metadata_finds_execute_created_ephemeral_primary_table() {
     let (engine, _dir) = workspace_engine();
-    engine.execute_command("CREATE TABLE regr_195 (id INT)").unwrap();
+    engine
+        .execute_command("CREATE TABLE regr_195 (id INT)")
+        .unwrap();
     // Mirrors after_execute_catalog_update → reconcile_in(engine, None).
     table_catalog::reconcile(&engine).unwrap();
 
@@ -635,7 +637,9 @@ fn set_metadata_finds_execute_created_ephemeral_primary_table() {
 #[test]
 fn reconcile_preserves_ephemeral_primary_metadata_across_unrelated_ddl() {
     let (engine, _dir) = workspace_engine();
-    engine.execute_command("CREATE TABLE trap_probe (id INT)").unwrap();
+    engine
+        .execute_command("CREATE TABLE trap_probe (id INT)")
+        .unwrap();
     engine
         .execute_command("INSERT INTO trap_probe VALUES (1), (2)")
         .unwrap();
@@ -653,14 +657,19 @@ fn reconcile_preserves_ephemeral_primary_metadata_across_unrelated_ddl() {
     .unwrap();
 
     // A later, unrelated structural execute on the primary triggers reconcile.
-    engine.execute_command("CREATE TABLE trap_trigger (id INT)").unwrap();
+    engine
+        .execute_command("CREATE TABLE trap_trigger (id INT)")
+        .unwrap();
     table_catalog::reconcile(&engine).unwrap();
 
     let entry = table_catalog::get(&engine, "trap_probe")
         .unwrap()
         .expect("trap_probe catalog row must survive an unrelated execute");
     assert_eq!(entry.purpose.as_deref(), Some("keep me"));
-    assert_eq!(entry.source_url.as_deref(), Some("https://example.com/trap"));
+    assert_eq!(
+        entry.source_url.as_deref(),
+        Some("https://example.com/trap")
+    );
 }
 
 /// Delete-trap guard: reconciling the shared catalog must not delete
@@ -684,7 +693,9 @@ fn reconcile_does_not_delete_persistent_rows_when_reconciling_shared_catalog() {
     )
     .unwrap();
     // An ephemeral-primary table present alongside it.
-    engine.execute_command("CREATE TABLE eph_tbl (id INT)").unwrap();
+    engine
+        .execute_command("CREATE TABLE eph_tbl (id INT)")
+        .unwrap();
 
     table_catalog::reconcile(&engine).unwrap();
 
@@ -700,7 +711,9 @@ fn reconcile_does_not_delete_persistent_rows_when_reconciling_shared_catalog() {
 #[test]
 fn reconcile_reaps_dropped_ephemeral_primary_table() {
     let (engine, _dir) = workspace_engine();
-    engine.execute_command("CREATE TABLE dropme (id INT)").unwrap();
+    engine
+        .execute_command("CREATE TABLE dropme (id INT)")
+        .unwrap();
     table_catalog::upsert_stub(&engine, "dropme", "load_data", None, Some(5), true).unwrap();
     engine.execute_command("DROP TABLE dropme").unwrap();
 
@@ -735,7 +748,9 @@ fn reconcile_does_not_false_rename_persistent_row_onto_new_ephemeral_table() {
     )
     .unwrap();
     // A brand-new ephemeral-primary scratch table with a coincident count (0).
-    engine.execute_command("CREATE TABLE scratch (id INT)").unwrap();
+    engine
+        .execute_command("CREATE TABLE scratch (id INT)")
+        .unwrap();
     // Drop the persistent table so `sales` becomes a "disappeared" catalog row.
     engine
         .execute_command("DROP TABLE \"persistent\".\"public\".sales")
