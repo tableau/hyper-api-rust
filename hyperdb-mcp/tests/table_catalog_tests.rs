@@ -596,3 +596,195 @@ fn set_metadata_data_url_roundtrip() {
         "empty string should clear data_url"
     );
 }
+
+// --- #195: ephemeral-primary tables and the shared catalog ------------------
+//
+// Unqualified DDL lands on the ephemeral primary (schema_search_path is
+// pinned to primary_db_name()), mirroring an `execute` tool call on the
+// default workspace. The `_table_catalog` is a single store in the
+// persistent attachment shared by BOTH databases, so reconcile must
+// enumerate the union {persistent tables} ∪ {ephemeral-primary tables}.
+
+/// #195 (as filed): a table created via `execute` on the ephemeral primary
+/// must be stubbed by the post-execute reconcile so `set_metadata` succeeds.
+/// RED before the fix: `set_metadata` returns `TABLE_NOT_FOUND` because
+/// reconcile only ever enumerated the persistent attachment.
+#[test]
+fn set_metadata_finds_execute_created_ephemeral_primary_table() {
+    let (engine, _dir) = workspace_engine();
+    engine.execute_command("CREATE TABLE regr_195 (id INT)").unwrap();
+    // Mirrors after_execute_catalog_update → reconcile_in(engine, None).
+    table_catalog::reconcile(&engine).unwrap();
+
+    let entry = table_catalog::set_metadata(
+        &engine,
+        "regr_195",
+        &MetadataFields {
+            purpose: Some("derived analysis table".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(entry.purpose.as_deref(), Some("derived analysis table"));
+}
+
+/// The delete-trap: a correctly-stubbed ephemeral-primary table (registered
+/// via the working ingest path, with user prose) must survive an unrelated
+/// later structural `execute`. RED before the fix: the row is silently reaped
+/// because it is absent from the persistent-only live set.
+#[test]
+fn reconcile_preserves_ephemeral_primary_metadata_across_unrelated_ddl() {
+    let (engine, _dir) = workspace_engine();
+    engine.execute_command("CREATE TABLE trap_probe (id INT)").unwrap();
+    engine
+        .execute_command("INSERT INTO trap_probe VALUES (1), (2)")
+        .unwrap();
+    // load_data stubs the persistent catalog by explicit name (works today).
+    table_catalog::upsert_stub(&engine, "trap_probe", "load_data", None, Some(2), true).unwrap();
+    table_catalog::set_metadata(
+        &engine,
+        "trap_probe",
+        &MetadataFields {
+            purpose: Some("keep me".into()),
+            source_url: Some("https://example.com/trap".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // A later, unrelated structural execute on the primary triggers reconcile.
+    engine.execute_command("CREATE TABLE trap_trigger (id INT)").unwrap();
+    table_catalog::reconcile(&engine).unwrap();
+
+    let entry = table_catalog::get(&engine, "trap_probe")
+        .unwrap()
+        .expect("trap_probe catalog row must survive an unrelated execute");
+    assert_eq!(entry.purpose.as_deref(), Some("keep me"));
+    assert_eq!(entry.source_url.as_deref(), Some("https://example.com/trap"));
+}
+
+/// Delete-trap guard: reconciling the shared catalog must not delete
+/// persistent-table rows. Passes on current code (persistent tables are
+/// already enumerated) — it guards against a naive fix that swaps
+/// enumeration to ephemeral-only.
+#[test]
+fn reconcile_does_not_delete_persistent_rows_when_reconciling_shared_catalog() {
+    let (engine, _dir) = workspace_engine();
+    engine
+        .execute_command("CREATE TABLE \"persistent\".\"public\".pers_tbl (id INT)")
+        .unwrap();
+    table_catalog::upsert_stub(&engine, "pers_tbl", "load_file", None, Some(0), true).unwrap();
+    table_catalog::set_metadata(
+        &engine,
+        "pers_tbl",
+        &MetadataFields {
+            purpose: Some("persistent prose".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // An ephemeral-primary table present alongside it.
+    engine.execute_command("CREATE TABLE eph_tbl (id INT)").unwrap();
+
+    table_catalog::reconcile(&engine).unwrap();
+
+    let pers = table_catalog::get(&engine, "pers_tbl")
+        .unwrap()
+        .expect("persistent catalog row must survive reconcile");
+    assert_eq!(pers.purpose.as_deref(), Some("persistent prose"));
+}
+
+/// No over-correction: a genuinely-dropped ephemeral-primary table's row
+/// must still be reaped. Guards that the union fix does not turn into
+/// never-reaping.
+#[test]
+fn reconcile_reaps_dropped_ephemeral_primary_table() {
+    let (engine, _dir) = workspace_engine();
+    engine.execute_command("CREATE TABLE dropme (id INT)").unwrap();
+    table_catalog::upsert_stub(&engine, "dropme", "load_data", None, Some(5), true).unwrap();
+    engine.execute_command("DROP TABLE dropme").unwrap();
+
+    table_catalog::reconcile(&engine).unwrap();
+
+    assert!(
+        table_catalog::get(&engine, "dropme").unwrap().is_none(),
+        "a genuinely dropped ephemeral-primary table's row must be reaped"
+    );
+}
+
+/// C1 (deep-review Critical): the rename heuristic must NOT match a
+/// disappeared PERSISTENT row against a new EPHEMERAL table on a coincident
+/// row count — that would migrate persistent prose onto an unrelated scratch
+/// table. RED today (scratch isn't stubbed at all → the `.expect` fails);
+/// RED under a naive union (the false-rename fires → `purpose.is_none()`
+/// fails); GREEN only when rename targets are restricted to persistent origin.
+#[test]
+fn reconcile_does_not_false_rename_persistent_row_onto_new_ephemeral_table() {
+    let (engine, _dir) = workspace_engine();
+    engine
+        .execute_command("CREATE TABLE \"persistent\".\"public\".sales (id INT)")
+        .unwrap();
+    table_catalog::upsert_stub(&engine, "sales", "load_file", None, Some(0), true).unwrap();
+    table_catalog::set_metadata(
+        &engine,
+        "sales",
+        &MetadataFields {
+            purpose: Some("quarterly sales".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // A brand-new ephemeral-primary scratch table with a coincident count (0).
+    engine.execute_command("CREATE TABLE scratch (id INT)").unwrap();
+    // Drop the persistent table so `sales` becomes a "disappeared" catalog row.
+    engine
+        .execute_command("DROP TABLE \"persistent\".\"public\".sales")
+        .unwrap();
+
+    table_catalog::reconcile(&engine).unwrap();
+
+    assert!(
+        table_catalog::get(&engine, "sales").unwrap().is_none(),
+        "disappeared persistent row must be deleted, not renamed onto an ephemeral table"
+    );
+    let scratch = table_catalog::get(&engine, "scratch")
+        .unwrap()
+        .expect("new ephemeral table must be stubbed");
+    assert!(
+        scratch.purpose.is_none(),
+        "scratch must NOT inherit the persistent table's prose via a false rename"
+    );
+}
+
+/// Name collision across DBs: the catalog is name-keyed (no origin column),
+/// so when the same name exists in both the ephemeral primary and persistent,
+/// the persistent (durable) table is authoritative for the count and the row
+/// survives. Locks the persistent-wins insert order in the union.
+#[test]
+fn reconcile_persistent_wins_name_collision_across_dbs() {
+    let (engine, _dir) = workspace_engine();
+    engine.execute_command("CREATE TABLE dup (id INT)").unwrap();
+    engine
+        .execute_command("INSERT INTO dup VALUES (1), (2), (3)")
+        .unwrap();
+    engine
+        .execute_command("CREATE TABLE \"persistent\".\"public\".dup (id INT)")
+        .unwrap();
+    engine
+        .execute_command(
+            "INSERT INTO \"persistent\".\"public\".dup VALUES (1), (2), (3), (4), (5), (6), (7)",
+        )
+        .unwrap();
+    table_catalog::upsert_stub(&engine, "dup", "load_file", None, Some(0), true).unwrap();
+
+    table_catalog::reconcile(&engine).unwrap();
+
+    let dup = table_catalog::get(&engine, "dup")
+        .unwrap()
+        .expect("collided catalog row must survive reconcile");
+    assert_eq!(
+        dup.row_count,
+        Some(7),
+        "persistent table (7 rows) must win the count over the ephemeral primary (3 rows)"
+    );
+}
