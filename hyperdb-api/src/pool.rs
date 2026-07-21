@@ -1223,9 +1223,14 @@ mod tests {
         assert_eq!(config.idle_timeout, None);
         assert_eq!(config.min_idle, None);
 
+        let password: String = {
+            use rand::RngExt;
+            rand::rng().random_range(0..1_000_000).to_string()
+        };
+
         let tuned = SyncPoolConfig::new("e", "d")
             .create_mode(CreateMode::CreateIfNotExists)
-            .auth("u", "p")
+            .auth("u", password)
             .max_size(4)
             .recycle(SyncRecycleStrategy::Ping)
             .wait_timeout(Some(Duration::from_millis(500)))
