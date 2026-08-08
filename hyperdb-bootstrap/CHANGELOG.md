@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Bump the pinned `hyperd` release to `0.0.26225` (build `rbf04a855`).**
+  Updates the version, build id, and all four per-platform sha256s in
+  `hyperd-version.toml`. The `macos-arm64` Java bundle's `hyperd` was
+  verified to be a native arm64 Mach-O binary, preserving the reason this
+  crate downloads from the Java bundle rather than the C++ one.
+
+  **Performance.** A/B benchmark of the unified suite
+  (`hyperdb-api/benches/benchmark_suite.rs`, 100M rows, median of 3 runs,
+  Apple Silicon) against the previous pin `0.0.25080`: single-connection
+  full-scan query throughput improves substantially — **sync +66%**
+  (18.8 → 31.2 M rows/s) and **async +34%** (18.7 → 25.1 M rows/s) —
+  while single-threaded insert throughput dips **~5–7%**
+  (Inserter 26.9 → 24.9 M rows/s). Multi-connection (`× 4`) workloads
+  were dominated by thermal throttling on the test machine and are not
+  reported as a reliable delta. All 1485 workspace tests pass against the
+  new engine with identical query results.
+
 ### Fixed
 
 - **Download `hyperd` from the Java API bundle instead of the C++ bundle.**

@@ -8,14 +8,14 @@
 #
 # Bump these values (and sha256s) when upgrading. Contributors without
 # an override get this exact release, so reproducibility depends on it.
-version  = "0.0.25080"
-build_id = "r2bfd835b"
+version  = "0.0.26225"
+build_id = "rbf04a855"
 
 # sha256 of each platform's .zip. Omit a platform to skip verification
 # for that platform (not recommended). Compute with:
 #   shasum -a 256 tableauhyperapi-java-<platform>-release-main.<version>.<build_id>.zip
 [sha256]
-"macos-arm64"    = "2b0fa3fefcf4eba60f052e1cb51abfc32d8c84354274513763760f9549b45991"
-"macos-x86_64"   = "2fb7e58a449f5902e603f46ee7a73c70c85a2ef01e0c6435a26f893c2b9ee1f0"
-"linux-x86_64"   = "3d3fd2104f55f7fad832470592394dc78f350a03d52e89d36c5288b202dd0bc0"
-"windows-x86_64" = "9dc4851d416e0e6e00f0367ee6b45fcd676e7ba3a110d4644e3bec871b9aa1de"
+"macos-arm64"    = "6d7afccdf013feaae8ce3d9d75a85f1537dcc90579cfa50e059560a8f769fc18"
+"macos-x86_64"   = "44fcb84cf325f4c7069ec0424ccd78bd4e4563118f3a09c7dbc1cf95864ccff5"
+"linux-x86_64"   = "09ebe670548efb1e0abc1713c58f1503cb1cc1ce42a7bf9999ffc10851678376"
+"windows-x86_64" = "73daa8100cf5fc478afc69f42146d62f184007b39bc730b92475a8ae6afdb2c2"

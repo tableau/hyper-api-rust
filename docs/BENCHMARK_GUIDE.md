@@ -448,6 +448,10 @@ out differently — worth measuring.
 
 - [DEVELOPMENT.md](../DEVELOPMENT.md) — workspace architecture, build
   instructions, and pointers to crate-level dev guides.
+- [hyperd-release-benchmarks.md](hyperd-release-benchmarks.md) — per-release
+  performance history of the pinned `hyperd` engine. Where this guide files
+  results *by platform*, that file tracks them *by release* so an engine bump's
+  effect is visible over time. Populated by the `update-hyperd-release` skill.
 
 ## Reproducibility notes
 
