@@ -37,7 +37,9 @@ curl -sL "https://tableau.github.io/hyper-db/docs/releases" | \
 ```
 
 Confirm all four platform zips are listed for that version and share one build id.
-(The `verify-upcoming-hyper-release` user skill can also validate the page.)
+(The [`hyper-api-release-verify-upcoming-packages`](../hyper-api-release-verify-upcoming-packages/SKILL.md)
+skill — bundled `verify_release.py` — validates the whole page's downloadability and
+zip integrity for a given `--version`.)
 
 ### 3. Compute the four sha256s
 
