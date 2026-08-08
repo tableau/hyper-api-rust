@@ -4,7 +4,7 @@ This file provides guidance to AI coding assistants working with code in this re
 
 **Subdirectory guidance:** The [`hyperdb-api-node/`](hyperdb-api-node/AGENTS.md) directory has its own `AGENTS.md` covering the Node.js/TypeScript bindings, napi-rs build system, and JS-specific patterns.
 
-**Bootstrapping `hyperd`:** Contributors obtain the `hyperd` executable by running `make download-hyperd` (or `.\build.ps1 download-hyperd`). The implementation lives in the [`hyperdb-bootstrap`](hyperdb-bootstrap/) crate; the pinned release is baked into [`hyperdb-bootstrap/hyperd-version.toml`](hyperdb-bootstrap/hyperd-version.toml). Bumping `hyperd` = edit that file (version + build_id + per-platform sha256s), bump the crate version, publish.
+**Bootstrapping `hyperd`:** Contributors obtain the `hyperd` executable by running `make download-hyperd` (or `.\build.ps1 download-hyperd`). The implementation lives in the [`hyperdb-bootstrap`](hyperdb-bootstrap/) crate; the pinned release is baked into [`hyperdb-bootstrap/hyperd-version.toml`](hyperdb-bootstrap/hyperd-version.toml). Bumping `hyperd` = edit that file (version + build_id + per-platform sha256s), then let the `fix(bootstrap):` commit drive the version via release-please (the crate uses `version.workspace = true` — don't hand-edit a crate version). The full repeatable procedure — verify the pin, run the suite, A/B benchmark against the previous pin, and log the result — is captured in the [`update-hyperd-release`](.claude/skills/update-hyperd-release/SKILL.md) skill; per-release performance history is tracked in [`docs/hyperd-release-benchmarks.md`](docs/hyperd-release-benchmarks.md).
 
 ## Project Overview
 
