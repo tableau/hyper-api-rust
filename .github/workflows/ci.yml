@@ -150,6 +150,26 @@ jobs:
         if: steps.hyperd-cache.outputs.cache-hit != 'true'
         run: cargo run --release -p hyperdb-bootstrap --bin hyperdb-bootstrap -- download
 
+      - name: Start macOS hang watchdog
+        # DIAGNOSTIC (temporary): hyperd 0.0.26225 wedges after its
+        # callback connection succeeds on the macOS-14 runner only, so
+        # the test binary stalls until the 45-min job cap (see PR #219).
+        # This backgrounds a watchdog that, once a hyperd has been alive
+        # past a threshold, `sample`s its native C++ stack + the stalled
+        # test process, copies hyperd's JSON log, uploads them as an
+        # artifact, and kills the wedged processes so the job ends in
+        # minutes. Remove once the hang is root-caused and fixed.
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          # Pass the workspace path via env (not inline in run:) so the
+          # expansion stays out of the shell command line.
+          DIAG_DIR: ${{ github.workspace }}/macos-hang-diagnostics
+        run: |
+          nohup bash scripts/macos-hang-watchdog.sh "$DIAG_DIR" \
+            > macos-hang-diagnostics-nohup.log 2>&1 &
+          echo "watchdog started (pid $!)"
+
       - name: Workspace tests
         shell: bash
         env:
@@ -164,6 +184,20 @@ jobs:
         # hyperdb-api-node needs napi-rs + a Node.js toolchain; it gets
         # its own workflow when wired up. hyperdb-bootstrap has its own
         # coverage (next step) and doesn't need hyperd running.
+
+      - name: Upload macOS hang diagnostics
+        # Runs even when the test step failed/was cancelled — that's the
+        # whole point: the watchdog fires precisely when tests hang.
+        # Paired with the diagnostic watchdog above; remove together.
+        if: always() && runner.os == 'macOS'
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-hang-diagnostics
+          path: |
+            macos-hang-diagnostics/
+            macos-hang-diagnostics-nohup.log
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: hyperdb-bootstrap tests
         run: cargo test -p hyperdb-bootstrap
