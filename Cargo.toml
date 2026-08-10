@@ -60,7 +60,7 @@ webpki-roots = "1.0"
 zeroize = "1.8"
 # Salesforce OAuth dependencies
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "form"] }
-jsonwebtoken = { version = "10", default-features = false, features = ["use_pem", "rust_crypto"] }
+jsonwebtoken = { version = "11", default-features = false, features = ["use_pem", "rust_crypto"] }
 rsa = { version = "0.9", features = ["pem"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
