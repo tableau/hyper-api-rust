@@ -589,6 +589,15 @@ This is a Harness plan-driven change with role separation:
 6. The main thread performs the final merge-readiness judgment. No developer
    self-report substitutes for validator output, and no agent that implemented
    a task acts as its final reviewer or publisher.
+7. After implementation, validation, and review are complete, create
+   `/Users/ssteiner/dev/ssteiner-ai/notes/hyperdb-mcp-agent-ux-implementation-2026-08-13.md`
+   as the durable handoff and memory artifact. It records the approved design
+   and plan, actual changes and commits, before/after catalog measurements,
+   every final verification command and exit status, reviewer findings and
+   resolutions, deferred decisions, known operational constraints, and the
+   LLM/reasoning mode and UI client used for the work. Any genuinely reusable
+   role lesson is also added to the applicable tracked agent-profile LEARNINGS
+   LOG; do not add speculative or one-off noise merely to create an entry.
 
 ## Implementation boundaries
 
@@ -669,4 +678,7 @@ The design is complete when:
 - focused and workspace gates, including strict Clippy, have captured green
   output; and
 - independent per-task and integrated adversarial reviews have no unresolved
-  Critical or Important findings.
+  Critical or Important findings; and
+- the dated `ssteiner-ai` implementation note contains the plan, evidence,
+  review record, deferred work, and durable memories needed for a future
+  implementation or maintenance session.
