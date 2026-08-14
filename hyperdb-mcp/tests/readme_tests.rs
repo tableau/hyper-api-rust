@@ -11,6 +11,8 @@
 
 use hyperdb_mcp::readme::README;
 
+const PUBLIC_README: &str = include_str!("../README.md");
+
 #[test]
 fn readme_is_non_trivial() {
     assert!(
@@ -82,5 +84,61 @@ fn readme_includes_sql_dialect_pointers() {
     assert!(
         README.contains("Hyper"),
         "README should identify the underlying Hyper engine"
+    );
+}
+
+#[test]
+fn doctor_readme_contract() {
+    fn command_on_line(line: &str) -> &str {
+        let line = line.trim().strip_prefix("$ ").unwrap_or(line.trim());
+        line.split_once("  #")
+            .map_or(line, |(command, _comment)| command.trim_end())
+    }
+
+    fn has_exact_command(readme: &str, command: &str) -> bool {
+        readme.lines().any(|line| command_on_line(line) == command)
+    }
+
+    assert!(
+        has_exact_command(PUBLIC_README, "hyperdb-mcp doctor"),
+        "public README must show the exact human-report command `hyperdb-mcp doctor`"
+    );
+    assert!(
+        has_exact_command(PUBLIC_README, "hyperdb-mcp doctor --json"),
+        "public README must show the exact machine-report command `hyperdb-mcp doctor --json`"
+    );
+
+    let lines: Vec<_> = PUBLIC_README.lines().collect();
+    let command_line = lines
+        .iter()
+        .position(|line| command_on_line(line) == "hyperdb-mcp doctor --json")
+        .expect("exact doctor --json command was asserted above");
+    let start = command_line.saturating_sub(12);
+    let end = (command_line + 21).min(lines.len());
+    let doctor_scope = lines[start..end].join("\n").to_lowercase();
+
+    assert!(
+        doctor_scope.contains("side-effect-free") || doctor_scope.contains("side effect free"),
+        "doctor documentation must state that collection is side-effect-free:\n{doctor_scope}"
+    );
+    assert!(
+        [
+            "does not start",
+            "doesn't start",
+            "without starting",
+            "never starts",
+            "will not start",
+        ]
+        .iter()
+        .any(|phrase| doctor_scope.contains(phrase))
+            && (doctor_scope.contains("daemon") || doctor_scope.contains("hyperd"))
+            && doctor_scope.contains("database"),
+        "doctor documentation must say it starts neither a daemon nor a database:\n{doctor_scope}"
+    );
+    assert!(
+        doctor_scope.contains("local paths")
+            && doctor_scope.contains("review")
+            && doctor_scope.contains("shar"),
+        "doctor documentation must warn users to review local paths before sharing:\n{doctor_scope}"
     );
 }

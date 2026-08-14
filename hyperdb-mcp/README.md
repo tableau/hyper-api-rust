@@ -255,6 +255,15 @@ hyperdb-mcp daemon          # Run as a daemon explicitly (rarely needed)
 
 State files live at `~/.hyperdb/` by default (override with `HYPERDB_STATE_DIR`).
 
+For installation and configuration diagnostics that also work before MCP can start, use the native doctor command:
+
+```bash
+hyperdb-mcp doctor
+hyperdb-mcp doctor --json
+```
+
+Doctor is side-effect-free: it does not start a daemon or `hyperd`, and it does not open or create a database. Reports contain local paths; review them before sharing.
+
 **Port discovery.** The daemon binds a TCP health/lock port — by default it scans upward from **7485** (16 ports) and uses the first free one; set `HYPERDB_DAEMON_PORT` to pin an exact port (no scan). The health port doubles as a single-instance lock and an identity check: clients send `PING` and require a `PONG hyperdb-mcp <version>` reply before trusting a daemon, so an unrelated process occupying the port is skipped rather than mistaken for the daemon.
 
 **Staying resident.** By default the daemon never idle-shuts-down — keeping `hyperd` warm means the next tool call connects immediately instead of triggering a "restarting, please retry" round-trip. To opt into auto-shutdown (e.g. on CI), pass `--idle-timeout <SECS>` or set `HYPERDB_DAEMON_IDLE_TIMEOUT`.

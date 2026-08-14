@@ -256,7 +256,7 @@ impl Engine {
         // Resolve persistent path (if requested) and pre-create its parent dir.
         let persistent_path = match persistent_db_path.as_deref() {
             Some(p) => {
-                let path = PathBuf::from(shellexpand_tilde(p));
+                let path = crate::paths::effective_persistent_db_path(std::ffi::OsStr::new(p));
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| {
                         McpError::new(
@@ -1650,7 +1650,7 @@ pub fn is_internal_table(name: &str) -> bool {
 pub fn resolve_log_dir(persistent_db_path: Option<&str>) -> PathBuf {
     match persistent_db_path {
         Some(p) => {
-            let expanded = PathBuf::from(shellexpand_tilde(p));
+            let expanded = crate::paths::effective_persistent_db_path(std::ffi::OsStr::new(p));
             expanded
                 .parent()
                 .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf)
@@ -1914,47 +1914,6 @@ fn bootstrap_public_schema(connection: &Connection) -> Result<(), McpError> {
                 format!("Failed to bootstrap public schema: {e}"),
             )
         })
-}
-
-/// Minimal `~/` (and `~\` on Windows) expansion. Resolves the home
-/// directory via `$HOME` on Unix and `%USERPROFILE%` (falling back to
-/// `%HOMEDRIVE%%HOMEPATH%`) on Windows. `~username/` is not supported —
-/// callers who need that should expand their paths themselves.
-fn shellexpand_tilde(path: &str) -> String {
-    let rest = if let Some(r) = path.strip_prefix("~/") {
-        Some(r)
-    } else if cfg!(windows) {
-        path.strip_prefix("~\\")
-    } else {
-        None
-    };
-    let Some(rest) = rest else {
-        return path.to_string();
-    };
-    let Some(home) = home_dir() else {
-        return path.to_string();
-    };
-    let sep = std::path::MAIN_SEPARATOR;
-    format!("{}{sep}{rest}", home.to_string_lossy())
-}
-
-/// Resolve the user's home directory across platforms. Unix uses `$HOME`;
-/// Windows prefers `%USERPROFILE%` and falls back to `%HOMEDRIVE%%HOMEPATH%`.
-fn home_dir() -> Option<PathBuf> {
-    if cfg!(windows) {
-        if let Some(profile) = std::env::var_os("USERPROFILE") {
-            if !profile.is_empty() {
-                return Some(PathBuf::from(profile));
-            }
-        }
-        let drive = std::env::var_os("HOMEDRIVE")?;
-        let rel = std::env::var_os("HOMEPATH")?;
-        let mut combined = PathBuf::from(drive);
-        combined.push(PathBuf::from(rel));
-        Some(combined)
-    } else {
-        std::env::var_os("HOME").map(PathBuf::from)
-    }
 }
 
 #[cfg(test)]

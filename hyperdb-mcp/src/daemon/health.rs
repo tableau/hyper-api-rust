@@ -357,6 +357,7 @@ mod tests {
 
     #[test]
     fn health_status_returns_flat_enriched_record() {
+        let _network_guard = crate::diagnostics::real_network_test_guard();
         let public_run_signature: fn(HealthListener, Arc<DaemonState>, Arc<Mutex<DaemonInfo>>) =
             HealthListener::run;
         std::hint::black_box(public_run_signature);

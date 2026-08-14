@@ -67,6 +67,14 @@ const TABLE_SAMPLE_ROWS: u64 = 5;
 /// more compact wire format and the extra rows help LLMs see patterns.
 const TABLE_CSV_SAMPLE_ROWS: u64 = 20;
 
+/// Canonical generated-catalog metrics used by the native doctor command.
+pub(crate) struct DoctorCatalogSnapshot {
+    pub(crate) tool_count: usize,
+    pub(crate) canonical_tool_bytes: usize,
+    pub(crate) initialization_instructions_bytes: usize,
+    pub(crate) get_readme_bytes: usize,
+}
+
 /// Body of the `hyper://schema/kv` resource: describes the `_hyperdb_kv_store`
 /// backing table behind the `kv_*` tools, its (indexless) shape, the
 /// ephemeral-vs-persistent durability rule, per-database isolation, and the
@@ -1039,6 +1047,32 @@ impl std::fmt::Debug for HyperMcpServer {
 }
 
 impl HyperMcpServer {
+    /// Snapshot the exact generated router contract without warming an engine.
+    ///
+    /// The temporary server exists only to obtain the same initialization
+    /// instructions exposed by [`ServerHandler::get_info`]. Its session query
+    /// store and router registries are in-memory; this path never constructs an
+    /// [`Engine`] or starts Hyper.
+    pub(crate) fn doctor_catalog_snapshot(
+        read_only: bool,
+    ) -> Result<DoctorCatalogSnapshot, serde_json::Error> {
+        let tools = Self::tool_router().list_all();
+        let canonical_tool_bytes = serde_json::to_vec(&tools)?.len();
+        let server = Self::with_no_daemon(None, read_only, true);
+        let initialization_instructions_bytes = server
+            .get_info()
+            .instructions
+            .as_deref()
+            .map_or(0, str::len);
+
+        Ok(DoctorCatalogSnapshot {
+            tool_count: tools.len(),
+            canonical_tool_bytes,
+            initialization_instructions_bytes,
+            get_readme_bytes: crate::readme::README.len(),
+        })
+    }
+
     /// Create a server instance. Pass `Some(path)` for persistent workspace,
     /// `None` for ephemeral (temp directory, auto-cleaned).
     ///

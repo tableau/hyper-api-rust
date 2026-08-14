@@ -25,6 +25,7 @@ use hyperdb_mcp::daemon;
 use hyperdb_mcp::daemon::discovery;
 use hyperdb_mcp::daemon::health;
 use hyperdb_mcp::daemon::run::DaemonConfig;
+use hyperdb_mcp::diagnostics::{self, DoctorOptions};
 use hyperdb_mcp::engine::{resolve_log_dir, CLIENT_LOG_FILE_NAME};
 use hyperdb_mcp::paths;
 use hyperdb_mcp::server::HyperMcpServer;
@@ -73,6 +74,17 @@ struct Cli {
 }
 
 impl Cli {
+    fn validate_persistent_options(&self) -> Result<(), &'static str> {
+        if self.ephemeral_only && (self.persistent_db.is_some() || self.workspace.is_some()) {
+            return Err("--ephemeral-only is incompatible with --persistent-db / --workspace");
+        }
+        if self.persistent_db.is_some() && self.workspace.is_some() {
+            return Err("Both --persistent-db and --workspace were supplied. \
+                 --workspace is a deprecated alias; pass only --persistent-db.");
+        }
+        Ok(())
+    }
+
     /// Translate the deprecated `--workspace` flag to `--persistent-db`,
     /// emitting a one-time deprecation warning, and resolve the final
     /// persistent path according to the precedence rules in
@@ -82,29 +94,31 @@ impl Cli {
     /// Errors out if both `--persistent-db` and `--workspace` are
     /// supplied — there's no sensible "winner", so be loud about it.
     fn resolve_persistent_path(&self) -> Result<Option<std::path::PathBuf>, &'static str> {
-        if self.ephemeral_only {
-            if self.persistent_db.is_some() || self.workspace.is_some() {
-                return Err("--ephemeral-only is incompatible with --persistent-db / --workspace");
-            }
-            return Ok(None);
-        }
-        if self.persistent_db.is_some() && self.workspace.is_some() {
-            return Err("Both --persistent-db and --workspace were supplied. \
-                 --workspace is a deprecated alias; pass only --persistent-db.");
-        }
+        self.validate_persistent_options()?;
         if self.workspace.is_some() {
             eprintln!(
                 "warning: --workspace is deprecated; use --persistent-db instead. \
                  The old flag will be removed in a future release."
             );
         }
-        let cli_value = self.persistent_db.as_deref().or(self.workspace.as_deref());
-        Ok(paths::resolve_persistent_db_path(cli_value))
+        Ok(paths::resolve_persistent_db_path_with_source(
+            self.persistent_db.as_deref(),
+            self.workspace.as_deref(),
+            self.ephemeral_only,
+        )
+        .observed_path)
     }
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Inspect installation, configuration, daemon, and MCP catalog state without starting Hyper
+    Doctor {
+        /// Emit the typed report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Run as a background daemon managing a shared hyperd process
     Daemon {
         #[command(subcommand)]
@@ -132,9 +146,11 @@ enum DaemonAction {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    let command = cli.command.take();
 
-    match cli.command {
+    match command {
+        Some(Commands::Doctor { json }) => run_doctor_mode(&cli, json),
         Some(Commands::Daemon {
             action: Some(DaemonAction::Stop),
             port,
@@ -161,6 +177,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => run_mcp_mode(cli).await,
     }
+}
+
+fn run_doctor_mode(cli: &Cli, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    if let Err(message) = cli.validate_persistent_options() {
+        eprintln!("error: {message}");
+        std::process::exit(2);
+    }
+    let report = diagnostics::collect_doctor_report(DoctorOptions {
+        persistent_db: cli.persistent_db.as_deref(),
+        deprecated_workspace: cli.workspace.as_deref(),
+        ephemeral_only: cli.ephemeral_only,
+        read_only: cli.read_only,
+        no_daemon: cli.no_daemon,
+    })?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", diagnostics::render_doctor_human(&report));
+    }
+    Ok(())
 }
 
 async fn run_daemon_mode(
