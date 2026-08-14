@@ -110,7 +110,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), Box<dyn std::error::
         started_at: chrono::Utc::now().to_rfc3339(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     };
-    discovery::write_discovery_file(&info)?;
+    discovery::write_enriched_discovery_file(&info)?;
     info!(path = %discovery::discovery_file_path()?.display(), "discovery file written");
 
     // Step 4: Build the shared state.
@@ -325,7 +325,7 @@ fn try_restart_hyperd(
         info_guard.hyperd_endpoint.clone_from(&new_endpoint);
         info_guard.clone()
     };
-    discovery::write_discovery_file(&snapshot)
+    discovery::write_enriched_discovery_file(&snapshot)
         .map_err(|e| RestartError::SpawnFailed(format!("discovery write: {e}")))?;
 
     guard.hyper = Some(new_hyper);

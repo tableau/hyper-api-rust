@@ -482,6 +482,28 @@ fn daemon_heartbeat_prevents_idle_shutdown() {
 // ─── Unit tests: Discovery file (require ENV_LOCK) ────────────────────────────
 
 #[test]
+fn legacy_daemon_info_literal_is_source_compatible() {
+    let info = DaemonInfo {
+        pid: 12345,
+        hyperd_endpoint: "127.0.0.1:54321".to_string(),
+        health_port: 7484,
+        started_at: "2026-05-20T10:30:00Z".to_string(),
+        version: "0.1.3".to_string(),
+    };
+
+    assert_eq!(
+        serde_json::to_value(info).unwrap(),
+        serde_json::json!({
+            "pid": 12345,
+            "hyperd_endpoint": "127.0.0.1:54321",
+            "health_port": 7484,
+            "started_at": "2026-05-20T10:30:00Z",
+            "version": "0.1.3"
+        })
+    );
+}
+
+#[test]
 fn discovery_file_write_and_read() {
     let _lock = acquire_env_lock();
     let tmp = TempDir::new().unwrap();

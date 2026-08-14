@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, warn};
 
-use super::discovery::DaemonInfo;
+use super::discovery::{DaemonInfo, DaemonRecord};
 
 /// Identifying token included in PONG responses. Used to verify that a bound
 /// port is owned by a hyperdb-mcp daemon (not a foreign service).
@@ -157,6 +157,17 @@ impl HealthListener {
     }
 }
 
+fn status_json(info: &Mutex<DaemonInfo>) -> String {
+    let snapshot = info.lock().expect("DaemonInfo mutex poisoned").clone();
+    match DaemonRecord::with_current_identity(&snapshot) {
+        Ok(record) => serde_json::to_string(&record).unwrap_or_default(),
+        Err(error) => {
+            warn!(%error, "could not collect daemon executable identity for STATUS");
+            serde_json::to_string(&snapshot).unwrap_or_default()
+        }
+    }
+}
+
 #[expect(
     clippy::needless_pass_by_value,
     reason = "TcpStream must be owned for BufReader"
@@ -183,12 +194,7 @@ fn handle_client(stream: TcpStream, state: &DaemonState, info: &Mutex<DaemonInfo
                         state.request_shutdown();
                         "STOPPING\n".to_string()
                     }
-                    "STATUS" => {
-                        // Brief lock — only to clone the current snapshot.
-                        let snapshot = info.lock().expect("DaemonInfo mutex poisoned").clone();
-                        let json = serde_json::to_string(&snapshot).unwrap_or_default();
-                        format!("{json}\n")
-                    }
+                    "STATUS" => format!("{}\n", status_json(info)),
                     "REPORT_HYPERD_ERROR" => {
                         state.request_restart();
                         "OK\n".to_string()
@@ -289,4 +295,121 @@ pub fn ping_identified(
     // The 3rd token is the daemon's version; absent ⇒ accept with empty
     // version (future-proofing for a token-only reply).
     Some(tokens.next().unwrap_or("").to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    use serde_json::{json, Value};
+
+    use crate::diagnostics::ReportedPath;
+
+    use super::*;
+
+    fn daemon_info(health_port: u16) -> DaemonInfo {
+        DaemonInfo {
+            pid: 4242,
+            hyperd_endpoint: "127.0.0.1:54321".to_string(),
+            health_port,
+            started_at: "2026-08-13T12:34:56Z".to_string(),
+            version: "0.7.0".to_string(),
+        }
+    }
+
+    fn expected_status(info: &DaemonInfo) -> Value {
+        let executable = std::env::current_exe().unwrap();
+        let executable_path = ReportedPath::from_os_str(executable.as_os_str());
+
+        json!({
+            "pid": info.pid,
+            "hyperd_endpoint": info.hyperd_endpoint,
+            "health_port": info.health_port,
+            "started_at": info.started_at,
+            "version": info.version,
+            "identity": {
+                "mcp_version": crate::version::mcp_version_string(),
+                "executable_path": executable_path
+            }
+        })
+    }
+
+    fn check_status_json(
+        label: &str,
+        response: &str,
+        expected: &Value,
+        failures: &mut Vec<String>,
+    ) {
+        match serde_json::from_str::<Value>(response.trim()) {
+            Ok(actual) => {
+                if actual != *expected {
+                    failures.push(format!(
+                        "{label} was not the exact flat enriched record: {actual}"
+                    ));
+                }
+                if actual.get("info").is_some() {
+                    failures.push(format!("{label} nested legacy fields under `info`"));
+                }
+            }
+            Err(error) => failures.push(format!("{label} was not JSON: {error}")),
+        }
+    }
+
+    #[test]
+    fn health_status_returns_flat_enriched_record() {
+        let public_run_signature: fn(HealthListener, Arc<DaemonState>, Arc<Mutex<DaemonInfo>>) =
+            HealthListener::run;
+        std::hint::black_box(public_run_signature);
+
+        let listener = HealthListener::bind(0).unwrap();
+        let port = listener.port;
+        let state = Arc::new(DaemonState::new());
+        let info = Arc::new(Mutex::new(daemon_info(port)));
+        let initial_expected = expected_status(&info.lock().unwrap());
+        let mut failures = Vec::new();
+
+        match catch_unwind(AssertUnwindSafe(|| status_json(info.as_ref()))) {
+            Ok(response) => check_status_json(
+                "private STATUS serializer",
+                &response,
+                &initial_expected,
+                &mut failures,
+            ),
+            Err(_) => failures.push("private STATUS serializer is not implemented".to_string()),
+        }
+
+        let run_state = Arc::clone(&state);
+        let run_info = Arc::clone(&info);
+        let handle = std::thread::spawn(move || listener.run(run_state, run_info));
+
+        let initial_response = send_command(port, "STATUS").unwrap();
+        check_status_json(
+            "initial STATUS response",
+            &initial_response,
+            &initial_expected,
+            &mut failures,
+        );
+
+        {
+            let mut current = info.lock().unwrap();
+            current.hyperd_endpoint = "127.0.0.1:60000".to_string();
+        }
+        let updated_expected = expected_status(&info.lock().unwrap());
+        let updated_response = send_command(port, "STATUS").unwrap();
+        check_status_json(
+            "STATUS response after shared DaemonInfo update",
+            &updated_response,
+            &updated_expected,
+            &mut failures,
+        );
+
+        let _ = send_command(port, "STOP");
+        handle.join().unwrap();
+
+        assert!(
+            failures.is_empty(),
+            "health STATUS contract failures:\n{}",
+            failures.join("\n")
+        );
+    }
 }

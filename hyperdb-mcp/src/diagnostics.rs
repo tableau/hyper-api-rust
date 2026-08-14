@@ -12,7 +12,7 @@ const MAX_LAUNCHER_INFO_BYTES: usize = 16 * 1024;
 const MAX_REPORTED_STRING_BYTES: usize = 4 * 1024;
 
 /// How an operating-system path was converted to its bounded display form.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PathEncoding {
     /// The original path was valid UTF-8.
@@ -28,6 +28,26 @@ pub struct ReportedPath {
     pub display: String,
     /// Whether display conversion was exact or lossy.
     pub encoding: PathEncoding,
+}
+
+impl<'de> Deserialize<'de> for ReportedPath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireReportedPath {
+            display: String,
+            encoding: PathEncoding,
+        }
+
+        let mut wire = WireReportedPath::deserialize(deserializer)?;
+        truncate_utf8(&mut wire.display, MAX_REPORTED_STRING_BYTES);
+        Ok(Self {
+            display: wire.display,
+            encoding: wire.encoding,
+        })
+    }
 }
 
 impl ReportedPath {
@@ -327,5 +347,103 @@ fn parse_launcher_version(
             component: component.to_owned(),
         });
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use serde_json::{json, Value};
+    use tempfile::TempDir;
+
+    use crate::daemon::discovery::{
+        read_discovery_file_raw, DaemonBuildIdentity, DaemonRecord, RawDiscoveryRead,
+    };
+
+    use super::ReportedPath;
+
+    fn assert_identity_accessors(
+        identity: &DaemonBuildIdentity,
+        expected_version: &str,
+        expected_path: &ReportedPath,
+    ) {
+        assert_eq!(identity.mcp_version(), expected_version);
+        assert_eq!(identity.executable_path(), expected_path);
+    }
+
+    fn assert_record_accessors(record: &DaemonRecord) {
+        let _ = record.info();
+        let _ = record.identity();
+    }
+
+    fn assert_record_contract(
+        path: &Path,
+        expected_wire: &Value,
+        expected_identity: Option<(&str, &ReportedPath)>,
+    ) {
+        std::fs::write(path, serde_json::to_vec(expected_wire).unwrap()).unwrap();
+
+        let record = match read_discovery_file_raw(path) {
+            RawDiscoveryRead::Parsed { record, .. } => record,
+            other => panic!("expected parsed raw daemon record, got {other:?}"),
+        };
+        assert_record_accessors(&record);
+
+        let round_trip = serde_json::to_value(&record).unwrap();
+        assert_eq!(round_trip, *expected_wire);
+        assert!(
+            round_trip.get("info").is_none(),
+            "legacy daemon fields must remain at the top level"
+        );
+
+        let info = record.info();
+        assert_eq!(info.pid, 4242);
+        assert_eq!(info.hyperd_endpoint, "127.0.0.1:54321");
+        assert_eq!(info.health_port, 7485);
+        assert_eq!(info.started_at, "2026-08-13T12:34:56Z");
+        assert_eq!(info.version, "0.7.0");
+
+        match (record.identity(), expected_identity) {
+            (None, None) => {}
+            (Some(identity), Some((expected_version, expected_path))) => {
+                assert_identity_accessors(identity, expected_version, expected_path);
+            }
+            (actual, expected) => {
+                panic!("identity mismatch: actual={actual:?}, expected={expected:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn doctor_can_inspect_raw_daemon_record() {
+        let tmp = TempDir::new().unwrap();
+        let old_wire = json!({
+            "pid": 4242,
+            "hyperd_endpoint": "127.0.0.1:54321",
+            "health_port": 7485,
+            "started_at": "2026-08-13T12:34:56Z",
+            "version": "0.7.0"
+        });
+        assert_record_contract(&tmp.path().join("old.json"), &old_wire, None);
+
+        let executable_path =
+            ReportedPath::from_os_str(std::ffi::OsStr::new("/opt/hyperdb/bin/hyperdb-mcp"));
+        let enriched_wire = json!({
+            "pid": 4242,
+            "hyperd_endpoint": "127.0.0.1:54321",
+            "health_port": 7485,
+            "started_at": "2026-08-13T12:34:56Z",
+            "version": "0.7.0",
+            "identity": {
+                "mcp_version": "0.7.0.rabc123",
+                "executable_path": executable_path
+            }
+        });
+        assert_record_contract(
+            &tmp.path().join("enriched.json"),
+            &enriched_wire,
+            Some(("0.7.0.rabc123", &executable_path)),
+        );
     }
 }
