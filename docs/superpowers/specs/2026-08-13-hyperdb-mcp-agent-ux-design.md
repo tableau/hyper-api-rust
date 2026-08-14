@@ -1,9 +1,13 @@
 # HyperDB MCP Agent UX and Operational Diagnostics — Design
 
 **Status:** Approved; adversarial-review amendments incorporated
-**Date:** 2026-08-13  
-**Author:** Stefan Steiner with Codex Desktop (ultra reasoning)  
-**Base branch:** `origin/main` @ `87e0b9d`  
+
+**Date:** 2026-08-13
+
+**Author:** Stefan Steiner with Codex Desktop (ultra reasoning)
+
+**Base branch:** `origin/main` @ `87e0b9d`
+
 **Working branch:** `codex/hyperdb-mcp-agent-ux`
 
 ## Context
