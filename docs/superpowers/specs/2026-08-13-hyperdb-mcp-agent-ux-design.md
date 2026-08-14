@@ -1,6 +1,6 @@
 # HyperDB MCP Agent UX and Operational Diagnostics — Design
 
-**Status:** Proposed (architecture approved; written-spec review pending)  
+**Status:** Approved; adversarial-review amendments incorporated
 **Date:** 2026-08-13  
 **Author:** Stefan Steiner with Codex Desktop (ultra reasoning)  
 **Base branch:** `origin/main` @ `87e0b9d`  
@@ -111,7 +111,7 @@ persistent file is informational rather than automatically unhealthy.
 
 #### Report model
 
-The report has four stable top-level sections plus warnings:
+The report has five stable top-level sections plus warnings:
 
 ```json
 {
@@ -149,6 +149,7 @@ uses `HYPERD_PATH` or an upward `.hyperd/current/hyperd` search.
 `daemon` reports one of these discovery states:
 
 - `missing`;
+- `unreadable`;
 - `malformed`;
 - `parsed_unreachable`;
 - `live_from_discovery`; or
@@ -156,9 +157,28 @@ uses `HYPERD_PATH` or an upward `.hyperd/current/hyperd` search.
 
 When available, it includes PID, endpoint, health port, start time, plain semver
 used by takeover logic, full build identity, and native executable path. A
-non-mutating raw discovery read and identified PING/scan supply these facts.
+non-mutating raw discovery read, bounded candidate scan, and fresh enriched
+`STATUS` verification supply these facts.
 Doctor must not call the current cleanup-oriented `discover()` path, because
 that path deletes a stale discovery file.
+
+`missing` is reserved for `NotFound`. Permission failures and other discovery
+I/O errors are `unreadable`, with a bounded warning that preserves the error
+kind without pretending the file is absent or malformed. Doctor still produces
+a report when this happens.
+
+The collector is a pure orchestration layer with injected raw-reader,
+status-prober, bounded-scanner, and clock/deadline functions. Unit tests drive
+every state without a real fixed-port scan and make cleanup/write operations
+unrepresentable in that layer; one isolated child-process smoke test exercises
+the real CLI. Both a raw discovery record and a scan hit are only candidate
+locations. Doctor obtains and parses a fresh enriched `STATUS` response,
+verifies that its health port is the responding candidate port, and uses those
+fresh facts before attributing PID/build/executable identity. For a discovery
+candidate, it compares fresh facts with the raw record and emits a
+stale/replaced-record warning on PID/build/executable disagreement without
+deleting the file. Neither a raw record nor a scan-only `DaemonInfo` value is
+sufficient live identity evidence.
 
 `tool_catalog` reports the full-profile tool count and minified serialized byte
 size from the same generated router contract used by MCP. Initialization
@@ -176,10 +196,18 @@ JSON environment value containing only:
 - selected native executable path.
 
 Rust treats these values as launcher-reported metadata, validates the expected
-shape, and never blindly re-emits unknown keys. Source manifests intentionally
-lack versions, so unavailable local-development values remain `null` rather
-than being guessed. Direct Cargo or crates.io launches report launcher metadata
-as absent.
+shape, and never blindly re-emits unknown keys. The whole value is capped at 16
+KiB and each reported string at 4 KiB. Source manifests intentionally lack
+versions, so unavailable local-development values remain `null` rather than
+being guessed. Direct Cargo or crates.io launches report launcher metadata as
+absent.
+
+Every installation/configuration/daemon path uses one typed representation:
+`display` plus an `encoding` marker (`utf8` or `lossy`). JSON escaping remains
+standard serde JSON escaping. Human output additionally escapes C0, DEL, and
+ESC characters in every launcher-controlled string and path so a package name,
+version, or path cannot inject terminal control sequences. Reports explicitly
+warn that they contain local paths and should be reviewed before sharing.
 
 Warnings identify mismatched wrapper/platform/native base versions, malformed
 launcher metadata, a stale or malformed daemon record, and a live daemon whose
@@ -189,14 +217,19 @@ guessed lock owner.
 #### Compatibility-safe daemon record
 
 The current public `DaemonInfo` Rust struct remains unchanged so downstream
-exhaustive struct literals do not break. A version-tolerant internal discovery
-record wraps or flattens the existing fields and adds optional build identity
-and executable path. Existing public read/write helpers retain their behavior;
+exhaustive struct literals do not break. The version-tolerant internal record
+has this exact wire shape: `#[serde(flatten)] info: DaemonInfo` keeps every
+legacy field at the JSON top level, and one optional additive `identity` object
+contains full build identity and executable path. It must not serialize a
+nested `info` object. Existing public read/write helpers retain their behavior;
 new internal helpers expose the richer record to doctor and daemon status.
 
 Old discovery JSON must parse, new readers must accept absent identity fields,
-and takeover comparison must continue using the existing plain semver only.
-Unknown fields remain forward compatible.
+old readers must ignore the new `identity` object, and takeover comparison must
+continue using the existing plain semver only. Unknown fields remain forward
+compatible. Exact old/new discovery-file and health-`STATUS` fixtures plus an
+exhaustive legacy `DaemonInfo` literal protect wire and Rust source
+compatibility.
 
 ### 2. Shared installation identity and status contract
 
@@ -228,9 +261,12 @@ The documented degraded contract becomes:
 - `hyperd_running: false` is not definitive in a degraded local response or
   when daemon discovery is unavailable.
 
-The stale `hyper://readme` status consumer is corrected to use the keys actually
-emitted by `Engine::status`. Broader unification of resource and tool response
-shapes is deferred.
+The stale `hyper://readme` status consumer reads only `has_persistent` and
+`persistent_path` from `Engine::status`. That engine value has no `read_only`
+key; the resource renders read-only state directly from
+`HyperMcpServer::read_only`, the same authoritative configuration source used
+to augment full/degraded tool status. Broader unification of resource and tool
+response shapes is deferred.
 
 ### 3. Adjacent daemon reliability fixes
 
@@ -238,12 +274,18 @@ Two confirmed defects are included because they directly undermine the new
 diagnostic story:
 
 1. `hyperdb-mcp daemon status --port <N>` currently discards `<N>`. Status must
-   probe the explicit port when supplied and use discovery plus scan only when
-   it is absent.
+   accept that exact spelling (while retaining the existing pre-action spelling
+   if Clap can do so compatibly), probe the explicit port when supplied, and use
+   discovery plus scan only when it is absent.
 2. A client reporting a dead `hyperd` currently targets the configured base
    port rather than the health port of the daemon it actually discovered. The
    report path must use the cached discovered health port, matching heartbeat
    routing.
+
+The engine mutex is explicitly scoped/dropped before heartbeat or error-report
+TCP I/O. Those best-effort calls use bounded connect/read/write timeouts. A slow
+health peer therefore cannot retain the engine lock or prevent another
+status/engine caller from proceeding.
 
 No new `hyperd` flags or takeover semantics are introduced.
 
@@ -372,6 +414,13 @@ even when horizontal bars draw it along the physical x-axis.
 - Swap axis descriptions appropriately and reserve more category-label space.
 - Document that callers should increase chart height for long rankings rather
   than adding speculative automatic sizing.
+- Preserve characterized vertical-bar edge behavior: a duplicate
+  category/series row remains a second overlapping mark in input order; a
+  missing category/series cell remains a gap; series are ordered
+  deterministically by their existing key order; and the eight-color palette
+  cycles for the ninth and later series. One category, long labels, and Unicode
+  labels remain accepted. They are not aggregated, truncated, auto-sized, or
+  rejected merely for layout quality.
 
 #### Legend and value labels
 
@@ -380,6 +429,8 @@ even when horizontal bars draw it along the physical x-axis.
   regardless of `show_legend`.
 - `label_values: true` labels bar values only, using the original scalar display
   form. Using it with another chart type is a caller-facing invalid argument.
+- The internal point model retains that original scalar text before numeric
+  conversion so labels do not round-trip through `f64` formatting.
 - No collision-avoidance or formatting language is added.
 
 #### Positive logarithmic measure scale
@@ -391,8 +442,15 @@ even when horizontal bars draw it along the physical x-axis.
   caller-facing invalid argument; values are never silently dropped or
   clamped.
 - Logarithmic bars begin at the effective positive lower bound rather than zero.
-- A single repeated positive value receives a sensible multiplicative padded
-  range.
+- Automatic ranges are computed in natural-log space. Five-percent log-span
+  padding is clamped to `ln(f64::from_bits(1))..=ln(f64::MAX)` before
+  exponentiation. A single repeated value uses a fixed five-percent decade
+  span. If exponentiation/rounding collapses an endpoint at a finite bound, use
+  the adjacent representable positive float on the available side; the final
+  range must be finite, positive, strictly increasing, and enclose every value.
+- An explicit log range must contain every plotted value. In particular, a log
+  bar outside the range is rejected rather than drawn from the positive lower
+  baseline into inverted or clipped geometry.
 - Histogram log behavior, x-log, symlog, negative-only log, and custom bases are
   deferred.
 
@@ -402,6 +460,9 @@ even when horizontal bars draw it along the physical x-axis.
   route can create numeric positions against a category-count axis and put bars
   off-canvas.
 - `y_range` is applied to bars; it is currently documented but ignored.
+- A linear bar baseline is zero when zero is in range, otherwise the nearer
+  explicit range boundary (lower for positive-only, upper for negative-only),
+  so a fixed range never creates off-axis baseline geometry.
 - Explicit ranges are validated as finite and strictly increasing before
   Plotters receives them.
 - Existing temporal line/scatter documentation and test names are corrected to
@@ -464,8 +525,8 @@ Do not hand-edit workspace/package versions or the root generated changelog.
 
 ## Error handling
 
-- Doctor distinguishes absent, malformed, unreachable, and live state without
-  mutating it.
+- Doctor distinguishes absent, unreadable, malformed, unreachable, and live
+  state without mutating it.
 - Invalid launcher JSON becomes an explicit warning; it cannot crash startup.
 - Installation paths that cannot be represented as UTF-8 use a lossless or
   clearly marked display representation rather than panicking.
@@ -492,8 +553,21 @@ both the red and green commands/output.
   metadata warns without crashing.
 - Old and enriched daemon discovery JSON both parse.
 - Stale/malformed discovery remains on disk after doctor.
+- A non-`NotFound` discovery I/O failure reports `unreadable`; it does not
+  become `missing`, `malformed`, or a whole-command failure.
 - A daemon found by explicit discovery and one found only by scan are
   distinguished.
+- Discovery and scan candidates both require a fresh port-verified enriched
+  `STATUS`; a deterministic mismatched-PID/build discovery fixture reports the
+  fresh identity plus a stale/replaced warning and leaves the file untouched.
+- Pure collector tests inject the reader/prober/scanner/deadline and prove that
+  no cleanup or write dependency is reachable; the real child-process case is
+  a smoke test, not the sole side-effect proof.
+- Known path/control-character inputs are escaped in human output, non-UTF-8
+  path display is marked, overlong strings are bounded, an unknown secret
+  sentinel never appears, and reports warn before sharing local paths.
+- Exact old/new flat discovery and health-`STATUS` fixtures plus an exhaustive
+  legacy `DaemonInfo` literal preserve compatibility.
 - `daemon status --port` probes the supplied port.
 - restart reports use the discovered health port.
 
@@ -504,7 +578,18 @@ both the red and green commands/output.
 - A real two-private-engine reproduction holds one persistent file open and
   verifies the second attachment returns the same actionable classification.
 - A `55006` error outside persistent attach remains outside this mapping.
+- Failed warm-up leaves MCP serving: status remains prompt and the first
+  persistent-routed tool returns structured `RESOURCE_BUSY`.
 - The test does not invent or depend on unsupported `hyperd` flags.
+- The real two-engine and MCP warm-up reproductions run wholly in a dedicated
+  child test process. The parent owns the exact child handle and kills then
+  waits for it on timeout, guaranteeing that a blocked attach cannot leave an
+  in-process worker behind. A Hyper API lifecycle characterization separately
+  has a helper report its exact `HyperProcess::pid()`, kills/waits the helper,
+  and bounded-polls that hyperd PID until the callback-connection dead-man
+  switch shuts it down. The lock tests may claim guaranteed cleanup only while
+  that characterization passes; otherwise they require reviewed process-group
+  or job-object containment/lifecycle repair first.
 
 ### Status
 
@@ -529,6 +614,10 @@ both the red and green commands/output.
 - `copy_query.target_database` remains present and consistent.
 - Query content order, chart image delivery, and old-client text JSON remain
   unchanged.
+- An explicit routed-tool allowlist is checked against schema-derived candidates
+  plus the semantic `copy_query` exception. Tests cover every existing success
+  shape, including empty, not-found, and partial shapes where the tool treats
+  those outcomes as success, while pinning prior fields and content order.
 
 ### Tool catalog
 
@@ -539,6 +628,11 @@ both the red and green commands/output.
 - Read-only mode does not silently change the advertised full surface.
 - Generated router names drive README coverage so a tool cannot bypass the
   documentation assertion.
+- The byte metric is exactly minified `serde_json::to_vec` output for the typed
+  `Vec<Tool>` returned by the generated router, excluding the JSON-RPC envelope.
+  The unchanged base is remeasured through that same helper, the budget is the
+  integer `57_344`, and output-schema/annotation presence or absence is asserted
+  explicitly.
 
 ### Chart
 
@@ -548,7 +642,8 @@ both the red and green commands/output.
   visible values, and log ticks/values without image goldens.
 - PNG smoke tests cover each new renderer path.
 - Range tests cover reversed, equal, non-finite, zero, negative, mixed-sign,
-  one-value, and explicit-range cases.
+  one-value, minimum-positive-subnormal, maximum-finite, and explicit-range
+  containment cases.
 - Existing vertical linear output remains the default.
 - MCP dispatch tests prove schema deserialization and result metadata.
 - Long/Unicode categories, duplicate category-series rows, missing cells,
@@ -590,14 +685,16 @@ This is a Harness plan-driven change with role separation:
    self-report substitutes for validator output, and no agent that implemented
    a task acts as its final reviewer or publisher.
 7. After implementation, validation, and review are complete, create
-   `/Users/ssteiner/dev/ssteiner-ai/notes/hyperdb-mcp-agent-ux-implementation-2026-08-13.md`
+   `/Users/ssteiner/dev/ssteiner-ai/notes/hyperdb-mcp-agent-ux-implementation-2026-08-14.md`
    as the durable handoff and memory artifact. It records the approved design
    and plan, actual changes and commits, before/after catalog measurements,
    every final verification command and exit status, reviewer findings and
    resolutions, deferred decisions, known operational constraints, and the
    LLM/reasoning mode and UI client used for the work. Any genuinely reusable
    role lesson is also added to the applicable tracked agent-profile LEARNINGS
-   LOG; do not add speculative or one-off noise merely to create an entry.
+   LOG; do not add speculative or one-off noise merely to create an entry. A
+   fresh read-only reviewer fact-checks the completed note against immutable
+   commits, source, and captured command evidence before handoff.
 
 ## Implementation boundaries
 
