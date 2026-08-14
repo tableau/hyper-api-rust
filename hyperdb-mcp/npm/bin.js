@@ -2,7 +2,7 @@
 // Copyright (c) 2026, Salesforce, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-const { execFileSync } = require('child_process')
+const { spawnSync } = require('child_process')
 const { join, dirname } = require('path')
 const { existsSync } = require('fs')
 
@@ -39,20 +39,36 @@ function findBinary() {
 
   // Try resolving from the installed platform package
   try {
-    const pkgDir = dirname(require.resolve(`${pkg}/package.json`))
+    const packagePath = require.resolve(`${pkg}/package.json`)
+    const pkgDir = dirname(packagePath)
     const bin = join(pkgDir, getBinaryName())
-    if (existsSync(bin)) return { bin, dir: pkgDir }
+    if (existsSync(bin)) return { bin, dir: pkgDir, pkg, packagePath }
   } catch (_) {}
 
   // Fallback: binary in platform subdirectory (local dev / assemble-npm.sh)
   const platformDir = pkg.replace('hyperdb-mcp-', '')
   const subdir = join(__dirname, platformDir)
   const subdirBin = join(subdir, getBinaryName())
-  if (existsSync(subdirBin)) return { bin: subdirBin, dir: subdir }
+  const sourcePackagePath = join(subdir, 'package.json')
+  if (existsSync(subdirBin)) {
+    return {
+      bin: subdirBin,
+      dir: subdir,
+      pkg,
+      packagePath: sourcePackagePath,
+    }
+  }
 
   // Fallback: binary in same directory
   const localBin = join(__dirname, getBinaryName())
-  if (existsSync(localBin)) return { bin: localBin, dir: __dirname }
+  if (existsSync(localBin)) {
+    return {
+      bin: localBin,
+      dir: __dirname,
+      pkg,
+      packagePath: sourcePackagePath,
+    }
+  }
 
   throw new Error(
     `Could not find hyperdb-mcp binary for ${platform}-${arch}. ` +
@@ -60,24 +76,91 @@ function findBinary() {
   )
 }
 
-const { bin, dir } = findBinary()
+function packageIdentity(packagePath, fallbackName) {
+  let manifest = {}
+  try {
+    manifest = require(packagePath)
+  } catch (_) {}
 
-// Point hyperdb-mcp at the bundled hyperd if not already set
-if (!process.env.HYPERD_PATH) {
-  const hyperd = join(dir, getHyperdName())
-  if (existsSync(hyperd)) {
-    process.env.HYPERD_PATH = hyperd
+  return {
+    name: typeof manifest.name === 'string' ? manifest.name : fallbackName,
+    version: typeof manifest.version === 'string' ? manifest.version : null,
+    package_path: packagePath,
   }
 }
 
-// Spawn the MCP server, inheriting stdio for MCP protocol communication
-const result = require('child_process').spawnSync(bin, process.argv.slice(2), {
-  stdio: 'inherit',
-  env: process.env,
-})
-
-if (result.error) {
-  throw result.error
+function buildLauncherInfo({ wrapper, platform, executable_path }) {
+  return {
+    wrapper: {
+      name: wrapper.name,
+      version: wrapper.version ?? null,
+      package_path: wrapper.package_path,
+    },
+    platform: {
+      name: platform.name,
+      version: platform.version ?? null,
+      package_path: platform.package_path,
+    },
+    executable_path,
+  }
 }
 
-process.exit(result.status ?? 1)
+function prepareLauncherEnvironment({
+  inherited_env,
+  configured_hyperd,
+  bundled_hyperd,
+  launcher_info,
+}) {
+  const env = { ...inherited_env }
+  if (!configured_hyperd && bundled_hyperd !== undefined) {
+    env.HYPERD_PATH = bundled_hyperd
+  }
+  env.HYPERDB_MCP_LAUNCHER_INFO = JSON.stringify(launcher_info)
+  return env
+}
+
+function launch({ executable_path, args, env, spawnSync }) {
+  const result = spawnSync(executable_path, args, {
+    stdio: 'inherit',
+    env,
+  })
+
+  if (result.error) {
+    throw result.error
+  }
+
+  return result.status ?? 1
+}
+
+function main() {
+  const { bin, dir, pkg, packagePath } = findBinary()
+  const configuredHyperd = process.env.HYPERD_PATH
+
+  // Point hyperdb-mcp at the bundled hyperd if not already set
+  const bundledHyperd = join(dir, getHyperdName())
+  const launcherInfo = buildLauncherInfo({
+    wrapper: packageIdentity(join(__dirname, 'package.json'), 'hyperdb-mcp'),
+    platform: packageIdentity(packagePath, pkg),
+    executable_path: bin,
+  })
+  const env = prepareLauncherEnvironment({
+    inherited_env: process.env,
+    configured_hyperd: configuredHyperd,
+    bundled_hyperd: existsSync(bundledHyperd) ? bundledHyperd : undefined,
+    launcher_info: launcherInfo,
+  })
+
+  // Spawn the MCP server, inheriting stdio for MCP protocol communication
+  return launch({
+    executable_path: bin,
+    args: process.argv.slice(2),
+    env,
+    spawnSync,
+  })
+}
+
+if (require.main === module) {
+  process.exit(main())
+}
+
+module.exports = { buildLauncherInfo, prepareLauncherEnvironment, launch }
