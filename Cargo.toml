@@ -34,7 +34,7 @@ repository = "https://github.com/tableau/hyper-api-rust"
 homepage = "https://github.com/tableau/hyper-api-rust"
 
 [workspace.dependencies]
-base64 = "0.22"
+base64 = "0.23"
 byteorder = "1.5"
 bytes = "1.11"
 geo-types = "0.7"
