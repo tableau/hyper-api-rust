@@ -39,7 +39,7 @@ schemars = "1.2"
 thiserror = { workspace = true }
 chrono = { workspace = true }
 plotters = "0.3"
-base64 = "0.22"
+base64 = "0.23"
 notify = "8"
 tokio-util = { version = "0.7", features = ["rt"] }
 tempfile = { workspace = true }
