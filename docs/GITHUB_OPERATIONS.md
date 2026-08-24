@@ -404,7 +404,7 @@ The workflow's regex validator rejects malformed tag names, and
 
 | Secret | Used by | Scope |
 |---|---|---|
-| `RELEASE_PLEASE_TOKEN` | [release-please.yml](../.github/workflows/release-please.yml) | Fine-grained PAT; triggers CI on release-please PRs/tags (see below) |
+| `RELEASE_PLEASE_TOKEN` | [release-please.yml](../.github/workflows/release-please.yml) | Classic PAT; triggers CI on release-please PRs/tags (see below) |
 | `CARGO_REGISTRY_TOKEN` | [release.yml](../.github/workflows/release.yml) `publish` job | `cargo publish` to crates.io |
 | `NPM_TOKEN` | [npm-build-publish.yml](../.github/workflows/npm-build-publish.yml) `publish-npm` job | `npm publish` to npmjs.org |
 | `GITHUB_TOKEN` | Every workflow | Auto-provided by GitHub Actions; used to post releases, download artifacts, verify CI status |
@@ -414,33 +414,49 @@ The workflow's regex validator rejects malformed tag names, and
 GitHub Actions suppresses workflow triggers on events created by
 `GITHUB_TOKEN` (anti-recursion protection). Without a PAT, PRs opened
 by release-please don't trigger CI, and tags it pushes don't trigger
-`release.yml` or `npm-build-publish.yml`. The workaround is a
-fine-grained PAT stored as `RELEASE_PLEASE_TOKEN`.
+`release.yml` or `npm-build-publish.yml`. The workaround is a PAT
+stored as `RELEASE_PLEASE_TOKEN`.
 
-### Option A: Fine-grained PAT (current setup)
+### Option A: Classic PAT (current setup)
 
-1. Go to **Settings → Developer settings → Personal access tokens →
-   Fine-grained tokens → Generate new token**.
+The token was originally issued as a **fine-grained** PAT, but that
+approach didn't work in practice — the `tableau` org restricts
+fine-grained PAT access (org admin approval required per-token via
+<https://github.com/organizations/tableau/settings/personal-access-tokens>),
+and it was never approved there. A **classic** PAT sidesteps that
+approval flow entirely (it only needs org SSO authorization, which is
+typically already granted), so that's what's actually deployed.
+
+1. Go to <https://github.com/settings/tokens> (classic tokens, on
+   your personal GitHub account — not an EMU/org-managed account) →
+   **Generate new token → Generate new token (classic)**.
 2. Configure:
-   - **Token name:** `release-please-hyper-api-rust`
-   - **Expiration:** 90 days (set a calendar reminder to rotate)
-   - **Resource owner:** `tableau`
-   - **Repository access:** Only select → `tableau/hyper-api-rust`
-   - **Permissions → Repository:**
-     - Contents: Read and write
-     - Pull requests: Read and write
+   - **Note:** `release-please-hyper-api-rust`
+   - **Expiration:** currently set to **no expiration** (see below)
+   - **Scopes:** `repo` (full) and `workflow` — classic tokens don't
+     have fine-grained contents/PR permissions, so `repo` covers both
 3. Click "Generate token" and copy it.
-4. Add it as a repo secret:
+4. If the token page shows an **"Enable SSO" / "Configure SSO"**
+   dropdown next to it, authorize it for the `tableau` org — without
+   this the secret update succeeds but the token can't touch the repo.
+5. Add it as a repo secret:
    ```bash
    gh secret set RELEASE_PLEASE_TOKEN --repo tableau/hyper-api-rust
    ```
-5. The [release-please workflow](../.github/workflows/release-please.yml)
+6. The [release-please workflow](../.github/workflows/release-please.yml)
    references this secret via `token: ${{ secrets.RELEASE_PLEASE_TOKEN }}`.
 
-**Rotation:** when the PAT expires, generate a new one with the same
-settings and update the secret. Release-please will fail with a 401
-until the secret is refreshed — CI on `main` pushes will still show the
-failure clearly.
+**Expiration:** as of the 2026-08-24 rotation, the token is set to
+**no expiration**, specifically to stop the recurring 401-on-expiry
+failure mode described below. This trades away forced rotation for
+reliability — if that tradeoff changes (e.g. a security review flags
+non-expiring PATs), switch to Option B (GitHub App token) instead of
+going back to a time-boxed classic PAT.
+
+**Rotation (if it's ever time-boxed again):** generate a new one with
+the same settings and update the secret. Release-please will fail with
+a 401 until the secret is refreshed — CI on `main` pushes will still
+show the failure clearly.
 
 ### Option B: GitHub App token (recommended for larger teams)
 
