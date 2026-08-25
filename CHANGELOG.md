@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.1](https://github.com/tableau/hyper-api-rust/compare/v0.7.0...v0.7.1) (2026-08-25)
+
+
+### Bug Fixes
+
+* **bootstrap:** bump pinned hyperd to 0.0.26359 (r07abb490) ([#237](https://github.com/tableau/hyper-api-rust/issues/237)) ([1ea0375](https://github.com/tableau/hyper-api-rust/commit/1ea037548746600ec718c51517898a5e42da6be4))
+* **deps:** bump h2 for RUSTSEC-2026-0258, fix new clippy unused_async_trait_impl lint ([#235](https://github.com/tableau/hyper-api-rust/issues/235)) ([753d1f5](https://github.com/tableau/hyper-api-rust/commit/753d1f571780360111b14306abff2f2b5bccae49))
+
 ## [0.7.0](https://github.com/tableau/hyper-api-rust/compare/v0.6.1...v0.7.0) (2026-07-11)
 
 
