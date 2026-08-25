@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Bump the pinned `hyperd` release to `0.0.26359` (`r07abb490`).** This
+  supersedes the never-shipped `0.0.26225` bump attempt (PR #219), which was
+  held because `0.0.26225` deadlocked on Apple Silicon Macs running macOS
+  versions prior to 26 during JIT exception-frame registration. `0.0.26359`
+  fixes that engine defect ("Fixed an issue in Hyper on Apple Silicon Macs
+  running macOS versions prior to version 26"). Updates the version, build id,
+  and all four per-platform sha256s in `hyperd-version.toml`.
+
 ### Fixed
 
 - **Download `hyperd` from the Java API bundle instead of the C++ bundle.**
