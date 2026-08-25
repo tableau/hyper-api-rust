@@ -15,7 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   versions prior to 26 during JIT exception-frame registration. `0.0.26359`
   fixes that engine defect ("Fixed an issue in Hyper on Apple Silicon Macs
   running macOS versions prior to version 26"). Updates the version, build id,
-  and all four per-platform sha256s in `hyperd-version.toml`.
+  and all four per-platform sha256s in `hyperd-version.toml`. Performance
+  (same-session A/B vs the live `0.0.25080` pin, median of 3 runs at 100M rows,
+  single-connection): `full_scan` queries **+67% sync / +33% async** on the
+  dominant scan path, filtered queries ~flat; bulk inserts show a small
+  regression (Inserter −11%, ChunkSender −6%, async −4%) — soft numbers, as the
+  insert path carries cold-start variance and multi-connection deltas throttle
+  thermally on a laptop. Verified native arm64 and all 1485 workspace tests pass;
+  the macOS-14 CI runner is green (the deadlock is gone).
 
 ### Fixed
 

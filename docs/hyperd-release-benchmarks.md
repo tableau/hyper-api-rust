@@ -27,14 +27,16 @@ introduced by an engine bump is visible over time.
 | Release | Build | Date | Machine | Inserter (sync) | ChunkSender (sync) | AsyncArrowInserter | Δ vs prev | Notes |
 |---|---|---|---|---:|---:|---:|---|---|
 | 0.0.25080 | r2bfd835b | (baseline) | M-series (thermal, laptop) | 26.87 | 26.10 | 30.01 | — | Prior pin; measured as A/B baseline during the 0.0.26225 bump. |
-| 0.0.26225 | rbf04a855 | 2026-08-07 | M-series (thermal, laptop) | 24.94 | 24.67 | 29.95 | sync insert −5–7%; async ~flat | See PR #219. |
+| 0.0.26225 | rbf04a855 | 2026-08-07 | M-series (thermal, laptop) | 24.94 | 24.67 | 29.95 | sync insert −5–7%; async ~flat | See PR #219 (never shipped — held by the macOS-14 deadlock). |
+| 0.0.26359 | r07abb490 | 2026-08-24 | M-series (thermal, laptop) | 24.12 | 24.62 | 30.07 | vs live 0.0.25080: Inserter −11%, ChunkSender −6%, async −4% | **Shipped fix for the macOS-14 deadlock that held 0.0.26225** (PR #237). Same-session 0.0.25080 A/B baseline: 27.17 / 26.12 / 31.33. Insert path carries cold-start variance and the new engine ran second, so treat the small insert deltas as soft. |
 
 ## Query (single-connection, M rows/s)
 
 | Release | Build | Date | Machine | full_scan (sync) | full_scan (async) | filtered (sync) | filtered (async) | Δ vs prev | Notes |
 |---|---|---|---|---:|---:|---:|---:|---|---|
 | 0.0.25080 | r2bfd835b | (baseline) | M-series (thermal, laptop) | 18.79 | 18.73 | 33.23 | 27.05 | — | Prior pin. |
-| 0.0.26225 | rbf04a855 | 2026-08-07 | M-series (thermal, laptop) | 31.23 | 25.10 | 32.89 | 27.18 | **full_scan +66% sync / +34% async**; filtered ~flat | Large win on the dominant query path. All 1485 workspace tests pass; identical query results. |
+| 0.0.26225 | rbf04a855 | 2026-08-07 | M-series (thermal, laptop) | 31.23 | 25.10 | 32.89 | 27.18 | **full_scan +66% sync / +34% async**; filtered ~flat | Large win on the dominant query path. All 1485 workspace tests pass; identical query results. Never shipped (macOS-14 deadlock). |
+| 0.0.26359 | r07abb490 | 2026-08-24 | M-series (thermal, laptop) | 31.40 | 24.91 | 33.14 | 27.04 | **full_scan +67% sync / +33% async** vs live 0.0.25080; filtered ~flat | The full_scan win from the 0.262xx engine line survives into the deadlock-fixed build (PR #237). Same-session 0.0.25080 A/B baseline: 18.82 / 18.68 / 33.56 / 26.24. All 1485 tests pass; macOS-14 CI green (no deadlock). |
 
 ## How to add a release
 
