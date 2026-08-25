@@ -625,6 +625,7 @@ impl AuthenticatedGrpcClient {
 
     #[expect(
         clippy::unused_async,
+        clippy::unused_async_trait_impl,
         reason = "async fn retained for API symmetry; callers await regardless of whether the current body is synchronous"
     )]
     /// Closes the gRPC connection.

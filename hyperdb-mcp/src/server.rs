@@ -4504,6 +4504,10 @@ impl HyperMcpServer {
 
 #[tool_handler]
 #[prompt_handler]
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "ServerHandler trait methods are async by trait contract; several handlers here (and the tool_handler/prompt_handler macro expansions) have no await points but keeping them as async fn matches the trait signature callers expect"
+)]
 impl ServerHandler for HyperMcpServer {
     fn get_info(&self) -> ServerInfo {
         let sql_dialect = "\n\
