@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.2](https://github.com/tableau/hyper-api-rust/compare/v0.7.1...v0.7.2) (2026-08-26)
+
+
+### Bug Fixes
+
+* bundle correct hyperd 0.0.26359 in npm packages ([#239](https://github.com/tableau/hyper-api-rust/issues/239)) ([59a74e0](https://github.com/tableau/hyper-api-rust/commit/59a74e0397c252d2a5a757dd48e8e2c031857d7a))
+
 ## [0.7.1](https://github.com/tableau/hyper-api-rust/compare/v0.7.0...v0.7.1) (2026-08-25)
 
 
