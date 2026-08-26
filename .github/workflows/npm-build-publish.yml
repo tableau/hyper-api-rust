@@ -23,8 +23,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  HYPERD_VERSION: "0.0.25080"
-  HYPERD_BUILD_ID: "r2bfd835b"
+  HYPERD_VERSION: "0.0.26359"
+  HYPERD_BUILD_ID: "r07abb490"
 
 jobs:
   verify-ci:
@@ -96,7 +96,7 @@ jobs:
             os: macos-14
             target: aarch64-apple-darwin
             hyperd-slug: macos-arm64
-            hyperd-sha256: "2b0fa3fefcf4eba60f052e1cb51abfc32d8c84354274513763760f9549b45991"
+            hyperd-sha256: "434a5e7f95d914a7b328ac333b872fa044fabc6e23ad2aac9d0c9b762032b5ab"
           # TODO: re-enable when macos-13 runners are more available
           # - platform: darwin-x64
           #   os: macos-13
@@ -107,12 +107,12 @@ jobs:
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             hyperd-slug: linux-x86_64
-            hyperd-sha256: "3d3fd2104f55f7fad832470592394dc78f350a03d52e89d36c5288b202dd0bc0"
+            hyperd-sha256: "40e488c01ddc1ecaa53123a88fcf4150161a5828e1c22b475dd73e1cd9cbbbed"
           - platform: win32-x64-msvc
             os: windows-latest
             target: x86_64-pc-windows-msvc
             hyperd-slug: windows-x86_64
-            hyperd-sha256: "9dc4851d416e0e6e00f0367ee6b45fcd676e7ba3a110d4644e3bec871b9aa1de"
+            hyperd-sha256: "8546e67501ed3f15e97c9a0ed6a0dfc56fa9f070878bac435a7e5f7d1bfb6c99"
     runs-on: ${{ matrix.os }}
     defaults:
       run:
