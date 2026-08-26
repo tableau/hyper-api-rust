@@ -11,11 +11,15 @@ on:
       - "hyperdb-bootstrap/hyperd-version.toml"
       - "hyperdb-bootstrap/src/**"
       - ".github/workflows/verify-hyperd-pin.yml"
+      - ".github/workflows/npm-build-publish.yml"
+      - ".github/scripts/verify-npm-hyperd-pin.py"
   pull_request:
     paths:
       - "hyperdb-bootstrap/hyperd-version.toml"
       - "hyperdb-bootstrap/src/**"
       - ".github/workflows/verify-hyperd-pin.yml"
+      - ".github/workflows/npm-build-publish.yml"
+      - ".github/scripts/verify-npm-hyperd-pin.py"
   schedule:
     # Weekly sanity check — independent of PR traffic.
     - cron: "0 12 * * 1"
@@ -30,8 +34,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - name: Install mold linker
-        run: sudo apt-get update -q && sudo apt-get install -y mold
+      - name: Install build + guard dependencies (mold, python3-yaml)
+        run: sudo apt-get update -q && sudo apt-get install -y mold python3-yaml
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
@@ -39,3 +43,10 @@ jobs:
           rustflags: ""
       - name: Verify pinned release URLs are reachable
         run: cargo run --release -p hyperdb-bootstrap --bin hyperdb-bootstrap -- verify
+
+      - name: Verify npm-build-publish.yml hyperd pin matches the toml
+        # The release workflow bundles hyperd into the npm packages from its
+        # OWN hardcoded version/build_id/sha256s, decoupled from the toml.
+        # 0.7.1 shipped npm with the stale 0.0.25080 engine because only the
+        # toml was bumped. This guard fails the build if they ever drift again.
+        run: python3 .github/scripts/verify-npm-hyperd-pin.py
