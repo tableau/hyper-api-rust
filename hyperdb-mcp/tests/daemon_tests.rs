@@ -10,6 +10,7 @@
 //! shared mutex — every test that touches env vars acquires `ENV_LOCK` first.
 
 use std::net::TcpListener;
+use std::process::{Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,6 +22,8 @@ use tempfile::TempDir;
 /// Cargo runs tests in the same process by default — this prevents races.
 /// We recover from poison to prevent one test's panic from cascading.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
+const ENGINE_REPORT_CHILD_ENV: &str = "HYPERDB_MCP_ENGINE_REPORT_CHILD";
+const ENGINE_REPORT_TEST_NAME: &str = "report_hyperd_error_targets_discovered_health_port";
 
 fn acquire_env_lock() -> std::sync::MutexGuard<'static, ()> {
     ENV_LOCK
@@ -409,6 +412,235 @@ fn resolve_port_scan_scans_when_env_unset() {
     let scan = discovery::resolve_port_scan();
     assert_eq!(scan.base, hyperdb_mcp::daemon::DEFAULT_DAEMON_BASE_PORT);
     assert_eq!(scan.span, hyperdb_mcp::daemon::DAEMON_PORT_SCAN_SPAN);
+}
+
+#[test]
+fn daemon_status_post_action_port_targets_explicit_listener() {
+    let _lock = acquire_env_lock();
+    let temp_dir = TempDir::new().expect("create isolated daemon-status state root");
+    let state_dir = temp_dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).expect("create isolated daemon-status state directory");
+    let discovery_path = state_dir.join("daemon.json");
+    let stale_discovery = br#"{
+  "pid": 424242,
+  "hyperd_endpoint": "127.0.0.1:1",
+  "health_port": 0,
+  "started_at": "stale-discovery-sentinel",
+  "version": "0.0.0-stale"
+}"#;
+    std::fs::write(&discovery_path, stale_discovery)
+        .expect("write stale discovery sentinel for explicit-port bypass proof");
+
+    let mut explicit_listener = CliStatusListener::start();
+    let reserved_base = TcpListener::bind(("127.0.0.1", 0))
+        .expect("reserve an isolated discovery base port different from the explicit listener");
+    let base_port = reserved_base
+        .local_addr()
+        .expect("read reserved discovery base address")
+        .port();
+    assert_ne!(
+        base_port, explicit_listener.port,
+        "isolated discovery base must differ from the explicit target"
+    );
+
+    let spellings = [
+        vec![
+            "daemon".to_string(),
+            "status".to_string(),
+            "--port".to_string(),
+            explicit_listener.port.to_string(),
+        ],
+        vec![
+            "daemon".to_string(),
+            "--port".to_string(),
+            explicit_listener.port.to_string(),
+            "status".to_string(),
+        ],
+    ];
+    let mut failures = Vec::new();
+
+    for args in &spellings {
+        let output = run_cli_child_with_watchdog(args, &state_dir, base_port);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() {
+            failures.push(format!(
+                "`hyperdb-mcp {}` exited {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                args.join(" "),
+                output.status
+            ));
+        }
+        let expected_port_line = format!("Health port:    {}", explicit_listener.port);
+        if !stdout.contains(&expected_port_line) {
+            failures.push(format!(
+                "`hyperdb-mcp {}` did not report the explicit listener {expected_port_line:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                args.join(" ")
+            ));
+        }
+    }
+
+    let received_commands = explicit_listener.stop_and_join();
+    if received_commands != ["STATUS", "STATUS"] {
+        failures.push(format!(
+            "explicit listener received {received_commands:?}, expected one STATUS from each literal spelling"
+        ));
+    }
+    match std::fs::read(&discovery_path) {
+        Ok(contents) if contents == stale_discovery => {}
+        Ok(contents) => failures.push(format!(
+            "explicit status mutated stale discovery sentinel: {:?}",
+            String::from_utf8_lossy(&contents)
+        )),
+        Err(error) => failures.push(format!(
+            "explicit status removed or made stale discovery unreadable: {error}"
+        )),
+    }
+
+    assert!(
+        failures.is_empty(),
+        "explicit daemon status contract failures:\n{}",
+        failures.join("\n\n")
+    );
+}
+
+#[test]
+fn report_hyperd_error_targets_discovered_health_port() {
+    let _lock = acquire_env_lock();
+    if std::env::var_os(ENGINE_REPORT_CHILD_ENV).is_some() {
+        run_engine_report_child();
+    } else {
+        run_bounded_engine_report_child();
+    }
+}
+
+fn run_bounded_engine_report_child() {
+    let temp_dir = TempDir::new().expect("create isolated engine-construction state root");
+    let state_dir = temp_dir.path().join("state");
+    let process_temp_dir = temp_dir.path().join("tmp");
+    std::fs::create_dir_all(&state_dir).expect("create isolated engine-construction state");
+    std::fs::create_dir_all(&process_temp_dir).expect("create isolated process temp directory");
+    let configured_base =
+        TcpListener::bind(("127.0.0.1", 0)).expect("reserve configured daemon base port");
+    let configured_base_port = configured_base
+        .local_addr()
+        .expect("read configured daemon base port")
+        .port();
+
+    let mut command = std::process::Command::new(
+        std::env::current_exe().expect("locate daemon integration-test binary"),
+    );
+    command
+        .arg("--exact")
+        .arg(ENGINE_REPORT_TEST_NAME)
+        .arg("--nocapture")
+        .current_dir(temp_dir.path())
+        .env(ENGINE_REPORT_CHILD_ENV, "1")
+        .env("HOME", &state_dir)
+        .env("USERPROFILE", &state_dir)
+        .env("HYPERDB_STATE_DIR", &state_dir)
+        .env("HYPERDB_DAEMON_PORT", configured_base_port.to_string())
+        .env("TMPDIR", &process_temp_dir)
+        .env("TEMP", &process_temp_dir)
+        .env("TMP", &process_temp_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .expect("spawn exact Engine-report regression child");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let kill_result = child.kill();
+                let output = child
+                    .wait_with_output()
+                    .expect("reap timed-out Engine-report child");
+                panic!(
+                    "Engine-report child exceeded 10s; kill={kill_result:?}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(error) => {
+                let kill_result = child.kill();
+                let output = child
+                    .wait_with_output()
+                    .expect("reap Engine-report child after status error");
+                panic!(
+                    "Engine-report child status failed: {error}; kill={kill_result:?}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .expect("collect completed Engine-report child output");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("running 1 test"),
+        "exact child filter executed zero or multiple tests\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        output.status.success(),
+        "Engine-report child failed with {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+}
+
+fn run_engine_report_child() {
+    let configured_base_port = std::env::var("HYPERDB_DAEMON_PORT")
+        .expect("parent must configure a distinct daemon base port")
+        .parse::<u16>()
+        .expect("configured daemon base port must be a u16");
+
+    let health_listener = HealthListener::bind(0).expect("bind discovered health listener");
+    let health_port = health_listener.port;
+    assert_ne!(
+        health_port, configured_base_port,
+        "discovered health port must differ from the configured base"
+    );
+    let daemon_info = DaemonInfo {
+        pid: 616_161,
+        // Port zero is never a reachable TCP server endpoint. It makes the
+        // public Engine constructor enter the daemon connection-error branch
+        // without racing another process for a recently released port.
+        hyperd_endpoint: "127.0.0.1:0".to_string(),
+        health_port,
+        started_at: "2026-08-14T12:34:56Z".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    let mut health_listener = OwnedHealthListener::start(health_listener, daemon_info.clone());
+    discovery::write_discovery_file(&daemon_info)
+        .expect("write isolated non-base daemon discovery record");
+    assert!(
+        !health_listener.state.consume_restart_request(),
+        "restart flag must begin clear"
+    );
+
+    let error = hyperdb_mcp::engine::Engine::new(None)
+        .expect_err("unreachable discovered Hyper endpoint must fail Engine construction");
+
+    let restart_requested = health_listener.state.consume_restart_request();
+    health_listener.stop_and_join();
+    assert!(
+        error
+            .message
+            .contains("Failed to connect to daemon hyperd at 127.0.0.1:0"),
+        "public Engine constructor must fail in try_daemon_mode, got: {}",
+        error.message
+    );
+    assert!(
+        restart_requested,
+        "Engine::try_daemon_mode must report through the non-base health port from discovery"
+    );
 }
 
 // ─── Unit tests: idle timeout logic (no env vars) ─────────────────────────────
@@ -1111,6 +1343,198 @@ fn daemon_mode_ephemeral_database_cleaned_up_on_drop() {
 }
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
+
+struct OwnedHealthListener {
+    state: Arc<DaemonState>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl OwnedHealthListener {
+    fn start(listener: HealthListener, info: DaemonInfo) -> Self {
+        let state = Arc::new(DaemonState::new());
+        let run_state = Arc::clone(&state);
+        let info = Arc::new(Mutex::new(info));
+        let handle = std::thread::spawn(move || listener.run(run_state, info));
+        Self {
+            state,
+            handle: Some(handle),
+        }
+    }
+
+    fn stop_and_join(&mut self) {
+        self.state.request_shutdown();
+        if let Some(handle) = self.handle.take() {
+            handle
+                .join()
+                .expect("owned health listener must shut down cleanly");
+        }
+    }
+}
+
+impl Drop for OwnedHealthListener {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
+struct CliStatusListener {
+    port: u16,
+    handle: Option<std::thread::JoinHandle<Vec<String>>>,
+}
+
+impl CliStatusListener {
+    fn start() -> Self {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .expect("bind OS-assigned explicit daemon-status listener");
+        let port = listener
+            .local_addr()
+            .expect("read explicit daemon-status listener address")
+            .port();
+        let handle = std::thread::spawn(move || {
+            let mut commands = Vec::new();
+            loop {
+                let (mut stream, _) = listener
+                    .accept()
+                    .expect("explicit daemon-status listener accept");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("bound explicit daemon-status request read");
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .expect("bound explicit daemon-status response write");
+                let mut line = String::new();
+                BufReader::new(&stream)
+                    .read_line(&mut line)
+                    .expect("read explicit daemon-status command");
+                let command = line.trim();
+                if command == "TEST_SHUTDOWN" {
+                    break;
+                }
+                commands.push(command.to_string());
+                let response = serde_json::json!({
+                    "pid": 515151,
+                    "hyperd_endpoint": "127.0.0.1:54321",
+                    "health_port": port,
+                    "started_at": "2026-08-14T12:34:56Z",
+                    "version": env!("CARGO_PKG_VERSION")
+                });
+                writeln!(stream, "{response}").expect("write explicit daemon-status response");
+            }
+            commands
+        });
+        Self {
+            port,
+            handle: Some(handle),
+        }
+    }
+
+    fn stop_and_join(&mut self) -> Vec<String> {
+        use std::io::Write;
+
+        if self.handle.is_none() {
+            return Vec::new();
+        }
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", self.port))
+            .expect("connect explicit daemon-status listener shutdown");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .expect("bound explicit daemon-status shutdown write");
+        stream
+            .write_all(b"TEST_SHUTDOWN\n")
+            .expect("signal explicit daemon-status listener shutdown");
+        self.handle
+            .take()
+            .expect("explicit daemon-status listener handle exists")
+            .join()
+            .expect("explicit daemon-status listener must join")
+    }
+}
+
+impl Drop for CliStatusListener {
+    fn drop(&mut self) {
+        if self.handle.is_some() {
+            let _ = self.stop_and_join();
+        }
+    }
+}
+
+fn run_cli_child_with_watchdog(
+    args: &[String],
+    state_dir: &std::path::Path,
+    base_port: u16,
+) -> Output {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hyperdb-mcp"));
+    command.env_clear();
+    preserve_child_runtime_environment(&mut command);
+    command
+        .current_dir(
+            state_dir
+                .parent()
+                .expect("isolated daemon-status state has a parent"),
+        )
+        .env("HOME", state_dir)
+        .env("USERPROFILE", state_dir)
+        .env("HYPERDB_STATE_DIR", state_dir)
+        .env("HYPERDB_DAEMON_PORT", base_port.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args(args);
+    let mut child = command.spawn().expect("spawn isolated daemon-status child");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .expect("collect completed daemon-status child output");
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let kill_error = child.kill().err();
+                let output = child
+                    .wait_with_output()
+                    .expect("wait for timed-out daemon-status child after kill");
+                panic!(
+                    "daemon-status child exceeded 5s and was killed ({kill_error:?})\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(error) => {
+                let kill_error = child.kill().err();
+                let output = child
+                    .wait_with_output()
+                    .expect("wait for daemon-status child after status error");
+                panic!(
+                    "daemon-status child status failed: {error}; kill result: {kill_error:?}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+}
+
+fn preserve_child_runtime_environment(command: &mut std::process::Command) {
+    for key in [
+        "PATH",
+        "SystemRoot",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "LD_LIBRARY_PATH",
+        "DYLD_LIBRARY_PATH",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+}
 
 /// Starts a health listener on a random port and returns the port, join handle,
 /// and shared state. Does NOT touch env vars — safe for parallel use.

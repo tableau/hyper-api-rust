@@ -127,7 +127,7 @@ enum Commands {
         /// TCP port for health listener and single-instance lock. When omitted,
         /// the daemon scans from the base port to find a free port. For stop/status
         /// commands, omitting the port uses discovery + scanning to find the running daemon.
-        #[arg(long)]
+        #[arg(long, global = true)]
         port: Option<u16>,
 
         /// Idle timeout in seconds before the daemon shuts down
@@ -161,9 +161,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Commands::Daemon {
             action: Some(DaemonAction::Status),
+            port,
             ..
         }) => {
-            daemon_status();
+            daemon_status(port);
             Ok(())
         }
         Some(Commands::Daemon {
@@ -309,16 +310,32 @@ fn daemon_stop(port: Option<u16>) {
     }
 }
 
-fn daemon_status() {
-    if let Some(info) = discovery::find_running_daemon() {
-        println!("Daemon is running:");
-        println!("  PID:            {}", info.pid);
-        println!("  Hyperd endpoint: {}", info.hyperd_endpoint);
-        println!("  Health port:    {}", info.health_port);
-        println!("  Started:        {}", info.started_at);
-        println!("  Version:        {}", info.version);
+fn daemon_status(port: Option<u16>) {
+    let info = if let Some(port) = port {
+        match health::send_command(port, "STATUS") {
+            Ok(response) => match serde_json::from_str::<discovery::DaemonInfo>(response.trim()) {
+                Ok(info) => info,
+                Err(e) => {
+                    eprintln!("Daemon on port {port} returned invalid status: {e}");
+                    std::process::exit(1);
+                }
+            },
+            Err(e) => {
+                eprintln!("No daemon running on port {port} (or cannot connect): {e}");
+                std::process::exit(1);
+            }
+        }
+    } else if let Some(info) = discovery::find_running_daemon() {
+        info
     } else {
         eprintln!("No daemon is currently running.");
         std::process::exit(1);
-    }
+    };
+
+    println!("Daemon is running:");
+    println!("  PID:            {}", info.pid);
+    println!("  Hyperd endpoint: {}", info.hyperd_endpoint);
+    println!("  Health port:    {}", info.health_port);
+    println!("  Started:        {}", info.started_at);
+    println!("  Version:        {}", info.version);
 }

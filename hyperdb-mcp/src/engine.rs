@@ -394,7 +394,7 @@ impl Engine {
             // The daemon's discovery file points at this endpoint but we can't
             // reach it — hyperd is likely dead. Tell the daemon so it can
             // restart it on its next monitor tick.
-            daemon::health::report_hyperd_error_to_daemon();
+            daemon::health::report_hyperd_error_to_daemon(info.health_port);
             McpError::new(
                 ErrorCode::InternalError,
                 format!("Failed to connect to daemon hyperd at {endpoint}: {e}"),

@@ -998,6 +998,10 @@ pub struct SuggestQueriesArgs {
 /// starting `hyperd` if the client never calls a tool.
 pub struct HyperMcpServer {
     engine: Arc<Mutex<Option<Engine>>>,
+    /// Serializes construction while keeping the public engine mutex available
+    /// for status observers and health-plane callbacks.  Only the initializer
+    /// holds this guard; it must never protect tool execution.
+    engine_initialization: Mutex<()>,
     /// `true` once [`Self::ensure_catalog_ready`] has successfully run on
     /// the current engine, so we only try to create / reconcile
     /// `_table_catalog` once per process. Reset to `false` if the
@@ -1111,6 +1115,7 @@ impl HyperMcpServer {
         let saved_queries: Arc<dyn SavedQueryStore> = build_store(persistent_path.as_deref());
         Self {
             engine: Arc::new(Mutex::new(None)),
+            engine_initialization: Mutex::new(()),
             catalog_ready: Arc::new(Mutex::new(false)),
             watchers: Arc::new(crate::watcher::WatcherRegistry::new()),
             saved_queries,
@@ -1339,48 +1344,76 @@ impl HyperMcpServer {
     /// [`Self::catalog_ready`] flag so the subsequent `with_engine` call
     /// runs the catalog bootstrap. We can't run the bootstrap here
     /// because it needs to issue SQL back through `Engine`, and we're
-    /// still holding the outer lock.
+    /// still holding the outer lock. Engine construction is single-flight but
+    /// deliberately occurs outside the public engine mutex: daemon discovery,
+    /// its best-effort health report, and attachment replay may all perform
+    /// slow I/O.
     fn ensure_engine(&self) -> Result<std::sync::MutexGuard<'_, Option<Engine>>, McpError> {
+        let guard = self
+            .engine
+            .lock()
+            .map_err(|_| McpError::new(ErrorCode::InternalError, "Lock poisoned"))?;
+        if guard.is_some() {
+            return Ok(guard);
+        }
+        drop(guard);
+
+        let initialization = self
+            .engine_initialization
+            .lock()
+            .map_err(|_| McpError::new(ErrorCode::InternalError, "Lock poisoned"))?;
+
+        // A competing initializer may have completed while this caller was
+        // waiting for the single-flight guard. Recheck before constructing.
+        let guard = self
+            .engine
+            .lock()
+            .map_err(|_| McpError::new(ErrorCode::InternalError, "Lock poisoned"))?;
+        if guard.is_some() {
+            drop(initialization);
+            return Ok(guard);
+        }
+        drop(guard);
+
+        tracing::info!(
+            persistent_db = self.workspace_path.as_deref().unwrap_or("<ephemeral-only>"),
+            no_daemon = self.no_daemon,
+            "initializing hyper engine"
+        );
+        let engine = if self.no_daemon {
+            Engine::new_no_daemon(self.workspace_path.clone())?
+        } else {
+            Engine::new(self.workspace_path.clone())?
+        };
+        tracing::info!(
+            ephemeral_path = %engine.ephemeral_path().display(),
+            persistent_path = ?engine.persistent_path(),
+            log_dir = %engine.log_dir().display(),
+            "engine ready"
+        );
+        // Replay any attachments tracked across the previous engine's lifetime
+        // before handing the engine out to a tool. This work stays outside the
+        // public engine mutex because it may issue SQL / I/O.
+        if let Err(e) = self.attachments.replay_all(&engine) {
+            tracing::warn!(err = %e.message, "failed to replay attachments on new engine");
+        }
+
         let mut guard = self
             .engine
             .lock()
             .map_err(|_| McpError::new(ErrorCode::InternalError, "Lock poisoned"))?;
-        if guard.is_none() {
-            tracing::info!(
-                persistent_db = self.workspace_path.as_deref().unwrap_or("<ephemeral-only>"),
-                no_daemon = self.no_daemon,
-                "initializing hyper engine"
-            );
-            let engine = if self.no_daemon {
-                Engine::new_no_daemon(self.workspace_path.clone())?
-            } else {
-                Engine::new(self.workspace_path.clone())?
-            };
-            tracing::info!(
-                ephemeral_path = %engine.ephemeral_path().display(),
-                persistent_path = ?engine.persistent_path(),
-                log_dir = %engine.log_dir().display(),
-                "engine ready"
-            );
-            // Replay any attachments tracked across the previous
-            // engine's lifetime *before* handing the engine out to a
-            // tool — otherwise the first post-reconnect tool call
-            // would see the attachments missing from Hyper's view even
-            // though the registry still lists them. Logs replay
-            // failures; those entries are dropped from the registry
-            // inside `replay_all` so a single stale attachment doesn't
-            // block recovery.
-            if let Err(e) = self.attachments.replay_all(&engine) {
-                tracing::warn!(err = %e.message, "failed to replay attachments on new engine");
-            }
-            *guard = Some(engine);
-            // New engine → catalog may need to be created/reconciled
-            // even if we already did it against a prior (now-dead)
-            // engine.
-            if let Ok(mut ready) = self.catalog_ready.lock() {
-                *ready = false;
-            }
+        debug_assert!(
+            guard.is_none(),
+            "single-flight initializer lost engine ownership"
+        );
+        *guard = Some(engine);
+        // New engine → catalog may need to be created/reconciled even if we
+        // already did it against a prior (now-dead) engine. Preserve the
+        // existing engine-then-catalog lock order.
+        if let Ok(mut ready) = self.catalog_ready.lock() {
+            *ready = false;
         }
+        drop(initialization);
         Ok(guard)
     }
 
@@ -1520,46 +1553,52 @@ impl HyperMcpServer {
     where
         F: FnOnce(&Engine) -> Result<R, McpError>,
     {
-        let mut guard = self.ensure_engine()?;
-        let engine = guard.as_ref().expect("ensure_engine guarantees Some");
-        // Bootstrap the catalog exactly once per engine. Intentionally
-        // runs *inside* `with_engine` (not `ensure_engine`) so the
-        // catalog SQL can see errors classified via the normal error
-        // path. No-op in bare or read-only mode.
-        self.ensure_catalog_ready(engine);
-        // In daemon mode, send a heartbeat so the daemon knows we're still active.
-        // Debounced to avoid per-call TCP overhead (only sends if >60s since last).
-        // Pass the health port from the engine we already hold — calling
-        // self.engine.lock() here would deadlock (we already hold that mutex).
-        if !self.no_daemon {
-            self.maybe_send_heartbeat(engine.daemon_health_port());
-        }
-        let result = f(engine);
-        if let Err(e) = &result {
-            tracing::debug!(code = ?e.code, message = %e.message, "tool call returned error");
-            if e.code == ErrorCode::ConnectionLost {
-                tracing::warn!(
-                    // Matches both the "hyperd crashed / socket closed" family
-                    // and the "wire desynchronized" family — see
-                    // [`crate::error::is_connection_lost`] for the full
-                    // classifier and both triggers.
-                    "connection to hyperd lost or desynchronized ({}); \
-                     dropping engine so next call reconnects",
-                    e.message
-                );
-                *guard = None;
-                // Reset so the next call re-bootstraps the catalog
-                // against the fresh engine.
-                if let Ok(mut ready) = self.catalog_ready.lock() {
-                    *ready = false;
-                }
-                // Tell the daemon hyperd looks dead from over here. The daemon
-                // will pick up the flag on its next monitor tick and restart.
-                // Skipped in --no-daemon mode because there's no daemon to tell.
-                if !self.no_daemon {
-                    crate::daemon::health::report_hyperd_error_to_daemon();
+        let (result, daemon_health_port, connection_lost) = {
+            let mut guard = self.ensure_engine()?;
+            let engine = guard.as_ref().expect("ensure_engine guarantees Some");
+            let daemon_health_port = engine.daemon_health_port();
+            // Bootstrap the catalog exactly once per engine. Intentionally
+            // runs *inside* `with_engine` (not `ensure_engine`) so the
+            // catalog SQL can see errors classified via the normal error
+            // path. No-op in bare or read-only mode.
+            self.ensure_catalog_ready(engine);
+            let result = f(engine);
+            let connection_lost = result
+                .as_ref()
+                .is_err_and(|e| e.code == ErrorCode::ConnectionLost);
+            if let Err(e) = &result {
+                tracing::debug!(code = ?e.code, message = %e.message, "tool call returned error");
+                if connection_lost {
+                    tracing::warn!(
+                        // Matches both the "hyperd crashed / socket closed" family
+                        // and the "wire desynchronized" family — see
+                        // [`crate::error::is_connection_lost`] for the full
+                        // classifier and both triggers.
+                        "connection to hyperd lost or desynchronized ({}); \
+                         dropping engine so next call reconnects",
+                        e.message
+                    );
+                    *guard = None;
+                    // Reset so the next call re-bootstraps the catalog
+                    // against the fresh engine.
+                    if let Ok(mut ready) = self.catalog_ready.lock() {
+                        *ready = false;
+                    }
                 }
             }
+            drop(guard);
+            (result, daemon_health_port, connection_lost)
+        };
+
+        // Health-plane TCP I/O must not hold the engine mutex. The captured
+        // port is authoritative for the daemon this engine actually uses;
+        // `None` means local fallback and therefore no daemon report.
+        if connection_lost {
+            if let Some(port) = daemon_health_port {
+                crate::daemon::health::report_hyperd_error_to_daemon(port);
+            }
+        } else {
+            self.maybe_send_heartbeat(daemon_health_port);
         }
         result
     }
@@ -1568,22 +1607,26 @@ impl HyperMcpServer {
     /// Debounced: only sends if more than 60 seconds have elapsed since the last heartbeat,
     /// avoiding a new TCP connection on every tool call.
     ///
-    /// Accepts the daemon health port directly (from the caller's already-held
-    /// engine reference) to avoid re-locking `self.engine` — which would deadlock
-    /// since `with_engine` holds that mutex when calling us.
+    /// Accepts the daemon health port captured while the engine was locked so
+    /// this method never needs to re-lock `self.engine` after guard release.
     fn maybe_send_heartbeat(&self, daemon_health_port: Option<u16>) {
         const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-        let should_send = self
-            .last_heartbeat
-            .lock()
-            .is_ok_and(|guard| guard.elapsed() >= HEARTBEAT_INTERVAL);
-        if should_send {
-            if let Some(port) = daemon_health_port {
-                let _ = crate::daemon::health::send_command(port, "HEARTBEAT");
-                if let Ok(mut guard) = self.last_heartbeat.lock() {
-                    *guard = std::time::Instant::now();
-                }
+        let Some(port) = daemon_health_port else {
+            return;
+        };
+
+        let should_send = self.last_heartbeat.lock().is_ok_and(|mut guard| {
+            if guard.elapsed() < HEARTBEAT_INTERVAL {
+                return false;
             }
+            // Reserve the interval before I/O. Concurrent callers observe this
+            // timestamp and return, and a failed best-effort send still avoids
+            // an immediate retry storm.
+            *guard = std::time::Instant::now();
+            true
+        });
+        if should_send {
+            let _ = crate::daemon::health::send_command(port, "HEARTBEAT");
         }
     }
 
@@ -5473,6 +5516,270 @@ mod kv_value_path_size_tests {
             err.message.contains("hard limit"),
             "message should name the hard limit: {}",
             err.message
+        );
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_debounce_tests {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc::{self, Receiver, Sender};
+    use std::sync::{Arc, Barrier};
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+
+    use super::HyperMcpServer;
+
+    struct HeldHeartbeatPeer {
+        port: u16,
+        release: Option<Sender<()>>,
+        handle: Option<JoinHandle<Result<Vec<String>, String>>>,
+    }
+
+    impl HeldHeartbeatPeer {
+        fn spawn() -> Self {
+            let listener =
+                TcpListener::bind(("127.0.0.1", 0)).expect("bind controlled heartbeat listener");
+            listener
+                .set_nonblocking(true)
+                .expect("make controlled heartbeat listener nonblocking");
+            let port = listener
+                .local_addr()
+                .expect("controlled heartbeat listener address")
+                .port();
+            let (release_tx, release_rx) = mpsc::channel();
+            let handle = std::thread::spawn(move || hold_heartbeat_responses(listener, release_rx));
+            Self {
+                port,
+                release: Some(release_tx),
+                handle: Some(handle),
+            }
+        }
+
+        fn release_and_join(mut self) -> Result<Vec<String>, String> {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+            self.handle
+                .take()
+                .expect("controlled heartbeat listener handle must exist")
+                .join()
+                .map_err(|payload| format!("controlled heartbeat listener panicked: {payload:?}"))?
+        }
+    }
+
+    impl Drop for HeldHeartbeatPeer {
+        fn drop(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn hold_heartbeat_responses(
+        listener: TcpListener,
+        release: Receiver<()>,
+    ) -> Result<Vec<String>, String> {
+        let hard_deadline = Instant::now() + Duration::from_secs(5);
+        let mut streams = Vec::new();
+        loop {
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => streams.push(stream),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => {
+                        return Err(format!("controlled heartbeat accept failed: {error}"));
+                    }
+                }
+            }
+
+            match release.try_recv() {
+                Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            if Instant::now() >= hard_deadline {
+                return Err("controlled heartbeat listener was never released".to_string());
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        // Accept any connections already queued when the release signal won
+        // the race with the nonblocking accept above.
+        let drain_deadline = Instant::now() + Duration::from_millis(50);
+        while Instant::now() < drain_deadline {
+            match listener.accept() {
+                Ok((stream, _)) => streams.push(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => return Err(format!("heartbeat queue drain failed: {error}")),
+            }
+        }
+
+        let mut commands = Vec::with_capacity(streams.len());
+        for mut stream in streams {
+            commands.push(read_heartbeat_command(&stream)?);
+            stream
+                .write_all(b"OK\n")
+                .map_err(|error| format!("acknowledge held heartbeat: {error}"))?;
+        }
+        Ok(commands)
+    }
+
+    fn read_heartbeat_command(stream: &TcpStream) -> Result<String, String> {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .map_err(|error| format!("set heartbeat read timeout: {error}"))?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .map_err(|error| format!("set heartbeat write timeout: {error}"))?;
+        let reader = stream
+            .try_clone()
+            .map_err(|error| format!("clone heartbeat stream: {error}"))?;
+        let mut command = String::new();
+        BufReader::new(reader)
+            .read_line(&mut command)
+            .map_err(|error| format!("read heartbeat command: {error}"))?;
+        Ok(command)
+    }
+
+    fn collect_immediate_heartbeats(
+        listener: TcpListener,
+        window: Duration,
+    ) -> Result<Vec<String>, String> {
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| format!("make follow-up listener nonblocking: {error}"))?;
+        let deadline = Instant::now() + window;
+        let mut commands = Vec::new();
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    commands.push(read_heartbeat_command(&stream)?);
+                    stream
+                        .write_all(b"OK\n")
+                        .map_err(|error| format!("acknowledge follow-up heartbeat: {error}"))?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => return Err(format!("follow-up heartbeat accept failed: {error}")),
+            }
+        }
+        Ok(commands)
+    }
+
+    #[test]
+    fn heartbeat_reservation_is_atomic_and_survives_send_failure() {
+        const CALLERS: usize = 4;
+        const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+
+        let server = Arc::new(HyperMcpServer::with_no_daemon(None, false, false));
+        *server
+            .last_heartbeat
+            .lock()
+            .expect("heartbeat timestamp mutex") = Instant::now() - HEARTBEAT_INTERVAL;
+
+        let peer = HeldHeartbeatPeer::spawn();
+        let barrier = Arc::new(Barrier::new(CALLERS + 1));
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let mut callers = Vec::with_capacity(CALLERS);
+        for _ in 0..CALLERS {
+            let server = Arc::clone(&server);
+            let barrier = Arc::clone(&barrier);
+            let completed = completed_tx.clone();
+            let port = peer.port;
+            callers.push(std::thread::spawn(move || {
+                barrier.wait();
+                server.maybe_send_heartbeat(Some(port));
+                let _ = completed.send(());
+            }));
+        }
+        drop(completed_tx);
+        barrier.wait();
+
+        // With an atomic reservation, all but the single sender return while
+        // that sender remains blocked on the held response. The old split
+        // check/update lets every caller enter network I/O instead.
+        let early_deadline = Instant::now() + Duration::from_secs(2);
+        let mut early_completions = 0;
+        while early_completions < CALLERS - 1 {
+            let remaining = early_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match completed_rx.recv_timeout(remaining) {
+                Ok(()) => early_completions += 1,
+                Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
+                    break;
+                }
+            }
+        }
+
+        let concurrent_commands = peer.release_and_join();
+        let caller_results: Vec<_> = callers.into_iter().map(JoinHandle::join).collect();
+
+        // Preserve the existing best-effort rule: even a refused connection
+        // consumes the debounce interval, so an immediate retry does not
+        // create a heartbeat storm while the daemon is unavailable.
+        let reservation =
+            TcpListener::bind(("127.0.0.1", 0)).expect("reserve a closed heartbeat port");
+        let failed_port = reservation
+            .local_addr()
+            .expect("closed heartbeat port address")
+            .port();
+        drop(reservation);
+        *server
+            .last_heartbeat
+            .lock()
+            .expect("heartbeat timestamp mutex") = Instant::now() - HEARTBEAT_INTERVAL;
+        server.maybe_send_heartbeat(Some(failed_port));
+
+        let follow_up_listener = TcpListener::bind(("127.0.0.1", failed_port))
+            .expect("bind follow-up listener on refused heartbeat port");
+        let follow_up = std::thread::spawn(move || {
+            collect_immediate_heartbeats(follow_up_listener, Duration::from_millis(300))
+        });
+        server.maybe_send_heartbeat(Some(failed_port));
+        let follow_up_commands = follow_up.join();
+
+        let mut failures = Vec::new();
+        match concurrent_commands {
+            Ok(commands) if commands == ["HEARTBEAT\n"] => {}
+            Ok(commands) => failures.push(format!(
+                "concurrent callers sent {} commands instead of one: {commands:?}",
+                commands.len()
+            )),
+            Err(error) => failures.push(error),
+        }
+        if early_completions != CALLERS - 1 {
+            failures.push(format!(
+                "only {early_completions} of {} non-senders returned before the held heartbeat was released",
+                CALLERS - 1
+            ));
+        }
+        for (index, result) in caller_results.into_iter().enumerate() {
+            if let Err(payload) = result {
+                failures.push(format!("heartbeat caller {index} panicked: {payload:?}"));
+            }
+        }
+        match follow_up_commands {
+            Ok(Ok(commands)) if commands.is_empty() => {}
+            Ok(Ok(commands)) => failures.push(format!(
+                "a failed heartbeat did not reserve the debounce interval; immediate retry sent {commands:?}"
+            )),
+            Ok(Err(error)) => failures.push(error),
+            Err(payload) => failures.push(format!("follow-up heartbeat peer panicked: {payload:?}")),
+        }
+
+        assert!(
+            failures.is_empty(),
+            "heartbeat reservation failures:\n{}",
+            failures.join("\n")
         );
     }
 }
