@@ -9,9 +9,99 @@
 mod common;
 
 use hyperdb_api::{Connection, CreateMode, HyperProcess};
+use std::fs;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
+
+const CALLBACK_PARENT_KILL_CHILD_ENV: &str = "HYPERDB_CALLBACK_PARENT_KILL_CHILD";
+
+/// Killing the owning client process must close its callback connection, so
+/// `hyperd` shuts itself down even though the client's `Drop` implementation
+/// never gets a chance to run.
+#[test]
+fn callback_connection_shutdowns_hyperd_after_parent_kill() {
+    if let Some(pid_file) = std::env::var_os(CALLBACK_PARENT_KILL_CHILD_ENV) {
+        let params = common::test_hyper_params("callback_connection_parent_kill_child")
+            .expect("child must create Hyper parameters");
+        let hyper = HyperProcess::new(None, Some(&params)).expect("child must start HyperProcess");
+        let pid = hyper
+            .pid()
+            .expect("child must report HyperProcess public PID");
+        fs::write(pid_file, pid.to_string()).expect("child must report Hyper PID to parent");
+
+        loop {
+            thread::park();
+        }
+    }
+
+    let temp_dir = tempfile::tempdir().expect("parent must create RAII temp directory");
+    let pid_file = temp_dir.path().join("hyperd-pid");
+    let test_name = "callback_connection_shutdowns_hyperd_after_parent_kill";
+    let mut child = Command::new(std::env::current_exe().expect("test executable path"))
+        .args(["--exact", test_name, "--nocapture"])
+        .env(CALLBACK_PARENT_KILL_CHILD_ENV, &pid_file)
+        .spawn()
+        .expect("parent must start exact helper child");
+
+    let pid = wait_for_reported_pid(&pid_file, Duration::from_secs(10)).unwrap_or_else(|message| {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("callback helper failed before reporting hyperd PID: {message}");
+    });
+    assert!(
+        is_process_running(pid),
+        "reported hyperd PID {pid} must be live before its parent is killed"
+    );
+
+    child.kill().expect("parent must kill exact helper child");
+    let child_status = child
+        .wait()
+        .expect("parent must wait for killed helper child");
+    assert!(
+        !child_status.success(),
+        "the deliberately killed helper child must not report success"
+    );
+
+    let shutdown_detected = bounded_process_exit_poll(pid, Duration::from_secs(10));
+    assert!(
+        shutdown_detected,
+        "hyperd PID {pid} remained live after its callback-owning parent was killed"
+    );
+}
+
+fn wait_for_reported_pid(pid_file: &std::path::Path, timeout: Duration) -> Result<u32, String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match fs::read_to_string(pid_file) {
+            Ok(contents) => {
+                return contents
+                    .trim()
+                    .parse()
+                    .map_err(|error| format!("invalid PID report {contents:?}: {error}"));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("could not read PID report: {error}")),
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("no PID report appeared at {}", pid_file.display()));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn bounded_process_exit_poll(pid: u32, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if !is_process_running(pid) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
 
 #[test]
 fn test_hyper_process_start_stop() {

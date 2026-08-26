@@ -126,6 +126,40 @@ fn maps_22003_to_schema_mismatch_with_override_suggestion() {
     );
 }
 
+/// SQLSTATE 55006 is not globally synonymous with a file lock. Only the
+/// reserved persistent-attachment boundary has enough context to present it
+/// as `RESOURCE_BUSY`; unrelated server operations must retain their existing
+/// generic mapping.
+#[test]
+fn non_attach_55006_preserves_existing_mapping() {
+    let raw_message = "cannot drop database while another session uses it";
+    let upstream = hyperdb_api::Error::server(Some("55006".to_string()), raw_message, None, None);
+
+    let mapped: McpError = upstream.into();
+
+    assert_eq!(mapped.code, ErrorCode::SqlError);
+    assert!(mapped.message.contains("55006"));
+    assert!(mapped.message.contains(raw_message));
+    assert_ne!(mapped.code, ErrorCode::ResourceBusy);
+}
+
+/// Even a legacy lock-like phrase must not override the lack of persistent
+/// attachment context. The global mapper sees only an arbitrary structured
+/// server error, so this remains `SQL_ERROR`; the engine's reserved-attach
+/// boundary is the sole place that may present it as `RESOURCE_BUSY`.
+#[test]
+fn non_attach_55006_with_legacy_phrase_preserves_existing_mapping() {
+    let raw_message = "database is already attached by another client connection";
+    let upstream = hyperdb_api::Error::server(Some("55006".to_string()), raw_message, None, None);
+
+    let mapped: McpError = upstream.into();
+
+    assert_eq!(mapped.code, ErrorCode::SqlError);
+    assert!(mapped.message.contains("55006"));
+    assert!(mapped.message.contains(raw_message));
+    assert_ne!(mapped.code, ErrorCode::ResourceBusy);
+}
+
 /// The classifier must also fire on human-readable spellings, not just the
 /// raw SQLSTATE code, because different hyperd versions format the message
 /// differently.

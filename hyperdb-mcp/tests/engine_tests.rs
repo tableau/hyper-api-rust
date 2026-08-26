@@ -7,7 +7,15 @@
 mod common;
 
 use common::TestEngine;
+use hyperdb_mcp::engine::Engine;
 use hyperdb_mcp::error::ErrorCode;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+use tempfile::TempDir;
+
+const PERSISTENT_LOCK_CHILD_ENV: &str = "HYPERDB_MCP_PERSISTENT_LOCK_CHILD";
 
 /// Verify that creating an Engine successfully starts hyperd and establishes
 /// a live connection.
@@ -15,6 +23,122 @@ use hyperdb_mcp::error::ErrorCode;
 fn engine_starts_and_connects() {
     let te = TestEngine::new_ephemeral();
     assert!(te.engine.is_running());
+}
+
+/// A second private engine must diagnose a locked reserved persistent
+/// attachment without risking a permanently blocked integration-test worker.
+/// The parent owns the exact helper child and always kills + waits on timeout.
+#[test]
+fn real_persistent_lock_reproduces_resource_busy() {
+    if let Some(workspace) = std::env::var_os(PERSISTENT_LOCK_CHILD_ENV) {
+        run_real_persistent_lock_child(std::path::PathBuf::from(workspace));
+        return;
+    }
+
+    let temp_dir = TempDir::new().expect("parent must own RAII workspace directory");
+    let workspace = temp_dir.path().join("contended-persistent.hyper");
+    run_contained_child(
+        "real_persistent_lock_reproduces_resource_busy",
+        PERSISTENT_LOCK_CHILD_ENV,
+        &workspace,
+    );
+}
+
+fn run_real_persistent_lock_child(workspace: std::path::PathBuf) {
+    let effective_path = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.clone());
+    let owner = Engine::new_no_daemon(Some(workspace.to_string_lossy().into_owned()))
+        .expect("owner engine must attach the persistent workspace first");
+    let error = Engine::new_no_daemon(Some(workspace.to_string_lossy().into_owned()))
+        .expect_err("second private engine must reject the contended persistent workspace");
+
+    assert_eq!(error.code, ErrorCode::ResourceBusy);
+    assert!(
+        error.message.contains("55006"),
+        "must retain the lock SQLSTATE: {}",
+        error.message
+    );
+    assert!(
+        error.message.to_lowercase().contains("attached")
+            || error.message.to_lowercase().contains("lock"),
+        "must retain Hyper's raw lock diagnostic: {}",
+        error.message
+    );
+    assert!(
+        error.message.contains(effective_path.to_str().unwrap()),
+        "must report the exact effective persistent path {}: {}",
+        effective_path.display(),
+        error.message
+    );
+    let guidance = error
+        .suggestion
+        .expect("persistent lock needs recovery guidance");
+    let guidance_lower = guidance.to_lowercase();
+    assert!(
+        guidance_lower.contains("doctor"),
+        "guidance must point to doctor: {guidance}"
+    );
+    assert!(
+        guidance_lower.contains("possible")
+            && (guidance_lower.contains("owner") || guidance_lower.contains("process")),
+        "guidance must describe a possible owner without accusation: {guidance}"
+    );
+
+    drop(owner);
+}
+
+fn run_contained_child(test_name: &str, child_env: &str, workspace: &Path) {
+    let mut child =
+        Command::new(std::env::current_exe().expect("integration test executable path"))
+            .args(["--exact", test_name, "--nocapture"])
+            .env(child_env, workspace)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("parent must spawn the exact lock helper child");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let output = child
+                    .wait_with_output()
+                    .expect("parent must collect completed helper output");
+                assert!(
+                    status.success(),
+                    "lock helper failed with {status}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+                return;
+            }
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                let kill_error = child.kill().err();
+                let output = child
+                    .wait_with_output()
+                    .expect("parent must wait for timed-out helper child");
+                panic!(
+                    "lock helper exceeded its 15s bound and was killed ({kill_error:?})\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let output = child
+                    .wait_with_output()
+                    .expect("parent must wait after helper status error");
+                panic!(
+                    "lock helper status check failed: {error}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            }
+        }
+    }
 }
 
 /// Tables whose names begin with `_hyperdb_` are `HyperDB` infrastructure

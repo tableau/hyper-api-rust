@@ -13,7 +13,8 @@
 use rmcp::model::{CallToolRequestParams, CallToolResult, ClientInfo};
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::{ClientHandler, ServiceExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -22,6 +23,8 @@ use hyperdb_mcp::engine::Engine;
 use hyperdb_mcp::server::HyperMcpServer;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+const PERSISTENT_LOCK_MCP_CHILD_ENV: &str = "HYPERDB_MCP_PERSISTENT_LOCK_MCP_CHILD";
 
 /// Minimal client handler — its only job is to satisfy `ServiceExt`
 /// so the server-side tool calls can be issued.
@@ -84,6 +87,43 @@ impl TestHarness {
             Ok(())
         });
 
+        let client = DummyClientHandler
+            .serve(client_io)
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+
+        Ok(Self {
+            client,
+            server_handle,
+            engine_handle,
+            persistent_path,
+            _temp_dir: temp_dir,
+        })
+    }
+
+    /// Same in-memory MCP harness, but attaches a caller-owned persistent
+    /// workspace. The parent of the self-child fixture owns that path's RAII
+    /// directory, so it remains valid for the complete contention scenario.
+    async fn start_at_persistent(
+        persistent_path: PathBuf,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let temp_dir = Arc::new(TempDir::new()?);
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        let workspace = Some(persistent_path.to_string_lossy().to_string());
+        let server = HyperMcpServer::with_no_daemon(workspace, false, true);
+        let engine_handle = server.engine_handle();
+
+        let server_handle = tokio::spawn(async move {
+            let running = server
+                .serve(server_io)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+            running
+                .waiting()
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+            Ok(())
+        });
         let client = DummyClientHandler
             .serve(client_io)
             .await
@@ -200,6 +240,138 @@ fn is_error(result: &CallToolResult) -> bool {
 fn status_json(result: &CallToolResult) -> serde_json::Value {
     serde_json::from_str(&first_text(result).expect("status must return a text payload"))
         .expect("status payload must be JSON")
+}
+
+/// Persistent contention must be reported by the first persistent-routed
+/// operation without making the MCP status endpoint unavailable. The whole
+/// potentially blocking scenario runs in an exact self-child owned by the
+/// parent, which kills and waits on every timeout/error path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistent_lock_keeps_mcp_available() -> TestResult {
+    if let Some(workspace) = std::env::var_os(PERSISTENT_LOCK_MCP_CHILD_ENV) {
+        return run_persistent_lock_mcp_child(PathBuf::from(workspace)).await;
+    }
+
+    let temp_dir = TempDir::new()?;
+    let workspace = temp_dir.path().join("contended-mcp-persistent.hyper");
+    run_contained_mcp_child(
+        "persistent_lock_keeps_mcp_available",
+        PERSISTENT_LOCK_MCP_CHILD_ENV,
+        &workspace,
+    );
+    Ok(())
+}
+
+async fn run_persistent_lock_mcp_child(workspace: PathBuf) -> TestResult {
+    let effective_path = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.clone());
+    let owner = Engine::new_no_daemon(Some(workspace.to_string_lossy().into_owned()))?;
+    let h = TestHarness::start_at_persistent(workspace).await?;
+
+    let status = tokio::time::timeout(
+        Duration::from_secs(2),
+        call_tool(&h.client, "status", serde_json::json!({})),
+    )
+    .await
+    .expect("status must remain promptly available while persistent attachment is contended")?;
+    assert!(
+        !is_error(&status),
+        "status must stay available despite persistent contention: {}",
+        all_text(&status)
+    );
+
+    let query = tokio::time::timeout(
+        Duration::from_secs(2),
+        call_tool(
+            &h.client,
+            "query",
+            serde_json::json!({ "sql": "SELECT 1", "database": "persistent" }),
+        ),
+    )
+    .await
+    .expect("persistent-routed query must return before the child bound")?;
+    assert!(is_error(&query), "contended persistent query must fail");
+    let diagnostic = all_text(&query);
+    assert!(
+        diagnostic.contains("RESOURCE_BUSY"),
+        "must return structured RESOURCE_BUSY: {diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("55006"),
+        "must retain SQLSTATE evidence: {diagnostic}"
+    );
+    assert!(
+        diagnostic.contains(effective_path.to_str().unwrap()),
+        "must name exact effective persistent path {}: {diagnostic}",
+        effective_path.display()
+    );
+    let lower = diagnostic.to_lowercase();
+    assert!(
+        lower.contains("doctor"),
+        "must include doctor guidance: {diagnostic}"
+    );
+    assert!(
+        lower.contains("possible") && (lower.contains("owner") || lower.contains("process")),
+        "must describe a possible owner without accusation: {diagnostic}"
+    );
+
+    h.shutdown().await?;
+    drop(owner);
+    Ok(())
+}
+
+fn run_contained_mcp_child(test_name: &str, child_env: &str, workspace: &Path) {
+    let mut child =
+        Command::new(std::env::current_exe().expect("integration test executable path"))
+            .args(["--exact", test_name, "--nocapture"])
+            .env(child_env, workspace)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("parent must spawn exact MCP lock helper child");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let output = child
+                    .wait_with_output()
+                    .expect("parent must collect completed MCP helper output");
+                assert!(
+                    status.success(),
+                    "MCP lock helper failed with {status}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+                return;
+            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                let kill_error = child.kill().err();
+                let output = child
+                    .wait_with_output()
+                    .expect("parent must wait for timed-out MCP helper child");
+                panic!(
+                    "MCP lock helper exceeded its 15s bound and was killed ({kill_error:?})\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let output = child
+                    .wait_with_output()
+                    .expect("parent must wait after MCP helper status error");
+                panic!(
+                    "MCP lock helper status check failed: {error}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            }
+        }
+    }
 }
 
 /// A normal response and the lock-contended fallback have one installation

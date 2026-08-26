@@ -93,24 +93,18 @@ fn attach_default_persistent(
             "CREATE DATABASE IF NOT EXISTS {}",
             escape_sql_path(&path_str)
         );
-        connection.execute_command(&create_sql).map_err(|e| {
-            McpError::new(
-                ErrorCode::InternalError,
-                format!("Failed to create persistent database: {e}"),
-            )
-        })?;
+        connection
+            .execute_command(&create_sql)
+            .map_err(|e| persistent_attach_error(e, persistent_path))?;
     }
     let attach_sql = format!(
         "ATTACH DATABASE {path} AS \"{alias}\"",
         path = escape_sql_path(&path_str),
         alias = PERSISTENT_ALIAS,
     );
-    connection.execute_command(&attach_sql).map_err(|e| {
-        McpError::new(
-            ErrorCode::InternalError,
-            format!("Failed to attach persistent database: {e}"),
-        )
-    })?;
+    connection
+        .execute_command(&attach_sql)
+        .map_err(|e| persistent_attach_error(e, persistent_path))?;
     // Pin search_path to the primary so unqualified SQL keeps routing
     // there even with the persistent attachment present. Mirrors the
     // logic AttachRegistry uses for user-attached databases.
@@ -125,6 +119,30 @@ fn attach_default_persistent(
         )
     })?;
     Ok(PersistentAttachOutcome { file_was_created })
+}
+
+/// Converts a Hyper error from the reserved persistent-attachment path.
+///
+/// SQLSTATE `55006` has enough meaning to be a lock conflict only here: the
+/// reserved persistent database is being created or attached. Older hyperd
+/// versions omit the structured SQLSTATE, so retain the established wording
+/// fallback for that boundary too.
+fn persistent_attach_error(err: hyperdb_api::Error, persistent_path: &Path) -> McpError {
+    let raw_error = err.to_string();
+    if err.sqlstate() == Some("55006") || crate::error::is_resource_busy(&raw_error) {
+        return McpError::new(
+            ErrorCode::ResourceBusy,
+            format!(
+                "Failed to attach persistent database {}: {raw_error}",
+                persistent_path.display()
+            ),
+        )
+        .with_suggestion(
+            "The persistent database may be held by another process. Run `hyperdb-mcp doctor` to inspect the configuration and possible owner, then close the possible owner or copy the file before retrying.",
+        );
+    }
+
+    McpError::from(err)
 }
 
 /// File-stem of a `.hyper` path as the unqualified database name Hyper
@@ -1973,6 +1991,56 @@ mod statement_helper_tests {
         assert_eq!(
             classify_statement("-- pretend to be readonly\nINSERT INTO t VALUES (1)"),
             StatementKind::Dml
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SQLSTATE 55006 is only a lock conflict in the reserved persistent
+    /// attachment path. The conversion must retain Hyper's diagnostics while
+    /// adding actionable, non-accusatory recovery guidance for that path.
+    #[test]
+    fn persistent_attach_55006_maps_resource_busy() {
+        let persistent_path = PathBuf::from("/tmp/task7-persistent-workspace.hyper");
+        let upstream = hyperdb_api::Error::server(
+            Some("55006".to_string()),
+            "database is already attached by another client connection",
+            None,
+            None,
+        );
+
+        let mapped = persistent_attach_error(upstream, &persistent_path);
+
+        assert_eq!(mapped.code, ErrorCode::ResourceBusy);
+        assert!(
+            mapped.message.contains("55006"),
+            "must retain SQLSTATE evidence: {}",
+            mapped.message
+        );
+        assert!(
+            mapped.message.contains("already attached"),
+            "must retain Hyper's raw diagnostic: {}",
+            mapped.message
+        );
+        assert!(
+            mapped.message.contains(persistent_path.to_str().unwrap()),
+            "must name the exact effective persistent path: {}",
+            mapped.message
+        );
+        let guidance = mapped
+            .suggestion
+            .expect("RESOURCE_BUSY needs recovery guidance");
+        let lower = guidance.to_lowercase();
+        assert!(
+            lower.contains("doctor"),
+            "guidance must direct callers to doctor: {guidance}"
+        );
+        assert!(
+            lower.contains("possible") && (lower.contains("owner") || lower.contains("process")),
+            "guidance must describe a possible owner without accusing one: {guidance}"
         );
     }
 }

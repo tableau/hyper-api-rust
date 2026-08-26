@@ -16,7 +16,7 @@ use serde::Serialize;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ErrorCode {
-    /// The `hyperd` binary was not found at `HYPERD_PATH` or on `PATH`.
+    /// The `hyperd` binary was not found at the configured `HYPERD_PATH`.
     HyperdNotFound,
     /// A file path argument points to a nonexistent or unreadable file.
     FileNotFound,
@@ -115,7 +115,7 @@ impl std::error::Error for McpError {}
 /// phrased as instructions so an LLM can act on them directly.
 fn default_suggestion(code: ErrorCode, _message: &str) -> Option<String> {
     match code {
-        ErrorCode::HyperdNotFound => Some("Set HYPERD_PATH environment variable or ensure hyperd is on PATH".into()),
+        ErrorCode::HyperdNotFound => Some("Set HYPERD_PATH to the hyperd executable (or its containing directory).".into()),
         ErrorCode::FileNotFound => Some("Verify the file path exists and is accessible".into()),
         ErrorCode::UnsupportedFormat => Some("Specify format explicitly: json, csv, parquet, or arrow_ipc".into()),
         ErrorCode::SchemaMismatch => Some("Retry with an explicit schema override".into()),
@@ -127,7 +127,7 @@ fn default_suggestion(code: ErrorCode, _message: &str) -> Option<String> {
         ErrorCode::ReadOnlyViolation => Some("Server is in read-only mode. Use query_data or query_file for one-shot analysis, or restart without --read-only.".into()),
         ErrorCode::ConnectionLost => Some("The hyperd connection was lost or fell out of wire-protocol sync. Retry the request — the server will tear down the engine and reconnect automatically.".into()),
         ErrorCode::InvalidArgument => Some("Check the tool argument shape and allowed values. The message identifies the offending field.".into()),
-        ErrorCode::ResourceBusy => Some("The .hyper file is held by another process. Close the other MCP server (or hyperd instance) that owns it, or copy the file first and attach the copy.".into()),
+        ErrorCode::ResourceBusy => Some("The .hyper file may be held by another process. Run `hyperdb-mcp doctor` to inspect the configuration and possible owner; then close that possible owner or copy the file before attaching the copy.".into()),
         ErrorCode::InternalError => None,
     }
 }
@@ -192,9 +192,12 @@ impl From<hyperdb_api::Error> for McpError {
             return McpError::new(ErrorCode::ConnectionLost, msg);
         }
 
-        // Resource-busy is a hyperd attach-time error; same multi-source
-        // problem as connection-lost.
-        if is_resource_busy(&msg) {
+        // Older hyperd versions can report attach contention only as a
+        // human-readable phrase. Do not let that fallback override an
+        // explicit SQLSTATE: structured server errors need the reserved
+        // persistent-attach boundary to determine whether `55006` is a
+        // database lock rather than an unrelated object-in-use conflict.
+        if err.sqlstate().is_none() && is_resource_busy(&msg) {
             return McpError::new(ErrorCode::ResourceBusy, msg);
         }
 
@@ -311,7 +314,7 @@ pub fn is_connection_lost(msg: &str) -> bool {
 /// [`ErrorCode::ResourceBusy`] instead of a generic internal error.
 /// Matches the wording hyperd uses when a `.hyper` file is locked or
 /// already attached by another process.
-fn is_resource_busy(msg: &str) -> bool {
+pub(crate) fn is_resource_busy(msg: &str) -> bool {
     let lower = msg.to_lowercase();
     lower.contains("already attached")
         || lower.contains("database is in use")
