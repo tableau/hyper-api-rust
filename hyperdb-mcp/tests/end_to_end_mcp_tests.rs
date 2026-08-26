@@ -14,9 +14,11 @@ use rmcp::model::{CallToolRequestParams, CallToolResult, ClientInfo};
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::{ClientHandler, ServiceExt};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+use hyperdb_mcp::engine::Engine;
 use hyperdb_mcp::server::HyperMcpServer;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -36,6 +38,8 @@ impl ClientHandler for DummyClientHandler {
 struct TestHarness {
     client: RunningService<RoleClient, DummyClientHandler>,
     server_handle: tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    /// Shared engine handle retained for status-lock regression scenarios.
+    engine_handle: Arc<Mutex<Option<Engine>>>,
     /// Persistent workspace path — kept alive via the temp dir.
     /// Held by the harness so individual tests can read it back if a
     /// scenario ever needs to inspect the on-disk file directly.
@@ -66,6 +70,7 @@ impl TestHarness {
             Some(persistent_path.to_string_lossy().to_string())
         };
         let server = HyperMcpServer::with_no_daemon(workspace, read_only, true);
+        let engine_handle = server.engine_handle();
 
         let server_handle = tokio::spawn(async move {
             let running = server
@@ -87,6 +92,7 @@ impl TestHarness {
         Ok(Self {
             client,
             server_handle,
+            engine_handle,
             persistent_path,
             _temp_dir: temp_dir,
         })
@@ -99,6 +105,48 @@ impl TestHarness {
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
         self.server_handle.await??;
         Ok(())
+    }
+}
+
+/// A native thread holds the engine mutex until this guard is dropped. Keeping
+/// the lock outside Tokio means a non-Send `MutexGuard` never crosses an
+/// `.await`, while `Drop` releases the fixture even when an assertion panics.
+struct EngineLockHolder {
+    release: Option<mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for EngineLockHolder {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .expect("engine-lock fixture thread must finish");
+        }
+    }
+}
+
+/// Lock the server engine on a native thread and wait until it definitely owns
+/// the mutex before issuing a status request.
+fn hold_engine_lock(engine_handle: Arc<Mutex<Option<Engine>>>) -> EngineLockHolder {
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let _guard = engine_handle.lock().expect("engine mutex");
+        ready_tx.send(()).expect("test must await engine lock");
+        release_rx.recv().expect("test must release engine lock");
+    });
+
+    ready_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("engine-lock fixture must become ready promptly");
+
+    EngineLockHolder {
+        release: Some(release_tx),
+        thread: Some(thread),
     }
 }
 
@@ -146,6 +194,138 @@ fn all_text(result: &CallToolResult) -> String {
 /// Did the tool return an `is_error: true` content block?
 fn is_error(result: &CallToolResult) -> bool {
     result.is_error.unwrap_or(false)
+}
+
+/// Parse the sole JSON text block emitted by the `status` tool.
+fn status_json(result: &CallToolResult) -> serde_json::Value {
+    serde_json::from_str(&first_text(result).expect("status must return a text payload"))
+        .expect("status payload must be JSON")
+}
+
+/// A normal response and the lock-contended fallback have one installation
+/// identity contract. Only engine-dependent statistics may be absent when the
+/// fallback says `engine_busy: true`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_full_and_degraded_share_identity_contract() -> TestResult {
+    let h = TestHarness::start(false, false).await?;
+
+    // Ensure the server's eager warm-up has completed before observing the
+    // uncontended branch; otherwise startup itself legitimately uses the
+    // degraded response while the engine is still absent.
+    let warm_up = call_tool(
+        &h.client,
+        "query",
+        serde_json::json!({ "sql": "SELECT 1 AS ready" }),
+    )
+    .await?;
+    assert!(
+        !is_error(&warm_up),
+        "query must initialize the engine: {:?}",
+        first_text(&warm_up)
+    );
+
+    let full_result = call_tool(&h.client, "status", serde_json::json!({})).await?;
+    assert!(!is_error(&full_result), "full status must succeed");
+    let full = status_json(&full_result);
+    assert_eq!(full["engine_busy"], false, "uncontended status is full");
+
+    let _engine_lock = hold_engine_lock(Arc::clone(&h.engine_handle));
+    let degraded_result = call_tool(&h.client, "status", serde_json::json!({})).await?;
+    assert!(!is_error(&degraded_result), "degraded status must succeed");
+    let degraded = status_json(&degraded_result);
+    assert_eq!(degraded["engine_busy"], true, "lock contention is explicit");
+
+    for key in [
+        "mcp_version",
+        "hyper_rust_api_version",
+        "installation",
+        "default_database",
+    ] {
+        assert!(
+            full.get(key).is_some(),
+            "full status missing `{key}`: {full}"
+        );
+        assert!(
+            degraded.get(key).is_some(),
+            "degraded status missing `{key}`: {degraded}"
+        );
+        assert_eq!(
+            full[key], degraded[key],
+            "full and degraded status disagree on `{key}`"
+        );
+    }
+
+    assert_eq!(
+        full["mcp_version"],
+        hyperdb_mcp::version::mcp_version_string()
+    );
+    assert_eq!(
+        full["hyper_rust_api_version"],
+        hyperdb_mcp::version::hyper_api_version_string()
+    );
+    assert!(
+        full["installation"].is_object(),
+        "installation must be a structured identity: {}",
+        full["installation"]
+    );
+    assert_eq!(full["default_database"], "local");
+
+    drop(_engine_lock);
+    h.shutdown().await
+}
+
+/// The status fast path must not wait behind an in-flight data-plane lock and
+/// must honestly omit fields that require that lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_degraded_returns_promptly_while_engine_locked() -> TestResult {
+    let h = TestHarness::start(false, false).await?;
+    let _engine_lock = hold_engine_lock(Arc::clone(&h.engine_handle));
+
+    let started = Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        call_tool(&h.client, "status", serde_json::json!({})),
+    )
+    .await
+    .expect("status must return before the explicit one-second bound")?;
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "status exceeded its one-second prompt-return bound"
+    );
+    assert!(!is_error(&result), "degraded status must succeed");
+    let status = status_json(&result);
+
+    assert_eq!(status["engine_busy"], true);
+    assert_eq!(
+        status["mcp_version"],
+        hyperdb_mcp::version::mcp_version_string(),
+        "degraded status must retain the MCP identity"
+    );
+    assert_eq!(
+        status["hyper_rust_api_version"],
+        hyperdb_mcp::version::hyper_api_version_string(),
+        "degraded status must retain the underlying API identity"
+    );
+    assert!(
+        status["installation"].is_object(),
+        "degraded status must retain installation identity"
+    );
+    assert_eq!(status["default_database"], "local");
+    for omitted in [
+        "table_count",
+        "total_rows",
+        "disk_usage_bytes",
+        "ephemeral_path",
+        "logs",
+    ] {
+        assert!(
+            status.get(omitted).is_none(),
+            "degraded status must omit `{omitted}`: {status}"
+        );
+    }
+
+    drop(_engine_lock);
+    h.shutdown().await
 }
 
 // =====================================================================

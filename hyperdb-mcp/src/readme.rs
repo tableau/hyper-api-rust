@@ -149,7 +149,10 @@ watcher targets the alias; call `unwatch_directory` first.
 - `inspect_file` — dry-run schema inference on a CSV / Parquet / Arrow
   IPC file without loading it.
 - `status` — plugin health, workspace path, table count, total rows,
-  disk usage, watchers, attached databases, read-only flag.
+  disk usage, watchers, attached databases, read-only flag. When
+  `engine_busy: true`, the response is partial and non-definitive:
+  `hyperd_running: false` is inconclusive; retry `status` for full
+  statistics after the in-progress operation completes.
 
 ### Export
 - `export` — write a table or query result to a file (Parquet, Iceberg,

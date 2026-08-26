@@ -1642,7 +1642,7 @@ impl HyperMcpServer {
     ///
     /// Clients should check `engine_busy: true` and retry `status` later if
     /// they need the full stats, or wait for the in-progress operation to finish.
-    fn status_degraded(&self) -> Value {
+    fn status_degraded(&self) -> Result<Value, McpError> {
         // Use discover() — NOT find_running_daemon(). discover() reads the
         // daemon.json file + one PING to the known health port (~1ms if alive,
         // 300ms timeout if dead). find_running_daemon() adds a 16-port scan on
@@ -1683,17 +1683,60 @@ impl HyperMcpServer {
             .map(super::attach::AttachedDb::to_json)
             .collect();
 
-        json!({
-            "engine_busy": true,
-            "hyperd_running": hyperd_running,
-            "persistent_path": persistent_path,
-            "has_persistent": self.workspace_path.is_some(),
-            "engine": engine_block,
-            "hyper_rust_api_version": crate::version::mcp_version_string(),
-            "watchers": self.watchers.to_json(),
-            "read_only": self.read_only,
-            "attachments": attachments,
-        })
+        self.augment_status_response(
+            json!({
+                "hyperd_running": hyperd_running,
+                "persistent_path": persistent_path,
+                "has_persistent": self.workspace_path.is_some(),
+                "engine": engine_block,
+            }),
+            true,
+            attachments,
+        )
+    }
+
+    /// Add server-owned status facts to either a full engine response or the
+    /// lock-contended degraded response. Engine-owned metrics remain intact.
+    fn augment_status_response(
+        &self,
+        mut status: Value,
+        engine_busy: bool,
+        attachments: Vec<Value>,
+    ) -> Result<Value, McpError> {
+        let installation = crate::diagnostics::current_installation_identity().map_err(|e| {
+            McpError::new(
+                ErrorCode::InternalError,
+                format!("Could not identify the current MCP installation: {e}"),
+            )
+        })?;
+        let installation = serde_json::to_value(installation).map_err(|e| {
+            McpError::new(
+                ErrorCode::InternalError,
+                format!("Could not serialize MCP installation identity: {e}"),
+            )
+        })?;
+        let status = status.as_object_mut().ok_or_else(|| {
+            McpError::new(
+                ErrorCode::InternalError,
+                "Status response must be a JSON object",
+            )
+        })?;
+
+        status.insert("engine_busy".into(), json!(engine_busy));
+        status.insert(
+            "mcp_version".into(),
+            json!(crate::version::mcp_version_string()),
+        );
+        status.insert(
+            "hyper_rust_api_version".into(),
+            json!(crate::version::hyper_api_version_string()),
+        );
+        status.insert("installation".into(), installation);
+        status.insert("default_database".into(), json!("local"));
+        status.insert("watchers".into(), self.watchers.to_json());
+        status.insert("read_only".into(), json!(self.read_only));
+        status.insert("attachments".into(), Value::Array(attachments));
+        Ok(status.clone().into())
     }
 
     /// Run a closure that accesses the saved-query store.
@@ -3614,29 +3657,32 @@ impl HyperMcpServer {
         // hyperd was down at startup, or a ConnectionLost just dropped it), we
         // report the degraded response honestly rather than blocking to init.
         let Ok(guard) = self.engine.try_lock() else {
-            return Self::ok_content(self.status_degraded());
+            return match self.status_degraded() {
+                Ok(status) => Self::ok_content(status),
+                Err(e) => Self::err_content(e),
+            };
         };
         let Some(engine) = guard.as_ref() else {
-            return Self::ok_content(self.status_degraded());
+            return match self.status_degraded() {
+                Ok(status) => Self::ok_content(status),
+                Err(e) => Self::err_content(e),
+            };
         };
         self.ensure_catalog_ready(engine);
         let result = engine.status();
 
         match result {
-            Ok(mut val) => {
-                if let Some(obj) = val.as_object_mut() {
-                    obj.insert("engine_busy".into(), json!(false));
-                    obj.insert("watchers".into(), self.watchers.to_json());
-                    obj.insert("read_only".into(), json!(self.read_only));
-                    let attachments: Vec<Value> = self
-                        .attachments
-                        .list()
-                        .iter()
-                        .map(super::attach::AttachedDb::to_json)
-                        .collect();
-                    obj.insert("attachments".into(), Value::Array(attachments));
+            Ok(val) => {
+                let attachments = self
+                    .attachments
+                    .list()
+                    .iter()
+                    .map(super::attach::AttachedDb::to_json)
+                    .collect();
+                match self.augment_status_response(val, false, attachments) {
+                    Ok(status) => Self::ok_content(status),
+                    Err(e) => Self::err_content(e),
                 }
-                Self::ok_content(val)
             }
             Err(e) => Self::err_content(e),
         }
@@ -4396,18 +4442,19 @@ impl HyperMcpServer {
             .with_engine(super::engine::Engine::describe_tables)
             .unwrap_or_default();
 
-        let workspace_mode = status
-            .get("workspace_mode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let workspace_path = status
-            .get("workspace_path")
+        let workspace_mode = if status
+            .get("has_persistent")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            "persistent"
+        } else {
+            "ephemeral"
+        };
+        let persistent_path = status
+            .get("persistent_path")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let read_only = status
-            .get("read_only")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
         let table_count = tables.len();
 
         let mut md = String::new();
@@ -4415,10 +4462,10 @@ impl HyperMcpServer {
         let _ = writeln!(
             md,
             "- Mode: **{workspace_mode}**{}\n",
-            if read_only { " (read-only)" } else { "" }
+            if self.read_only { " (read-only)" } else { "" }
         );
-        if !workspace_path.is_empty() {
-            let _ = writeln!(md, "- Path: `{workspace_path}`\n");
+        if !persistent_path.is_empty() {
+            let _ = writeln!(md, "- Path: `{persistent_path}`\n");
         }
         let _ = write!(md, "- Tables: **{table_count}**\n\n");
 

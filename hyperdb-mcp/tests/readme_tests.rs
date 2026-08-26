@@ -142,3 +142,30 @@ fn doctor_readme_contract() {
         "doctor documentation must warn users to review local paths before sharing:\n{doctor_scope}"
     );
 }
+
+/// `status` can return a deliberately partial response while another tool
+/// owns the engine mutex. The LLM-facing README must prevent clients from
+/// treating that fallback as definitive and tell them how to obtain full data.
+#[test]
+fn readme_degraded_status_contract() {
+    assert!(
+        README.contains("engine_busy: true"),
+        "README must name the degraded-status signal"
+    );
+    assert!(
+        README.contains("partial"),
+        "README must label engine_busy status as partial/non-definitive"
+    );
+    assert!(
+        README.contains("hyperd_running: false"),
+        "README must document the degraded hyperd_running value"
+    );
+    assert!(
+        README.contains("inconclusive") || README.contains("non-definitive"),
+        "README must say degraded hyperd_running: false is inconclusive"
+    );
+    assert!(
+        README.contains("retry"),
+        "README must guide clients to retry status for full statistics"
+    );
+}

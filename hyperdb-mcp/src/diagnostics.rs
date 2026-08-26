@@ -185,6 +185,21 @@ pub enum DoctorReportError {
     Catalog(#[from] serde_json::Error),
 }
 
+/// Collect the installation identity shared by `doctor` and MCP `status`.
+///
+/// This only inspects process metadata and the bounded launcher environment
+/// value. It deliberately performs no daemon, filesystem, or database probe.
+pub fn current_installation_identity() -> Result<InstallationIdentity, io::Error> {
+    let current_executable = std::env::current_exe()?;
+    let launcher_info = std::env::var_os("HYPERDB_MCP_LAUNCHER_INFO");
+    Ok(installation_identity_from_parts(
+        current_executable.as_os_str(),
+        &crate::version::mcp_version_string(),
+        &crate::version::hyper_api_version_string(),
+        launcher_info.as_deref(),
+    ))
+}
+
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum DoctorStatus {
@@ -530,15 +545,8 @@ fn discovery_fact_mismatches(
 pub fn collect_doctor_report(
     options: DoctorOptions<'_>,
 ) -> Result<DoctorReport, DoctorReportError> {
-    let current_executable =
-        std::env::current_exe().map_err(DoctorReportError::CurrentExecutable)?;
-    let launcher_info = std::env::var_os("HYPERDB_MCP_LAUNCHER_INFO");
-    let installation = installation_identity_from_parts(
-        current_executable.as_os_str(),
-        &crate::version::mcp_version_string(),
-        &crate::version::hyper_api_version_string(),
-        launcher_info.as_deref(),
-    );
+    let installation =
+        current_installation_identity().map_err(DoctorReportError::CurrentExecutable)?;
 
     let resolved = crate::paths::resolve_persistent_db_path_with_source(
         options.persistent_db,

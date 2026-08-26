@@ -88,6 +88,35 @@ fn read_workspace_resource_returns_status() {
     assert!(version.contains(".r"));
 }
 
+/// The workspace README derives persistence from the status keys that
+/// `Engine::status` actually emits, and derives the read-only marker from the
+/// server configuration rather than a nonexistent engine-status key.
+#[test]
+fn resource_status_renderer_uses_actual_engine_keys() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("readonly-persistent.hyper");
+    let server = HyperMcpServer::with_no_daemon(Some(path.to_string_lossy().into()), true, true);
+
+    let body = server
+        .resource_body_for_uri("hyper://readme")
+        .unwrap()
+        .expect("workspace readme resource should exist");
+    let text = body.to_text();
+
+    assert!(
+        text.contains("- Mode: **persistent** (read-only)"),
+        "README must render persistence and server read-only state: {text}"
+    );
+    assert!(
+        text.contains(&format!("- Path: `{}`", path.display())),
+        "README must render Engine::status persistent_path: {text}"
+    );
+    assert!(
+        !text.contains("**unknown**"),
+        "README must not consult obsolete workspace_mode: {text}"
+    );
+}
+
 /// Verify that reading <hyper://tables> returns the tables list with schemas
 /// and row counts.
 #[test]
