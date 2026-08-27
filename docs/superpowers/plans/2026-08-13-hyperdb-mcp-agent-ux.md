@@ -25,7 +25,7 @@ Clap; serde/schemars; Plotters 0.3.7; CommonJS Node wrapper; real `hyperd` via
 **Design specification:**
 `docs/superpowers/specs/2026-08-13-hyperdb-mcp-agent-ux-design.md`
 
-**Base:** `origin/main` @ `87e0b9d`
+**Final integration base:** `origin/main` @ `e609061` (plan originally approved at `87e0b9d`)
 **Branch:** `codex/hyperdb-mcp-agent-ux`
 **Worktree:**
 `/Users/ssteiner/Documents/Codex/2026-08-12/insta/hyper-api-rust-mcp-ux`

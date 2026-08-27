@@ -6,7 +6,7 @@
 
 **Author:** Stefan Steiner with Codex Desktop (ultra reasoning)
 
-**Base branch:** `origin/main` @ `87e0b9d`
+**Final integration base:** `origin/main` @ `e609061` (design originally approved at `87e0b9d`)
 
 **Working branch:** `codex/hyperdb-mcp-agent-ux`
 
