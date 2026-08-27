@@ -1275,6 +1275,33 @@ impl HyperMcpServer {
         Ok(Some(resolved))
     }
 
+    /// Return the canonical name of the database a successful tool call used.
+    /// The primary ephemeral database is addressed as `local` in MCP results.
+    fn resolved_database_name(target_db: Option<&str>) -> &str {
+        target_db.unwrap_or(LOCAL_ALIAS)
+    }
+
+    /// Add database-routing metadata to a successful object payload.
+    ///
+    /// Tool errors retain their established error response shape, so this
+    /// helper rejects non-object values rather than wrapping them.
+    fn with_resolved_database(
+        mut payload: Value,
+        target_db: Option<&str>,
+    ) -> Result<Value, McpError> {
+        let object = payload.as_object_mut().ok_or_else(|| {
+            McpError::new(
+                ErrorCode::InternalError,
+                "successful tool response must be a JSON object",
+            )
+        })?;
+        object.insert(
+            "resolved_database".into(),
+            Value::String(Self::resolved_database_name(target_db).to_owned()),
+        );
+        Ok(payload)
+    }
+
     /// Soft threshold (bytes) above which a single KV value triggers a non-fatal
     /// `warning` in the write response. The write always succeeds.
     const KV_SOFT_SIZE_WARN_BYTES: usize = 1_048_576;
@@ -2617,10 +2644,14 @@ impl HyperMcpServer {
             let elapsed = timer.elapsed_ms();
             let stats = crate::stats::QueryStats {
                 operation: "query".into(),
-                rows_returned: rows.len() as u64,
+                rows_returned: u64::try_from(rows.len())
+                    .expect("usize query result count always fits in u64"),
                 rows_scanned: 0,
                 elapsed_ms: elapsed,
-                result_size_bytes: serde_json::to_string(&rows).map_or(0, |s| s.len() as u64),
+                result_size_bytes: serde_json::to_string(&rows).map_or(0, |serialized| {
+                    u64::try_from(serialized.len())
+                        .expect("usize serialized query size always fits in u64")
+                }),
                 tables_touched: vec![],
             };
             let payload = if truncated {
@@ -2642,7 +2673,8 @@ impl HyperMcpServer {
                     "stats": stats.to_json(),
                 })
             };
-            Ok((params.sql.clone(), payload))
+            Self::with_resolved_database(payload, target_db.as_deref())
+                .map(|payload| (params.sql.clone(), payload))
         });
 
         match result {
@@ -2768,12 +2800,12 @@ impl HyperMcpServer {
             if any_structural {
                 self.after_execute_catalog_update(engine, target_db.as_deref());
             }
-            Ok(json!({
+            Self::with_resolved_database(json!({
                 "statements": per_statement.len(),
                 "affected_rows": affected_total,
                 "per_statement": per_statement,
                 "stats": { "operation": operation, "elapsed_ms": elapsed },
-            }))
+            }), target_db.as_deref())
         });
 
         match result {
@@ -2812,7 +2844,7 @@ impl HyperMcpServer {
                     json!({ "operation": "sample", "elapsed_ms": elapsed }),
                 );
             }
-            Ok(sample)
+            Self::with_resolved_database(sample, target_db.as_deref())
         });
 
         match result {
@@ -2908,11 +2940,11 @@ impl HyperMcpServer {
             }
 
             let elapsed = timer.elapsed_ms();
-            Ok((chart, elapsed, opts, disposition))
+            Ok((chart, elapsed, opts, disposition, target_db))
         });
 
         match result {
-            Ok((chart, elapsed_ms, opts, disposition)) => {
+            Ok((chart, elapsed_ms, opts, disposition, target_db)) => {
                 let format_str = match opts.format {
                     ChartFormat::Png => "png",
                     ChartFormat::Svg => "svg",
@@ -2932,8 +2964,14 @@ impl HyperMcpServer {
                 if let Some(p) = output_path_str {
                     stats.insert("output_path".into(), json!(p));
                 }
-                let stats_text =
-                    serde_json::to_string_pretty(&Value::Object(stats)).unwrap_or_default();
+                let stats = match Self::with_resolved_database(
+                    Value::Object(stats),
+                    target_db.as_deref(),
+                ) {
+                    Ok(stats) => stats,
+                    Err(e) => return Self::err_content(e),
+                };
+                let stats_text = serde_json::to_string_pretty(&stats).unwrap_or_default();
 
                 let mut content = Vec::with_capacity(2);
                 if wants_inline {
@@ -3042,16 +3080,17 @@ impl HyperMcpServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self.with_engine(|engine| {
             let target_db = self.resolve_db(engine, params.database.as_deref(), None, false)?;
-            match params.table.as_deref() {
+            let tables = match params.table.as_deref() {
                 Some(name) => engine
                     .describe_table_in(target_db.as_deref(), name)
                     .map(|t| vec![t]),
                 None => engine.describe_tables_in(target_db.as_deref()),
-            }
+            }?;
+            Self::with_resolved_database(json!({"tables": tables}), target_db.as_deref())
         });
 
         match result {
-            Ok(tables) => Self::ok_content(json!({"tables": tables})),
+            Ok(val) => Self::ok_content(val),
             Err(e) => Self::err_content(e),
         }
     }

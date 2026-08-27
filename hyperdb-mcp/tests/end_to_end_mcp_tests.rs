@@ -231,6 +231,184 @@ fn all_text(result: &CallToolResult) -> String {
         .join("\n")
 }
 
+/// Record a successful object response that must remain mirrored between its
+/// sole text block and `structuredContent`. Returns the parsed text payload so
+/// callers can pin their tool-specific legacy fields as well.
+fn record_object_response(
+    failures: &mut Vec<String>,
+    case: &str,
+    result: &CallToolResult,
+    expected_database: &str,
+    expected_fields: &[&str],
+) -> Option<serde_json::Value> {
+    if is_error(result) {
+        failures.push(format!(
+            "{case}: tool returned an error: {:?}",
+            first_text(result)
+        ));
+    }
+    if result.content.len() != 1 {
+        failures.push(format!(
+            "{case}: expected one JSON text block, got {} content blocks",
+            result.content.len()
+        ));
+    }
+
+    let Some(text) = result
+        .content
+        .first()
+        .and_then(|content| content.raw.as_text())
+        .map(|content| content.text.as_str())
+    else {
+        failures.push(format!("{case}: first content block must be text JSON"));
+        return None;
+    };
+    let payload = match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(payload) => payload,
+        Err(error) => {
+            failures.push(format!("{case}: text block is not JSON: {error}"));
+            return None;
+        }
+    };
+
+    if result.structured_content.as_ref() != Some(&payload) {
+        failures.push(format!(
+            "{case}: structuredContent must exactly mirror the JSON text block"
+        ));
+    }
+    let Some(object) = payload.as_object() else {
+        failures.push(format!("{case}: JSON payload must be an object"));
+        return Some(payload);
+    };
+    let mut actual_fields: Vec<_> = object.keys().map(String::as_str).collect();
+    actual_fields.sort_unstable();
+    let mut expected_fields = expected_fields.to_vec();
+    expected_fields.sort_unstable();
+    if actual_fields != expected_fields {
+        failures.push(format!(
+            "{case}: top-level fields changed: expected {expected_fields:?}, got {actual_fields:?}"
+        ));
+    }
+    if object.get("resolved_database") != Some(&serde_json::json!(expected_database)) {
+        failures.push(format!(
+            "{case}: resolved_database must be {expected_database:?}, got {:?}",
+            object.get("resolved_database")
+        ));
+    }
+    Some(payload)
+}
+
+/// Record the query tool's intentionally non-standard two-text-block result.
+/// Query has no structuredContent, and its JSON payload is specifically the
+/// second block after formatted SQL.
+fn record_query_response(
+    failures: &mut Vec<String>,
+    case: &str,
+    result: &CallToolResult,
+    expected_database: &str,
+    expected_sql: &str,
+    expected_rows: serde_json::Value,
+) {
+    if is_error(result) {
+        failures.push(format!(
+            "{case}: tool returned an error: {:?}",
+            first_text(result)
+        ));
+    }
+    if result.structured_content.is_some() {
+        failures.push(format!("{case}: query must not add structuredContent"));
+    }
+    if result.content.len() != 2 {
+        failures.push(format!(
+            "{case}: query must preserve SQL-text then JSON-text content order; got {} blocks",
+            result.content.len()
+        ));
+    }
+
+    let sql_text = result
+        .content
+        .first()
+        .and_then(|content| content.raw.as_text())
+        .map(|content| content.text.as_str());
+    let expected_sql_block = format!("```sql\n{expected_sql}\n```");
+    if sql_text != Some(expected_sql_block.as_str()) {
+        failures.push(format!(
+            "{case}: formatted SQL block changed: expected {expected_sql_block:?}, got {sql_text:?}"
+        ));
+    }
+
+    let Some(json_text) = result
+        .content
+        .get(1)
+        .and_then(|content| content.raw.as_text())
+        .map(|content| content.text.as_str())
+    else {
+        failures.push(format!("{case}: second query block must be JSON text"));
+        return;
+    };
+    let payload = match serde_json::from_str::<serde_json::Value>(json_text) {
+        Ok(payload) => payload,
+        Err(error) => {
+            failures.push(format!("{case}: second query block is not JSON: {error}"));
+            return;
+        }
+    };
+    let Some(object) = payload.as_object() else {
+        failures.push(format!("{case}: query JSON payload must be an object"));
+        return;
+    };
+    let mut actual_fields: Vec<_> = object.keys().map(String::as_str).collect();
+    actual_fields.sort_unstable();
+    let mut expected_fields = vec!["result", "resolved_database", "stats"];
+    expected_fields.sort_unstable();
+    if actual_fields != expected_fields {
+        failures.push(format!(
+            "{case}: query top-level fields changed: expected {expected_fields:?}, got {actual_fields:?}"
+        ));
+    }
+    if object.get("result") != Some(&expected_rows) {
+        failures.push(format!(
+            "{case}: query result changed: expected {expected_rows}, got {:?}",
+            object.get("result")
+        ));
+    }
+    if object.get("resolved_database") != Some(&serde_json::json!(expected_database)) {
+        failures.push(format!(
+            "{case}: resolved_database must be {expected_database:?}, got {:?}",
+            object.get("resolved_database")
+        ));
+    }
+    let stats = object.get("stats").and_then(serde_json::Value::as_object);
+    let expected_stats = [
+        "elapsed_ms",
+        "operation",
+        "result_size_bytes",
+        "rows_returned",
+        "rows_scanned",
+        "scan_rate_rows_sec",
+        "tables_touched",
+    ];
+    let mut actual_stats = stats
+        .map(|stats| stats.keys().map(String::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    actual_stats.sort_unstable();
+    if actual_stats != expected_stats {
+        failures.push(format!(
+            "{case}: query stats fields changed: expected {expected_stats:?}, got {actual_stats:?}"
+        ));
+    }
+    if object["stats"]["operation"] != serde_json::json!("query") {
+        failures.push(format!("{case}: query stats.operation must remain query"));
+    }
+    if object["stats"]["rows_returned"]
+        != serde_json::json!(expected_rows.as_array().map_or(0, Vec::len))
+    {
+        failures.push(format!(
+            "{case}: query stats.rows_returned must mirror result length"
+        ));
+    }
+}
+
 /// Did the tool return an `is_error: true` content block?
 fn is_error(result: &CallToolResult) -> bool {
     result.is_error.unwrap_or(false)
@@ -1216,4 +1394,592 @@ async fn tool_execute_singleton_uses_auto_commit_path() -> TestResult {
         "singleton must report statements=1; got: {body}"
     );
     h.shutdown().await
+}
+
+/// All query-oriented tools expose the canonical database they actually used,
+/// without changing their established payloads or MCP content layouts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resolved_database_query_success_shapes() -> TestResult {
+    let h = TestHarness::start(false, false).await?;
+    let attached_dir = TempDir::new()?;
+    let attached_path = attached_dir.path().join("attached.hyper");
+    let mut failures = Vec::new();
+
+    // The primary starts with no user tables (the durable catalog lives in
+    // the separate persistent attachment), so this is the successful empty
+    // listing branch before the remaining fixture tables are created.
+    match call_tool(&h.client, "describe", serde_json::json!({})).await {
+        Ok(result) => {
+            if let Some(payload) = record_object_response(
+                &mut failures,
+                "describe empty local listing",
+                &result,
+                "local",
+                &["resolved_database", "tables"],
+            ) {
+                if payload["tables"] != serde_json::json!([]) {
+                    failures.push(format!(
+                        "describe empty local listing: tables must remain an empty array, got {:?}",
+                        payload.get("tables")
+                    ));
+                }
+            }
+        }
+        Err(error) => failures.push(format!(
+            "describe empty local listing: MCP call failed: {error}"
+        )),
+    }
+
+    // Fixture setup intentionally uses the normal tool surface so each routed
+    // call below observes the same search-path and attachment behavior users
+    // get. The calls under test are aggregated later, rather than stopping at
+    // the first missing resolved_database field.
+    for (case, tool, args) in [
+        (
+            "setup local table",
+            "execute",
+            serde_json::json!({ "sql": ["CREATE TABLE local_rows (x INT, label TEXT)"] }),
+        ),
+        (
+            "setup persistent empty table",
+            "execute",
+            serde_json::json!({
+                "sql": ["CREATE TABLE persistent_empty (x INT)"],
+                "database": "PERSISTENT"
+            }),
+        ),
+        (
+            "setup truncation table",
+            "execute",
+            serde_json::json!({
+                "sql": [
+                    "CREATE TABLE truncation_rows AS SELECT i FROM generate_series(1, 10001) s(i)"
+                ]
+            }),
+        ),
+        (
+            "setup mixed-case attachment",
+            "attach_database",
+            serde_json::json!({
+                "alias": "MiXeD_Attached",
+                "kind": "local_file",
+                "path": attached_path.to_string_lossy(),
+                "writable": true,
+                "on_missing": "create"
+            }),
+        ),
+        (
+            "setup attached table",
+            "execute",
+            serde_json::json!({
+                "sql": ["CREATE TABLE attached_rows (x INT)"],
+                "database": "MIXED_ATTACHED"
+            }),
+        ),
+    ] {
+        let result = call_tool(&h.client, tool, args).await?;
+        if is_error(&result) {
+            return Err(format!("{case} failed: {:?}", first_text(&result)).into());
+        }
+    }
+
+    macro_rules! call_case {
+        ($case:expr, $tool:expr, $args:expr) => {
+            match call_tool(&h.client, $tool, $args).await {
+                Ok(result) => Some(result),
+                Err(error) => {
+                    failures.push(format!("{}: MCP call failed: {error}", $case));
+                    None
+                }
+            }
+        };
+    }
+
+    // Execute preserves both singleton and transaction response shapes while
+    // covering the default primary and the canonicalized attached alias.
+    if let Some(result) = call_case!(
+        "execute local transaction",
+        "execute",
+        serde_json::json!({
+            "sql": [
+                "INSERT INTO local_rows VALUES (1, 'local')",
+                "INSERT INTO local_rows VALUES (2, 'second')"
+            ]
+        })
+    ) {
+        if let Some(payload) = record_object_response(
+            &mut failures,
+            "execute local transaction",
+            &result,
+            "local",
+            &[
+                "affected_rows",
+                "per_statement",
+                "resolved_database",
+                "statements",
+                "stats",
+            ],
+        ) {
+            if payload["statements"] != serde_json::json!(2)
+                || payload["affected_rows"] != serde_json::json!(2)
+                || payload["stats"]["operation"] != serde_json::json!("transaction")
+                || payload["per_statement"].as_array().map_or(0, Vec::len) != 2
+            {
+                failures.push(
+                    "execute local transaction: legacy transaction counters or operation changed"
+                        .into(),
+                );
+            }
+        }
+    }
+    if let Some(result) = call_case!(
+        "execute attached command",
+        "execute",
+        serde_json::json!({
+            "sql": ["INSERT INTO attached_rows VALUES (7)"],
+            "database": "MiXeD_AtTaChEd"
+        })
+    ) {
+        if let Some(payload) = record_object_response(
+            &mut failures,
+            "execute attached command",
+            &result,
+            "mixed_attached",
+            &[
+                "affected_rows",
+                "per_statement",
+                "resolved_database",
+                "statements",
+                "stats",
+            ],
+        ) {
+            if payload["statements"] != serde_json::json!(1)
+                || payload["affected_rows"] != serde_json::json!(1)
+                || payload["stats"]["operation"] != serde_json::json!("command")
+                || payload["per_statement"].as_array().map_or(0, Vec::len) != 1
+            {
+                failures.push(
+                    "execute attached command: legacy command counters or operation changed".into(),
+                );
+            }
+        }
+    }
+
+    // Query's JSON is deliberately the *second* text block. Exercise both a
+    // normal result and the existing successful zero-row result.
+    if let Some(result) = call_case!(
+        "query local rows",
+        "query",
+        serde_json::json!({ "sql": "SELECT x FROM local_rows WHERE x = 1" })
+    ) {
+        record_query_response(
+            &mut failures,
+            "query local rows",
+            &result,
+            "local",
+            "SELECT\n  x\nFROM\n  local_rows\nWHERE\n  x = 1",
+            serde_json::json!([{ "x": 1 }]),
+        );
+    }
+    if let Some(result) = call_case!(
+        "query persistent zero rows",
+        "query",
+        serde_json::json!({
+            "sql": "SELECT x FROM persistent_empty",
+            "database": "PERSISTENT"
+        })
+    ) {
+        record_query_response(
+            &mut failures,
+            "query persistent zero rows",
+            &result,
+            "persistent",
+            "SELECT\n  x\nFROM\n  persistent_empty",
+            serde_json::json!([]),
+        );
+    }
+    if let Some(result) = call_case!(
+        "query attached mixed case",
+        "query",
+        serde_json::json!({
+            "sql": "SELECT x FROM attached_rows",
+            "database": "MiXeD_AtTaChEd"
+        })
+    ) {
+        record_query_response(
+            &mut failures,
+            "query attached mixed case",
+            &result,
+            "mixed_attached",
+            "SELECT\n  x\nFROM\n  attached_rows",
+            serde_json::json!([{ "x": 7 }]),
+        );
+    }
+    if let Some(result) = call_case!(
+        "query local truncation",
+        "query",
+        serde_json::json!({ "sql": "SELECT i FROM truncation_rows" })
+    ) {
+        if is_error(&result) {
+            failures.push(format!(
+                "query local truncation: tool returned an error: {:?}",
+                first_text(&result)
+            ));
+        }
+        if result.structured_content.is_some() {
+            failures.push("query local truncation: query must not add structuredContent".into());
+        }
+        if result.content.len() != 2
+            || result
+                .content
+                .first()
+                .and_then(|content| content.raw.as_text())
+                .map(|content| content.text.as_str())
+                != Some("```sql\nSELECT\n  i\nFROM\n  truncation_rows\n```")
+            || result
+                .content
+                .get(1)
+                .and_then(|content| content.raw.as_text())
+                .is_none()
+        {
+            failures.push(
+                "query local truncation: content must remain formatted SQL then JSON text".into(),
+            );
+        }
+        let payload = result
+            .content
+            .get(1)
+            .and_then(|content| content.raw.as_text())
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content.text).ok());
+        let expected_fields = [
+            "hint",
+            "resolved_database",
+            "result",
+            "rows_returned",
+            "stats",
+            "total_rows",
+            "truncated",
+        ];
+        let mut fields = payload
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .map(|object| object.keys().map(String::as_str).collect::<Vec<_>>())
+            .unwrap_or_default();
+        fields.sort_unstable();
+        let rows = payload
+            .as_ref()
+            .and_then(|payload| payload.get("result"))
+            .and_then(serde_json::Value::as_array);
+        let expected_hint = "Result set has 10001 rows; only the first 10000 are shown. Add a LIMIT clause, aggregate with GROUP BY, or use the `export` tool to write the full result to a file.";
+        if fields != expected_fields
+            || rows.map_or(0, Vec::len) != 10_000
+            || rows
+                .and_then(|rows| rows.first())
+                .and_then(|row| row.get("i"))
+                != Some(&serde_json::json!(1))
+            || rows
+                .and_then(|rows| rows.last())
+                .and_then(|row| row.get("i"))
+                != Some(&serde_json::json!(10_000))
+            || payload
+                .as_ref()
+                .and_then(|payload| payload.get("truncated"))
+                != Some(&serde_json::json!(true))
+            || payload
+                .as_ref()
+                .and_then(|payload| payload.get("total_rows"))
+                != Some(&serde_json::json!(10_001))
+            || payload
+                .as_ref()
+                .and_then(|payload| payload.get("rows_returned"))
+                != Some(&serde_json::json!(10_000))
+            || payload.as_ref().and_then(|payload| payload.get("hint"))
+                != Some(&serde_json::json!(expected_hint))
+            || payload
+                .as_ref()
+                .and_then(|payload| payload.get("resolved_database"))
+                != Some(&serde_json::json!("local"))
+            || payload
+                .as_ref()
+                .and_then(|payload| payload.get("stats"))
+                .and_then(|stats| stats.get("rows_returned"))
+                != Some(&serde_json::json!(10_000))
+        {
+            failures.push(format!(
+                "query local truncation: legacy truncation fields or resolved database changed: {payload:?}"
+            ));
+        }
+    }
+
+    // Sample has normal and empty successful payloads, each retaining the
+    // single text/structured mirror that older clients consume.
+    for (case, args, database, table, row_count, sample_size) in [
+        (
+            "sample local rows",
+            serde_json::json!({ "table": "local_rows", "n": 5 }),
+            "local",
+            "local_rows",
+            2,
+            2,
+        ),
+        (
+            "sample persistent empty",
+            serde_json::json!({
+                "table": "persistent_empty",
+                "n": 5,
+                "database": "PERSISTENT"
+            }),
+            "persistent",
+            "persistent_empty",
+            0,
+            0,
+        ),
+        (
+            "sample attached mixed case",
+            serde_json::json!({
+                "table": "attached_rows",
+                "n": 5,
+                "database": "MiXeD_AtTaChEd"
+            }),
+            "mixed_attached",
+            "attached_rows",
+            1,
+            1,
+        ),
+    ] {
+        if let Some(result) = call_case!(case, "sample", args) {
+            if let Some(payload) = record_object_response(
+                &mut failures,
+                case,
+                &result,
+                database,
+                &[
+                    "resolved_database",
+                    "row_count",
+                    "rows",
+                    "sample_size",
+                    "schema",
+                    "stats",
+                    "table",
+                ],
+            ) {
+                if payload["table"] != serde_json::json!(table)
+                    || payload["row_count"] != serde_json::json!(row_count)
+                    || payload["sample_size"] != serde_json::json!(sample_size)
+                    || payload["rows"].as_array().map_or(usize::MAX, Vec::len)
+                        != usize::try_from(sample_size).expect("sample size is non-negative")
+                    || payload["schema"].as_array().map_or(0, Vec::len) == 0
+                    || payload["stats"]["operation"] != serde_json::json!("sample")
+                {
+                    failures.push(format!("{case}: legacy sample fields changed"));
+                }
+            }
+        }
+    }
+
+    // Describe's table-specific and populated-listing variants are both
+    // successes; the empty listing was pinned above before fixture setup.
+    for (case, args, database, expected_table, expected_count) in [
+        (
+            "describe local listing",
+            serde_json::json!({}),
+            "local",
+            None,
+            Some(2),
+        ),
+        (
+            "describe persistent table",
+            serde_json::json!({ "table": "persistent_empty", "database": "PERSISTENT" }),
+            "persistent",
+            Some("persistent_empty"),
+            Some(1),
+        ),
+        (
+            "describe attached mixed case",
+            serde_json::json!({ "table": "attached_rows", "database": "MiXeD_AtTaChEd" }),
+            "mixed_attached",
+            Some("attached_rows"),
+            Some(1),
+        ),
+    ] {
+        if let Some(result) = call_case!(case, "describe", args) {
+            if let Some(payload) = record_object_response(
+                &mut failures,
+                case,
+                &result,
+                database,
+                &["resolved_database", "tables"],
+            ) {
+                let tables = payload["tables"].as_array();
+                if tables.map_or(false, |tables| tables.len() != expected_count.unwrap_or(0)) {
+                    failures.push(format!(
+                        "{case}: describe table count changed: got {tables:?}"
+                    ));
+                }
+                if let Some(expected_table) = expected_table {
+                    if tables
+                        .and_then(|tables| tables.first())
+                        .and_then(|table| table.get("name"))
+                        != Some(&serde_json::json!(expected_table))
+                    {
+                        failures.push(format!(
+                            "{case}: describe must preserve table name {expected_table}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // Chart is the other custom response: inline keeps image first and stats
+    // second; disk-only returns just stats. Neither gains structuredContent.
+    if let Some(result) = call_case!(
+        "chart local inline",
+        "chart",
+        serde_json::json!({
+            "sql": "SELECT label, x FROM local_rows",
+            "chart_type": "bar",
+            "x": "label",
+            "y": "x"
+        })
+    ) {
+        if result.structured_content.is_some() {
+            failures.push("chart local inline: chart must not add structuredContent".into());
+        }
+        if result.content.len() != 2
+            || result
+                .content
+                .first()
+                .and_then(|content| content.raw.as_image())
+                .is_none()
+            || result
+                .content
+                .get(1)
+                .and_then(|content| content.raw.as_text())
+                .is_none()
+        {
+            failures.push(
+                "chart local inline: content must remain image first, stats text second".into(),
+            );
+        }
+        let stats = result
+            .content
+            .get(1)
+            .and_then(|content| content.raw.as_text())
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content.text).ok());
+        let expected_fields = [
+            "bytes",
+            "elapsed_ms",
+            "format",
+            "height",
+            "inline",
+            "operation",
+            "resolved_database",
+            "rows_plotted",
+            "width",
+        ];
+        let mut fields = stats
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .map(|object| object.keys().map(String::as_str).collect::<Vec<_>>())
+            .unwrap_or_default();
+        fields.sort_unstable();
+        if fields != expected_fields
+            || stats.as_ref().and_then(|stats| stats.get("operation"))
+                != Some(&serde_json::json!("chart"))
+            || stats.as_ref().and_then(|stats| stats.get("inline"))
+                != Some(&serde_json::json!(true))
+            || stats
+                .as_ref()
+                .and_then(|stats| stats.get("resolved_database"))
+                != Some(&serde_json::json!("local"))
+        {
+            failures.push(format!(
+                "chart local inline: legacy stats or resolved database changed: {stats:?}"
+            ));
+        }
+    }
+    if let Some(result) = call_case!(
+        "chart persistent disk only",
+        "chart",
+        serde_json::json!({
+            "sql": "SELECT 1 AS x, 2 AS y",
+            "chart_type": "bar",
+            "x": "x",
+            "y": "y",
+            "format": "svg",
+            "inline": false,
+            "database": "PERSISTENT"
+        })
+    ) {
+        if result.structured_content.is_some()
+            || result.content.len() != 1
+            || result
+                .content
+                .first()
+                .and_then(|content| content.raw.as_text())
+                .is_none()
+        {
+            failures.push(
+                "chart persistent disk only: content must remain one stats text block".into(),
+            );
+        }
+        let stats = result
+            .content
+            .first()
+            .and_then(|content| content.raw.as_text())
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content.text).ok());
+        let expected_fields = [
+            "bytes",
+            "elapsed_ms",
+            "format",
+            "height",
+            "inline",
+            "operation",
+            "output_path",
+            "resolved_database",
+            "rows_plotted",
+            "width",
+        ];
+        let mut fields = stats
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .map(|object| object.keys().map(String::as_str).collect::<Vec<_>>())
+            .unwrap_or_default();
+        fields.sort_unstable();
+        if fields != expected_fields
+            || stats.as_ref().and_then(|stats| stats.get("operation"))
+                != Some(&serde_json::json!("chart"))
+            || stats.as_ref().and_then(|stats| stats.get("format"))
+                != Some(&serde_json::json!("svg"))
+            || stats.as_ref().and_then(|stats| stats.get("inline"))
+                != Some(&serde_json::json!(false))
+            || stats
+                .as_ref()
+                .and_then(|stats| stats.get("resolved_database"))
+                != Some(&serde_json::json!("persistent"))
+            || stats
+                .as_ref()
+                .and_then(|stats| stats.get("output_path"))
+                .and_then(serde_json::Value::as_str)
+                .is_none()
+        {
+            failures.push(format!(
+                "chart persistent disk only: legacy stats or resolved database changed: {stats:?}"
+            ));
+        }
+    }
+
+    if let Err(error) = h.shutdown().await {
+        failures.push(format!("test harness shutdown failed: {error}"));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "resolved_database query success-shape regressions:\n- {}",
+            failures.join("\n- ")
+        )
+        .into())
+    }
 }
