@@ -10,7 +10,10 @@
 //! plumbing, error mapping — exercising server-handler behavior that
 //! engine-level tests can't reach.
 
-use rmcp::model::{CallToolRequestParams, CallToolResult, ClientInfo};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResult, ClientInfo, ResourceUpdatedNotificationParam,
+    SubscribeRequestParams,
+};
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::{ClientHandler, ServiceExt};
 use std::path::{Path, PathBuf};
@@ -26,14 +29,44 @@ type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 const PERSISTENT_LOCK_MCP_CHILD_ENV: &str = "HYPERDB_MCP_PERSISTENT_LOCK_MCP_CHILD";
 
-/// Minimal client handler — its only job is to satisfy `ServiceExt`
-/// so the server-side tool calls can be issued.
+/// Resource notifications captured by the in-memory client. The aggregate
+/// routed-response tests use these to pin the mutation side effects that must
+/// survive additive `resolved_database` metadata.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum NotificationEvent {
+    ResourceUpdated(String),
+    ResourceListChanged,
+}
+
+/// Minimal client handler that also records resource notifications emitted by
+/// the server after successful mutations.
 #[derive(Debug, Clone)]
-struct DummyClientHandler;
+struct DummyClientHandler {
+    notification_tx: tokio::sync::mpsc::UnboundedSender<NotificationEvent>,
+}
 
 impl ClientHandler for DummyClientHandler {
     fn get_info(&self) -> ClientInfo {
         ClientInfo::default()
+    }
+
+    async fn on_resource_updated(
+        &self,
+        params: ResourceUpdatedNotificationParam,
+        _context: rmcp::service::NotificationContext<RoleClient>,
+    ) {
+        let _ = self
+            .notification_tx
+            .send(NotificationEvent::ResourceUpdated(params.uri));
+    }
+
+    async fn on_resource_list_changed(
+        &self,
+        _context: rmcp::service::NotificationContext<RoleClient>,
+    ) {
+        let _ = self
+            .notification_tx
+            .send(NotificationEvent::ResourceListChanged);
     }
 }
 
@@ -43,6 +76,7 @@ struct TestHarness {
     server_handle: tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
     /// Shared engine handle retained for status-lock regression scenarios.
     engine_handle: Arc<Mutex<Option<Engine>>>,
+    notification_rx: tokio::sync::mpsc::UnboundedReceiver<NotificationEvent>,
     /// Persistent workspace path — kept alive via the temp dir.
     /// Held by the harness so individual tests can read it back if a
     /// scenario ever needs to inspect the on-disk file directly.
@@ -87,7 +121,8 @@ impl TestHarness {
             Ok(())
         });
 
-        let client = DummyClientHandler
+        let (notification_tx, notification_rx) = tokio::sync::mpsc::unbounded_channel();
+        let client = DummyClientHandler { notification_tx }
             .serve(client_io)
             .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
@@ -96,6 +131,7 @@ impl TestHarness {
             client,
             server_handle,
             engine_handle,
+            notification_rx,
             persistent_path,
             _temp_dir: temp_dir,
         })
@@ -124,7 +160,8 @@ impl TestHarness {
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
             Ok(())
         });
-        let client = DummyClientHandler
+        let (notification_tx, notification_rx) = tokio::sync::mpsc::unbounded_channel();
+        let client = DummyClientHandler { notification_tx }
             .serve(client_io)
             .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
@@ -133,6 +170,7 @@ impl TestHarness {
             client,
             server_handle,
             engine_handle,
+            notification_rx,
             persistent_path,
             _temp_dir: temp_dir,
         })
@@ -234,11 +272,10 @@ fn all_text(result: &CallToolResult) -> String {
 /// Record a successful object response that must remain mirrored between its
 /// sole text block and `structuredContent`. Returns the parsed text payload so
 /// callers can pin their tool-specific legacy fields as well.
-fn record_object_response(
+fn record_legacy_object_response(
     failures: &mut Vec<String>,
     case: &str,
     result: &CallToolResult,
-    expected_database: &str,
     expected_fields: &[&str],
 ) -> Option<serde_json::Value> {
     if is_error(result) {
@@ -289,13 +326,208 @@ fn record_object_response(
             "{case}: top-level fields changed: expected {expected_fields:?}, got {actual_fields:?}"
         ));
     }
-    if object.get("resolved_database") != Some(&serde_json::json!(expected_database)) {
+    Some(payload)
+}
+
+fn record_object_response(
+    failures: &mut Vec<String>,
+    case: &str,
+    result: &CallToolResult,
+    expected_database: &str,
+    expected_fields: &[&str],
+) -> Option<serde_json::Value> {
+    let payload = record_legacy_object_response(failures, case, result, expected_fields)?;
+    if payload.get("resolved_database") != Some(&serde_json::json!(expected_database)) {
         failures.push(format!(
             "{case}: resolved_database must be {expected_database:?}, got {:?}",
-            object.get("resolved_database")
+            payload.get("resolved_database")
         ));
     }
     Some(payload)
+}
+
+fn record_fields(
+    failures: &mut Vec<String>,
+    case: &str,
+    value: &serde_json::Value,
+    expected_fields: &[&str],
+) {
+    let Some(object) = value.as_object() else {
+        failures.push(format!("{case}: expected a JSON object, got {value}"));
+        return;
+    };
+    let mut actual: Vec<_> = object.keys().map(String::as_str).collect();
+    actual.sort_unstable();
+    let mut expected = expected_fields.to_vec();
+    expected.sort_unstable();
+    if actual != expected {
+        failures.push(format!(
+            "{case}: fields changed: expected {expected:?}, got {actual:?}"
+        ));
+    }
+}
+
+/// Pin the common success envelope plus the legacy ingest payload and stats.
+fn record_ingest_response(
+    failures: &mut Vec<String>,
+    case: &str,
+    result: &CallToolResult,
+    expected_database: &str,
+    expected_rows: u64,
+    expected_table: &str,
+    expected_operation: &str,
+    expected_format: &str,
+    expected_schema_columns: usize,
+    schema_changed: bool,
+) -> Option<serde_json::Value> {
+    let payload = record_object_response(
+        failures,
+        case,
+        result,
+        expected_database,
+        &["resolved_database", "rows", "schema", "stats"],
+    )?;
+    if payload["rows"] != serde_json::json!(expected_rows) {
+        failures.push(format!(
+            "{case}: rows changed: expected {expected_rows}, got {:?}",
+            payload.get("rows")
+        ));
+    }
+    let schema = payload["schema"].as_array();
+    if schema.map(Vec::len) != Some(expected_schema_columns) {
+        failures.push(format!(
+            "{case}: schema column count changed: expected {expected_schema_columns}, got {:?}",
+            schema.map(Vec::len)
+        ));
+    }
+    if let Some(schema) = schema {
+        for (index, column) in schema.iter().enumerate() {
+            record_fields(
+                failures,
+                &format!("{case} schema column {index}"),
+                column,
+                &["name", "nullable", "type"],
+            );
+        }
+    }
+
+    let mut expected_stats = vec![
+        "bytes_read",
+        "bytes_stored",
+        "compression_ratio",
+        "elapsed_ms",
+        "file_format",
+        "ingest_throughput_mb_sec",
+        "operation",
+        "rows",
+        "rows_per_sec",
+        "schema_inference_ms",
+        "table",
+    ];
+    if schema_changed {
+        expected_stats.push("schema_changed");
+    }
+    record_fields(
+        failures,
+        &format!("{case} stats"),
+        &payload["stats"],
+        &expected_stats,
+    );
+    let stats = &payload["stats"];
+    if stats["rows"] != serde_json::json!(expected_rows)
+        || stats["table"] != serde_json::json!(expected_table)
+        || stats["operation"] != serde_json::json!(expected_operation)
+        || stats["file_format"] != serde_json::json!(expected_format)
+        || stats["schema_changed"]
+            != if schema_changed {
+                serde_json::json!(true)
+            } else {
+                serde_json::Value::Null
+            }
+    {
+        failures.push(format!(
+            "{case}: legacy ingest stats changed: expected rows={expected_rows}, table={expected_table:?}, operation={expected_operation:?}, format={expected_format:?}, schema_changed={schema_changed}; got {stats}"
+        ));
+    }
+    Some(payload)
+}
+
+fn record_copy_response(
+    failures: &mut Vec<String>,
+    case: &str,
+    result: &CallToolResult,
+    expected_database: &str,
+    expected_table: &str,
+    expected_mode: &str,
+    expected_rows: i64,
+) {
+    if let Some(payload) = record_object_response(
+        failures,
+        case,
+        result,
+        expected_database,
+        &[
+            "mode",
+            "resolved_database",
+            "row_count",
+            "stats",
+            "target_database",
+            "target_table",
+        ],
+    ) {
+        if payload["target_database"] != serde_json::json!(expected_database)
+            || payload["target_database"] != payload["resolved_database"]
+            || payload["target_table"] != serde_json::json!(expected_table)
+            || payload["mode"] != serde_json::json!(expected_mode)
+            || payload["row_count"] != serde_json::json!(expected_rows)
+        {
+            failures.push(format!(
+                "{case}: legacy copy result changed or target_database disagrees with resolved_database: {payload}"
+            ));
+        }
+        record_fields(
+            failures,
+            &format!("{case} stats"),
+            &payload["stats"],
+            &["elapsed_ms", "operation"],
+        );
+        if payload["stats"]["operation"] != serde_json::json!("copy_query") {
+            failures.push(format!("{case}: stats.operation must remain copy_query"));
+        }
+    }
+}
+
+async fn record_notifications(
+    failures: &mut Vec<String>,
+    case: &str,
+    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<NotificationEvent>,
+    expected: &[NotificationEvent],
+) {
+    let mut actual = Vec::with_capacity(expected.len());
+    for _ in 0..expected.len() {
+        match tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await {
+            Ok(Some(event)) => actual.push(event),
+            Ok(None) => {
+                failures.push(format!("{case}: notification channel closed early"));
+                break;
+            }
+            Err(_) => {
+                failures.push(format!(
+                    "{case}: timed out waiting for {} notification(s); received {actual:?}",
+                    expected.len()
+                ));
+                break;
+            }
+        }
+    }
+    actual.sort_unstable();
+    let mut expected = expected.to_vec();
+    expected.sort_unstable();
+    if actual != expected {
+        failures.push(format!(
+            "{case}: resource notifications changed: expected {expected:?}, got {actual:?}"
+        ));
+    }
 }
 
 /// Record the query tool's intentionally non-standard two-text-block result.
@@ -1982,4 +2214,1076 @@ async fn resolved_database_query_success_shapes() -> TestResult {
         )
         .into())
     }
+}
+
+/// Every successful ingest/export/watch/catalog response keeps its legacy
+/// shape while reporting the canonical database selected by routing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resolved_database_data_success_shapes() -> TestResult {
+    let mut h = TestHarness::start(false, false).await?;
+    let temp = TempDir::new()?;
+    let watch_dir = TempDir::new()?;
+    let attached_path = temp.path().join("mixed-data.hyper");
+    let base_csv = temp.path().join("base.csv");
+    let merge_add_csv = temp.path().join("merge-add.csv");
+    let merge_same_csv = temp.path().join("merge-same.csv");
+    let batch_a_csv = temp.path().join("batch-a.csv");
+    let batch_b_csv = temp.path().join("batch-b.csv");
+    std::fs::write(&base_csv, b"id,name\n1,alice\n2,bob\n")?;
+    std::fs::write(&merge_add_csv, b"id,name,extra\n1,alicia,new\n")?;
+    std::fs::write(&merge_same_csv, b"id,name,extra\n2,robert,same\n")?;
+    std::fs::write(&batch_a_csv, b"id,value\n1,a\n2,b\n")?;
+    std::fs::write(&batch_b_csv, b"id,value\n3,c\n")?;
+    let mut failures = Vec::new();
+
+    macro_rules! call_case {
+        ($case:expr, $tool:expr, $args:expr) => {
+            match call_tool(&h.client, $tool, $args).await {
+                Ok(result) => Some(result),
+                Err(error) => {
+                    failures.push(format!("{}: MCP call failed: {error}", $case));
+                    None
+                }
+            }
+        };
+    }
+
+    if let Some(result) = call_case!(
+        "setup mixed-case data attachment",
+        "attach_database",
+        serde_json::json!({
+            "alias": "MiXeD_Data",
+            "kind": "local_file",
+            "path": attached_path.to_string_lossy(),
+            "writable": true,
+            "on_missing": "create"
+        })
+    ) {
+        if is_error(&result) {
+            failures.push(format!(
+                "setup mixed-case data attachment: {:?}",
+                first_text(&result)
+            ));
+        }
+    }
+
+    if let Err(error) = h
+        .client
+        .subscribe(SubscribeRequestParams::new("hyper://workspace"))
+        .await
+    {
+        failures.push(format!(
+            "setup workspace resource subscription failed: {error}"
+        ));
+    }
+
+    if let Some(result) = call_case!(
+        "load_data local replace",
+        "load_data",
+        serde_json::json!({
+            "table": "inline_local",
+            "format": "json",
+            "data": r#"[{"id":1,"name":"one"},{"id":2,"name":"two"}]"#
+        })
+    ) {
+        record_ingest_response(
+            &mut failures,
+            "load_data local replace",
+            &result,
+            "local",
+            2,
+            "inline_local",
+            "load_data",
+            "json",
+            2,
+            false,
+        );
+        record_notifications(
+            &mut failures,
+            "load_data local replace",
+            &mut h.notification_rx,
+            &[
+                NotificationEvent::ResourceUpdated("hyper://workspace".into()),
+                NotificationEvent::ResourceListChanged,
+            ],
+        )
+        .await;
+    }
+
+    if let Some(result) = call_case!(
+        "load_data explicit local wins over persist",
+        "load_data",
+        serde_json::json!({
+            "table": "inline_local",
+            "format": "json",
+            "mode": "append",
+            "database": "LoCaL",
+            "persist": true,
+            "data": r#"[{"id":3,"name":"three"}]"#
+        })
+    ) {
+        record_ingest_response(
+            &mut failures,
+            "load_data explicit local wins over persist",
+            &result,
+            "local",
+            1,
+            "inline_local",
+            "load_data",
+            "json",
+            2,
+            false,
+        );
+        record_notifications(
+            &mut failures,
+            "load_data explicit local wins over persist",
+            &mut h.notification_rx,
+            &[NotificationEvent::ResourceUpdated(
+                "hyper://workspace".into(),
+            )],
+        )
+        .await;
+    }
+
+    if let Some(result) = call_case!(
+        "load_file persist true replace",
+        "load_file",
+        serde_json::json!({
+            "path": base_csv.to_string_lossy(),
+            "table": "file_persistent",
+            "format": "csv",
+            "persist": true
+        })
+    ) {
+        record_ingest_response(
+            &mut failures,
+            "load_file persist true replace",
+            &result,
+            "persistent",
+            2,
+            "file_persistent",
+            "load_file",
+            "csv",
+            2,
+            false,
+        );
+        record_notifications(
+            &mut failures,
+            "load_file persist true replace",
+            &mut h.notification_rx,
+            &[
+                NotificationEvent::ResourceUpdated("hyper://workspace".into()),
+                NotificationEvent::ResourceListChanged,
+            ],
+        )
+        .await;
+    }
+
+    if let Some(result) = call_case!(
+        "load_file attached replace",
+        "load_file",
+        serde_json::json!({
+            "path": base_csv.to_string_lossy(),
+            "table": "file_attached",
+            "format": "csv",
+            "database": "MiXeD_DaTa"
+        })
+    ) {
+        record_ingest_response(
+            &mut failures,
+            "load_file attached replace",
+            &result,
+            "mixed_data",
+            2,
+            "file_attached",
+            "load_file",
+            "csv",
+            2,
+            false,
+        );
+        record_notifications(
+            &mut failures,
+            "load_file attached replace",
+            &mut h.notification_rx,
+            &[
+                NotificationEvent::ResourceUpdated("hyper://workspace".into()),
+                NotificationEvent::ResourceListChanged,
+            ],
+        )
+        .await;
+    }
+
+    if let Some(result) = call_case!(
+        "load_file attached merge adds schema",
+        "load_file",
+        serde_json::json!({
+            "path": merge_add_csv.to_string_lossy(),
+            "table": "file_attached",
+            "format": "csv",
+            "mode": "merge",
+            "merge_key": ["id"],
+            "database": "MIXED_DATA"
+        })
+    ) {
+        record_ingest_response(
+            &mut failures,
+            "load_file attached merge adds schema",
+            &result,
+            "mixed_data",
+            1,
+            "file_attached",
+            "load_file",
+            "csv",
+            3,
+            true,
+        );
+        record_notifications(
+            &mut failures,
+            "load_file attached merge adds schema",
+            &mut h.notification_rx,
+            &[
+                NotificationEvent::ResourceUpdated("hyper://workspace".into()),
+                NotificationEvent::ResourceListChanged,
+            ],
+        )
+        .await;
+    }
+
+    if let Some(result) = call_case!(
+        "load_file attached merge preserves schema",
+        "load_file",
+        serde_json::json!({
+            "path": merge_same_csv.to_string_lossy(),
+            "table": "file_attached",
+            "format": "csv",
+            "mode": "merge",
+            "merge_key": ["id"],
+            "database": "mixed_data"
+        })
+    ) {
+        record_ingest_response(
+            &mut failures,
+            "load_file attached merge preserves schema",
+            &result,
+            "mixed_data",
+            1,
+            "file_attached",
+            "load_file",
+            "csv",
+            3,
+            false,
+        );
+        record_notifications(
+            &mut failures,
+            "load_file attached merge preserves schema",
+            &mut h.notification_rx,
+            &[NotificationEvent::ResourceUpdated(
+                "hyper://workspace".into(),
+            )],
+        )
+        .await;
+    }
+
+    if let Some(result) = call_case!(
+        "load_files all success local precedence",
+        "load_files",
+        serde_json::json!({
+            "files": [
+                {"path": batch_a_csv.to_string_lossy(), "table": "batch_local_a", "format": "csv"},
+                {"path": batch_b_csv.to_string_lossy(), "table": "batch_local_b", "format": "csv"}
+            ],
+            "concurrency": 2,
+            "database": "LOCAL",
+            "persist": true
+        })
+    ) {
+        if let Some(payload) = record_object_response(
+            &mut failures,
+            "load_files all success local precedence",
+            &result,
+            "local",
+            &["resolved_database", "results", "summary"],
+        ) {
+            record_fields(
+                &mut failures,
+                "load_files all success local precedence summary",
+                &payload["summary"],
+                &["concurrency", "failed", "succeeded", "total"],
+            );
+            if payload["summary"]
+                != serde_json::json!({"total": 2, "succeeded": 2, "failed": 0, "concurrency": 2})
+            {
+                failures.push(format!(
+                    "load_files all success local precedence: summary changed: {}",
+                    payload["summary"]
+                ));
+            }
+            let results = payload["results"].as_array();
+            if results.map(Vec::len) != Some(2) {
+                failures.push(format!(
+                    "load_files all success local precedence: expected two results, got {results:?}"
+                ));
+            }
+            if let Some(results) = results {
+                for (index, (table, rows)) in [("batch_local_a", 2), ("batch_local_b", 1)]
+                    .into_iter()
+                    .enumerate()
+                {
+                    if let Some(entry) = results.get(index) {
+                        record_fields(
+                            &mut failures,
+                            &format!("load_files all success local precedence result {index}"),
+                            entry,
+                            &["rows", "schema", "stats", "table"],
+                        );
+                        if entry["table"] != serde_json::json!(table)
+                            || entry["rows"] != serde_json::json!(rows)
+                            || entry.get("resolved_database").is_some()
+                        {
+                            failures.push(format!(
+                                "load_files all success local precedence result {index}: legacy entry changed or duplicated resolved_database: {entry}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        record_notifications(
+            &mut failures,
+            "load_files all success local precedence",
+            &mut h.notification_rx,
+            &[
+                NotificationEvent::ResourceUpdated("hyper://workspace".into()),
+                NotificationEvent::ResourceUpdated("hyper://workspace".into()),
+                NotificationEvent::ResourceListChanged,
+            ],
+        )
+        .await;
+    }
+
+    if let Some(result) = call_case!(
+        "load_files partial per-file success",
+        "load_files",
+        serde_json::json!({
+            "files": [
+                {"path": batch_b_csv.to_string_lossy(), "table": "batch_partial_ok", "format": "csv"},
+                {"path": batch_a_csv.to_string_lossy(), "table": "batch_partial_bad", "format": "csv", "schema": 42}
+            ],
+            "concurrency": 2,
+            "persist": true
+        })
+    ) {
+        if let Some(payload) = record_object_response(
+            &mut failures,
+            "load_files partial per-file success",
+            &result,
+            "persistent",
+            &["resolved_database", "results", "summary"],
+        ) {
+            if payload["summary"]
+                != serde_json::json!({"total": 2, "succeeded": 1, "failed": 1, "concurrency": 2})
+            {
+                failures.push(format!(
+                    "load_files partial per-file success: summary changed: {}",
+                    payload["summary"]
+                ));
+            }
+            let results = payload["results"].as_array();
+            if let Some(results) = results {
+                if let Some(success) = results.first() {
+                    record_fields(
+                        &mut failures,
+                        "load_files partial per-file success result",
+                        success,
+                        &["rows", "schema", "stats", "table"],
+                    );
+                    if success["table"] != serde_json::json!("batch_partial_ok")
+                        || success["rows"] != serde_json::json!(1)
+                        || success.get("resolved_database").is_some()
+                    {
+                        failures.push(format!(
+                            "load_files partial per-file success: successful entry changed: {success}"
+                        ));
+                    }
+                }
+                if let Some(failed) = results.get(1) {
+                    record_fields(
+                        &mut failures,
+                        "load_files partial per-file failure result",
+                        failed,
+                        &["error", "table"],
+                    );
+                    record_fields(
+                        &mut failures,
+                        "load_files partial per-file failure error",
+                        &failed["error"],
+                        &["code", "message"],
+                    );
+                    if failed["table"] != serde_json::json!("batch_partial_bad")
+                        || failed["error"]["code"] != serde_json::json!("SchemaMismatch")
+                        || failed.get("resolved_database").is_some()
+                    {
+                        failures.push(format!(
+                            "load_files partial per-file success: failed entry changed: {failed}"
+                        ));
+                    }
+                }
+            } else {
+                failures.push(format!(
+                    "load_files partial per-file success: results must be an array: {}",
+                    payload["results"]
+                ));
+            }
+        }
+        record_notifications(
+            &mut failures,
+            "load_files partial per-file success",
+            &mut h.notification_rx,
+            &[
+                NotificationEvent::ResourceUpdated("hyper://workspace".into()),
+                NotificationEvent::ResourceListChanged,
+            ],
+        )
+        .await;
+    }
+
+    if let Some(result) = call_case!(
+        "load_files all entries failed remains top-level success",
+        "load_files",
+        serde_json::json!({
+            "files": [
+                {"path": batch_a_csv.to_string_lossy(), "table": "batch_all_bad", "format": "csv", "schema": 42}
+            ],
+            "concurrency": 1,
+            "database": "MiXeD_DaTa"
+        })
+    ) {
+        if let Some(payload) = record_object_response(
+            &mut failures,
+            "load_files all entries failed remains top-level success",
+            &result,
+            "mixed_data",
+            &["resolved_database", "results", "summary"],
+        ) {
+            if payload["summary"]
+                != serde_json::json!({"total": 1, "succeeded": 0, "failed": 1, "concurrency": 1})
+                || payload["results"].as_array().map(Vec::len) != Some(1)
+                || payload["results"][0]["error"]["code"] != serde_json::json!("SchemaMismatch")
+            {
+                failures.push(format!(
+                    "load_files all entries failed remains top-level success: legacy batch shape changed: {payload}"
+                ));
+            }
+        }
+    }
+
+    let canonical_watch_dir = match watch_dir.path().canonicalize() {
+        Ok(path) => Some(path),
+        Err(error) => {
+            failures.push(format!("watch directory canonicalization failed: {error}"));
+            None
+        }
+    };
+    if let Some(result) = call_case!(
+        "watch_directory attached empty initial sweep",
+        "watch_directory",
+        serde_json::json!({
+            "path": watch_dir.path().to_string_lossy(),
+            "table": "file_attached",
+            "database": "MiXeD_DaTa",
+            "max_concurrent": 1
+        })
+    ) {
+        if let Some(payload) = record_object_response(
+            &mut failures,
+            "watch_directory attached empty initial sweep",
+            &result,
+            "mixed_data",
+            &[
+                "directory",
+                "initial_sweep",
+                "max_concurrent",
+                "resolved_database",
+                "status",
+                "table",
+            ],
+        ) {
+            record_fields(
+                &mut failures,
+                "watch_directory attached empty initial sweep stats",
+                &payload["initial_sweep"],
+                &["files_failed", "files_ingested"],
+            );
+            if payload["directory"]
+                != serde_json::json!(canonical_watch_dir
+                    .as_deref()
+                    .unwrap_or_else(|| watch_dir.path())
+                    .to_string_lossy())
+                || payload["table"] != serde_json::json!("file_attached")
+                || payload["status"] != serde_json::json!("watching")
+                || payload["max_concurrent"] != serde_json::json!(1)
+                || payload["initial_sweep"]
+                    != serde_json::json!({"files_ingested": 0, "files_failed": 0})
+            {
+                failures.push(format!(
+                    "watch_directory attached empty initial sweep: watcher handle changed: {payload}"
+                ));
+            }
+        }
+    }
+
+    if let Some(result) = call_case!(
+        "watch_directory registry status",
+        "status",
+        serde_json::json!({})
+    ) {
+        let payload = first_text(&result)
+            .as_deref()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok());
+        let watcher = payload
+            .as_ref()
+            .and_then(|body| body["watchers"].as_array())
+            .and_then(|watchers| watchers.first());
+        if let Some(watcher) = watcher {
+            record_fields(
+                &mut failures,
+                "watch_directory registry status entry",
+                watcher,
+                &[
+                    "directory",
+                    "files_failed",
+                    "files_ingested",
+                    "in_flight",
+                    "last_error",
+                    "last_event_ms_ago",
+                    "max_concurrent",
+                    "table",
+                    "target_db",
+                ],
+            );
+            if watcher["target_db"] != serde_json::json!("mixed_data")
+                || watcher["table"] != serde_json::json!("file_attached")
+                || watcher["files_ingested"] != serde_json::json!(0)
+                || watcher["files_failed"] != serde_json::json!(0)
+                || watcher["in_flight"] != serde_json::json!(0)
+            {
+                failures.push(format!(
+                    "watch_directory registry status: active watcher state changed: {watcher}"
+                ));
+            }
+        } else {
+            failures.push(format!(
+                "watch_directory registry status: expected one active watcher, got {payload:?}"
+            ));
+        }
+    }
+
+    if let Some(path) = canonical_watch_dir.as_ref() {
+        if let Some(result) = call_case!(
+            "watch_directory teardown",
+            "unwatch_directory",
+            serde_json::json!({"path": path.to_string_lossy()})
+        ) {
+            if let Some(payload) = record_legacy_object_response(
+                &mut failures,
+                "watch_directory teardown",
+                &result,
+                &[
+                    "directory",
+                    "files_failed",
+                    "files_ingested",
+                    "last_error",
+                    "status",
+                    "table",
+                ],
+            ) {
+                if payload["status"] != serde_json::json!("stopped")
+                    || payload["table"] != serde_json::json!("file_attached")
+                    || payload["files_ingested"] != serde_json::json!(0)
+                    || payload["files_failed"] != serde_json::json!(0)
+                {
+                    failures.push(format!(
+                        "watch_directory teardown: legacy stop summary changed: {payload}"
+                    ));
+                }
+            }
+        }
+    }
+
+    if let Some(result) = call_case!(
+        "watch_directory registry empty after teardown",
+        "status",
+        serde_json::json!({})
+    ) {
+        let payload = first_text(&result)
+            .as_deref()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok());
+        if payload
+            .as_ref()
+            .and_then(|body| body["watchers"].as_array())
+            .is_none_or(|watchers| !watchers.is_empty())
+        {
+            failures.push(format!(
+                "watch_directory registry empty after teardown: watcher handle leaked: {payload:?}"
+            ));
+        }
+    }
+
+    let csv_export_path = temp.path().join("persistent.csv");
+    if let Some(result) = call_case!(
+        "export persistent table to csv",
+        "export",
+        serde_json::json!({
+            "table": "file_persistent",
+            "path": csv_export_path.to_string_lossy(),
+            "format": "csv",
+            "database": "PERSISTENT"
+        })
+    ) {
+        if let Some(payload) = record_object_response(
+            &mut failures,
+            "export persistent table to csv",
+            &result,
+            "persistent",
+            &[
+                "file_size_bytes",
+                "output_path",
+                "resolved_database",
+                "rows",
+                "stats",
+            ],
+        ) {
+            record_fields(
+                &mut failures,
+                "export persistent table to csv stats",
+                &payload["stats"],
+                &[
+                    "elapsed_ms",
+                    "file_size_bytes",
+                    "format",
+                    "operation",
+                    "output_path",
+                    "rows",
+                    "rows_per_sec",
+                ],
+            );
+            if payload["rows"] != serde_json::json!(2)
+                || payload["output_path"] != serde_json::json!(csv_export_path.to_string_lossy())
+                || payload["file_size_bytes"]
+                    .as_u64()
+                    .is_none_or(|bytes| bytes == 0)
+                || payload["stats"]["operation"] != serde_json::json!("export")
+                || payload["stats"]["format"] != serde_json::json!("csv")
+            {
+                failures.push(format!(
+                    "export persistent table to csv: legacy export payload changed: {payload}"
+                ));
+            }
+        }
+        if !csv_export_path.is_file() {
+            failures.push("export persistent table to csv: output file was not created".into());
+        }
+    }
+
+    let hyper_export_path = temp.path().join("local.hyper");
+    if let Some(result) = call_case!(
+        "export bare local hyper snapshot",
+        "export",
+        serde_json::json!({
+            "path": hyper_export_path.to_string_lossy(),
+            "format": "hyper",
+            "database": "LOCAL"
+        })
+    ) {
+        if let Some(payload) = record_object_response(
+            &mut failures,
+            "export bare local hyper snapshot",
+            &result,
+            "local",
+            &[
+                "file_size_bytes",
+                "output_path",
+                "resolved_database",
+                "rows",
+                "stats",
+            ],
+        ) {
+            if payload["rows"] != serde_json::json!(0)
+                || payload["stats"]["format"] != serde_json::json!("hyper")
+                || payload["output_path"] != serde_json::json!(hyper_export_path.to_string_lossy())
+            {
+                failures.push(format!(
+                    "export bare local hyper snapshot: legacy snapshot payload changed: {payload}"
+                ));
+            }
+        }
+        if !hyper_export_path.is_file() {
+            failures.push("export bare local hyper snapshot: output file was not created".into());
+        }
+    }
+
+    if let Some(result) = call_case!(
+        "set_table_metadata attached catalog entry",
+        "set_table_metadata",
+        serde_json::json!({
+            "table": "file_attached",
+            "database": "MiXeD_DaTa",
+            "purpose": "resolved database regression",
+            "license": "CC0",
+            "notes": "legacy fields stay intact"
+        })
+    ) {
+        if let Some(payload) = record_object_response(
+            &mut failures,
+            "set_table_metadata attached catalog entry",
+            &result,
+            "mixed_data",
+            &[
+                "created_by",
+                "data_url",
+                "last_modified_by",
+                "last_refreshed_at",
+                "license",
+                "load_params",
+                "load_tool",
+                "loaded_at",
+                "notes",
+                "purpose",
+                "resolved_database",
+                "row_count",
+                "source_description",
+                "source_url",
+                "table_name",
+            ],
+        ) {
+            if payload["table_name"] != serde_json::json!("file_attached")
+                || payload["purpose"] != serde_json::json!("resolved database regression")
+                || payload["license"] != serde_json::json!("CC0")
+                || payload["notes"] != serde_json::json!("legacy fields stay intact")
+                || payload["load_tool"] != serde_json::json!("load_file")
+                || payload["row_count"] != serde_json::json!(1)
+                || payload["loaded_at"].as_str().is_none()
+                || payload["last_refreshed_at"].as_str().is_none()
+            {
+                failures.push(format!(
+                    "set_table_metadata attached catalog entry: legacy catalog entry changed: {payload}"
+                ));
+            }
+        }
+    }
+
+    if let Some(result) = call_case!(
+        "catalog routing side effects",
+        "query",
+        serde_json::json!({
+            "sql": "SELECT table_name, load_tool FROM _table_catalog WHERE table_name = 'file_attached'",
+            "database": "mixed_data"
+        })
+    ) {
+        let text = all_text(&result);
+        if is_error(&result) || !text.contains("file_attached") || !text.contains("load_file") {
+            failures.push(format!(
+                "catalog routing side effects: attached catalog stub missing or changed: {text}"
+            ));
+        }
+    }
+
+    let mut unexpected_notifications = Vec::new();
+    while let Ok(notification) = h.notification_rx.try_recv() {
+        unexpected_notifications.push(notification);
+    }
+    if !unexpected_notifications.is_empty() {
+        failures.push(format!(
+            "non-mutating data cases emitted unexpected resource notifications: {unexpected_notifications:?}"
+        ));
+    }
+
+    if let Err(error) = h.shutdown().await {
+        failures.push(format!("test harness shutdown failed: {error}"));
+    }
+    assert!(
+        failures.is_empty(),
+        "resolved_database data success-shape regressions:\n- {}",
+        failures.join("\n- ")
+    );
+    Ok(())
+}
+
+/// `copy_query` keeps its legacy `target_database` compatibility field and
+/// makes it identical to the common canonical routing metadata for every mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn copy_query_preserves_target_and_resolved_database() -> TestResult {
+    let mut h = TestHarness::start(false, false).await?;
+    let temp = TempDir::new()?;
+    let attached_path = temp.path().join("copy-target.hyper");
+    let mut failures = Vec::new();
+
+    macro_rules! call_case {
+        ($case:expr, $tool:expr, $args:expr) => {
+            match call_tool(&h.client, $tool, $args).await {
+                Ok(result) => Some(result),
+                Err(error) => {
+                    failures.push(format!("{}: MCP call failed: {error}", $case));
+                    None
+                }
+            }
+        };
+    }
+
+    if let Some(result) = call_case!(
+        "setup mixed-case copy target",
+        "attach_database",
+        serde_json::json!({
+            "alias": "MiXeD_Copy",
+            "kind": "local_file",
+            "path": attached_path.to_string_lossy(),
+            "writable": true,
+            "on_missing": "create"
+        })
+    ) {
+        if is_error(&result) {
+            failures.push(format!(
+                "setup mixed-case copy target: {:?}",
+                first_text(&result)
+            ));
+        }
+    }
+    if let Err(error) = h
+        .client
+        .subscribe(SubscribeRequestParams::new("hyper://workspace"))
+        .await
+    {
+        failures.push(format!("setup copy resource subscription failed: {error}"));
+    }
+
+    if let Some(result) = call_case!(
+        "copy create local default",
+        "copy_query",
+        serde_json::json!({
+            "mode": "create",
+            "target_table": "copy_local",
+            "sql": "SELECT 1 AS x"
+        })
+    ) {
+        record_copy_response(
+            &mut failures,
+            "copy create local default",
+            &result,
+            "local",
+            "copy_local",
+            "create",
+            1,
+        );
+        record_notifications(
+            &mut failures,
+            "copy create local default",
+            &mut h.notification_rx,
+            &[
+                NotificationEvent::ResourceUpdated("hyper://workspace".into()),
+                NotificationEvent::ResourceUpdated("hyper://workspace".into()),
+                NotificationEvent::ResourceListChanged,
+            ],
+        )
+        .await;
+    }
+
+    if let Some(result) = call_case!(
+        "copy append explicit local",
+        "copy_query",
+        serde_json::json!({
+            "mode": "append",
+            "target_database": "LoCaL",
+            "target_table": "copy_local",
+            "sql": "SELECT 2 AS x"
+        })
+    ) {
+        record_copy_response(
+            &mut failures,
+            "copy append explicit local",
+            &result,
+            "local",
+            "copy_local",
+            "append",
+            2,
+        );
+        record_notifications(
+            &mut failures,
+            "copy append explicit local",
+            &mut h.notification_rx,
+            &[
+                NotificationEvent::ResourceUpdated("hyper://workspace".into()),
+                NotificationEvent::ResourceUpdated("hyper://workspace".into()),
+            ],
+        )
+        .await;
+    }
+
+    if let Some(result) = call_case!(
+        "copy replace local",
+        "copy_query",
+        serde_json::json!({
+            "mode": "replace",
+            "target_database": "LOCAL",
+            "target_table": "copy_local",
+            "sql": "SELECT 3 AS x UNION ALL SELECT 4 AS x"
+        })
+    ) {
+        record_copy_response(
+            &mut failures,
+            "copy replace local",
+            &result,
+            "local",
+            "copy_local",
+            "replace",
+            2,
+        );
+        record_notifications(
+            &mut failures,
+            "copy replace local",
+            &mut h.notification_rx,
+            &[
+                NotificationEvent::ResourceUpdated("hyper://workspace".into()),
+                NotificationEvent::ResourceUpdated("hyper://workspace".into()),
+                NotificationEvent::ResourceListChanged,
+            ],
+        )
+        .await;
+    }
+
+    if let Some(result) = call_case!(
+        "copy create attached canonical alias",
+        "copy_query",
+        serde_json::json!({
+            "mode": "create",
+            "target_database": "MiXeD_CoPy",
+            "target_table": "copy_attached",
+            "sql": "SELECT 10 AS x"
+        })
+    ) {
+        record_copy_response(
+            &mut failures,
+            "copy create attached canonical alias",
+            &result,
+            "mixed_copy",
+            "copy_attached",
+            "create",
+            1,
+        );
+        record_notifications(
+            &mut failures,
+            "copy create attached canonical alias",
+            &mut h.notification_rx,
+            &[
+                NotificationEvent::ResourceUpdated("hyper://workspace".into()),
+                NotificationEvent::ResourceListChanged,
+            ],
+        )
+        .await;
+    }
+
+    if let Some(result) = call_case!(
+        "copy append attached canonical alias",
+        "copy_query",
+        serde_json::json!({
+            "mode": "append",
+            "target_database": "MIXED_COPY",
+            "target_table": "copy_attached",
+            "sql": "SELECT 11 AS x"
+        })
+    ) {
+        record_copy_response(
+            &mut failures,
+            "copy append attached canonical alias",
+            &result,
+            "mixed_copy",
+            "copy_attached",
+            "append",
+            2,
+        );
+        record_notifications(
+            &mut failures,
+            "copy append attached canonical alias",
+            &mut h.notification_rx,
+            &[NotificationEvent::ResourceUpdated(
+                "hyper://workspace".into(),
+            )],
+        )
+        .await;
+    }
+
+    if let Some(result) = call_case!(
+        "copy replace attached canonical alias",
+        "copy_query",
+        serde_json::json!({
+            "mode": "replace",
+            "target_database": "mixed_copy",
+            "target_table": "copy_attached",
+            "sql": "SELECT 12 AS x UNION ALL SELECT 13 AS x"
+        })
+    ) {
+        record_copy_response(
+            &mut failures,
+            "copy replace attached canonical alias",
+            &result,
+            "mixed_copy",
+            "copy_attached",
+            "replace",
+            2,
+        );
+        record_notifications(
+            &mut failures,
+            "copy replace attached canonical alias",
+            &mut h.notification_rx,
+            &[
+                NotificationEvent::ResourceUpdated("hyper://workspace".into()),
+                NotificationEvent::ResourceListChanged,
+            ],
+        )
+        .await;
+    }
+
+    for (case, sql, database) in [
+        (
+            "copy local target contents",
+            "SELECT COUNT(*) AS n FROM copy_local",
+            None,
+        ),
+        (
+            "copy attached target contents",
+            "SELECT COUNT(*) AS n FROM copy_attached",
+            Some("mixed_copy"),
+        ),
+    ] {
+        let args = match database {
+            Some(database) => serde_json::json!({"sql": sql, "database": database}),
+            None => serde_json::json!({"sql": sql}),
+        };
+        if let Some(result) = call_case!(case, "query", args) {
+            let text = all_text(&result);
+            if is_error(&result) || (!text.contains("\"n\":2") && !text.contains("\"n\": 2")) {
+                failures.push(format!(
+                    "{case}: copied table must contain the two replace rows; got {text}"
+                ));
+            }
+        }
+    }
+
+    let mut unexpected_notifications = Vec::new();
+    while let Ok(notification) = h.notification_rx.try_recv() {
+        unexpected_notifications.push(notification);
+    }
+    if !unexpected_notifications.is_empty() {
+        failures.push(format!(
+            "copy_query emitted unexpected extra resource notifications: {unexpected_notifications:?}"
+        ));
+    }
+    if let Err(error) = h.shutdown().await {
+        failures.push(format!("test harness shutdown failed: {error}"));
+    }
+    assert!(
+        failures.is_empty(),
+        "copy_query resolved-database compatibility regressions:\n- {}",
+        failures.join("\n- ")
+    );
+    Ok(())
 }

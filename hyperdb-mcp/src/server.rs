@@ -1302,6 +1302,18 @@ impl HyperMcpServer {
         Ok(payload)
     }
 
+    /// Add routing metadata to a successful object payload and wrap it as an
+    /// MCP result. A non-object success is treated as an internal tool error.
+    fn ok_content_with_resolved_database(
+        payload: Value,
+        target_db: Option<&str>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        match Self::with_resolved_database(payload, target_db) {
+            Ok(payload) => Self::ok_content(payload),
+            Err(e) => Self::err_content(e),
+        }
+    }
+
     /// Soft threshold (bytes) above which a single KV value triggers a non-fatal
     /// `warning` in the write response. The write always succeeds.
     const KV_SOFT_SIZE_WARN_BYTES: usize = 1_048_576;
@@ -2021,11 +2033,14 @@ impl HyperMcpServer {
                 );
             }
 
-            Ok(json!({
-                "rows": ingest_result.rows,
-                "schema": schema_json,
-                "stats": ingest_result.stats.to_json(),
-            }))
+            Self::with_resolved_database(
+                json!({
+                    "rows": ingest_result.rows,
+                    "schema": schema_json,
+                    "stats": ingest_result.stats.to_json(),
+                }),
+                target_db.as_deref(),
+            )
         });
 
         match result {
@@ -2139,14 +2154,16 @@ impl HyperMcpServer {
                 );
             }
 
-            Ok((
+            let payload = Self::with_resolved_database(
                 json!({
                     "rows": ingest_result.rows,
                     "schema": schema_json,
                     "stats": ingest_result.stats.to_json(),
                 }),
-                schema_changed,
-            ))
+                target_db.as_deref(),
+            )?;
+
+            Ok((payload, schema_changed))
         });
 
         match result {
@@ -2521,15 +2538,18 @@ impl HyperMcpServer {
         let success_count = outcomes.iter().filter(|o| o.ok.is_some()).count();
         let failure_count = outcomes.len() - success_count;
 
-        Self::ok_content(json!({
-            "results": results_json,
-            "summary": {
-                "total": outcomes.len(),
-                "succeeded": success_count,
-                "failed": failure_count,
-                "concurrency": concurrency,
-            }
-        }))
+        Self::ok_content_with_resolved_database(
+            json!({
+                "results": results_json,
+                "summary": {
+                    "total": outcomes.len(),
+                    "succeeded": success_count,
+                    "failed": failure_count,
+                    "concurrency": concurrency,
+                }
+            }),
+            target_db.as_deref(),
+        )
     }
 
     /// Ingest an Apache Iceberg table directory into a workspace table
@@ -3032,7 +3052,7 @@ impl HyperMcpServer {
             Some(self.subscriptions_handle()),
             path.clone(),
             params.table.clone(),
-            target_db,
+            target_db.clone(),
             options,
         );
         match result {
@@ -3047,7 +3067,7 @@ impl HyperMcpServer {
                         "files_failed": stats.files_failed,
                     },
                 });
-                Self::ok_content(body)
+                Self::ok_content_with_resolved_database(body, target_db.as_deref())
             }
             Err(e) => Self::err_content(e),
         }
@@ -3197,12 +3217,15 @@ impl HyperMcpServer {
                 source_db: target_db.clone(),
             };
             let export_result = export_to_file(engine, &opts)?;
-            Ok(json!({
-                "output_path": export_result.stats.output_path,
-                "rows": export_result.rows,
-                "file_size_bytes": export_result.stats.file_size_bytes,
-                "stats": export_result.stats.to_json(),
-            }))
+            Self::with_resolved_database(
+                json!({
+                    "output_path": export_result.stats.output_path,
+                    "rows": export_result.rows,
+                    "file_size_bytes": export_result.stats.file_size_bytes,
+                    "stats": export_result.stats.to_json(),
+                }),
+                target_db.as_deref(),
+            )
         });
 
         match result {
@@ -3332,15 +3355,16 @@ impl HyperMcpServer {
             // would also fail at the Hyper layer, but the resolve_db
             // error is more actionable).
             let target_db = self.resolve_db(engine, params.database.as_deref(), None, true)?;
-            crate::table_catalog::set_metadata_in(
+            let entry = crate::table_catalog::set_metadata_in(
                 engine,
                 &table_name,
                 &fields,
                 target_db.as_deref(),
-            )
+            )?;
+            Self::with_resolved_database(entry.to_json(), target_db.as_deref())
         });
         match result {
-            Ok(entry) => Self::ok_content(entry.to_json()),
+            Ok(body) => Self::ok_content(body),
             Err(e) => Self::err_content(e),
         }
     }
@@ -3356,10 +3380,14 @@ impl HyperMcpServer {
         let result = self.with_engine(|engine| {
             let db = self.resolve_db(engine, p.database.as_deref(), p.persist, true)?;
             let kv = Self::kv_open(engine, db.as_deref(), &p.store)?;
-            kv.get(&p.key).map_err(McpError::from)
+            let value = kv.get(&p.key).map_err(McpError::from)?;
+            Ok((value, db))
         });
         match result {
-            Ok(value) => Self::ok_content(json!({ "found": value.is_some(), "value": value })),
+            Ok((value, db)) => Self::ok_content_with_resolved_database(
+                json!({ "found": value.is_some(), "value": value }),
+                db.as_deref(),
+            ),
             Err(e) => Self::err_content(e),
         }
     }
@@ -3417,18 +3445,17 @@ impl HyperMcpServer {
         let result = self.with_engine(|engine| {
             let db = self.resolve_db(engine, p.database.as_deref(), p.persist, true)?;
             let kv = Self::kv_open(engine, db.as_deref(), &p.store)?;
-            if overwrite {
-                kv.set(&p.key, &value)
-                    .map(|o| (true, o.created))
-                    .map_err(McpError::from)
+            let (stored, created) = if overwrite {
+                let outcome = kv.set(&p.key, &value).map_err(McpError::from)?;
+                (true, outcome.created)
             } else {
-                kv.set_if_absent(&p.key, &value)
-                    .map(|written| (written, written))
-                    .map_err(McpError::from)
-            }
+                let written = kv.set_if_absent(&p.key, &value).map_err(McpError::from)?;
+                (written, written)
+            };
+            Ok((stored, created, db))
         });
         match result {
-            Ok((stored, created)) => {
+            Ok((stored, created, db)) => {
                 let mut body = json!({
                     "stored": stored,
                     "created": created,
@@ -3442,7 +3469,7 @@ impl HyperMcpServer {
                 if let Some(w) = Self::kv_size_warning(value_bytes) {
                     body["warning"] = json!(w);
                 }
-                Self::ok_content(body)
+                Self::ok_content_with_resolved_database(body, db.as_deref())
             }
             Err(e) => Self::err_content(e),
         }
@@ -3493,30 +3520,31 @@ impl HyperMcpServer {
         let result = self.with_engine(|engine| {
             let db = self.resolve_db(engine, p.database.as_deref(), p.persist, true)?;
             let kv = Self::kv_open(engine, db.as_deref(), &p.store)?;
-            if overwrite {
+            let body = if overwrite {
                 let o = kv.set_batch(&pairs).map_err(McpError::from)?;
-                Ok(json!({
+                json!({
                     "stored": o.created + o.overwritten,
                     "created": o.created,
                     "overwritten": o.overwritten,
-                }))
+                })
             } else {
                 let o = kv.set_batch_if_absent(&pairs).map_err(McpError::from)?;
-                Ok(json!({
+                json!({
                     "stored": o.written,
                     "created": o.written,
                     "skipped": o.skipped,
-                }))
-            }
+                })
+            };
+            Ok((body, db))
         });
 
         match result {
-            Ok(mut body) => {
+            Ok((mut body, db)) => {
                 body["total_bytes"] = json!(total_bytes);
                 if !warnings.is_empty() {
                     body["warnings"] = json!(warnings);
                 }
-                Self::ok_content(body)
+                Self::ok_content_with_resolved_database(body, db.as_deref())
             }
             Err(e) => Self::err_content(e),
         }
@@ -3536,12 +3564,14 @@ impl HyperMcpServer {
         let result = self.with_engine(|engine| {
             let db = self.resolve_db(engine, p.database.as_deref(), p.persist, true)?;
             let kv = Self::kv_open(engine, db.as_deref(), &p.store)?;
-            kv.delete(&p.key).map_err(McpError::from)
+            let deleted = kv.delete(&p.key).map_err(McpError::from)?;
+            Ok((deleted, db))
         });
         match result {
-            Ok(deleted) => {
-                Self::ok_content(json!({ "deleted": deleted, "store": p.store, "key": p.key }))
-            }
+            Ok((deleted, db)) => Self::ok_content_with_resolved_database(
+                json!({ "deleted": deleted, "store": p.store, "key": p.key }),
+                db.as_deref(),
+            ),
             Err(e) => Self::err_content(e),
         }
     }
@@ -3559,23 +3589,28 @@ impl HyperMcpServer {
             let db = self.resolve_db(engine, p.database.as_deref(), p.persist, true)?;
             let kv = Self::kv_open(engine, db.as_deref(), &p.store)?;
             if with_values {
-                kv.entries().map(|pairs| (Some(pairs), None))
+                let entries = kv.entries().map_err(McpError::from)?;
+                Ok((Some(entries), None, db))
             } else {
-                kv.keys().map(|keys| (None, Some(keys)))
+                let keys = kv.keys().map_err(McpError::from)?;
+                Ok((None, Some(keys), db))
             }
-            .map_err(McpError::from)
         });
         match result {
-            Ok((Some(entries), None)) => {
+            Ok((Some(entries), None, db)) => {
                 let arr: Vec<Value> = entries
                     .into_iter()
                     .map(|(k, v)| json!({ "key": k, "value": v }))
                     .collect();
-                Self::ok_content(json!({ "store": p.store, "entries": arr }))
+                Self::ok_content_with_resolved_database(
+                    json!({ "store": p.store, "entries": arr }),
+                    db.as_deref(),
+                )
             }
-            Ok((None, Some(keys))) => {
-                Self::ok_content(json!({ "store": p.store, "count": keys.len(), "keys": keys }))
-            }
+            Ok((None, Some(keys), db)) => Self::ok_content_with_resolved_database(
+                json!({ "store": p.store, "count": keys.len(), "keys": keys }),
+                db.as_deref(),
+            ),
             Ok(_) => unreachable!("exactly one of entries/keys is Some"),
             Err(e) => Self::err_content(e),
         }
@@ -3591,14 +3626,18 @@ impl HyperMcpServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self.with_engine(|engine| {
             let db = self.resolve_db(engine, p.database.as_deref(), p.persist, true)?;
-            match db.as_deref() {
+            let stores = match db.as_deref() {
                 Some(alias) => engine.connection().kv_list_stores_in(alias),
                 None => engine.connection().kv_list_stores(),
             }
-            .map_err(McpError::from)
+            .map_err(McpError::from)?;
+            Ok((stores, db))
         });
         match result {
-            Ok(stores) => Self::ok_content(json!({ "count": stores.len(), "stores": stores })),
+            Ok((stores, db)) => Self::ok_content_with_resolved_database(
+                json!({ "count": stores.len(), "stores": stores }),
+                db.as_deref(),
+            ),
             Err(e) => Self::err_content(e),
         }
     }
@@ -3616,14 +3655,17 @@ impl HyperMcpServer {
             let kv = Self::kv_open(engine, db.as_deref(), &p.store)?;
             let key_count = kv.size().map_err(McpError::from)?;
             let value_bytes = kv.byte_size().map_err(McpError::from)?;
-            Ok(json!({
-                "store": p.store,
-                "size": key_count,
-                "bytes": value_bytes,
-            }))
+            Ok((
+                json!({
+                    "store": p.store,
+                    "size": key_count,
+                    "bytes": value_bytes,
+                }),
+                db,
+            ))
         });
         match result {
-            Ok(val) => Self::ok_content(val),
+            Ok((body, db)) => Self::ok_content_with_resolved_database(body, db.as_deref()),
             Err(e) => Self::err_content(e),
         }
     }
@@ -3643,13 +3685,17 @@ impl HyperMcpServer {
         let result = self.with_engine(|engine| {
             let db = self.resolve_db(engine, p.database.as_deref(), p.persist, true)?;
             let kv = Self::kv_open(engine, db.as_deref(), &p.store)?;
-            kv.pop().map_err(McpError::from)
+            let entry = kv.pop().map_err(McpError::from)?;
+            Ok((entry, db))
         });
         match result {
-            Ok(Some((key, value))) => {
-                Self::ok_content(json!({ "found": true, "key": key, "value": value }))
+            Ok((Some((key, value)), db)) => Self::ok_content_with_resolved_database(
+                json!({ "found": true, "key": key, "value": value }),
+                db.as_deref(),
+            ),
+            Ok((None, db)) => {
+                Self::ok_content_with_resolved_database(json!({ "found": false }), db.as_deref())
             }
-            Ok(None) => Self::ok_content(json!({ "found": false })),
             Err(e) => Self::err_content(e),
         }
     }
@@ -3668,10 +3714,14 @@ impl HyperMcpServer {
         let result = self.with_engine(|engine| {
             let db = self.resolve_db(engine, p.database.as_deref(), p.persist, true)?;
             let kv = Self::kv_open(engine, db.as_deref(), &p.store)?;
-            kv.clear().map_err(McpError::from)
+            let removed = kv.clear().map_err(McpError::from)?;
+            Ok((removed, db))
         });
         match result {
-            Ok(removed) => Self::ok_content(json!({ "store": p.store, "removed": removed })),
+            Ok((removed, db)) => Self::ok_content_with_resolved_database(
+                json!({ "store": p.store, "removed": removed }),
+                db.as_deref(),
+            ),
             Err(e) => Self::err_content(e),
         }
     }
@@ -4064,7 +4114,7 @@ impl HyperMcpServer {
                 );
             }
 
-            copy_outcome
+            copy_outcome.and_then(|outcome| Self::with_resolved_database(outcome, target_db))
         });
 
         match result {

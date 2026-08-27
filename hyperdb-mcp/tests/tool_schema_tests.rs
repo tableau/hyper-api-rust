@@ -13,6 +13,7 @@ use rmcp::model::{CallToolRequestParams, CallToolResult, ClientInfo, Tool};
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::{ClientHandler, ServiceExt};
 use serde::Serialize;
+use std::collections::BTreeSet;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -51,6 +52,30 @@ const LEGACY_TOOL_NAMES: [&str; 33] = [
     "set_table_metadata",
     "status",
     "unwatch_directory",
+    "watch_directory",
+];
+
+const ROUTED_TOOL_ALLOWLIST: [&str; 21] = [
+    "chart",
+    "copy_query",
+    "describe",
+    "execute",
+    "export",
+    "kv_clear",
+    "kv_delete",
+    "kv_get",
+    "kv_list",
+    "kv_list_stores",
+    "kv_pop",
+    "kv_set",
+    "kv_set_many",
+    "kv_size",
+    "load_data",
+    "load_file",
+    "load_files",
+    "query",
+    "sample",
+    "set_table_metadata",
     "watch_directory",
 ];
 
@@ -314,6 +339,72 @@ async fn generated_catalog_readme_coverage_contract() -> TestResult {
     assert!(
         undocumented.is_empty(),
         "generated tools missing an exact backticked README mention: {undocumented:?}"
+    );
+    Ok(())
+}
+
+/// The semantic routed-tool inventory is explicit: generated parameter names
+/// measure likely candidates, but only the reviewed design allowlist defines
+/// which successful responses owe `resolved_database`. `copy_query` is the
+/// deliberate exception because its compatibility input is target_database.
+#[tokio::test]
+async fn routed_tool_allowlist_matches_generated_schemas() -> TestResult {
+    let harness = CatalogHarness::start(false).await?;
+    let tools = harness.list_all_tools().await?;
+    harness.shutdown().await?;
+
+    let routed_allowlist: BTreeSet<_> = ROUTED_TOOL_ALLOWLIST.into_iter().collect();
+    assert_eq!(
+        routed_allowlist.len(),
+        ROUTED_TOOL_ALLOWLIST.len(),
+        "the explicit semantic allowlist must not contain duplicates"
+    );
+
+    let schema_candidates: BTreeSet<_> = tools
+        .iter()
+        .filter_map(|tool| {
+            let properties = tool
+                .input_schema
+                .get("properties")
+                .and_then(serde_json::Value::as_object)?;
+            (properties.contains_key("database") || properties.contains_key("persist"))
+                .then_some(tool.name.as_ref())
+        })
+        .collect();
+
+    let copy_query = tools
+        .iter()
+        .find(|tool| tool.name == "copy_query")
+        .ok_or_else(|| std::io::Error::other("generated catalog omitted copy_query"))?;
+    let copy_properties = copy_query
+        .input_schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| std::io::Error::other("copy_query schema omitted top-level properties"))?;
+    assert!(
+        copy_properties.contains_key("target_database"),
+        "copy_query must retain its semantic target_database routing input"
+    );
+    assert!(
+        !copy_properties.contains_key("database") && !copy_properties.contains_key("persist"),
+        "copy_query is the named semantic exception, not a database/persist schema candidate"
+    );
+
+    let mut expected_schema_candidates = routed_allowlist.clone();
+    assert!(
+        expected_schema_candidates.remove("copy_query"),
+        "the semantic allowlist must include the copy_query exception"
+    );
+    assert_eq!(
+        schema_candidates, expected_schema_candidates,
+        "generated database/persist candidates drifted from the reviewed routed inventory"
+    );
+
+    let mut semantic_inventory = schema_candidates;
+    semantic_inventory.insert("copy_query");
+    assert_eq!(
+        semantic_inventory, routed_allowlist,
+        "schema candidates plus the copy_query exception must equal the explicit 21-tool allowlist"
     );
     Ok(())
 }
