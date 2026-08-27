@@ -540,7 +540,7 @@ fn record_query_response(
     result: &CallToolResult,
     expected_database: &str,
     expected_sql: &str,
-    expected_rows: serde_json::Value,
+    expected_rows: &serde_json::Value,
 ) {
     if is_error(result) {
         failures.push(format!(
@@ -599,7 +599,7 @@ fn record_query_response(
             "{case}: query top-level fields changed: expected {expected_fields:?}, got {actual_fields:?}"
         ));
     }
-    if object.get("result") != Some(&expected_rows) {
+    if object.get("result") != Some(expected_rows) {
         failures.push(format!(
             "{case}: query result changed: expected {expected_rows}, got {:?}",
             object.get("result")
@@ -1530,7 +1530,7 @@ async fn status_full_and_degraded_share_identity_contract() -> TestResult {
     let full = status_json(&full_result);
     assert_eq!(full["engine_busy"], false, "uncontended status is full");
 
-    let _engine_lock = hold_engine_lock(Arc::clone(&h.engine_handle));
+    let engine_lock_holder = hold_engine_lock(Arc::clone(&h.engine_handle));
     let degraded_result = call_tool(&h.client, "status", serde_json::json!({})).await?;
     assert!(!is_error(&degraded_result), "degraded status must succeed");
     let degraded = status_json(&degraded_result);
@@ -1571,7 +1571,7 @@ async fn status_full_and_degraded_share_identity_contract() -> TestResult {
     );
     assert_eq!(full["default_database"], "local");
 
-    drop(_engine_lock);
+    drop(engine_lock_holder);
     h.shutdown().await
 }
 
@@ -1580,7 +1580,7 @@ async fn status_full_and_degraded_share_identity_contract() -> TestResult {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn status_degraded_returns_promptly_while_engine_locked() -> TestResult {
     let h = TestHarness::start(false, false).await?;
-    let _engine_lock = hold_engine_lock(Arc::clone(&h.engine_handle));
+    let engine_lock_holder = hold_engine_lock(Arc::clone(&h.engine_handle));
 
     let started = Instant::now();
     let result = tokio::time::timeout(
@@ -1625,7 +1625,7 @@ async fn status_degraded_returns_promptly_while_engine_locked() -> TestResult {
         );
     }
 
-    drop(_engine_lock);
+    drop(engine_lock_holder);
     h.shutdown().await
 }
 
@@ -2529,7 +2529,7 @@ async fn resolved_database_query_success_shapes() -> TestResult {
             &result,
             "local",
             "SELECT\n  x\nFROM\n  local_rows\nWHERE\n  x = 1",
-            serde_json::json!([{ "x": 1 }]),
+            &serde_json::json!([{ "x": 1 }]),
         );
     }
     if let Some(result) = call_case!(
@@ -2546,7 +2546,7 @@ async fn resolved_database_query_success_shapes() -> TestResult {
             &result,
             "persistent",
             "SELECT\n  x\nFROM\n  persistent_empty",
-            serde_json::json!([]),
+            &serde_json::json!([]),
         );
     }
     if let Some(result) = call_case!(
@@ -2563,7 +2563,7 @@ async fn resolved_database_query_success_shapes() -> TestResult {
             &result,
             "mixed_attached",
             "SELECT\n  x\nFROM\n  attached_rows",
-            serde_json::json!([{ "x": 7 }]),
+            &serde_json::json!([{ "x": 7 }]),
         );
     }
     if let Some(result) = call_case!(
@@ -2762,7 +2762,7 @@ async fn resolved_database_query_success_shapes() -> TestResult {
                 &["resolved_database", "tables"],
             ) {
                 let tables = payload["tables"].as_array();
-                if tables.map_or(false, |tables| tables.len() != expected_count.unwrap_or(0)) {
+                if tables.is_some_and(|tables| tables.len() != expected_count.unwrap_or(0)) {
                     failures.push(format!(
                         "{case}: describe table count changed: got {tables:?}"
                     ));
@@ -2946,13 +2946,13 @@ async fn resolved_database_data_success_shapes() -> TestResult {
     let base_csv = temp.path().join("base.csv");
     let merge_add_csv = temp.path().join("merge-add.csv");
     let merge_same_csv = temp.path().join("merge-same.csv");
-    let batch_a_csv = temp.path().join("batch-a.csv");
-    let batch_b_csv = temp.path().join("batch-b.csv");
+    let two_row_batch_csv = temp.path().join("batch-a.csv");
+    let single_row_batch_csv = temp.path().join("batch-b.csv");
     std::fs::write(&base_csv, b"id,name\n1,alice\n2,bob\n")?;
     std::fs::write(&merge_add_csv, b"id,name,extra\n1,alicia,new\n")?;
     std::fs::write(&merge_same_csv, b"id,name,extra\n2,robert,same\n")?;
-    std::fs::write(&batch_a_csv, b"id,value\n1,a\n2,b\n")?;
-    std::fs::write(&batch_b_csv, b"id,value\n3,c\n")?;
+    std::fs::write(&two_row_batch_csv, b"id,value\n1,a\n2,b\n")?;
+    std::fs::write(&single_row_batch_csv, b"id,value\n3,c\n")?;
     let mut failures = Vec::new();
 
     macro_rules! call_case {
@@ -3208,8 +3208,8 @@ async fn resolved_database_data_success_shapes() -> TestResult {
         "load_files",
         serde_json::json!({
             "files": [
-                {"path": batch_a_csv.to_string_lossy(), "table": "batch_local_a", "format": "csv"},
-                {"path": batch_b_csv.to_string_lossy(), "table": "batch_local_b", "format": "csv"}
+                {"path": two_row_batch_csv.to_string_lossy(), "table": "batch_local_a", "format": "csv"},
+                {"path": single_row_batch_csv.to_string_lossy(), "table": "batch_local_b", "format": "csv"}
             ],
             "concurrency": 2,
             "database": "LOCAL",
@@ -3285,8 +3285,8 @@ async fn resolved_database_data_success_shapes() -> TestResult {
         "load_files",
         serde_json::json!({
             "files": [
-                {"path": batch_b_csv.to_string_lossy(), "table": "batch_partial_ok", "format": "csv"},
-                {"path": batch_a_csv.to_string_lossy(), "table": "batch_partial_bad", "format": "csv", "schema": 42}
+                {"path": single_row_batch_csv.to_string_lossy(), "table": "batch_partial_ok", "format": "csv"},
+                {"path": two_row_batch_csv.to_string_lossy(), "table": "batch_partial_bad", "format": "csv", "schema": 42}
             ],
             "concurrency": 2,
             "persist": true
@@ -3371,7 +3371,7 @@ async fn resolved_database_data_success_shapes() -> TestResult {
         "load_files",
         serde_json::json!({
             "files": [
-                {"path": batch_a_csv.to_string_lossy(), "table": "batch_all_bad", "format": "csv", "schema": 42}
+                {"path": two_row_batch_csv.to_string_lossy(), "table": "batch_all_bad", "format": "csv", "schema": 42}
             ],
             "concurrency": 1,
             "database": "MiXeD_DaTa"
@@ -3537,11 +3537,13 @@ async fn resolved_database_data_success_shapes() -> TestResult {
         let payload = first_text(&result)
             .as_deref()
             .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok());
-        if payload
+        if match payload
             .as_ref()
             .and_then(|body| body["watchers"].as_array())
-            .is_none_or(|watchers| !watchers.is_empty())
         {
+            Some(watchers) => !watchers.is_empty(),
+            None => true,
+        } {
             failures.push(format!(
                 "watch_directory registry empty after teardown: watcher handle leaked: {payload:?}"
             ));
@@ -3588,9 +3590,10 @@ async fn resolved_database_data_success_shapes() -> TestResult {
             );
             if payload["rows"] != serde_json::json!(2)
                 || payload["output_path"] != serde_json::json!(csv_export_path.to_string_lossy())
-                || payload["file_size_bytes"]
-                    .as_u64()
-                    .is_none_or(|bytes| bytes == 0)
+                || match payload["file_size_bytes"].as_u64() {
+                    Some(bytes) => bytes == 0,
+                    None => true,
+                }
                 || payload["stats"]["operation"] != serde_json::json!("export")
                 || payload["stats"]["format"] != serde_json::json!("csv")
             {

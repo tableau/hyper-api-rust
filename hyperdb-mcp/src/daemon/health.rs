@@ -138,6 +138,13 @@ impl HealthListener {
 
             match self.listener.accept() {
                 Ok((stream, _addr)) => {
+                    if let Err(error) = stream.set_nonblocking(false) {
+                        warn!(
+                            error = %error,
+                            "could not make accepted health connection blocking"
+                        );
+                        continue;
+                    }
                     let state = Arc::clone(&state);
                     let info = Arc::clone(&info);
                     std::thread::spawn(move || {
@@ -432,7 +439,12 @@ mod tests {
                     return Err("test peer stopped before accepting a connection".to_string());
                 }
                 match listener.accept() {
-                    Ok((stream, _)) => return script(stream, stop_rx),
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false).map_err(|error| {
+                            format!("make accepted test health peer blocking: {error}")
+                        })?;
+                        return script(stream, stop_rx);
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         if Instant::now() >= accept_deadline {
                             return Err("test peer timed out waiting for a connection".to_string());

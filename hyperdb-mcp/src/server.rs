@@ -5739,7 +5739,8 @@ mod heartbeat_debounce_tests {
                 .expect("controlled heartbeat listener address")
                 .port();
             let (release_tx, release_rx) = mpsc::channel();
-            let handle = std::thread::spawn(move || hold_heartbeat_responses(listener, release_rx));
+            let handle =
+                std::thread::spawn(move || hold_heartbeat_responses(&listener, &release_rx));
             Self {
                 port,
                 release: Some(release_tx),
@@ -5771,8 +5772,8 @@ mod heartbeat_debounce_tests {
     }
 
     fn hold_heartbeat_responses(
-        listener: TcpListener,
-        release: Receiver<()>,
+        listener: &TcpListener,
+        release: &Receiver<()>,
     ) -> Result<Vec<String>, String> {
         let hard_deadline = Instant::now() + Duration::from_secs(5);
         let mut streams = Vec::new();
@@ -5838,7 +5839,7 @@ mod heartbeat_debounce_tests {
     }
 
     fn collect_immediate_heartbeats(
-        listener: TcpListener,
+        listener: &TcpListener,
         window: Duration,
     ) -> Result<Vec<String>, String> {
         listener
@@ -5872,7 +5873,9 @@ mod heartbeat_debounce_tests {
         *server
             .last_heartbeat
             .lock()
-            .expect("heartbeat timestamp mutex") = Instant::now() - HEARTBEAT_INTERVAL;
+            .expect("heartbeat timestamp mutex") = Instant::now()
+            .checked_sub(HEARTBEAT_INTERVAL)
+            .expect("60-second heartbeat interval fits before current instant");
 
         let peer = HeldHeartbeatPeer::spawn();
         let barrier = Arc::new(Barrier::new(CALLERS + 1));
@@ -5926,13 +5929,15 @@ mod heartbeat_debounce_tests {
         *server
             .last_heartbeat
             .lock()
-            .expect("heartbeat timestamp mutex") = Instant::now() - HEARTBEAT_INTERVAL;
+            .expect("heartbeat timestamp mutex") = Instant::now()
+            .checked_sub(HEARTBEAT_INTERVAL)
+            .expect("60-second heartbeat interval fits before current instant");
         server.maybe_send_heartbeat(Some(failed_port));
 
         let follow_up_listener = TcpListener::bind(("127.0.0.1", failed_port))
             .expect("bind follow-up listener on refused heartbeat port");
         let follow_up = std::thread::spawn(move || {
-            collect_immediate_heartbeats(follow_up_listener, Duration::from_millis(300))
+            collect_immediate_heartbeats(&follow_up_listener, Duration::from_millis(300))
         });
         server.maybe_send_heartbeat(Some(failed_port));
         let follow_up_commands = follow_up.join();

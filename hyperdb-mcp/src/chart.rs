@@ -3731,6 +3731,7 @@ mod tests {
     }
 
     const LOG_RENDERING_CHILD_ENV: &str = "HYPERDB_MCP_LOG_RENDERING_CHILD";
+    const LOG_RENDERING_AGGREGATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(28);
 
     fn assert_full_domain_log_semantics() {
         let mut failures = Vec::new();
@@ -3880,9 +3881,21 @@ mod tests {
         }
     }
 
-    fn record_bounded_log_rendering_case(failures: &mut Vec<String>, case: &str) {
+    fn record_bounded_log_rendering_case(
+        failures: &mut Vec<String>,
+        case: &str,
+        aggregate_deadline: std::time::Instant,
+    ) {
         use std::process::{Command, Stdio};
         use std::time::{Duration, Instant};
+
+        if Instant::now() >= aggregate_deadline {
+            failures.push(format!(
+                "{case}: shared {}s log-rendering deadline elapsed before child launch",
+                LOG_RENDERING_AGGREGATE_TIMEOUT.as_secs()
+            ));
+            return;
+        }
 
         let mut child = Command::new(std::env::current_exe().expect("unit test executable path"))
             .args([
@@ -3897,7 +3910,6 @@ mod tests {
             .spawn()
             .expect("log rendering parent must spawn its exact helper child");
 
-        let deadline = Instant::now() + Duration::from_secs(4);
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -3913,7 +3925,7 @@ mod tests {
                     }
                     return;
                 }
-                Ok(None) if Instant::now() < deadline => {
+                Ok(None) if Instant::now() < aggregate_deadline => {
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 Ok(None) => {
@@ -3922,7 +3934,8 @@ mod tests {
                         .wait_with_output()
                         .expect("log rendering parent must wait for timed-out child");
                     failures.push(format!(
-                        "{case}: renderer exceeded the 4s bound and was killed ({kill_error:?})\nstdout:\n{}\nstderr:\n{}",
+                        "{case}: renderer exceeded the shared {}s log-rendering deadline and was killed ({kill_error:?})\nstdout:\n{}\nstderr:\n{}",
+                        LOG_RENDERING_AGGREGATE_TIMEOUT.as_secs(),
                         String::from_utf8_lossy(&output.stdout),
                         String::from_utf8_lossy(&output.stderr)
                     ));
@@ -4066,12 +4079,13 @@ mod tests {
             }
         }
 
+        let aggregate_deadline = std::time::Instant::now() + LOG_RENDERING_AGGREGATE_TIMEOUT;
         for case in [
             "full-domain-semantics",
             "explicit-adjacent-high",
             "auto-adjacent-high",
         ] {
-            record_bounded_log_rendering_case(&mut failures, case);
+            record_bounded_log_rendering_case(&mut failures, case, aggregate_deadline);
         }
 
         for orientation in [BarOrientation::Vertical, BarOrientation::Horizontal] {

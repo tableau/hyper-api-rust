@@ -234,6 +234,117 @@ fn health_listener_second_bind_same_port_fails() {
 }
 
 #[test]
+fn health_listener_waits_for_command_after_accept() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{Shutdown, SocketAddr, TcpStream};
+    use std::sync::mpsc;
+
+    const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(1);
+    const OVERALL_WATCHDOG: Duration = Duration::from_secs(3);
+
+    let listener = HealthListener::bind(0).expect("bind OS-assigned health-listener port");
+    let port = listener.port;
+    let info = DaemonInfo {
+        pid: 12345,
+        hyperd_endpoint: "127.0.0.1:54321".to_string(),
+        health_port: port,
+        started_at: "2026-05-20T10:30:00Z".to_string(),
+        version: "0.1.3".to_string(),
+    };
+    let mut listener = OwnedHealthListener::start(listener, info);
+    let (outcome_tx, outcome_rx) = mpsc::sync_channel(1);
+    let started = Instant::now();
+
+    let client = std::thread::spawn(move || {
+        struct ShutdownOnDrop(TcpStream);
+
+        impl ShutdownOnDrop {
+            fn connect(port: u16, timeout: Duration, label: &str) -> Result<Self, String> {
+                let address = SocketAddr::from(([127, 0, 0, 1], port));
+                let stream = TcpStream::connect_timeout(&address, timeout)
+                    .map_err(|error| format!("connect {label} raw health client: {error}"))?;
+                stream
+                    .set_read_timeout(Some(timeout))
+                    .map_err(|error| format!("set {label} client read timeout: {error}"))?;
+                stream
+                    .set_write_timeout(Some(timeout))
+                    .map_err(|error| format!("set {label} client write timeout: {error}"))?;
+                Ok(Self(stream))
+            }
+
+            fn ping(&mut self, label: &str) -> Result<String, String> {
+                self.0.write_all(b"PING\n").map_err(|error| {
+                    format!("{label} PING write failed ({:?}): {error}", error.kind())
+                })?;
+
+                let mut response = String::new();
+                match BufReader::new(&self.0).read_line(&mut response) {
+                    Ok(0) => Err(format!(
+                        "health listener returned early EOF for {label} PING"
+                    )),
+                    Ok(_) => Ok(response),
+                    Err(error) => Err(format!(
+                        "{label} PING read failed ({:?}): {error}",
+                        error.kind()
+                    )),
+                }
+            }
+        }
+
+        impl Drop for ShutdownOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.shutdown(Shutdown::Both);
+            }
+        }
+
+        let outcome = (|| -> Result<String, String> {
+            let expected_pong = format!("PONG hyperdb-mcp {}\n", hyperdb_mcp::version::MCP_VERSION);
+            let mut idle_client = ShutdownOnDrop::connect(port, CLIENT_IO_TIMEOUT, "first idle")?;
+
+            // A PONG from a later connection proves the listener has accepted
+            // and serviced connections while the first one remains byte-empty.
+            {
+                let mut progress_probe =
+                    ShutdownOnDrop::connect(port, CLIENT_IO_TIMEOUT, "progress probe")?;
+                let probe_response = progress_probe.ping("progress-probe")?;
+                if probe_response != expected_pong {
+                    return Err(format!(
+                        "progress probe returned unidentified response: {probe_response:?}"
+                    ));
+                }
+            }
+
+            // Keep the already-accepted first socket idle for more than two
+            // additional 100ms listener polls before sending its first command.
+            std::thread::sleep(Duration::from_millis(350));
+            idle_client.ping("delayed first-client")
+        })();
+        let _ = outcome_tx.send(outcome);
+    });
+
+    let outcome = outcome_rx.recv_timeout(OVERALL_WATCHDOG);
+    listener.stop_and_join();
+    let client_join = client.join();
+
+    assert!(
+        client_join.is_ok(),
+        "raw health-client thread panicked after listener cleanup"
+    );
+    let response = outcome.unwrap_or_else(|error| {
+        panic!("raw health-client scenario exceeded the {OVERALL_WATCHDOG:?} watchdog: {error}")
+    });
+    assert_eq!(
+        response,
+        Ok(format!(
+            "PONG hyperdb-mcp {}\n",
+            hyperdb_mcp::version::MCP_VERSION
+        )),
+        "HealthListener must keep an accepted connection open until its first command; elapsed={:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
 fn health_protocol_ping_pong() {
     let (port, _handle, _state) = start_health_listener();
 

@@ -189,6 +189,10 @@ pub enum DoctorReportError {
 ///
 /// This only inspects process metadata and the bounded launcher environment
 /// value. It deliberately performs no daemon, filesystem, or database probe.
+///
+/// # Errors
+///
+/// Returns an error if the operating system cannot resolve the current executable path.
 pub fn current_installation_identity() -> Result<InstallationIdentity, io::Error> {
     let current_executable = std::env::current_exe()?;
     let launcher_info = std::env::var_os("HYPERDB_MCP_LAUNCHER_INFO");

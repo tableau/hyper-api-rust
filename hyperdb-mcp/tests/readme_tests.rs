@@ -638,7 +638,7 @@ fn public_docs_database_and_read_only_contract() {
         && public_cli.contains("auto-spawn")
         && public_cli.contains("configured/base")
         && public_cli.contains("exact")
-        && contains_any(&public_cli, &["pin", "candidate", "discovery"]))
+        && contains_any(public_cli, &["pin", "candidate", "discovery"]))
     {
         failures.push(
             "public CLI reference must distinguish HYPERDB_DAEMON_PORT auto-spawn discovery from the foreground configured/base exact bind"

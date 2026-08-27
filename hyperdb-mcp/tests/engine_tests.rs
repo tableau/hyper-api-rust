@@ -31,7 +31,7 @@ fn engine_starts_and_connects() {
 #[test]
 fn real_persistent_lock_reproduces_resource_busy() {
     if let Some(workspace) = std::env::var_os(PERSISTENT_LOCK_CHILD_ENV) {
-        run_real_persistent_lock_child(std::path::PathBuf::from(workspace));
+        run_real_persistent_lock_child(Path::new(&workspace));
         return;
     }
 
@@ -44,10 +44,10 @@ fn real_persistent_lock_reproduces_resource_busy() {
     );
 }
 
-fn run_real_persistent_lock_child(workspace: std::path::PathBuf) {
+fn run_real_persistent_lock_child(workspace: &Path) {
     let effective_path = workspace
         .canonicalize()
-        .unwrap_or_else(|_| workspace.clone());
+        .unwrap_or_else(|_| workspace.to_path_buf());
     let owner = Engine::new_no_daemon(Some(workspace.to_string_lossy().into_owned()))
         .expect("owner engine must attach the persistent workspace first");
     let error = Engine::new_no_daemon(Some(workspace.to_string_lossy().into_owned()))
