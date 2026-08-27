@@ -15,6 +15,8 @@ const PUBLIC_README: &str = include_str!("../README.md");
 const SMOKE_TESTS: &str = include_str!("../SMOKE_TESTS.md");
 const DEMO: &str = include_str!("../examples/demo.rs");
 const CHANGELOG: &str = include_str!("../CHANGELOG.md");
+const DEVELOPMENT: &str = include_str!("../DEVELOPMENT.md");
+const LIB_SOURCE: &str = include_str!("../src/lib.rs");
 const SERVER_SOURCE: &str = include_str!("../src/server.rs");
 
 fn markdown_section<'a>(text: &'a str, heading: &str, next_heading: &str) -> &'a str {
@@ -400,7 +402,61 @@ fn public_docs_database_and_read_only_contract() {
     let public_export = markdown_section(&public, "#### `export`", "### visualization");
     let concise_export = markdown_section(&concise, "### export", "### saved queries");
     let public_cli = markdown_section(&public, "## cli reference", "\n---");
+    let concise_status = markdown_bullet(
+        markdown_section(&concise, "### inspect", "### export"),
+        "`status`",
+    );
+    let lib_source = LIB_SOURCE.to_lowercase();
+    let engine_crate_doc = markdown_section(&lib_source, "- [`engine`]", "- [`ingest`]");
+    let development = DEVELOPMENT.to_lowercase();
+    let development_prerequisites =
+        markdown_section(&development, "### prerequisites", "### build");
     let mut failures = Vec::new();
+
+    if !concise_status.contains("daemon/hyper connection facts") {
+        failures.push(
+            "get_readme status guidance must describe daemon/Hyper connection facts".to_owned(),
+        );
+    }
+    if concise_status.contains("daemon identity") {
+        failures.push(
+            "get_readme status guidance must not overclaim that status reports daemon identity"
+                .to_owned(),
+        );
+    }
+
+    if !(engine_crate_doc.contains("local database")
+        && engine_crate_doc.contains("persistent database"))
+    {
+        failures.push(
+            "crate-level engine documentation must use local and persistent database terminology"
+                .to_owned(),
+        );
+    }
+    if engine_crate_doc.contains("persistent workspace modes") {
+        failures.push(
+            "crate-level engine documentation must not claim persistent workspace modes".to_owned(),
+        );
+    }
+
+    if !(development_prerequisites.contains("hyperd_path")
+        && development_prerequisites.contains(".hyperd/current")
+        && contains_any(
+            development_prerequisites,
+            &["walk upward", "search upward", "ancestor"],
+        ))
+    {
+        failures.push(
+            "DEVELOPMENT prerequisites must document HYPERD_PATH and upward .hyperd/current discovery"
+                .to_owned(),
+        );
+    }
+    if contains_any(
+        development_prerequisites,
+        &["place on `path`", "searches path", "path fallback"],
+    ) {
+        failures.push("DEVELOPMENT prerequisites must not claim PATH lookup".to_owned());
+    }
 
     for (name, document) in [
         ("public README", public.as_str()),

@@ -154,8 +154,9 @@ alias. `copy_query` also retains `target_database`.
   writing a non-trivial query.
 - `inspect_file` — dry-run schema inference on a CSV / Parquet / Arrow
   IPC file without loading it.
-- `status` — plugin, native/API, and daemon identity; local/persistent
-  paths; table count; disk usage; watchers; attachments; read-only flag.
+- `status` — plugin and native/API identity; daemon/Hyper connection facts;
+  local/persistent paths; table count; disk usage; watchers; attachments;
+  read-only flag.
   Both full and degraded responses report `default_database: \"local\"`.
   When
   `engine_busy: true`, the response is partial and non-definitive:

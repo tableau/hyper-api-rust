@@ -3872,8 +3872,28 @@ mod tests {
         }
     }
 
+    fn assert_finite_extremes_line_renders() {
+        let rows = vec![
+            serde_json::json!({"category": 1, "value": f64::from_bits(1)}),
+            serde_json::json!({"category": 2, "value": f64::MAX}),
+        ];
+        match chart_svg_with_presentation(
+            &rows,
+            ChartType::Line,
+            None,
+            false,
+            None,
+            log_presentation(BarOrientation::Vertical),
+        ) {
+            Ok(svg) if svg.starts_with("<svg") => {}
+            Ok(_) => panic!("finite extremes: renderer returned malformed SVG"),
+            Err(error) => panic!("finite extremes: log SVG failed: {error}"),
+        }
+    }
+
     fn run_log_rendering_child_case(case: &str) {
         match case {
+            "finite-extremes-line" => assert_finite_extremes_line_renders(),
             "full-domain-semantics" => assert_full_domain_log_semantics(),
             "explicit-adjacent-high" => assert_explicit_adjacent_high_log_rejected(),
             "auto-adjacent-high" => assert_auto_adjacent_high_log_expands(),
@@ -4056,14 +4076,6 @@ mod tests {
                     serde_json::json!({"category": 2, "value": 10.0}),
                 ],
             ),
-            (
-                "finite extremes",
-                ChartType::Line,
-                vec![
-                    serde_json::json!({"category": 1, "value": f64::from_bits(1)}),
-                    serde_json::json!({"category": 2, "value": f64::MAX}),
-                ],
-            ),
         ] {
             match chart_svg_with_presentation(
                 &rows,
@@ -4081,6 +4093,7 @@ mod tests {
 
         let aggregate_deadline = std::time::Instant::now() + LOG_RENDERING_AGGREGATE_TIMEOUT;
         for case in [
+            "finite-extremes-line",
             "full-domain-semantics",
             "explicit-adjacent-high",
             "auto-adjacent-high",

@@ -21,7 +21,7 @@
 //! - [`schema`] — Three-tier schema inference: exact (Arrow/Parquet), structural (JSON),
 //!   heuristic (CSV). Also handles user-provided schema overrides.
 //! - [`engine`] — Manages the `HyperProcess` lifecycle, connection, table CRUD, and
-//!   query execution. Supports ephemeral and persistent workspace modes.
+//!   query execution across the local database and optional persistent database.
 //! - [`ingest`] — Loads inline JSON (row-by-row INSERT) and CSV (`COPY FROM`) into Hyper.
 //! - [`ingest_arrow`] — Loads Parquet and Arrow IPC files via the Arrow crate.
 //! - [`inspect`] — Dry-run file inspection powering the `inspect_file` MCP tool.

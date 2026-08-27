@@ -111,7 +111,10 @@ Three edges to this guarantee, all documented in `src/engine.rs`:
 ### Prerequisites
 
 - Rust toolchain (see `rust-version` in `Cargo.toml`)
-- `hyperd` binary — set `HYPERD_PATH` or place on `PATH`
+- `hyperd` binary — set `HYPERD_PATH` to the executable or its containing
+  directory. When the variable is absent or non-UTF-8, the runtime walks upward
+  through current-directory ancestors for `.hyperd/current/hyperd`; it does not
+  perform a general `PATH` lookup.
 
 ### Build
 
