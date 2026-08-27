@@ -102,6 +102,20 @@ shorthand; `execute` takes `database` only.
 - **Fully-qualified SQL** for power users:
   `INSERT INTO \"persistent\".\"public\".\"customers\" SELECT ...`
 
+### Chart presentation
+
+`chart` uses vertical bars by default; set `bar_orientation` to
+`vertical` or `horizontal`. `label_values=true` writes each original,
+exact y scalar beside its bar. `show_legend` defaults to true; set it
+false to suppress the legend. Long and Unicode labels are never
+truncated or auto-sized, so increase `width` / `height` if they clip.
+`y_scale` defaults to `linear`; `log` applies to the data-role y measure,
+including the physical x axis of horizontal bars. Log values and ranges
+must be finite and strictly positive (> 0): zero and negative values are
+invalid, logarithmic histograms are unsupported, and an explicit range
+must contain every plotted value. Log bars start at the positive lower
+bound, not zero.
+
 Each writable database carries its own `_table_catalog` table that
 tracks load tool, params, timestamps, and any prose metadata set via
 `set_table_metadata` — lazily seeded on first ingest into that DB.

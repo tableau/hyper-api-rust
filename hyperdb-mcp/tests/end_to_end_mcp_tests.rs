@@ -10,6 +10,7 @@
 //! plumbing, error mapping — exercising server-handler behavior that
 //! engine-level tests can't reach.
 
+use base64::Engine as _;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ClientInfo, ResourceUpdatedNotificationParam,
     SubscribeRequestParams,
@@ -646,10 +647,728 @@ fn is_error(result: &CallToolResult) -> bool {
     result.is_error.unwrap_or(false)
 }
 
+/// Pin the MCP error envelope, not just prose: `isError`, structuredContent,
+/// and the compatibility text block must all carry the requested code.
+fn record_error_contract(
+    failures: &mut Vec<String>,
+    case: &str,
+    result: &CallToolResult,
+    expected_code: &str,
+) {
+    if !is_error(result) {
+        failures.push(format!("{case}: expected an MCP tool error, got success"));
+        return;
+    }
+    if result.content.len() != 1 {
+        failures.push(format!(
+            "{case}: error must contain exactly one compatibility text block, got {}",
+            result.content.len()
+        ));
+    }
+    let Some(structured) = result.structured_content.as_ref() else {
+        failures.push(format!("{case}: error is missing structuredContent"));
+        return;
+    };
+    if structured
+        .pointer("/error/code")
+        .and_then(|value| value.as_str())
+        != Some(expected_code)
+    {
+        failures.push(format!(
+            "{case}: expected structured error code {expected_code}, got {structured}"
+        ));
+    }
+    let text_payload = first_text(result)
+        .as_deref()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok());
+    if text_payload.as_ref() != Some(structured) {
+        failures.push(format!(
+            "{case}: text error payload must mirror structuredContent exactly"
+        ));
+    }
+}
+
+fn schema_allows_type(schema: &serde_json::Value, expected: &str) -> bool {
+    match schema.get("type") {
+        Some(serde_json::Value::String(actual)) => actual == expected,
+        Some(serde_json::Value::Array(actual)) => actual.iter().any(|value| value == expected),
+        _ => false,
+    }
+}
+
+fn svg_text_opening_tag<'a>(svg: &'a str, exact_text: &str) -> Option<&'a str> {
+    let lines: Vec<_> = svg.lines().collect();
+    lines.windows(2).find_map(|window| {
+        (window[0].starts_with("<text ") && window[1].trim() == exact_text).then_some(window[0])
+    })
+}
+
+fn inline_image_bytes(
+    failures: &mut Vec<String>,
+    case: &str,
+    result: &CallToolResult,
+) -> Option<(String, Vec<u8>)> {
+    if is_error(result) {
+        failures.push(format!(
+            "{case}: expected chart success, got {:?}",
+            first_text(result)
+        ));
+        return None;
+    }
+    if result.structured_content.is_some()
+        || result.content.len() != 2
+        || result
+            .content
+            .get(1)
+            .and_then(|content| content.raw.as_text())
+            .is_none()
+    {
+        failures.push(format!(
+            "{case}: chart content must remain image first, stats text second, with no structuredContent"
+        ));
+    }
+    let Some(image) = result
+        .content
+        .first()
+        .and_then(|content| content.raw.as_image())
+    else {
+        failures.push(format!("{case}: first content block is not an image"));
+        return None;
+    };
+    match base64::engine::general_purpose::STANDARD.decode(&image.data) {
+        Ok(bytes) => Some((image.mime_type.clone(), bytes)),
+        Err(error) => {
+            failures.push(format!("{case}: inline image is not valid base64: {error}"));
+            None
+        }
+    }
+}
+
+fn svg_i32_attr(line: &str, name: &str) -> Option<i32> {
+    let marker = format!("{name}=\"");
+    line.split_once(&marker)?.1.split_once('"')?.0.parse().ok()
+}
+
+fn svg_primary_blue_rects(svg: &str) -> Vec<(i32, i32, i32, i32)> {
+    svg.lines()
+        .filter(|line| line.starts_with("<rect ") && line.contains("fill=\"#1F77B4\""))
+        .filter_map(|line| {
+            let rect = (
+                svg_i32_attr(line, "x")?,
+                svg_i32_attr(line, "y")?,
+                svg_i32_attr(line, "width")?,
+                svg_i32_attr(line, "height")?,
+            );
+            (rect.2 > 20 && rect.3 > 0).then_some(rect)
+        })
+        .collect()
+}
+
 /// Parse the sole JSON text block emitted by the `status` tool.
 fn status_json(result: &CallToolResult) -> serde_json::Value {
     serde_json::from_str(&first_text(result).expect("status must return a text payload"))
         .expect("status payload must be JSON")
+}
+
+/// Caller-invalid chart ranges must be rejected before Plotters and retain the
+/// structured MCP `INVALID_ARGUMENT` mapping on both axes, including ranges a
+/// chart type would otherwise ignore.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chart_mcp_rejects_invalid_ranges() -> TestResult {
+    let h = TestHarness::start(false, true).await?;
+    let mut failures = Vec::new();
+    let sql = "SELECT 1 AS category, 2 AS value UNION ALL SELECT 2, 3";
+
+    for (case, args) in [
+        (
+            "bar reversed ignored x range",
+            serde_json::json!({
+                "sql": sql,
+                "chart_type": "bar",
+                "x": "category",
+                "y": "value",
+                "x_range": [2.0, 1.0],
+                "format": "svg"
+            }),
+        ),
+        (
+            "bar equal y range",
+            serde_json::json!({
+                "sql": sql,
+                "chart_type": "bar",
+                "x": "category",
+                "y": "value",
+                "y_range": [2.0, 2.0],
+                "format": "svg"
+            }),
+        ),
+    ] {
+        let result = call_tool(&h.client, "chart", args).await?;
+        record_error_contract(&mut failures, case, &result, "INVALID_ARGUMENT");
+    }
+
+    h.shutdown().await?;
+    assert!(
+        failures.is_empty(),
+        "invalid chart range MCP failures:\n{}",
+        failures.join("\n")
+    );
+    Ok(())
+}
+
+/// A non-finite value returned by a real SQL DOUBLE expression is numeric
+/// input that the renderer cannot plot. It must retain the caller-invalid
+/// `INVALID_ARGUMENT` envelope rather than being converted to JSON null and
+/// misreported as a column schema problem.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chart_mcp_rejects_sql_non_finite_double() -> TestResult {
+    let h = TestHarness::start(false, true).await?;
+    let mut failures = Vec::new();
+    let result = call_tool(
+        &h.client,
+        "chart",
+        serde_json::json!({
+            "sql": "SELECT 'not-a-number' AS category, CAST('NaN' AS DOUBLE PRECISION) AS value",
+            "chart_type": "bar",
+            "x": "category",
+            "y": "value",
+            "format": "svg"
+        }),
+    )
+    .await?;
+    record_error_contract(
+        &mut failures,
+        "SQL non-finite DOUBLE",
+        &result,
+        "INVALID_ARGUMENT",
+    );
+
+    let histogram_result = call_tool(
+        &h.client,
+        "chart",
+        serde_json::json!({
+            "sql": "SELECT CAST(1.0 AS DOUBLE PRECISION) AS value UNION ALL SELECT CAST('NaN' AS DOUBLE PRECISION)",
+            "chart_type": "histogram",
+            "x": "value",
+            "format": "svg"
+        }),
+    )
+    .await?;
+    record_error_contract(
+        &mut failures,
+        "mixed finite/non-finite DOUBLE histogram",
+        &histogram_result,
+        "INVALID_ARGUMENT",
+    );
+
+    h.shutdown().await?;
+    assert!(
+        failures.is_empty(),
+        "SQL non-finite DOUBLE chart failures:\n{}",
+        failures.join("\n")
+    );
+    Ok(())
+}
+
+/// Presentation controls are a private renderer extension surfaced only via
+/// MCP. This pins their generated schema, omission defaults, structured invalid
+/// combinations, image/stats ordering, and both SVG semantics and PNG delivery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chart_mcp_presentation_options_contract() -> TestResult {
+    let h = TestHarness::start(false, true).await?;
+    let mut failures = Vec::new();
+
+    let tools = h.client.list_all_tools().await?;
+    let chart_tool = tools.iter().find(|tool| tool.name.as_ref() == "chart");
+    match chart_tool {
+        Some(tool) => {
+            let properties = tool
+                .input_schema
+                .get("properties")
+                .and_then(serde_json::Value::as_object);
+            let required = tool
+                .input_schema
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for (name, expected_type) in [
+                ("bar_orientation", "string"),
+                ("label_values", "boolean"),
+                ("show_legend", "boolean"),
+            ] {
+                match properties.and_then(|properties| properties.get(name)) {
+                    Some(schema) if schema_allows_type(schema, expected_type) => {}
+                    Some(schema) => failures.push(format!(
+                        "chart schema property {name} must allow {expected_type}, got {schema}"
+                    )),
+                    None => {
+                        failures.push(format!("chart schema is missing optional property {name}"));
+                    }
+                }
+                if required.iter().any(|value| value == name) {
+                    failures.push(format!("chart schema property {name} must remain optional"));
+                }
+            }
+            let orientation_enum = properties
+                .and_then(|properties| properties.get("bar_orientation"))
+                .and_then(|schema| schema.get("enum"))
+                .and_then(serde_json::Value::as_array);
+            let accepts_vertical = orientation_enum
+                .is_some_and(|values| values.iter().any(|value| value == "vertical"));
+            let accepts_horizontal = orientation_enum
+                .is_some_and(|values| values.iter().any(|value| value == "horizontal"));
+            if !accepts_vertical || !accepts_horizontal {
+                failures.push(format!(
+                    "bar_orientation schema must enumerate vertical and horizontal, got {orientation_enum:?}"
+                ));
+            }
+        }
+        None => failures.push("generated catalog is missing chart tool".into()),
+    }
+
+    let sql = "SELECT 'North' AS category, 137 AS value, 'Legend alpha' AS series \
+               UNION ALL SELECT 'South', 251, 'Legend beta'";
+    let default_result = call_tool(
+        &h.client,
+        "chart",
+        serde_json::json!({
+            "sql": sql,
+            "chart_type": "bar",
+            "x": "category",
+            "y": "value",
+            "series": "series",
+            "format": "svg",
+            "width": 520,
+            "height": 360
+        }),
+    )
+    .await?;
+    if let Some((mime, bytes)) = inline_image_bytes(
+        &mut failures,
+        "omitted presentation defaults",
+        &default_result,
+    ) {
+        if mime != "image/svg+xml" {
+            failures.push(format!("default SVG MIME changed: {mime}"));
+        }
+        match String::from_utf8(bytes) {
+            Ok(svg) => {
+                let category_tag = svg_text_opening_tag(&svg, "category");
+                let value_tag = svg_text_opening_tag(&svg, "value");
+                let category_axis_invalid = match category_tag {
+                    Some(tag) => tag.contains("rotate(270"),
+                    None => true,
+                };
+                let value_axis_invalid = match value_tag {
+                    Some(tag) => !tag.contains("rotate(270"),
+                    None => true,
+                };
+                if category_axis_invalid || value_axis_invalid {
+                    failures.push(
+                        "omitted bar_orientation must retain vertical category-x/value-y axes"
+                            .into(),
+                    );
+                }
+                if !svg.contains("Legend alpha") || !svg.contains("Legend beta") {
+                    failures.push("omitted show_legend must default to true".into());
+                }
+                if svg.lines().any(|line| line.trim() == "137")
+                    || svg.lines().any(|line| line.trim() == "251")
+                {
+                    failures.push("omitted label_values must default to false".into());
+                }
+            }
+            Err(error) => failures.push(format!("default SVG is not UTF-8: {error}")),
+        }
+    }
+
+    let horizontal_result = call_tool(
+        &h.client,
+        "chart",
+        serde_json::json!({
+            "sql": sql,
+            "chart_type": "bar",
+            "x": "category",
+            "y": "value",
+            "series": "series",
+            "format": "svg",
+            "bar_orientation": "horizontal",
+            "label_values": true,
+            "show_legend": false,
+            "width": 520,
+            "height": 360
+        }),
+    )
+    .await?;
+    if let Some((_, bytes)) = inline_image_bytes(
+        &mut failures,
+        "explicit horizontal presentation",
+        &horizontal_result,
+    ) {
+        match String::from_utf8(bytes) {
+            Ok(svg) => {
+                let category_tag = svg_text_opening_tag(&svg, "category");
+                let value_tag = svg_text_opening_tag(&svg, "value");
+                let category_axis_invalid = match category_tag {
+                    Some(tag) => !tag.contains("rotate(270"),
+                    None => true,
+                };
+                let value_axis_invalid = match value_tag {
+                    Some(tag) => tag.contains("rotate(270"),
+                    None => true,
+                };
+                if category_axis_invalid || value_axis_invalid {
+                    failures.push(
+                        "horizontal bars must swap to category-y/value-x axis descriptions".into(),
+                    );
+                }
+                for exact in ["137", "251"] {
+                    if !svg.lines().any(|line| line.trim() == exact) {
+                        failures.push(format!(
+                            "label_values:true must render exact scalar {exact}"
+                        ));
+                    }
+                }
+                if svg.contains("Legend alpha") || svg.contains("Legend beta") {
+                    failures.push("show_legend:false must remove series legend text".into());
+                }
+            }
+            Err(error) => failures.push(format!("horizontal SVG is not UTF-8: {error}")),
+        }
+    }
+
+    let png_result = call_tool(
+        &h.client,
+        "chart",
+        serde_json::json!({
+            "sql": sql,
+            "chart_type": "bar",
+            "x": "category",
+            "y": "value",
+            "series": "series",
+            "format": "png",
+            "bar_orientation": "horizontal",
+            "label_values": true,
+            "show_legend": false
+        }),
+    )
+    .await?;
+    if let Some((mime, bytes)) = inline_image_bytes(&mut failures, "horizontal PNG", &png_result) {
+        if mime != "image/png"
+            || !bytes.starts_with(&[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+        {
+            failures.push(format!(
+                "horizontal PNG must carry PNG MIME/magic, got {mime} and {:?}",
+                bytes.get(..8)
+            ));
+        }
+    }
+
+    for (case, args) in [
+        (
+            "label_values on line",
+            serde_json::json!({
+                "sql": sql,
+                "chart_type": "line",
+                "x": "value",
+                "y": "value",
+                "label_values": true,
+                "format": "svg"
+            }),
+        ),
+        (
+            "explicit vertical bar orientation on scatter",
+            serde_json::json!({
+                "sql": sql,
+                "chart_type": "scatter",
+                "x": "value",
+                "y": "value",
+                "bar_orientation": "vertical",
+                "format": "svg"
+            }),
+        ),
+        (
+            "unknown bar orientation",
+            serde_json::json!({
+                "sql": sql,
+                "chart_type": "bar",
+                "x": "category",
+                "y": "value",
+                "bar_orientation": "diagonal",
+                "format": "svg"
+            }),
+        ),
+    ] {
+        let result = call_tool(&h.client, "chart", args).await?;
+        record_error_contract(&mut failures, case, &result, "INVALID_ARGUMENT");
+    }
+
+    h.shutdown().await?;
+    assert!(
+        failures.is_empty(),
+        "chart presentation MCP failures:\n{}",
+        failures.join("\n")
+    );
+    Ok(())
+}
+
+/// NUMERIC values beyond f64's exact-integer boundary must retain their SQL
+/// scalar spelling all the way through the MCP query materializer and the
+/// renderer's value-label path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chart_mcp_preserves_high_precision_numeric_value_label() -> TestResult {
+    const EXACT_VALUE: &str = "9007199254740993";
+
+    let h = TestHarness::start(false, true).await?;
+    let mut failures = Vec::new();
+    let result = call_tool(
+        &h.client,
+        "chart",
+        serde_json::json!({
+            "sql": "SELECT 'precise' AS category, CAST(9007199254740993 AS NUMERIC(16,0)) AS value",
+            "chart_type": "bar",
+            "x": "category",
+            "y": "value",
+            "format": "svg",
+            "label_values": true,
+            "show_legend": false,
+            "width": 520,
+            "height": 360
+        }),
+    )
+    .await?;
+
+    if let Some((mime, bytes)) =
+        inline_image_bytes(&mut failures, "high-precision NUMERIC label", &result)
+    {
+        if mime != "image/svg+xml" {
+            failures.push(format!("high-precision chart MIME changed: {mime}"));
+        }
+        match String::from_utf8(bytes) {
+            Ok(svg) if svg_text_opening_tag(&svg, EXACT_VALUE).is_some() => {}
+            Ok(svg) => {
+                let lines: Vec<_> = svg.lines().collect();
+                let numeric_text: Vec<_> = lines
+                    .windows(2)
+                    .filter(|window| window[0].starts_with("<text "))
+                    .map(|window| window[1].trim())
+                    .filter(|text| text.chars().any(|character| character.is_ascii_digit()))
+                    .collect();
+                failures.push(format!(
+                    "label_values:true must preserve exact SQL NUMERIC {EXACT_VALUE}; numeric SVG text was {numeric_text:?}"
+                ));
+            }
+            Err(error) => failures.push(format!(
+                "high-precision NUMERIC chart SVG is not UTF-8: {error}"
+            )),
+        }
+    }
+
+    h.shutdown().await?;
+    assert!(
+        failures.is_empty(),
+        "high-precision NUMERIC chart failures:\n{}",
+        failures.join("\n")
+    );
+    Ok(())
+}
+
+/// The logarithmic measure scale remains MCP-only and defaults to linear. Pin
+/// its schema/parser, positive-domain validation, real log geometry, structured
+/// errors, and unchanged inline SVG/PNG content ordering.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chart_mcp_log_scale_contract() -> TestResult {
+    let h = TestHarness::start(false, true).await?;
+    let mut failures = Vec::new();
+
+    let tools = h.client.list_all_tools().await?;
+    let y_scale_schema = tools
+        .iter()
+        .find(|tool| tool.name.as_ref() == "chart")
+        .and_then(|tool| tool.input_schema.get("properties"))
+        .and_then(serde_json::Value::as_object)
+        .and_then(|properties| properties.get("y_scale"));
+    match y_scale_schema {
+        Some(schema) if schema_allows_type(schema, "string") => {
+            let values = schema.get("enum").and_then(serde_json::Value::as_array);
+            if !values.is_some_and(|values| {
+                values.iter().any(|value| value == "linear")
+                    && values.iter().any(|value| value == "log")
+            }) {
+                failures.push(format!(
+                    "y_scale schema must enumerate linear and log, got {schema}"
+                ));
+            }
+        }
+        Some(schema) => failures.push(format!(
+            "optional y_scale schema must allow string, got {schema}"
+        )),
+        None => failures.push("chart schema is missing optional y_scale".into()),
+    }
+    let y_scale_required = tools
+        .iter()
+        .find(|tool| tool.name.as_ref() == "chart")
+        .and_then(|tool| tool.input_schema.get("required"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|required| required.iter().any(|value| value == "y_scale"));
+    if y_scale_required {
+        failures.push("y_scale must remain optional so omission defaults to linear".into());
+    }
+
+    let linear_default = call_tool(
+        &h.client,
+        "chart",
+        serde_json::json!({
+            "sql": "SELECT 'negative' AS category, -10 AS value UNION ALL SELECT 'zero', 0 UNION ALL SELECT 'positive', 10",
+            "chart_type": "bar",
+            "x": "category",
+            "y": "value",
+            "format": "svg"
+        }),
+    )
+    .await?;
+    if inline_image_bytes(
+        &mut failures,
+        "omitted y_scale linear default",
+        &linear_default,
+    )
+    .is_none()
+    {
+        failures.push("omitted y_scale must continue accepting zero/negative linear data".into());
+    }
+
+    let positive_sql = "SELECT 'ten' AS category, 10 AS value UNION ALL SELECT 'hundred', 100";
+    let log_svg_result = call_tool(
+        &h.client,
+        "chart",
+        serde_json::json!({
+            "sql": positive_sql,
+            "chart_type": "bar",
+            "x": "category",
+            "y": "value",
+            "format": "svg",
+            "y_scale": "log",
+            "y_range": [1.0, 1000.0],
+            "width": 520,
+            "height": 360
+        }),
+    )
+    .await?;
+    if let Some((mime, bytes)) =
+        inline_image_bytes(&mut failures, "positive log SVG", &log_svg_result)
+    {
+        if mime != "image/svg+xml" {
+            failures.push(format!("log SVG MIME changed: {mime}"));
+        }
+        match String::from_utf8(bytes) {
+            Ok(svg) => {
+                let mut heights: Vec<_> = svg_primary_blue_rects(&svg)
+                    .into_iter()
+                    .map(|rect| rect.3)
+                    .collect();
+                heights.sort_unstable();
+                match heights.as_slice() {
+                    [short, tall] if *short > 0 => {
+                        let ratio = f64::from(*tall) / f64::from(*short);
+                        if !(1.7..=2.3).contains(&ratio) {
+                            failures.push(format!(
+                                "10 and 100 over log range 1..1000 must occupy one and two decades (about 2x heights), got {heights:?} ratio={ratio}"
+                            ));
+                        }
+                    }
+                    _ => failures.push(format!(
+                        "positive log SVG must contain two visible primary bars, got heights {heights:?}"
+                    )),
+                }
+            }
+            Err(error) => failures.push(format!("log SVG is not UTF-8: {error}")),
+        }
+    }
+
+    let log_png_result = call_tool(
+        &h.client,
+        "chart",
+        serde_json::json!({
+            "sql": positive_sql,
+            "chart_type": "bar",
+            "x": "category",
+            "y": "value",
+            "format": "png",
+            "y_scale": "log",
+            "y_range": [1.0, 1000.0]
+        }),
+    )
+    .await?;
+    if let Some((mime, bytes)) =
+        inline_image_bytes(&mut failures, "positive log PNG", &log_png_result)
+    {
+        if mime != "image/png"
+            || !bytes.starts_with(&[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+        {
+            failures.push(format!(
+                "log PNG must carry PNG MIME/magic, got {mime} and {:?}",
+                bytes.get(..8)
+            ));
+        }
+    }
+
+    for (case, args) in [
+        (
+            "unknown scale",
+            serde_json::json!({
+                "sql": positive_sql, "chart_type": "bar", "x": "category", "y": "value",
+                "y_scale": "symlog", "format": "svg"
+            }),
+        ),
+        (
+            "zero log value",
+            serde_json::json!({
+                "sql": "SELECT 'zero' AS category, 0 AS value", "chart_type": "bar",
+                "x": "category", "y": "value", "y_scale": "log", "format": "svg"
+            }),
+        ),
+        (
+            "negative log value",
+            serde_json::json!({
+                "sql": "SELECT 1 AS category, -1 AS value", "chart_type": "line",
+                "x": "category", "y": "value", "y_scale": "log", "format": "svg"
+            }),
+        ),
+        (
+            "mixed-sign log values",
+            serde_json::json!({
+                "sql": "SELECT 1 AS category, -1 AS value UNION ALL SELECT 2, 1",
+                "chart_type": "scatter", "x": "category", "y": "value",
+                "y_scale": "log", "format": "svg"
+            }),
+        ),
+        (
+            "log histogram",
+            serde_json::json!({
+                "sql": "SELECT 10 AS value", "chart_type": "histogram", "x": "value",
+                "y_scale": "log", "format": "svg"
+            }),
+        ),
+        (
+            "log range excludes plotted value",
+            serde_json::json!({
+                "sql": positive_sql, "chart_type": "bar", "x": "category", "y": "value",
+                "y_scale": "log", "y_range": [20.0, 200.0], "format": "svg"
+            }),
+        ),
+    ] {
+        let result = call_tool(&h.client, "chart", args).await?;
+        record_error_contract(&mut failures, case, &result, "INVALID_ARGUMENT");
+    }
+
+    h.shutdown().await?;
+    assert!(
+        failures.is_empty(),
+        "chart log-scale MCP failures:\n{}",
+        failures.join("\n")
+    );
+    Ok(())
 }
 
 /// Persistent contention must be reported by the first persistent-routed

@@ -169,3 +169,131 @@ fn readme_degraded_status_contract() {
         "README must guide clients to retry status for full statistics"
     );
 }
+
+/// The concise, LLM-facing README must be sufficient to choose the three chart
+/// presentation controls without guessing at defaults or label sizing.
+#[test]
+fn readme_chart_presentation_contract() {
+    fn surrounding_lines(text: &str, needle: &str, radius: usize) -> String {
+        let lines: Vec<_> = text.lines().collect();
+        let Some(index) = lines.iter().position(|line| line.contains(needle)) else {
+            return String::new();
+        };
+        let start = index.saturating_sub(radius);
+        let end = (index + radius + 1).min(lines.len());
+        lines[start..end].join("\n").to_lowercase()
+    }
+
+    let orientation = surrounding_lines(README, "bar_orientation", 4);
+    let values = surrounding_lines(README, "label_values", 4);
+    let legend = surrounding_lines(README, "show_legend", 4);
+    let chart = surrounding_lines(README, "`chart`", 20);
+    let mut failures: Vec<String> = Vec::new();
+
+    if !(orientation.contains("bar_orientation")
+        && orientation.contains("vertical")
+        && orientation.contains("horizontal"))
+    {
+        failures.push(
+            "README must name bar_orientation and both vertical/horizontal choices".to_string(),
+        );
+    }
+    if !(values.contains("label_values")
+        && values.contains("value")
+        && ["original", "exact", "verbatim"]
+            .iter()
+            .any(|word| values.contains(word)))
+    {
+        failures.push("README must say label_values uses the original/exact scalar".to_string());
+    }
+    if !(legend.contains("show_legend")
+        && legend.contains("default")
+        && legend.contains("true")
+        && ["false", "suppress", "hide"]
+            .iter()
+            .any(|word| legend.contains(word)))
+    {
+        failures
+            .push("README must document show_legend=true by default and suppression".to_string());
+    }
+    for required in [
+        "long", "unicode", "truncat", "auto", "siz", "clip", "width", "height",
+    ] {
+        if !chart.contains(required) {
+            failures.push(format!(
+                "README chart layout caveat is missing semantic token {required:?}"
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "chart presentation README failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// The LLM-facing README must make the positive-only logarithmic contract
+/// actionable without inviting unsupported x-log/symlog/histogram guesses.
+#[test]
+fn readme_chart_log_contract() {
+    fn surrounding_lines(text: &str, needle: &str, radius: usize) -> String {
+        let lines: Vec<_> = text.lines().collect();
+        let Some(index) = lines.iter().position(|line| line.contains(needle)) else {
+            return String::new();
+        };
+        let start = index.saturating_sub(radius);
+        let end = (index + radius + 1).min(lines.len());
+        lines[start..end].join("\n").to_lowercase()
+    }
+
+    let scale = surrounding_lines(README, "y_scale", 8);
+    let chart = surrounding_lines(README, "`chart`", 28);
+    let mut failures: Vec<String> = Vec::new();
+
+    if !(scale.contains("y_scale")
+        && scale.contains("linear")
+        && scale.contains("log")
+        && scale.contains("default"))
+    {
+        failures.push("README must document y_scale with linear default and log choice".into());
+    }
+    if !(scale.contains("positive")
+        && (scale.contains("zero") || scale.contains("> 0"))
+        && scale.contains("negative"))
+    {
+        failures.push("README must state that log values/ranges are strictly positive".into());
+    }
+    if !(scale.contains("horizontal") && scale.contains('y') && scale.contains("measure")) {
+        failures.push(
+            "README must tie y_scale to the data-role y measure even for horizontal bars".into(),
+        );
+    }
+    if !scale.contains("histogram") {
+        failures.push("README must say logarithmic histograms are unsupported".into());
+    }
+    if !(scale.contains("range")
+        && ["contain", "enclos", "include"]
+            .iter()
+            .any(|word| scale.contains(word))
+        && scale.contains("value"))
+    {
+        failures.push("README must require explicit log ranges to contain every value".into());
+    }
+    if !(chart.contains("bar")
+        && chart.contains("lower")
+        && chart.contains("bound")
+        && ["never zero", "not zero", "instead of zero"]
+            .iter()
+            .any(|phrase| chart.contains(phrase)))
+    {
+        failures
+            .push("README must say log bars start at the positive lower bound, not zero".into());
+    }
+
+    assert!(
+        failures.is_empty(),
+        "chart log README failures:\n{}",
+        failures.join("\n")
+    );
+}

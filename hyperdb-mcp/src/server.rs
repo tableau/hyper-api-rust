@@ -12,7 +12,9 @@
 //! includes full JSON Schema descriptions for each tool's inputs.
 
 use crate::attach::{self, AttachRegistry, AttachRequest, AttachSource, LOCAL_ALIAS};
-use crate::chart::{render_chart, ChartFormat, ChartOptions, ChartType};
+use crate::chart::{
+    render_chart_with_measure_metadata, ChartFormat, ChartOptions, ChartPresentation, ChartType,
+};
 use crate::engine::{classify_statement, is_read_only_sql, Engine, StatementKind};
 use crate::error::{ErrorCode, McpError};
 use crate::export::{export_to_file, ExportOptions};
@@ -483,6 +485,20 @@ pub struct DescribeParams {
     pub database: Option<String>,
 }
 
+fn chart_bar_orientation_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "enum": ["vertical", "horizontal"]
+    })
+}
+
+fn chart_y_scale_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "enum": ["linear", "log"]
+    })
+}
+
 /// Parameters for the `chart` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ChartParams {
@@ -512,14 +528,26 @@ pub struct ChartParams {
     /// Set explicitly to override auto-detection. Bar charts are always
     /// categorical regardless of this flag.
     pub x_as_category: Option<bool>,
+    /// Bar layout: "vertical" (default) or "horizontal". Invalid for
+    /// line, scatter, and histogram charts.
+    #[serde(default)]
+    #[schemars(schema_with = "chart_bar_orientation_schema")]
+    pub bar_orientation: Option<String>,
     /// Fix the x-axis range as [min, max]. Omit to auto-scale. Useful when
     /// comparing multiple charts at a consistent scale (e.g. [0, 1500] for
     /// population in millions) or when an outlier would distort auto-scaling.
     /// Ignored for bar charts (which use categorical x positions).
     pub x_range: Option<[f64; 2]>,
-    /// Fix the y-axis range as [min, max]. Omit to auto-scale.
+    /// Fix the data-role y measure range as [min, max]. This applies to bars;
+    /// horizontal bars render it on the physical x axis. Omit to auto-scale.
     /// Example: [0.0, 1.0] to pin a 0–1 index axis regardless of the data.
     pub y_range: Option<[f64; 2]>,
+    /// Data-role y measure scale: "linear" (default) or positive-only "log".
+    /// For horizontal bars this controls the physical x axis. Log histograms
+    /// are unsupported.
+    #[serde(default)]
+    #[schemars(schema_with = "chart_y_scale_schema")]
+    pub y_scale: Option<String>,
     /// Map series names to hex colors ("#rrggbb"). Series not listed here
     /// fall back to the default color palette. Example:
     /// {"India": "#e41a1c", "China": "#ff7f0e"}. Only meaningful when a
@@ -530,6 +558,11 @@ pub struct ChartParams {
     /// each series has exactly one point (e.g. one country per dot).
     /// Defaults to false (legend shown).
     pub label_points: Option<bool>,
+    /// For bars, draw the original y scalar beside each mark. Defaults false.
+    pub label_values: Option<bool>,
+    /// Show the series legend. Defaults true; `label_points=true` still
+    /// suppresses line/scatter legends.
+    pub show_legend: Option<bool>,
     /// Where to write the rendered image. Parent directory is created
     /// automatically. If omitted, a file is auto-generated under the
     /// system temp dir (`<temp>/hyperdb-charts/chart-<ts>-<pid>-<n>.<ext>`).
@@ -2875,7 +2908,7 @@ impl HyperMcpServer {
 
     /// Render a chart (PNG or SVG) from a SQL query.
     #[tool(
-        description = "Render a chart (bar, line, scatter, or histogram) from a SQL query. Returns the PNG/SVG image inline by default so MCP clients can display it directly. Set `inline=false` to skip the inline bytes and write to disk only (keeps the MCP transcript small for batch workflows). Combine `inline=true` with `output_path` to get both.\n\n**Data shape:** The query must return long-format data with one numeric `y` column. For multi-series charts, use a `series` column to split by category. If your data is wide-format (multiple value columns), reshape it with `UNION ALL` into (label, series, value) tuples before charting.\n\n**DATE/TIMESTAMP x-axis:** Line and scatter charts auto-detect non-numeric x columns. DATE, TIMESTAMP, and TIMESTAMPTZ values render with a **proportional time axis** — gaps between data points reflect real wall-clock time (4.5 h gap and 17 h gap don't look the same). Tick labels are formatted in the input kind: `%Y-%m-%d` for DATE, `%Y-%m-%d %H:%M:%S` for TIMESTAMP, with the originating timezone offset preserved for TIMESTAMPTZ. TEXT x columns fall back to evenly-spaced categorical mode. Set `x_as_category: true` to force categorical layout on temporal data (useful when even spacing reads better than proportional gaps).\n\n- `output_path`: explicit destination file path. Parent directory is created automatically (no need to pre-create it). If omitted and `inline=true` (default), no file is written. If omitted and `inline=false`, a file is auto-generated under the system temp dir as `hyperdb-charts/chart-<ts>-<pid>-<n>.<ext>`.\n- `inline`: when true (default), return the image bytes inline. Without `output_path`, suppresses the disk write entirely. With `output_path`, writes to disk AND returns inline. Set to false for disk-only output.\n- `format`: \"png\" (default) or \"svg\". Auto-derived from `output_path` extension when omitted. A mismatch between `format` and the path extension returns `INVALID_ARGUMENT`.\n- `overwrite`: default true. Set false to refuse overwriting an existing file (returns `PERMISSION_DENIED`).\n- `x_range` / `y_range`: fix axis extents across multiple charts (e.g. x_range=[0,1500], y_range=[0,1]).\n- `color_map`: stable per-series hex colors (e.g. {\"India\":\"#e41a1c\",\"China\":\"#ff7f0e\"}).\n- `label_points=true`: annotate each point with its series name instead of showing a legend — best when each series has exactly one point."
+        description = "Render a chart (bar, line, scatter, or histogram) from a SQL query. Returns the PNG/SVG image inline by default so MCP clients can display it directly. Set `inline=false` to skip the inline bytes and write to disk only (keeps the MCP transcript small for batch workflows). Combine `inline=true` with `output_path` to get both.\n\n**Data shape:** The query must return long-format data with one numeric `y` column. For multi-series charts, use a `series` column to split by category. If your data is wide-format (multiple value columns), reshape it with `UNION ALL` into (label, series, value) tuples before charting.\n\n**DATE/TIMESTAMP x-axis:** Line and scatter charts auto-detect non-numeric x columns. DATE, TIMESTAMP, and TIMESTAMPTZ values render with a **proportional time axis** — gaps between data points reflect real wall-clock time (4.5 h gap and 17 h gap don't look the same). Tick labels are formatted in the input kind: `%Y-%m-%d` for DATE, `%Y-%m-%d %H:%M:%S` for TIMESTAMP, with the originating timezone offset preserved for TIMESTAMPTZ. TEXT x columns fall back to evenly-spaced categorical mode. Set `x_as_category: true` to force categorical layout on temporal data (useful when even spacing reads better than proportional gaps).\n\n- `output_path`: explicit destination file path. Parent directory is created automatically (no need to pre-create it). If omitted and `inline=true` (default), no file is written. If omitted and `inline=false`, a file is auto-generated under the system temp dir as `hyperdb-charts/chart-<ts>-<pid>-<n>.<ext>`.\n- `inline`: when true (default), return the image bytes inline. Without `output_path`, suppresses the disk write entirely. With `output_path`, writes to disk AND returns inline. Set to false for disk-only output.\n- `format`: \"png\" (default) or \"svg\". Auto-derived from `output_path` extension when omitted. A mismatch between `format` and the path extension returns `INVALID_ARGUMENT`.\n- `overwrite`: default true. Set false to refuse overwriting an existing file (returns `PERMISSION_DENIED`).\n- `x_range`: finite increasing x extent for line/scatter; ignored for categorical bars.\n- `y_range`: finite increasing data-role y extent, including bars; horizontal bars render it on the physical x axis.\n- `color_map`: stable per-series hex colors (e.g. {\"India\":\"#e41a1c\",\"China\":\"#ff7f0e\"}).\n- `bar_orientation`: \"vertical\" (default) or \"horizontal\" for bars.\n- `label_values=true`: label bars with each original y scalar.\n- `show_legend`: true by default; false hides the legend.\n- `y_scale`: \"linear\" (default) or strictly-positive \"log\" for the y measure; log histograms are unsupported and explicit log ranges must contain every value.\n- `label_points=true`: annotate each point with its series name instead of showing a legend — best when each series has exactly one point."
     )]
     fn chart(
         &self,
@@ -2900,6 +2933,14 @@ impl HyperMcpServer {
                 params.format.as_deref(),
                 params.output_path.as_deref(),
             )?;
+            let chart_type = ChartType::parse(&params.chart_type)?;
+            let presentation = ChartPresentation::from_mcp(
+                chart_type,
+                params.bar_orientation.as_deref(),
+                params.label_values,
+                params.show_legend,
+                params.y_scale.as_deref(),
+            )?;
 
             // Optional database routing — temporarily redirect search_path
             // so unqualified names in the chart SQL resolve there.
@@ -2910,7 +2951,12 @@ impl HyperMcpServer {
             };
 
             let timer = crate::stats::StatsTimer::start();
-            let rows = engine.execute_query_to_json(&params.sql)?;
+            let measure_column = match chart_type {
+                ChartType::Histogram => params.x.as_deref().or(params.y.as_deref()),
+                ChartType::Bar | ChartType::Line | ChartType::Scatter => params.y.as_deref(),
+            };
+            let chart_rows =
+                engine.execute_chart_query_to_json(&params.sql, measure_column)?;
 
             // Parse color_map: skip entries whose hex string is malformed,
             // logging them via the description rather than hard-failing.
@@ -2928,7 +2974,7 @@ impl HyperMcpServer {
                 .unwrap_or_default();
 
             let opts = ChartOptions {
-                chart_type: ChartType::parse(&params.chart_type)?,
+                chart_type,
                 x_column: params.x.clone(),
                 y_column: params.y.clone(),
                 series_column: params.series.clone(),
@@ -2944,7 +2990,12 @@ impl HyperMcpServer {
                 label_points: params.label_points.unwrap_or(false),
             };
 
-            let chart = render_chart(&rows, &opts)?;
+            let chart = render_chart_with_measure_metadata(
+                &chart_rows.rows,
+                &opts,
+                presentation,
+                &chart_rows.measures,
+            )?;
 
             // Decide disk vs inline vs both. Write to disk *before*
             // building the content vec so an I/O failure surfaces as a

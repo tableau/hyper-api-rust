@@ -77,6 +77,26 @@ pub struct PersistentAttachOutcome {
     pub file_was_created: bool,
 }
 
+/// Typed view of the selected chart measure before JSON materialization can
+/// erase SQL nullability, non-finite floating-point state, or exact decimal
+/// display text.
+#[derive(Debug, Clone)]
+pub(crate) enum ChartMeasureValue {
+    Finite { coordinate: f64, display: String },
+    NonFinite,
+    Null,
+    NonNumeric,
+}
+
+/// JSON rows plus a row-aligned typed sidecar for the chart's measure column.
+/// This remains crate-private so ordinary query results keep their established
+/// JSON shapes.
+#[derive(Debug)]
+pub(crate) struct ChartQueryRows {
+    pub(crate) rows: Vec<Value>,
+    pub(crate) measures: Vec<ChartMeasureValue>,
+}
+
 /// Attach the persistent database under the reserved `"persistent"`
 /// alias on `connection`, creating the underlying `.hyper` file if it
 /// doesn't yet exist. Also pins `schema_search_path` to `primary_db_name`
@@ -863,6 +883,49 @@ impl Engine {
         Ok(rows_json)
     }
 
+    /// Execute a chart query while retaining the selected measure's typed
+    /// state alongside the ordinary JSON rows. The sidecar is row-aligned and
+    /// is consumed only by the MCP chart renderer.
+    pub(crate) fn execute_chart_query_to_json(
+        &self,
+        sql: &str,
+        measure_column: Option<&str>,
+    ) -> Result<ChartQueryRows, McpError> {
+        let mut result = self.connection.execute_query(sql).map_err(McpError::from)?;
+
+        let mut rows_json = Vec::new();
+        let mut measures = Vec::new();
+        let mut schema_opt = None;
+        while let Some(chunk) = result.next_chunk().map_err(McpError::from)? {
+            if schema_opt.is_none() {
+                schema_opt = result.schema();
+            }
+            if let Some(ref schema) = schema_opt {
+                let columns = schema.columns();
+                // JSON object insertion keeps the last duplicate column name,
+                // so select the same occurrence for the typed sidecar.
+                let measure = measure_column
+                    .and_then(|name| columns.iter().rev().find(|column| column.name() == name));
+                for row in &chunk {
+                    let measure_value = measure.map_or(ChartMeasureValue::NonNumeric, |column| {
+                        chart_measure_value(row, column.index(), &column.sql_type())
+                    });
+                    let mut obj = serde_json::Map::new();
+                    for col in columns {
+                        let val = row_value_to_json(row, col.index(), &col.sql_type());
+                        obj.insert(col.name().to_string(), val);
+                    }
+                    rows_json.push(Value::Object(obj));
+                    measures.push(measure_value);
+                }
+            }
+        }
+        Ok(ChartQueryRows {
+            rows: rows_json,
+            measures,
+        })
+    }
+
     /// Create a table from a schema definition.
     ///
     /// - `replace = true`: drops the existing table (if any) and recreates it.
@@ -1527,7 +1590,7 @@ impl Engine {
 /// | `BOOL` | `true`/`false` |
 /// | `SMALL_INT` / `INT` / `BIG_INT` | number |
 /// | `DOUBLE` / `FLOAT` | number |
-/// | `NUMERIC` | number when losslessly representable as `f64`, else string |
+/// | `NUMERIC` | number when representable as a finite `f64`, else string |
 /// | `DATE` | ISO 8601 date string (`YYYY-MM-DD`) |
 /// | `TIMESTAMP` / `TIMESTAMP_TZ` | ISO 8601 timestamp string |
 /// | `TEXT` / `VARCHAR` | string |
@@ -1583,12 +1646,12 @@ fn row_value_to_json(row: &hyperdb_api::Row, idx: usize, sql_type: &SqlType) -> 
         // handled inside `hyperdb-api`; this function only needs to pick
         // the JSON shape.
         //
-        // `Numeric::to_string()` uses the decoded scale, so round-trip
-        // through `f64` is only used for JSON compactness — if the
-        // value doesn't fit in `f64` losslessly (`serde_json::Number::
-        // from_f64` returns `None` for NaN/Infinity, and we can't
-        // always represent large i128 exactly as `f64`), fall back to
-        // the string form so the caller sees the exact value.
+        // `Numeric::to_string()` uses the decoded scale. Ordinary query
+        // results retain their established compact JSON shape: any value
+        // parseable as a finite `f64` becomes a JSON number, even when that
+        // conversion rounds, while values outside that domain remain exact
+        // strings. The chart-only materializer below retains the exact text
+        // separately for display labels.
         return row.get::<Numeric>(idx).map_or(Value::Null, |n| {
             let s = n.to_string();
             s.parse::<f64>()
@@ -1622,6 +1685,66 @@ fn row_value_to_json(row: &hyperdb_api::Row, idx: usize, sql_type: &SqlType) -> 
     // — add explicit branches above when those start appearing in
     // real queries.
     row.get::<String>(idx).map_or(Value::Null, Value::String)
+}
+
+fn chart_measure_value(
+    row: &hyperdb_api::Row,
+    idx: usize,
+    sql_type: &SqlType,
+) -> ChartMeasureValue {
+    use hyperdb_api::oids;
+    use hyperdb_api::Numeric;
+
+    if row.is_null(idx) {
+        return ChartMeasureValue::Null;
+    }
+
+    let oid = sql_type.internal_oid();
+    if oid == oids::DOUBLE.0 || oid == oids::FLOAT.0 {
+        return match row.get::<f64>(idx) {
+            Some(value) if value.is_finite() => ChartMeasureValue::Finite {
+                coordinate: value,
+                display: serde_json::Number::from_f64(value)
+                    .map_or_else(|| value.to_string(), |number| number.to_string()),
+            },
+            Some(_) => ChartMeasureValue::NonFinite,
+            None => ChartMeasureValue::NonNumeric,
+        };
+    }
+    if oid == oids::NUMERIC.0 {
+        return row
+            .get::<Numeric>(idx)
+            .map_or(ChartMeasureValue::NonNumeric, |numeric| {
+                let coordinate = numeric.to_f64();
+                if coordinate.is_finite() {
+                    ChartMeasureValue::Finite {
+                        coordinate,
+                        display: numeric.to_string(),
+                    }
+                } else {
+                    ChartMeasureValue::NonFinite
+                }
+            });
+    }
+
+    let json_value = row_value_to_json(row, idx, sql_type);
+    match json_value {
+        Value::Bool(value) => ChartMeasureValue::Finite {
+            coordinate: if value { 1.0 } else { 0.0 },
+            display: value.to_string(),
+        },
+        Value::Number(number) => number
+            .as_f64()
+            .map_or(ChartMeasureValue::NonNumeric, |value| {
+                ChartMeasureValue::Finite {
+                    coordinate: value,
+                    display: number.to_string(),
+                }
+            }),
+        Value::Null | Value::String(_) | Value::Array(_) | Value::Object(_) => {
+            ChartMeasureValue::NonNumeric
+        }
+    }
 }
 
 /// Name of the client-side log file written in [`resolve_log_dir`].
