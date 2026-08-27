@@ -168,6 +168,15 @@ fn serialized_len<T: Serialize + ?Sized>(value: &T) -> usize {
         .len()
 }
 
+fn property_description<'a>(tool: &'a Tool, property: &str) -> Option<&'a str> {
+    tool.input_schema
+        .get("properties")?
+        .as_object()?
+        .get(property)?
+        .get("description")?
+        .as_str()
+}
+
 fn readme_text(result: &CallToolResult) -> Result<&str, std::io::Error> {
     let mut text_blocks = result
         .content
@@ -339,6 +348,130 @@ async fn generated_catalog_readme_coverage_contract() -> TestResult {
     assert!(
         undocumented.is_empty(),
         "generated tools missing an exact backticked README mention: {undocumented:?}"
+    );
+    Ok(())
+}
+
+/// This catches production mutations to generated parameter schemas that
+/// misstate attachment errors, KV writability, catalog routing, or chart input
+/// fields even when unrelated README text still contains the same tokens.
+#[tokio::test]
+async fn generated_guidance_matches_database_side_effect_contract() -> TestResult {
+    let harness = CatalogHarness::start(false).await?;
+    let tools = harness.list_all_tools().await?;
+    harness.shutdown().await?;
+    let mut failures = Vec::new();
+
+    let attach = tools
+        .iter()
+        .find(|tool| tool.name == "attach_database")
+        .ok_or_else(|| std::io::Error::other("generated catalog omitted attach_database"))?;
+    let attach_path = property_description(attach, "path")
+        .unwrap_or("")
+        .to_lowercase();
+    if attach_path.contains("resource_busy") {
+        failures.push(
+            "attach_database.path must not promise reserved-persistent RESOURCE_BUSY classification for user attachments"
+                .to_owned(),
+        );
+    }
+
+    for tool_name in ["kv_get", "kv_delete"] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == tool_name)
+            .ok_or_else(|| {
+                std::io::Error::other(format!("generated catalog omitted {tool_name}"))
+            })?;
+        let database = property_description(tool, "database")
+            .unwrap_or("")
+            .to_lowercase();
+        if !(database.contains("attached") && database.contains("writable")) {
+            failures.push(format!(
+                "{tool_name}.database must say attached KV targets require writable access even though {tool_name} itself may be a reader"
+            ));
+        }
+    }
+
+    let metadata = tools
+        .iter()
+        .find(|tool| tool.name == "set_table_metadata")
+        .ok_or_else(|| std::io::Error::other("generated catalog omitted set_table_metadata"))?;
+    let metadata_table = property_description(metadata, "table")
+        .unwrap_or("")
+        .to_lowercase();
+    let metadata_database = property_description(metadata, "database")
+        .unwrap_or("")
+        .to_lowercase();
+    if !metadata_table.contains("catalog entry")
+        || metadata_table.contains("must already exist in the selected database")
+    {
+        failures.push(
+            "set_table_metadata.table must require an existing catalog entry, not table existence in a selected database"
+                .to_owned(),
+        );
+    }
+    if !(metadata_database.contains("local")
+        && metadata_database.contains("persistent")
+        && metadata_database.contains("shared")
+        && metadata_database.contains("name-keyed")
+        && metadata_database.contains("persistent catalog")
+        && metadata_database.contains("user-attached")
+        && metadata_database.contains("writable")
+        && metadata_database.contains("per-database"))
+    {
+        failures.push(
+            "set_table_metadata.database must describe the shared name-keyed local/persistent catalog and writable user-alias per-database catalog"
+                .to_owned(),
+        );
+    }
+
+    let chart = tools
+        .iter()
+        .find(|tool| tool.name == "chart")
+        .ok_or_else(|| std::io::Error::other("generated catalog omitted chart"))?;
+    let chart_properties = chart
+        .input_schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| std::io::Error::other("chart schema omitted top-level properties"))?;
+    for property in ["database", "color_map", "label_points"] {
+        if !chart_properties.contains_key(property) {
+            failures.push(format!("chart schema omitted `{property}`"));
+        }
+    }
+    let chart_database = property_description(chart, "database")
+        .unwrap_or("")
+        .to_lowercase();
+    let color_map = property_description(chart, "color_map")
+        .unwrap_or("")
+        .to_lowercase();
+    let label_points = property_description(chart, "label_points")
+        .unwrap_or("")
+        .to_lowercase();
+    if !(chart_database.contains("local")
+        && chart_database.contains("persistent")
+        && chart_database.contains("attached"))
+    {
+        failures.push("chart.database schema description must explain all routing choices".into());
+    }
+    if !(color_map.contains("series") && color_map.contains("hex")) {
+        failures.push("chart.color_map schema description must map series to hex colors".into());
+    }
+    if !(label_points.contains("line")
+        && label_points.contains("scatter")
+        && label_points.contains("legend"))
+    {
+        failures.push(
+            "chart.label_points schema description must cover line/scatter labels and legend suppression"
+                .into(),
+        );
+    }
+
+    assert!(
+        failures.is_empty(),
+        "generated guidance contract failures:\n- {}",
+        failures.join("\n- ")
     );
     Ok(())
 }

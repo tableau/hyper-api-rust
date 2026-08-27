@@ -23,7 +23,7 @@ This means an LLM can:
 - **Build on prior work** — load yesterday's cleaned dataset and extend it without re-processing from scratch
 - **Maintain structured context** — store relationship graphs, timelines, or decision logs as proper tables with typed columns
 
-The ephemeral database is scratch space (think: a whiteboard). The persistent database is long-term memory (think: a filing cabinet you can query). Multiple AI clients sharing the same daemon see the same persistent data — so Claude Code, Cursor, and VS Code Copilot can all read from and contribute to the same knowledge base.
+The local database is ephemeral scratch space (think: a whiteboard). The persistent database is long-term memory (think: a filing cabinet you can query). Multiple AI clients sharing the same daemon see the same persistent data — so Claude Code, Cursor, and VS Code Copilot can all read from and contribute to the same knowledge base.
 
 **Table or key-value store?** For a handful of small facts, notes, or flags, prefer the built-in key-value store (`kv_set` with `persist: true`) over `CREATE TABLE` + `load_data` — it needs no schema and no DDL. Reach for a real table when you need typed columns, JOINs, or aggregation. See [Working with both databases](#working-with-both-databases) for the `persist` / `database` mechanics that apply to both paths.
 
@@ -48,9 +48,9 @@ The ephemeral database is scratch space (think: a whiteboard). The persistent da
 - **Smart schema inference** — exact (Arrow/Parquet), structural (JSON), heuristic (CSV) with full-file numeric widening
 - **Pre-ingest file inspection** — `inspect_file` dry-runs the same inference without touching Hyper so LLMs can build safe schema overrides in one shot
 - **Partial schema overrides** — supply just the columns you want to correct (e.g. `{"population":"BIGINT"}`) — the rest keep their inferred type
-- **Rich resource surface** — workspace readme, per-table JSON and CSV samples, and one JSON + one CSV resource per table so LLMs can orient themselves via `resources/list` without any tool calls
+- **Rich resource surface** — database overview, per-table JSON and CSV samples, and one JSON + one CSV resource per table so LLMs can orient themselves via `resources/list` without any tool calls
 - **Saved queries** — register named read-only SQL with `save_query`; each query becomes `hyper://queries/{name}/definition` (metadata) + `hyper://queries/{name}/result` (live re-run). Persisted in the persistent attachment, session-only when `--ephemeral-only`
-- **Key-value scratchpad** — lightweight `kv_set` / `kv_get` / `kv_list` / `kv_delete` / `kv_pop` / `kv_size` / `kv_clear` / `kv_list_stores` store for small notes and state without a `CREATE TABLE`. Ephemeral by default (lost on restart); pass `persist: true` (or `database: "persistent"`) to make a store durable across sessions
+- **Key-value scratchpad** — lightweight `kv_set` / `kv_set_many` / `kv_get` / `kv_list` / `kv_delete` / `kv_pop` / `kv_size` / `kv_clear` / `kv_list_stores` store for small notes and state without a `CREATE TABLE`. Ephemeral by default (lost on restart); pass `persist: true` (or `database: "persistent"`) to make a store durable across sessions
 - **Live resource-update notifications** — MCP clients can `resources/subscribe` to any `hyper://...` URI; the server fires `notifications/resources/updated` after every ingest, DDL, watcher event, or saved-query mutation
 
 ---
@@ -118,8 +118,11 @@ export HYPERD_PATH="$PWD/.hyperd/current" # or pass via your MCP config
 `hyperdb-bootstrap` also has a library API if you'd rather wire the
 download into your own build script — see its
 [README](../hyperdb-bootstrap/README.md). If you already have `hyperd`
-elsewhere (Tableau Hyper API for C++/Python/Java ships one), point
-`HYPERD_PATH` at it or add it to your `PATH`.
+elsewhere (Tableau Hyper API for C++/Python/Java ships one), set
+`HYPERD_PATH` to either the executable or its containing directory.
+When that variable is absent or non-UTF-8, the runtime walks upward from its
+current directory for `.hyperd/current/hyperd`; it does not perform a general
+`PATH` lookup.
 
 ### MCP Client Configuration
 
@@ -156,7 +159,12 @@ By default, persistent storage lives at the platform data dir (`~/Library/Applic
 "args": ["--persistent-db", "/path/to/my-project.hyper"]
 ```
 
-Multiple MCP clients can point at the **same** persistent file simultaneously — they all connect through the shared `hyperd` daemon and use Hyper's MVCC transaction isolation. See [Operating Modes](#operating-modes) below.
+Multiple MCP clients can point at the **same** persistent file simultaneously
+when they reuse the shared `hyperd` daemon; Hyper's MVCC transaction isolation
+coordinates their connections. A separate private `hyperd`, Tableau, or another
+process trying to attach the same file can instead receive contextual
+`RESOURCE_BUSY`. See [Operating Modes](#operating-modes) and
+[Error Handling](#error-handling).
 
 #### Claude Code / AI Suite
 
@@ -182,7 +190,7 @@ Any tool that supports the MCP stdio transport can use this server. Point it at 
 
 ## Operating Modes
 
-Each session has **two databases**: an ephemeral primary (scratch space — always created fresh per session, deleted on exit) and a persistent database (queryable long-term memory — stored at the platform-default location or a path you supply, survives indefinitely). Unqualified SQL targets the ephemeral primary; the persistent database is reachable as the `"persistent"` alias.
+Each session has **two databases**: the ephemeral **local** primary (scratch space — always created fresh per session, deleted on exit) and a **persistent** database (queryable long-term memory — stored at the platform-default location or a path you supply, survives indefinitely). Unqualified SQL targets local; the durable database is reachable as the `"persistent"` alias. Additional `.hyper` files are **attached databases** under user-chosen aliases.
 
 ### Hyper engine
 
@@ -197,15 +205,15 @@ The shared daemon is the bigger win for users running multiple AI clients (Claud
 
 | Mode | Flag | Behavior |
 |---|---|---|
-| **Default** | *(none)* | Ephemeral primary in `$TMPDIR/hyperdb-mcp-<pid>-<n>/scratch.hyper` + persistent attachment at the platform data dir (e.g. `~/Library/Application Support/hyperdb/workspace.hyper` on macOS). |
+| **Default** | *(none)* | Ephemeral local database in `$TMPDIR/hyperdb-mcp-<pid>-<n>/scratch.hyper` + persistent attachment at the platform data dir (e.g. `~/Library/Application Support/hyperdb/workspace.hyper` on macOS). |
 | **Custom persistent path** | `--persistent-db <PATH>` | Same as default but the persistent file lives at `<PATH>`. The deprecated `--workspace <PATH>` is accepted as an alias with a stderr warning. |
-| **Ephemeral-only** | `--ephemeral-only` | No persistent attachment; the session has only the ephemeral primary plus any user-attached databases via `attach_database`. Saved queries fall back to in-memory storage and disappear when the session ends. |
+| **Ephemeral-only** | `--ephemeral-only` | No persistent attachment; the session has only the local database plus any user-attached databases via `attach_database`. Saved queries fall back to in-memory storage and disappear when the session ends. |
 
 `HYPERDB_PERSISTENT_DB` overrides the default persistent path the same way `--persistent-db` does.
 
 ### Working with both databases
 
-Tool calls default to the ephemeral primary — that's the LLM's scratch space for exploratory work that doesn't need to outlive the session. To store data in long-term memory (the persistent database), there are two ways to reach it:
+Tool calls default to the local database — that's the LLM's ephemeral scratch space for exploratory work that doesn't need to outlive the session. To store data in long-term memory (the persistent database), there are two ways to reach it:
 
 **1. Per-tool `database` parameter** (preferred for ergonomic LLM workflows):
 
@@ -222,7 +230,12 @@ describe({ database: "persistent" })
 sample({ table: "customers", database: "persistent" })
 ```
 
-The `database` parameter is available on `query`, `execute`, `load_data`, `load_file`, `load_files`, `watch_directory`, `describe`, `sample`, `chart`, `export`, and `set_table_metadata`. The shorthand `persist: true` (sugar for `database: "persistent"`) is available on `load_data`, `load_file`, `load_files`, and `watch_directory`. Pass any user-attached writable alias (created via `attach_database`) to target a custom database.
+The `database` parameter is available on `query`, `execute`, `load_data`, `load_file`, `load_files`, `watch_directory`, `describe`, `sample`, `chart`, `export`, and `set_table_metadata`. The shorthand `persist: true` (sugar for `database: "persistent"`) is available on `load_data`, `load_file`, `load_files`, and `watch_directory`. Read tools generally accept a read-only user attachment; write tools require a writable one. The exception is the KV family: every `kv_*` call to a user attachment requires it to be writable because the backing table may need initialization.
+
+Every successful database-routed response includes the canonical
+`resolved_database`: `"local"`, `"persistent"`, or the lowercase attached
+alias after precedence is applied. An explicit `database` wins over
+`persist: true`; `copy_query` additionally retains `target_database`.
 
 (`query_data` and `query_file` are one-shot tools that materialize the inline data into their own temp table and query it — they do not accept a `database` parameter because the data isn't in a persisted database to begin with.)
 
@@ -237,7 +250,12 @@ CREATE TABLE "persistent"."public"."revenue_2026" AS
   SELECT region, SUM(amount) FROM scratch_orders GROUP BY region;
 ```
 
-**Per-database `_table_catalog`:** every writable database — persistent and any user-attached writable file — gets its own `_table_catalog` lazily seeded on first ingest. MCP-managed metadata (load tool, params, timestamps, prose fields set via `set_table_metadata`) lives alongside the data file, so opening a `.hyper` file later as a primary workspace finds the catalog ready. If you want a pristine `.hyper` file for export with no MCP bookkeeping, run `DROP TABLE "<alias>"."public"."_table_catalog"` once and subsequent sessions opening that file will leave it dropped.
+**Metadata catalogs:** local and persistent tables share the persistent
+`_table_catalog`, keyed by table name across their union. `set_table_metadata`
+therefore targets an existing catalog entry rather than re-checking that the
+table exists in a selected local/persistent database. Each writable
+user-attached database has its own per-database catalog; read-only attachments
+cannot be metadata targets.
 
 **Detach safety:** `detach_database` rejects with `InvalidArgument` if any active watcher targets the alias — call `unwatch_directory` first. This prevents the watcher's pool from silently writing into a now-detached file (or worse, the wrong file if the alias is later re-attached to a different path).
 
@@ -262,9 +280,22 @@ hyperdb-mcp doctor
 hyperdb-mcp doctor --json
 ```
 
-Doctor is side-effect-free: it does not start a daemon or `hyperd`, and it does not open or create a database. Reports contain local paths; review them before sharing.
+Doctor is side-effect-free: it creates no directories, does not start a daemon
+or `hyperd`, and does not open or create a database. Its native executable, MCP build,
+and compiled Rust API identities are authoritative; npm wrapper/platform
+details are bounded, optional launcher-reported provenance. A live daemon is
+attributed only after a fresh `STATUS` response is verified. Reports contain
+local paths; review them before sharing.
 
-**Port discovery.** The daemon binds a TCP health/lock port — by default it scans upward from **7485** (16 ports) and uses the first free one; set `HYPERDB_DAEMON_PORT` to pin an exact port (no scan). The health port doubles as a single-instance lock and an identity check: clients send `PING` and require a `PONG hyperdb-mcp <version>` reply before trusting a daemon, so an unrelated process occupying the port is skipped rather than mistaken for the daemon.
+**Port discovery.** MCP auto-spawn discovers a live daemon first, then scans
+upward from **7485** across 16 candidates before starting one at the selected
+exact port. Setting `HYPERDB_DAEMON_PORT` pins auto-spawn to one candidate.
+In contrast, a manually launched foreground `hyperdb-mcp daemon` never scans:
+`--port <PORT>` binds that exact port, while an omitted `--port` binds the
+configured/base port exactly. The health port doubles as a single-instance
+lock and identity check: clients send `PING` and require a
+`PONG hyperdb-mcp <version>` reply before trusting a daemon, so an unrelated
+process is not mistaken for HyperDB.
 
 **Staying resident.** By default the daemon never idle-shuts-down — keeping `hyperd` warm means the next tool call connects immediately instead of triggering a "restarting, please retry" round-trip. To opt into auto-shutdown (e.g. on CI), pass `--idle-timeout <SECS>` or set `HYPERDB_DAEMON_IDLE_TIMEOUT`.
 
@@ -282,7 +313,7 @@ If hyperd repeatedly fails to start (3 attempts within 60 seconds — e.g., misc
 
 | Flag | Behavior |
 |---|---|
-| `--read-only` | Disables `execute`, `load_data`, `load_file`, `watch_directory`, `save_query`, `delete_query`, and the KV mutators (`kv_set`, `kv_delete`, `kv_pop`, `kv_clear`). Export (including `.hyper`) stays allowed — it's a read-only file copy. See [Read-Only Mode](#read-only-mode). |
+| `--read-only` | Guards `execute`, all four `load_*` tools, `watch_directory`, saved-query mutations, `set_table_metadata`, `copy_query`, `kv_set`, `kv_set_many`, `kv_delete`, `kv_pop`, `kv_clear`, and writable/create attachment. Read-only attachment, `unwatch_directory`, and export (including `.hyper`) stay available. See [Read-Only Mode](#read-only-mode). |
 
 ---
 
@@ -321,11 +352,11 @@ query_file(path: '/tmp/sales.parquet', sql: 'SELECT TOP 10 * FROM sales ORDER BY
 | `table_name` | string | no | Table name — defaults to filename stem |
 | `schema` | object | no | Partial column-name → type map (see [Schema Overrides](#schema-overrides)) |
 
-### Workspace Tools
+### Database Tools
 
 #### `load_data`
 
-Load inline data into a named workspace table.
+Load inline data into a named local, persistent, or attached-database table.
 
 ```
 load_data(table: 'customers', data: '[{"id":1,"name":"Alice"},...]')
@@ -341,7 +372,7 @@ load_data(table: 'customers', data: '[{"id":1,"name":"Alice"},...]')
 
 #### `load_file`
 
-Load a file into a named workspace table.
+Load a file into a named local, persistent, or attached-database table.
 
 ```
 load_file(table: 'orders', path: '/tmp/orders.csv')
@@ -362,7 +393,7 @@ so you can build a minimal, correct override in one shot.
 #### `load_iceberg`
 
 Load an [Apache Iceberg](https://iceberg.apache.org/) table into a named
-workspace table. Pass the absolute path to the Iceberg table root (the
+local table. Pass the absolute path to the Iceberg table root (the
 directory containing `metadata/` and `data/`); hyperd's native Iceberg
 reader derives the schema and resolves the snapshot.
 
@@ -383,7 +414,7 @@ Iceberg table metadata.
 
 #### `query`
 
-Run a **read-only** SQL query against the workspace. Accepts `SELECT`, `WITH`, `EXPLAIN`, `SHOW`, `VALUES`. For DDL/DML use `execute`.
+Run a **read-only** SQL query against local (default), persistent, or an attached database. Accepts `SELECT`, `WITH`, `EXPLAIN`, `SHOW`, `VALUES`. For DDL/DML use `execute`.
 
 ```
 query(sql: 'SELECT c.name, SUM(o.amount) FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY c.name')
@@ -414,7 +445,7 @@ Validation rules enforced before any SQL hits the server:
 
 #### `describe`
 
-List all workspace tables with their schemas, column types, and row counts.
+List all tables in the selected database with their schemas, column types, and row counts.
 
 #### `sample`
 
@@ -519,23 +550,24 @@ delete_query(name: 'top_5_customers')
 Returns `{ "deleted": true }` when the query existed, `{ "deleted": false }`
 when it did not (no error on unknown names). Disabled in read-only mode.
 
-### Key-Value Store
+### Key-Value Scratchpad
 
 Lightweight named scratchpad for stashing a value under `store` + `key` and
 recalling it later — remember a variable, a summary, a JSON config, or a
 work-queue entry without creating a table or running `load_data`.
 
-> **Stores default to the EPHEMERAL database and are LOST on server restart.**
+> **Stores default to the local database and are LOST on server restart.**
 > Pass `database="persistent"` (or `persist=true`) to make a store durable
 > across restarts, or an attached alias to target that database. Each database
 > has its own isolated set of stores; a store in one database is invisible from
 > another.
 
-Eight tools cover the surface:
+Nine tools cover the surface:
 
 | Tool | Purpose | Parameters |
 |---|---|---|
 | `kv_set` | Write/overwrite a value (upsert) | `store`, `key`, `value`, `database`, `persist` |
+| `kv_set_many` | Atomically write an `entries` batch, optionally skipping existing keys | `store`, `entries`, `overwrite`, `database`, `persist` |
 | `kv_get` | Read a value by store + key (`value` is null when absent, not an error) | `store`, `key`, `database`, `persist` |
 | `kv_delete` | Remove one key (`{deleted: true/false}`, no error on unknown key) | `store`, `key`, `database`, `persist` |
 | `kv_list` | List all keys in a store, sorted ascending | `store`, `database`, `persist` |
@@ -550,7 +582,12 @@ kv_get(store: 'session', key: 'last_report')
 ```
 
 Key properties:
-- **Read-only mode** — the four mutators (`kv_set`, `kv_delete`, `kv_pop`, `kv_clear`) are disabled and return `READ_ONLY_VIOLATION`; the four readers (`kv_get`, `kv_list`, `kv_size`, `kv_list_stores`) always work.
+- **Read-only mode** — the five mutators (`kv_set`, `kv_set_many`, `kv_delete`, `kv_pop`, `kv_clear`) are disabled and return `READ_ONLY_VIOLATION`; the global guard leaves the four readers (`kv_get`, `kv_list`, `kv_size`, `kv_list_stores`) available.
+- **Attached-database access** — every attached target must have been attached
+  with `writable=true`, even for readers, because a KV call may need to
+  initialize its backing table. The global `--read-only` guard still blocks
+  only the five mutators; an allowed reader can use local/persistent storage but
+  cannot use a read-only user attachment.
 - **Pop order** — `kv_pop` removes and returns the **lowest-keyed** entry in lexicographic key order (not insertion order), making a store usable as a simple work queue.
 - **No store registry** — a store that becomes empty simply **drops out** of `kv_list_stores`; there is no separate registry of store names.
 - **Backing table** — values live in `_hyperdb_kv_store(store_name, key, value)`, which is indexless (Hyper has no indexes) and hidden from `describe` by its `_hyperdb_` prefix, but is directly queryable — e.g. `LEFT JOIN` it to enrich an analytical table (always filter on `kv.store_name`). Uniqueness of `(store_name, key)` is enforced by the tool layer's upsert, atomic within a single server process. See the `hyper://schema/kv` resource for the schema and join pattern.
@@ -573,13 +610,16 @@ export(sql: 'SELECT ...', path: '~/Desktop/analysis.hyper', format: 'hyper')
 | `path` | string | yes | Output file path |
 | `format` | string | yes | `"csv"`, `"parquet"`, `"iceberg"`, `"arrow_ipc"`, or `"hyper"` |
 
-The `"hyper"` format produces a `.hyper` file that opens directly in **Tableau Desktop**.
+The `"hyper"` format produces a `.hyper` file that opens directly in **Tableau
+Desktop**. It does not mutate the source database; it creates or replaces the
+destination and materializes every user table from the selected source into it.
 
 ### Visualization
 
 #### `chart`
 
-Render a chart from a SQL query and return it inline as an image.
+Render a bounded quick diagnostic from a SQL query. This convenience tool is
+for inspecting or sharing one chart, not for dashboard/layout composition.
 
 ```
 chart(sql: 'SELECT product, SUM(revenue) as total FROM sales GROUP BY product', chart_type: 'bar', x: 'product', y: 'total', title: 'Revenue by Product')
@@ -588,17 +628,46 @@ chart(sql: 'SELECT product, SUM(revenue) as total FROM sales GROUP BY product', 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `sql` | string | yes | Read-only SQL query returning the data to plot |
+| `database` | string | no | Route SQL to `local` (default), `persistent`, or an attached alias |
 | `chart_type` | string | yes | `bar`, `line`, `scatter`, or `histogram` |
 | `x` | string | yes* | X-axis column (for histogram, the value column) |
 | `y` | string | yes* | Y-axis column (not required for histogram) |
 | `series` | string | no | Grouping column for multi-series plots |
+| `color_map` | object | no | Map series names to hex colors such as `{"East":"#e41a1c"}` |
+| `label_points` | bool | no | Label line/scatter points by series and suppress their legend |
 | `title` | string | no | Chart title |
 | `format` | string | no | `png` (default) or `svg` |
 | `width` | int | no | Pixels (default 800, clamped 200..4096) |
 | `height` | int | no | Pixels (default 480, clamped 150..4096) |
 | `bins` | int | no | Histogram bins (default 20, clamped 1..500) |
+| `output_path` | string | no | Destination file; parent directories are created |
+| `inline` | bool | no | Return image bytes inline (default `true`) |
+| `overwrite` | bool | no | Permit replacing `output_path` (default `true`) |
+| `bar_orientation` | string | no | `vertical` (default) or `horizontal`; bars only |
+| `label_values` | bool | no | Draw each original y scalar beside its bar |
+| `show_legend` | bool | no | Show series legend (default `true`) |
+| `y_scale` | string | no | `linear` (default) or positive `log`; no log histograms |
+| `x_as_category` | bool | no | Force even categorical spacing on line/scatter x values |
+| `x_range` / `y_range` | number pair | no | Explicit finite, strictly increasing bounds |
 
-Returns an `ImageContent` (base64 PNG or SVG) plus a stats JSON block.
+With neither path nor delivery override, the PNG (or requested SVG) is returned
+inline and no file is written. `output_path` means write plus inline; set
+`inline=false` for disk-only output, with an auto-generated temp path when no
+path is supplied. Explicit `format` and the path extension must agree. The
+result ends with a stats JSON block containing `resolved_database` and, when
+written, `output_path`.
+
+Line/scatter DATE, TIMESTAMP, and TIMESTAMPTZ x columns use proportional
+temporal spacing automatically; TEXT is categorical. Set `x_as_category=true`
+only when even spacing is deliberate. Bars always treat x as categorical.
+Horizontal rankings preserve SQL row order with the first row at the top.
+Long or Unicode labels are accepted but not auto-sized, so increase width or
+height when needed.
+
+All explicit ranges must be finite, strictly increasing, and representable.
+Log y values and bounds must also be positive and the explicit range must
+contain every plotted value. Log bars begin at the effective positive lower
+bound, never zero.
 
 ### Incremental Ingest
 
@@ -629,27 +698,32 @@ Key properties:
 
 #### `status`
 
-Returns plugin health, workspace mode, table count, total rows, disk usage, read-only flag, and active directory watchers with per-watcher stats.
+Returns MCP/native/API installation identity, daemon and Hyper connection facts,
+`default_database: "local"`, persistent-path state, table/row/disk statistics,
+read-only state, attachments, and active watchers. A full response has
+`engine_busy: false`. When `engine_busy: true`, the prompt response is partial:
+SQL-dependent statistics are intentionally omitted and `hyperd_running: false`
+is inconclusive. Retry `status` after the in-progress operation completes.
 
 ---
 
 ## MCP Resources
 
-The server exposes workspace state as MCP **Resources**, discoverable via
+The server exposes local and persistent database state as MCP **Resources**, discoverable via
 `resources/list`. Each resource advertises its own MIME type so clients
 can route it appropriately (LLM context vs. file download vs. chart).
 
 | URI | MIME | Content |
 |-----|------|---------|
-| `hyper://workspace` | `application/json` | Workspace mode, table count, total rows, disk usage |
+| `hyper://workspace` | `application/json` | Local/persistent state, table count, total rows, disk usage |
 | `hyper://tables` | `application/json` | Full list of tables with schemas and row counts |
-| `hyper://readme` | `text/markdown` | Workspace overview as markdown: table catalog, related resources per table, and tool hints for a cold-started LLM |
+| `hyper://readme` | `text/markdown` | Database overview as markdown: table catalog, related resources per table, and tool hints for a cold-started LLM |
 | `hyper://tables/{name}/schema` | `application/json` | Columns, types, nullability, and row count for one table |
 | `hyper://tables/{name}/sample` | `application/json` | First 5 rows of a table as JSON, with schema |
 | `hyper://tables/{name}/csv-sample` | `text/csv` | First 20 rows of a table as CSV, header-first |
 | `hyper://queries/{name}/definition` | `application/json` | Stored SQL + metadata for a saved query |
 | `hyper://queries/{name}/result` | `application/json` | Live result of a saved query — re-runs on every read |
-| `hyper://schema/kv` | `text/plain` | KV scratchpad schema: the `_hyperdb_kv_store(store_name, key, value)` backing table, its indexless shape, the ephemeral-vs-persistent durability rule, and the `LEFT JOIN` enrichment pattern |
+| `hyper://schema/kv` | `text/plain` | KV scratchpad schema: backing table and `LEFT JOIN` pattern, local-vs-persistent durability, global read-only guards, and writable user-attachment requirement (including readers) |
 
 Resource templates (discoverable via `resources/templates/list`):
 
@@ -679,8 +753,8 @@ of mutation:
 | `load_data` / `load_file` (replace mode) | `hyper://workspace`, `hyper://tables`, `hyper://readme`, per-table schema + sample + csv-sample | Yes |
 | `load_data` / `load_file` (append mode) | Same per-table + summary URIs | No &sup1; |
 | `watch_directory` ingest of a `.ready` pair | Same per-table + summary URIs | No &sup1; |
-| `execute` (INSERT / UPDATE / DELETE) | Workspace summary URIs | No |
-| `execute` (CREATE / DROP / ALTER / TRUNCATE / RENAME) | Workspace summary URIs | Yes |
+| `execute` (INSERT / UPDATE / DELETE) | Database-summary URIs | No |
+| `execute` (CREATE / DROP / ALTER / TRUNCATE / RENAME) | Database-summary URIs | Yes |
 | `save_query` | (none per-URI) | Yes — two new `hyper://queries/{name}/...` resources |
 | `delete_query` | `hyper://queries/{name}/definition`, `hyper://queries/{name}/result` | Yes — two resources disappeared |
 
@@ -715,8 +789,8 @@ Four guided analytical workflows registered as MCP **Prompts**.
 hyperdb-mcp --persistent-db ~/analytics.hyper --read-only
 ```
 
-- **Allowed:** `query`, `query_data`, `query_file`, `describe`, `sample`, `inspect_file`, `status`, `export`, and the KV readers `kv_get`, `kv_list`, `kv_size`, `kv_list_stores`
-- **Blocked:** `execute`, `load_data`, `load_file`, `watch_directory`, `save_query`, `delete_query`, and the KV mutators `kv_set`, `kv_delete`, `kv_pop`, `kv_clear` — return `READ_ONLY_VIOLATION`
+- **Allowed:** `query`, `query_data`, `query_file`, `describe`, `sample`, `inspect_file`, `status`, `chart`, `export` in every format including Hyper, read-only `attach_database`, `detach_database`, `list_attached_databases`, `unwatch_directory`, `get_readme`, and the KV readers `kv_get`, `kv_list`, `kv_size`, `kv_list_stores`
+- **Blocked:** `execute`, `load_data`, `load_file`, `load_files`, `load_iceberg`, `watch_directory`, `save_query`, `delete_query`, `set_table_metadata`, `copy_query`, `kv_set`, `kv_set_many`, `kv_delete`, `kv_pop`, and `kv_clear` — return `READ_ONLY_VIOLATION`. `attach_database` is also guarded when `writable: true` or `on_missing: "create"`; ordinary read-only attachment remains available.
 - **Resources, prompts, and resource subscriptions** work normally — read-only clients can still subscribe to `hyper://...` URIs and receive notifications when other (non-read-only) connections mutate state
 
 The `query` tool also enforces read-only at the SQL level — only `SELECT`/`WITH`/`EXPLAIN`/`SHOW`/`VALUES` are accepted.
@@ -846,7 +920,8 @@ Full reference: [Data Cloud SQL Reference](https://developer.salesforce.com/docs
 hyperdb-mcp [OPTIONS] [COMMAND]
 
 Commands:
-  daemon                  Run as a background daemon managing a shared hyperd process
+  daemon                  Run a foreground daemon managing a shared hyperd process
+  doctor                  Inspect identities/configuration without starting Hyper
 
 Options:
   --persistent-db <PATH>  Path to the persistent .hyper file. Defaults to the platform
@@ -856,8 +931,8 @@ Options:
                           the HYPERDB_PERSISTENT_DB env var.
   --ephemeral-only        Skip the persistent attachment entirely. Disables save_query
                           persistence (queries fall back to session storage).
-  --read-only             Disable mutating tools (execute, load_data, load_file,
-                          save_query, delete_query, watch_directory)
+  --read-only             Guard all load/mutation tools and writable/create attachment;
+                          read-only attachment, unwatch, and all export formats stay allowed
   --no-daemon             Disable the shared daemon and spawn a private hyperd
 
 Deprecated:
@@ -865,19 +940,21 @@ Deprecated:
                           stderr warning, and will be removed in a future release.
 
 Daemon subcommand:
-  hyperdb-mcp daemon                          Start the daemon (usually auto-spawned)
+  hyperdb-mcp daemon                          Start foreground on the configured/base port exactly
   hyperdb-mcp daemon stop                     Gracefully stop the running daemon
   hyperdb-mcp daemon status                   Show running daemon info
-  hyperdb-mcp daemon --port <PORT>            Pin the health/lock port. When omitted,
-                                              scans upward from 7485 for a free port.
+  hyperdb-mcp daemon --port <PORT>            Bind this exact health/lock port; foreground
+                                              startup never performs the auto-spawn scan.
   hyperdb-mcp daemon --idle-timeout <SECS>    Opt into idle shutdown after SECS idle.
                                               When omitted, the daemon stays resident.
 
 Environment:
-  HYPERD_PATH                  Path to hyperd binary (auto-detected if on PATH)
+  HYPERD_PATH                  Hyperd executable or containing directory; when absent or
+                               non-UTF-8, walk upward for .hyperd/current/hyperd (no PATH lookup)
   HYPERDB_PERSISTENT_DB        Override the default persistent-db path
   HYPERDB_STATE_DIR            Override daemon state directory (default ~/.hyperdb/)
-  HYPERDB_DAEMON_PORT          Pin daemon health/lock port (default: scan from 7485)
+  HYPERDB_DAEMON_PORT          Pin auto-spawn discovery to one health/lock candidate;
+                               foreground startup binds this configured/base port exactly
   HYPERDB_DAEMON_IDLE_TIMEOUT  Opt into idle shutdown (seconds); default: stay resident
 ```
 
@@ -896,6 +973,7 @@ Errors include a machine-readable code and a suggestion:
 | `SQL_ERROR` | Invalid SQL | Fix the query |
 | `TABLE_NOT_FOUND` | Table doesn't exist | Use `describe` to list tables |
 | `READ_ONLY_VIOLATION` | Mutating op in read-only mode | Use `query_*` / `inspect_file`, or restart without `--read-only` |
+| `RESOURCE_BUSY` | The reserved persistent attachment hit file contention (SQLSTATE 55006) | Run `hyperdb-mcp doctor`; compare client/daemon identities; close the possible owner (Hyper, Tableau, or another process), or copy/select another `.hyper` file; retry |
 | `CONNECTION_LOST` | `hyperd` crashed or wire protocol desynchronized | Retry — the server tears down the engine and reconnects on the next call |
 
 Server-returned errors include a machine-readable `code`, a `message`, and a
@@ -903,6 +981,12 @@ Server-returned errors include a machine-readable `code`, a `message`, and a
 an overflow names the workflow directly: "call `inspect_file`, then retry with
 a partial schema override", so the LLM does not need to infer the recovery
 steps from the SQLSTATE alone.
+
+`RESOURCE_BUSY` is contextual: only contention while attaching the configured
+persistent file gets this classification. The error preserves the effective
+path, raw Hyper diagnostic, and SQLSTATE; unrelated `55006` SQL errors remain
+`SQL_ERROR`. Doctor compares evidence but does not claim which possible owner
+holds the file and never kills a process.
 
 ---
 
@@ -912,7 +996,9 @@ steps from the SQLSTATE alone.
 
 **Server registered but tools not callable (Claude Code)** — Add `"mcp__HyperDB__*"` to the `permissions.allow` array in `~/.claude/settings.json`.
 
-**hyperd not found** — Set `HYPERD_PATH` in the MCP server's `env` config, or place `hyperd` on your `PATH`.
+**hyperd not found** — Set `HYPERD_PATH` in the MCP server's `env` config to
+the executable or its containing directory, or install it under an ancestor's
+`.hyperd/current/` directory. The runtime does not search the general `PATH`.
 
 ---
 

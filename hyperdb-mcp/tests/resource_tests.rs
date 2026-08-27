@@ -5,7 +5,93 @@
 //! and content for workspace / tables / per-table schema resources.
 
 use hyperdb_mcp::server::HyperMcpServer;
+use rmcp::model::{
+    ClientInfo, ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents,
+};
+use rmcp::service::{RoleClient, RunningService};
+use rmcp::{ClientHandler, ServiceExt};
 use tempfile::TempDir;
+
+type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+#[derive(Debug, Clone)]
+struct ResourceClientHandler;
+
+impl ClientHandler for ResourceClientHandler {
+    fn get_info(&self) -> ClientInfo {
+        ClientInfo::default()
+    }
+}
+
+struct ResourceHarness {
+    client: RunningService<RoleClient, ResourceClientHandler>,
+    server_handle: tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+}
+
+impl ResourceHarness {
+    async fn start(
+        persistent_path: Option<String>,
+        read_only: bool,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let (server_io, client_io) = tokio::io::duplex(128 * 1024);
+        let server = HyperMcpServer::with_no_daemon(persistent_path, read_only, true);
+        let server_handle =
+            tokio::spawn(async move {
+                let running = server.serve(server_io).await.map_err(
+                    |error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) },
+                )?;
+                running.waiting().await.map_err(
+                    |error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) },
+                )?;
+                Ok(())
+            });
+        let client = ResourceClientHandler
+            .serve(client_io)
+            .await
+            .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })?;
+        Ok(Self {
+            client,
+            server_handle,
+        })
+    }
+
+    async fn shutdown(self) -> TestResult {
+        self.client
+            .cancel()
+            .await
+            .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })?;
+        self.server_handle.await??;
+        Ok(())
+    }
+}
+
+fn resource_metadata(resource: &Resource) -> String {
+    let mut fields = vec![resource.name.as_str()];
+    if let Some(title) = resource.title.as_deref() {
+        fields.push(title);
+    }
+    if let Some(description) = resource.description.as_deref() {
+        fields.push(description);
+    }
+    fields.join(" ").to_lowercase()
+}
+
+fn single_text_resource<'a>(
+    result: &'a ReadResourceResult,
+    expected_uri: &str,
+) -> Result<(&'a str, Option<&'a str>), std::io::Error> {
+    match result.contents.as_slice() {
+        [ResourceContents::TextResourceContents {
+            uri,
+            mime_type,
+            text,
+            ..
+        }] if uri == expected_uri => Ok((text, mime_type.as_deref())),
+        contents => Err(std::io::Error::other(format!(
+            "expected one text resource for {expected_uri}, got {contents:?}"
+        ))),
+    }
+}
 
 /// Build a server with a fresh temp workspace, populate the engine's
 /// ephemeral primary with a test table, and return both the server and
@@ -62,6 +148,160 @@ fn list_resources_includes_workspace_tables_readme_and_per_table() {
     assert!(uris.contains(&"hyper://tables/widgets/csv-sample".to_string()));
 }
 
+/// This catches production mutations to the real MCP resource catalog and
+/// resource bodies that collapse simultaneous local/persistent state back into
+/// the legacy “workspace” concept or hide KV attachment writability.
+#[tokio::test]
+async fn resource_catalog_preserves_uri_and_database_model() -> TestResult {
+    let persistent_dir = TempDir::new()?;
+    let persistent_path = persistent_dir.path().join("persistent.hyper");
+    let persistent =
+        ResourceHarness::start(Some(persistent_path.to_string_lossy().into_owned()), false).await?;
+    let resources = persistent.client.list_all_resources().await?;
+    let readme_result = persistent
+        .client
+        .read_resource(ReadResourceRequestParams::new("hyper://readme"))
+        .await?;
+    let kv_schema_result = persistent
+        .client
+        .read_resource(ReadResourceRequestParams::new("hyper://schema/kv"))
+        .await?;
+    let (persistent_readme, persistent_readme_mime) =
+        single_text_resource(&readme_result, "hyper://readme")?;
+    let persistent_readme = persistent_readme.to_lowercase();
+    let (kv_schema, kv_schema_mime) = single_text_resource(&kv_schema_result, "hyper://schema/kv")?;
+    let kv_schema = kv_schema.to_lowercase();
+    persistent.shutdown().await?;
+
+    let disabled = ResourceHarness::start(None, false).await?;
+    let disabled_result = disabled
+        .client
+        .read_resource(ReadResourceRequestParams::new("hyper://readme"))
+        .await?;
+    let (disabled_readme, disabled_readme_mime) =
+        single_text_resource(&disabled_result, "hyper://readme")?;
+    let disabled_readme = disabled_readme.to_lowercase();
+    disabled.shutdown().await?;
+
+    let mut failures = Vec::new();
+    if persistent_readme_mime != Some("text/markdown") {
+        failures.push(format!(
+            "attached hyper://readme must be markdown, got {persistent_readme_mime:?}: {persistent_readme}"
+        ));
+    }
+    if disabled_readme_mime != Some("text/markdown") {
+        failures.push(format!(
+            "ephemeral-only hyper://readme must be markdown, got {disabled_readme_mime:?}: {disabled_readme}"
+        ));
+    }
+    if kv_schema_mime != Some("text/plain") {
+        failures.push(format!(
+            "hyper://schema/kv must be plain text, got {kv_schema_mime:?}: {kv_schema}"
+        ));
+    }
+    let compatibility = resources
+        .iter()
+        .find(|resource| resource.uri == "hyper://workspace");
+    let Some(compatibility) = compatibility else {
+        return Err(std::io::Error::other(
+            "resources/list removed compatibility URI hyper://workspace",
+        )
+        .into());
+    };
+    for uri in ["hyper://workspace", "hyper://readme"] {
+        let Some(resource) = resources.iter().find(|resource| resource.uri == uri) else {
+            failures.push(format!("resources/list omitted {uri}"));
+            continue;
+        };
+        let metadata = resource_metadata(resource);
+        if metadata.contains("workspace") {
+            failures.push(format!(
+                "{uri} name/title/description must use database terminology, not workspace: {metadata}"
+            ));
+        }
+        if !(metadata.contains("local") && metadata.contains("persistent")) {
+            failures.push(format!(
+                "{uri} metadata must distinguish local and persistent databases: {metadata}"
+            ));
+        }
+    }
+    if compatibility.uri != "hyper://workspace" {
+        failures.push("compatibility resource URI changed".to_owned());
+    }
+
+    let local_fact = persistent_readme
+        .lines()
+        .find(|line| line.trim_start().starts_with('-') && line.contains("local database"));
+    let persistent_fact = persistent_readme
+        .lines()
+        .find(|line| line.trim_start().starts_with('-') && line.contains("persistent database"));
+    if !matches!(local_fact, Some(line) if line.contains("default") && line.contains("ephemeral")) {
+        failures.push(
+            "hyper://readme must report the local database separately as ephemeral/default"
+                .to_owned(),
+        );
+    }
+    if !matches!(persistent_fact, Some(line) if line.contains("attached")) {
+        failures.push(
+            "hyper://readme must report the configured persistent database separately as attached"
+                .to_owned(),
+        );
+    }
+    if !persistent_readme.contains("persistent.hyper") {
+        failures.push("hyper://readme must report the attached persistent path".to_owned());
+    }
+    if !(persistent_readme.contains("local tables")
+        || persistent_readme.contains("tables in the local database"))
+    {
+        failures.push(
+            "hyper://readme must label its table inventory as local-database tables".to_owned(),
+        );
+    }
+    if persistent_readme.contains("# hyperdb workspace")
+        || persistent_readme.contains("- mode: **persistent**")
+    {
+        failures.push(
+            "hyper://readme must not collapse local and persistent state into a workspace mode"
+                .to_owned(),
+        );
+    }
+    let disabled_persistent_fact = disabled_readme
+        .lines()
+        .find(|line| line.trim_start().starts_with('-') && line.contains("persistent database"));
+    if !matches!(disabled_persistent_fact, Some(line) if line.contains("disabled")) {
+        failures.push(
+            "ephemeral-only hyper://readme must report the persistent database as disabled"
+                .to_owned(),
+        );
+    }
+
+    if !(kv_schema.contains("attached")
+        && kv_schema.contains("writable")
+        && (kv_schema.contains("even for readers") || kv_schema.contains("including readers")))
+    {
+        failures.push(
+            "hyper://schema/kv must say attached KV targets require writable access even for readers"
+                .to_owned(),
+        );
+    }
+    if !(kv_schema.contains("--read-only")
+        && kv_schema.contains("mutator")
+        && kv_schema.contains("reader"))
+    {
+        failures.push(
+            "hyper://schema/kv must distinguish the global --read-only mutator guard from allowed readers"
+                .to_owned(),
+        );
+    }
+
+    assert!(
+        failures.is_empty(),
+        "resource database-model contract failures:\n- {}",
+        failures.join("\n- ")
+    );
+    Ok(())
+}
+
 /// Verify that reading <hyper://workspace> returns the workspace status JSON
 /// including the `hyper_rust_api_version` field (`.r<hash>`-suffixed).
 #[test]
@@ -88,9 +328,8 @@ fn read_workspace_resource_returns_status() {
     assert!(version.contains(".r"));
 }
 
-/// The workspace README derives persistence from the status keys that
-/// `Engine::status` actually emits, and derives the read-only marker from the
-/// server configuration rather than a nonexistent engine-status key.
+/// This catches a renderer mutation that collapses the local and persistent
+/// databases into one workspace mode or drops the server's read-only state.
 #[test]
 fn resource_status_renderer_uses_actual_engine_keys() {
     let dir = TempDir::new().unwrap();
@@ -104,11 +343,19 @@ fn resource_status_renderer_uses_actual_engine_keys() {
     let text = body.to_text();
 
     assert!(
-        text.contains("- Mode: **persistent** (read-only)"),
-        "README must render persistence and server read-only state: {text}"
+        text.starts_with("# HyperDB databases"),
+        "README must identify the separate database model: {text}"
     );
     assert!(
-        text.contains(&format!("- Path: `{}`", path.display())),
+        text.contains("- Local database: **ephemeral** (default) (read-only)"),
+        "README must render the local database and server read-only state: {text}"
+    );
+    assert!(
+        text.contains("- Persistent database: **attached**"),
+        "README must render the persistent database attachment state: {text}"
+    );
+    assert!(
+        text.contains(&format!("- Persistent path: `{}`", path.display())),
         "README must render Engine::status persistent_path: {text}"
     );
     assert!(
@@ -192,8 +439,9 @@ fn read_table_csv_sample_resource_emits_csv() {
     assert!(data[1].starts_with("2,") && data[1].contains("Beta"));
 }
 
-/// Reading <hyper://readme> returns markdown listing every table, its row
-/// count, and pointers to the per-table resources.
+/// This catches a README renderer mutation that restores the legacy workspace
+/// heading or stops identifying table data as local while preserving its row
+/// count and per-table resource links.
 #[test]
 fn read_readme_resource_lists_tables_in_markdown() {
     let (server, _dir) = server_with_test_table();
@@ -203,8 +451,11 @@ fn read_readme_resource_lists_tables_in_markdown() {
         .expect("readme resource should exist");
     assert_eq!(body.mime_type(), "text/markdown");
     let text = body.to_text();
-    assert!(text.starts_with("# HyperDB workspace"));
-    assert!(text.contains("`widgets`"));
+    assert!(text.starts_with("# HyperDB databases"));
+    assert!(text.contains("- Local database: **ephemeral** (default)"));
+    assert!(text.contains("- Persistent database: **attached**"));
+    assert!(text.contains("## Local tables"));
+    assert!(text.contains("| `widgets` | 2 |"));
     assert!(text.contains("hyper://tables/widgets/schema"));
     assert!(text.contains("hyper://tables/widgets/sample"));
     assert!(text.contains("hyper://tables/widgets/csv-sample"));

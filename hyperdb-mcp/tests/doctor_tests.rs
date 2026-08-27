@@ -17,6 +17,7 @@ use tempfile::TempDir;
 
 const SECRET_SENTINEL: &str = "UNKNOWN_SECRET_SENTINEL_doctor_7d31e9";
 const MAX_REPORTED_STRING_BYTES: usize = 4 * 1024;
+const PUBLIC_README: &str = include_str!("../README.md");
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum SnapshotNode {
@@ -2095,5 +2096,191 @@ fn doctor_cli_reports_live_from_scan_via_real_health_listener() {
         failures.is_empty(),
         "real scanned HealthListener regressions:\n{}",
         failures.join("\n")
+    );
+}
+
+/// `--help` is the recovery surface available even when neither MCP nor
+/// `hyperd` can start, so its resolution and read-only claims must be exact.
+/// This catches mutations to Clap help or its checked-in static README mirror,
+/// especially cross-option token matches that conceal a false export claim.
+#[test]
+fn cli_help_matches_hyperd_and_read_only_contract() {
+    fn run_help(args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_hyperdb-mcp"))
+            .args(args)
+            .output()
+            .expect("run hyperdb-mcp help without starting the engine")
+    }
+
+    fn normalized_output(output: &Output) -> String {
+        let mut bytes = output.stdout.clone();
+        bytes.extend_from_slice(&output.stderr);
+        String::from_utf8_lossy(&bytes)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    }
+
+    fn option_scope<'a>(help: &'a str, flag: &str, next_flag: &str) -> &'a str {
+        let Some((_, after_flag)) = help.split_once(flag) else {
+            return "";
+        };
+        let Some((scope, _)) = after_flag.split_once(next_flag) else {
+            return after_flag;
+        };
+        scope
+    }
+
+    const GUARDED_TOOLS: &[&str] = &[
+        "execute",
+        "load_data",
+        "load_file",
+        "load_files",
+        "load_iceberg",
+        "watch_directory",
+        "save_query",
+        "delete_query",
+        "set_table_metadata",
+        "copy_query",
+        "kv_set",
+        "kv_set_many",
+        "kv_delete",
+        "kv_pop",
+        "kv_clear",
+    ];
+
+    let root_output = run_help(&["--help"]);
+    let daemon_output = run_help(&["daemon", "--help"]);
+    let root_help = normalized_output(&root_output);
+    let daemon_help = normalized_output(&daemon_output);
+    let read_only_help = option_scope(&root_help, "--read-only", "--no-daemon");
+    let static_cli = PUBLIC_README
+        .to_lowercase()
+        .split_once("## cli reference")
+        .and_then(|(_, tail)| tail.split_once("\n---"))
+        .map(|(section, _)| section.to_owned())
+        .unwrap_or_default();
+    let mut failures = Vec::new();
+
+    if !root_output.status.success() {
+        failures.push(format!(
+            "hyperdb-mcp --help exited with {}: {root_help}",
+            root_output.status
+        ));
+    }
+    if !daemon_output.status.success() {
+        failures.push(format!(
+            "hyperdb-mcp daemon --help exited with {}: {daemon_help}",
+            daemon_output.status
+        ));
+    }
+
+    if !(root_help.contains("hyperd_path")
+        && root_help.contains("executable")
+        && root_help.contains("directory")
+        && root_help.contains(".hyperd/current")
+        && ["walk upward", "search upward", "ancestor"]
+            .iter()
+            .any(|phrase| root_help.contains(phrase)))
+    {
+        failures.push(
+            "root help must describe HYPERD_PATH as an executable or containing directory and the upward .hyperd/current fallback"
+                .to_owned(),
+        );
+    }
+    if ["searches path", "path fallback", "or on path"]
+        .iter()
+        .any(|phrase| root_help.contains(phrase))
+    {
+        failures.push("root help must not claim the runtime searches PATH".to_owned());
+    }
+
+    for tool in GUARDED_TOOLS {
+        if !read_only_help.contains(tool) {
+            failures.push(format!("--read-only help is missing guarded tool {tool}"));
+        }
+    }
+    if !(read_only_help.contains("attach_database") && read_only_help.contains("writable")) {
+        failures.push(
+            "--read-only help must distinguish writable attach_database from allowed read-only attachment"
+                .to_owned(),
+        );
+    }
+    let export_availability = if let Some((_, after_export)) = read_only_help.split_once("export") {
+        after_export.contains("hyper")
+            && [
+                "allowed",
+                "remain available",
+                "stays available",
+                "stay available",
+            ]
+            .iter()
+            .any(|phrase| after_export.contains(phrase))
+    } else {
+        false
+    };
+    if !(read_only_help.contains("unwatch_directory") && export_availability) {
+        failures.push(
+            "--read-only help must explicitly keep unwatch_directory and Hyper-format export available"
+                .to_owned(),
+        );
+    }
+    for false_claim in [
+        "disables export",
+        "export is disabled",
+        "hyper-format export is disabled",
+        "disables hyper-format export",
+    ] {
+        if read_only_help.contains(false_claim) {
+            failures.push(format!(
+                "--read-only help still makes the associated false claim {false_claim:?}"
+            ));
+        }
+    }
+
+    if !(daemon_help.contains("auto-spawn")
+        && daemon_help.contains("scan")
+        && daemon_help.contains("foreground")
+        && daemon_help.contains("exact"))
+    {
+        failures.push(
+            "daemon help must distinguish auto-spawn port scanning from the foreground daemon's exact/base-port bind"
+                .to_owned(),
+        );
+    }
+    if daemon_help.contains("daemon scans from the base port to find a free port") {
+        failures.push(
+            "foreground daemon help must not promise startup scanning that it does not perform"
+                .to_owned(),
+        );
+    }
+
+    let static_daemon_command = static_cli
+        .lines()
+        .find(|line| line.trim_start().starts_with("daemon "))
+        .unwrap_or("");
+    if !static_daemon_command.contains("foreground") || static_daemon_command.contains("background")
+    {
+        failures.push(
+            "static README CLI command summary must describe `daemon` as foreground, not background"
+                .to_owned(),
+        );
+    }
+    if !(static_cli.contains("hyperdb_daemon_port")
+        && static_cli.contains("auto-spawn")
+        && static_cli.contains("configured/base")
+        && static_cli.contains("exact"))
+    {
+        failures.push(
+            "static README CLI reference must distinguish HYPERDB_DAEMON_PORT auto-spawn discovery from foreground configured/base binding"
+                .to_owned(),
+        );
+    }
+
+    assert!(
+        failures.is_empty(),
+        "CLI help contract failures:\n- {}",
+        failures.join("\n- ")
     );
 }

@@ -3,7 +3,8 @@
 
 //! Binary entry point for the `hyperdb-mcp` MCP server.
 //!
-//! Starts an MCP server on stdio, optionally backed by a persistent workspace.
+//! Starts an MCP server on stdio with a local database and optional persistent
+//! attachment.
 //! Can also run in daemon mode to manage a shared `hyperd` process.
 //!
 //! # Logging
@@ -41,7 +42,8 @@ const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), ".r", env!("HYPERDB_GIT
 #[command(
     name = "hyperdb-mcp",
     version = VERSION,
-    about = "MCP server for Hyper database analytics"
+    about = "MCP server for Hyper database analytics",
+    long_about = "MCP server for Hyper database analytics. HYPERD_PATH accepts either the hyperd executable or its containing directory. When HYPERD_PATH is absent or non-UTF-8, runtime resolution searches upward through current-directory ancestors for .hyperd/current/hyperd; no general PATH lookup is performed."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -59,12 +61,17 @@ struct Cli {
     workspace: Option<String>,
 
     /// Skip opening any persistent database. The session has only the
-    /// ephemeral primary plus any user-attached databases. Disables
+    /// local database plus any user-attached databases. Disables
     /// `save_query` persistence (queries fall back to session storage).
     #[arg(long, global = true)]
     ephemeral_only: bool,
 
-    /// Run in read-only mode: disables execute, `load_data`, `load_file`, and export to hyper format
+    /// Run in read-only mode. Guards `execute`, `load_data`, `load_file`,
+    /// `load_files`, `load_iceberg`, `watch_directory`, `save_query`,
+    /// `delete_query`, `set_table_metadata`, `copy_query`, `kv_set`,
+    /// `kv_set_many`, `kv_delete`, `kv_pop`, `kv_clear`, and writable/create
+    /// `attach_database`. Read-only `attach_database` remains available;
+    /// `unwatch_directory` and `export` (including Hyper format) stay available.
     #[arg(long, global = true)]
     read_only: bool,
 
@@ -112,21 +119,25 @@ impl Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Inspect installation, configuration, daemon, and MCP catalog state without starting Hyper
+    /// Side-effect-free installation/configuration/identity diagnostics; starts no Hyper or database
     Doctor {
         /// Emit the typed report as JSON
         #[arg(long)]
         json: bool,
     },
 
-    /// Run as a background daemon managing a shared hyperd process
+    /// Run a foreground daemon managing shared hyperd. Auto-spawn scans before
+    /// launching; foreground startup binds its configured/base port exactly.
     Daemon {
         #[command(subcommand)]
         action: Option<DaemonAction>,
 
-        /// TCP port for health listener and single-instance lock. When omitted,
-        /// the daemon scans from the base port to find a free port. For stop/status
-        /// commands, omitting the port uses discovery + scanning to find the running daemon.
+        /// Exact TCP health/lock port for foreground startup. Without `--port`,
+        /// the foreground daemon binds the configured/base port exactly
+        /// (`HYPERDB_DAEMON_PORT` when valid, otherwise 7485) and does not scan.
+        /// Auto-spawn performs bounded discovery from its configured base before
+        /// launching. For stop/status, omitting the port uses discovery plus
+        /// scanning.
         #[arg(long, global = true)]
         port: Option<u16>,
 

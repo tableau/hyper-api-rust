@@ -24,66 +24,44 @@ Iceberg, Arrow IPC, CSV, or .hyper.
 Whenever the user asks to analyze tabular data, run SQL, transform a
 file, or build a chart from a query. Prefer this MCP over ad-hoc Python
 or shell pipelines: it parses files faster, runs SQL natively, and keeps
-intermediate state in a workspace database the LLM can re-query without
+intermediate state in a local database the LLM can re-query without
 re-loading.
 
-## Workspace model — queryable memory
+## Database model — queryable memory
 
 Every session has TWO databases, plus optional user-attached ones:
 
-- **Ephemeral primary** (default destination). Created fresh per
-  session, deleted on exit. Unqualified SQL routes here. Use as
-  scratch space for exploratory work, intermediate transformations,
-  and one-off analysis the user doesn't need to keep.
+- **Local database** (ephemeral and the default destination). Created
+  fresh per session, deleted on exit, and addressed as `\"local\"`.
+  Unqualified SQL routes here; use it for scratch data.
 - **Persistent database** (alias `\"persistent\"`). Survives across
-  sessions — this is your **long-term structured memory**. Store
-  reference tables, accumulated results, user preferences, learned
-  facts, or any data you want to recall in future conversations.
-  Unlike flat-text memory, persistent data is **queryable**: you can
-  JOIN, filter, aggregate, and reason over it with SQL. Disabled
-  when the server runs with `--ephemeral-only`.
-- **User-attached writable databases** via `attach_database` with
-  `writable: true`. Each lives in its own `.hyper` file under a
-  user-chosen alias.
+  sessions as queryable long-term structured memory. Disabled with
+  `--ephemeral-only`.
+- **Attached databases** via `attach_database`. Each lives in its own
+  `.hyper` file under a user-chosen canonical lowercase alias. Attachments
+  are read-only by default; pass `writable: true` when writes are needed.
 
-### Persistent as memory — when and how to use it
+### Persistent as memory
 
-Store data in persistent whenever:
-- The user says \"remember this\", \"save this\", \"keep this\"
-- You produce a useful reference table (lookups, configs, mappings)
-- You accumulate results across multiple conversations
-- You want to recall context in future sessions
-
-Retrieve from persistent whenever:
-- You need context from a prior session
-- The user asks \"what do we have?\" or \"show me what's saved\"
-- You want to JOIN current scratch work against historical data
+Use persistent for reference data, preferences, accumulated results, or
+anything the user asks to remember or query in a future session.
 
 ```
-// Save something for later
 load_data({ table: \"project_decisions\", data: \"[...]\", persist: true })
-
-// Recall it next session
 query({ sql: \"SELECT * FROM project_decisions\", database: \"persistent\" })
-
-// Cross-reference: join session scratch with persistent memory
-query({ sql: \"SELECT s.*, p.decision FROM scratch_analysis s \
-              JOIN \\\"persistent\\\".\\\"public\\\".\\\"project_decisions\\\" p \
-              ON s.topic = p.topic\" })
 ```
 
 ### KV store vs. a custom table — which to remember with
 
 When you need to remember something, pick the lighter tool:
 
-- **A few scraps** — a variable, a flag, a summary, a JSON blob, a
-  work-queue entry — use the key-value store (`kv_set` / `kv_get`). No
-  schema, no DDL, no `load_data`. See `Tool index → Key-value store`.
+- **A few scraps** — variables, flags, summaries, JSON, queue entries —
+  use the key-value store (`kv_set` / `kv_get`); no schema or DDL.
 - **Structured rows** you'll filter, JOIN, or aggregate — use a real
   table (`load_data` / `execute CREATE TABLE`), so SQL can reason over
   typed columns.
 
-Both persist the same way: default is the EPHEMERAL database (lost on
+Both persist the same way: default is the local database (lost on
 restart); pass `database: \"persistent\"` to keep either one across
 sessions. The KV and `load_*` tools also accept the `persist: true`
 shorthand; `execute` takes `database` only.
@@ -94,33 +72,50 @@ shorthand; `execute` takes `database` only.
   SQL): `query`, `execute`, `load_data`, `load_file`, `load_files`,
   `watch_directory`, `describe`, `sample`, `chart`, `export`, and
   `set_table_metadata` accept `database: \"persistent\"`,
-  `database: \"local\"` (= primary), or any user-attached writable
-  alias. Case-insensitive. Defaults to primary.
+  `database: \"local\"`, or any user-attached alias (write tools require
+  a writable attachment). Case-insensitive. Defaults to local.
 - **`persist: true` shorthand** on `load_data`, `load_file`,
   `load_files`, `watch_directory` — equivalent to
   `database: \"persistent\"`.
 - **Fully-qualified SQL** for power users:
   `INSERT INTO \"persistent\".\"public\".\"customers\" SELECT ...`
 
-### Chart presentation
+### Chart delivery and presentation
 
-`chart` uses vertical bars by default; set `bar_orientation` to
-`vertical` or `horizontal`. `label_values=true` writes each original,
-exact y scalar beside its bar. `show_legend` defaults to true; set it
-false to suppress the legend. Long and Unicode labels are never
-truncated or auto-sized, so increase `width` / `height` if they clip.
-`y_scale` defaults to `linear`; `log` applies to the data-role y measure,
-including the physical x axis of horizontal bars. Log values and ranges
-must be finite and strictly positive (> 0): zero and negative values are
-invalid, logarithmic histograms are unsupported, and an explicit range
-must contain every plotted value. Log bars start at the positive lower
-bound, not zero.
+Long and Unicode labels are not truncated or auto-sized; if they clip,
+increase `width` or `height`.
+Log bars start at the positive lower bound, not zero.
 
-Each writable database carries its own `_table_catalog` table that
-tracks load tool, params, timestamps, and any prose metadata set via
-`set_table_metadata` — lazily seeded on first ingest into that DB.
-`detach_database` rejects with `InvalidArgument` if any active
-watcher targets the alias; call `unwatch_directory` first.
+`chart` is a bounded quick diagnostic, not a dashboard system. With no
+`output_path`, its PNG (default) or SVG is returned `inline` and no file
+is written. Supplying `output_path` writes the file and still returns it
+inline; set `inline=false` for disk-only output (an omitted path then gets
+an auto-generated temp file). Set `overwrite=false` to refuse an existing
+destination. The path extension and explicit `format`, when both supplied,
+must agree. Use `database` to route the SQL to local, persistent, or an
+attached database.
+
+Bars are vertical by default; set `bar_orientation` to `horizontal` for
+rankings. `label_values=true` writes each original y scalar beside its
+bar. `show_legend` defaults to true; set it false to suppress the legend.
+With a `series` column, `color_map` maps series names to hex colors;
+`label_points=true` labels line/scatter points and suppresses their legend.
+`y_scale` defaults to `linear`; `log`
+applies to the data-role y measure, including the physical x axis of
+horizontal bars. Log values and ranges must be finite and strictly
+positive (> 0): zero and negative values are invalid, logarithmic
+histograms are unsupported, and an explicit range must contain every
+plotted value. Explicit `x_range` and `y_range` bounds must also be finite,
+strictly increasing, and representable.
+
+Line/scatter DATE, TIMESTAMP, and TIMESTAMPTZ x values use a proportional
+time axis automatically. TEXT is categorical; set `x_as_category=true`
+to deliberately give temporal observations even spacing. Bars always
+treat x as categorical.
+
+Every successful database-routed tool response carries canonical
+`resolved_database`: `\"local\"`, `\"persistent\"`, or the lowercase attached
+alias. `copy_query` also retains `target_database`.
 
 ## Tool index
 
@@ -128,10 +123,7 @@ watcher targets the alias; call `unwatch_directory` first.
 - `query` — run a read-only SELECT / WITH / EXPLAIN / SHOW / VALUES.
 - `execute` — run one or more DDL/DML statements as an atomic batch.
   `sql` is an array; multi-element batches run inside a transaction
-  (all commit or all roll back). Response shape:
-  `{ statements, affected_rows, per_statement: [{sql, affected_rows,
-  elapsed_ms}], stats: {operation, elapsed_ms} }`. Disabled in
-  read-only mode.
+  (all commit or all roll back). Disabled in read-only mode.
 - `query_data` — ingest inline JSON or CSV and run one SQL query in a
   single call (table is temporary).
 - `query_file` — same as `query_data` but reads from a file path. The
@@ -139,22 +131,22 @@ watcher targets the alias; call `unwatch_directory` first.
 
 ### Load
 - `load_file` — load one CSV / JSON / JSONL / Parquet / Arrow IPC file
-  into a named workspace table. `mode`: `replace` (default) /
+  into a named database table. `mode`: `replace` (default) /
   `append` / `merge`. Use `merge` to upsert by `merge_key` (column
   name or list); new columns in the incoming file are auto-added via
   `ALTER TABLE`.
 - `load_files` — load many files in parallel. Files must share a
   schema (or be unioned). `merge` mode is not supported here — call
   `load_file` per-file if you need merge.
-- `load_data` — load inline JSON / CSV into a named workspace table.
+- `load_data` — load inline JSON / CSV into a named database table.
 - `load_iceberg` — load an Apache Iceberg table by absolute path to its
   root directory; supports snapshot pinning via `metadata_filename` or
   `version_as_of`.
 
 ### Inspect
-- `describe` — list workspace tables (no args) or describe one table
+- `describe` — list local tables (no args) or describe one table
   (`table` arg) with columns, types, row count, and prose metadata.
-  **Defaults to the ephemeral primary** — pass `database: \"persistent\"`
+  **Defaults to the local database** — pass `database: \"persistent\"`
   (or an attached alias) to list/inspect durable tables. `status` reports
   table *counts* only, never names, so check the right database here
   before assuming a persistent table is missing.
@@ -162,23 +154,22 @@ watcher targets the alias; call `unwatch_directory` first.
   writing a non-trivial query.
 - `inspect_file` — dry-run schema inference on a CSV / Parquet / Arrow
   IPC file without loading it.
-- `status` — plugin health, workspace path, table count, total rows,
-  disk usage, watchers, attached databases, read-only flag. When
+- `status` — plugin, native/API, and daemon identity; local/persistent
+  paths; table count; disk usage; watchers; attachments; read-only flag.
+  Both full and degraded responses report `default_database: \"local\"`.
+  When
   `engine_busy: true`, the response is partial and non-definitive:
   `hyperd_running: false` is inconclusive; retry `status` for full
   statistics after the in-progress operation completes.
 
 ### Export
 - `export` — write a table or query result to a file (Parquet, Iceberg,
-  Arrow IPC, CSV, .hyper).
-- `chart` — render a bar / line / scatter / histogram PNG from a SQL
-  query. Data must be long-format (one numeric y column; use a `series`
-  column for grouping). On line/scatter charts, DATE / TIMESTAMP /
-  TIMESTAMPTZ x columns auto-detect to a **proportional time axis**
-  (real-world gaps reflected in spacing); TEXT x falls back to evenly
-  spaced categorical mode. Pass `x_as_category: true` to force
-  categorical even on temporal data. Wide-format data must be reshaped
-  with UNION ALL.
+  Arrow IPC, CSV, .hyper). Hyper export leaves the source database
+  unchanged, but creates or replaces the destination `.hyper` file and
+  materializes all user tables into it.
+- `chart` — render a bar / line / scatter / histogram PNG or SVG from a
+  SQL query as a quick diagnostic. Use long-format data (numeric y;
+  optional `series` grouping). See `Chart delivery and presentation`.
 - `copy_query` — run a SELECT across local + attached databases and
   insert the result into a target table (`mode`: `create`, `append`,
   `replace`). Cross-database analytics in one tool call.
@@ -187,7 +178,9 @@ watcher targets the alias; call `unwatch_directory` first.
 - `save_query` — save a named read-only SQL query for later reuse.
 - `delete_query` — delete a named saved query.
 - `set_table_metadata` — update prose metadata (source_url, purpose,
-  notes, license, source_description) on a table catalog entry.
+  notes, license, source_description) on an existing table catalog entry.
+  Local and persistent tables share one name-keyed persistent catalog;
+  writable user-attached databases have per-database catalogs.
 
 ### Multi-database
 - `attach_database` — attach an additional .hyper database under an
@@ -213,11 +206,8 @@ watcher targets the alias; call `unwatch_directory` first.
 - `kv_set_many` — atomic batch write. Pass an `entries` array of
   `{key, value}` objects. All keys validated up front; an invalid key
   aborts the whole batch without writing anything. `overwrite: false`
-  skips existing keys within the batch. Returns
-  `{stored, created, overwritten, total_bytes}` (or `skipped` instead
-  of `overwritten` under `overwrite: false`). `total_bytes` counts all
-  submitted values — an upper bound on bytes actually persisted when
-  keys are skipped or duplicated.
+  skips existing keys. Returns counts plus `total_bytes`, which counts
+  submitted values and may exceed bytes persisted when entries skip.
 - `kv_get` — read a value by store + key.
 - `kv_delete` — delete a key.
 - `kv_list` — list keys in a store. Pass `values: true` to return
@@ -231,10 +221,13 @@ watcher targets the alias; call `unwatch_directory` first.
 - `kv_clear` — delete all keys in a store.
 
 Every kv_* tool takes the same optional `database` parameter as the data
-tools. Omit it and the store lives in the EPHEMERAL database (lost on
+tools. Omit it and the store lives in the local database (lost on
 restart); pass `\"persistent\"` (or `persist: true`) to persist across
-restarts, or any attached alias to target that database. Each database
-has its own isolated set of stores. Enrich analytical tables with KV
+restarts, or any attached alias to target that database. Every user-attached
+target must be writable, even for readers, because the backing table may
+need initialization. The global `--read-only` guard blocks the five KV
+mutators but not the four readers. Each database has its own isolated set
+of stores. Enrich analytical tables with KV
 metadata via LEFT JOIN — always filter `kv.store_name = '<namespace>'`
 to avoid row multiplication, and keep the KV table in the same database
 as the joined table. See the `hyper://schema/kv` resource for the join
@@ -263,13 +256,20 @@ scale 0 and truncates decimal places. Example: `41.54178215::numeric`
   Sales` reads `sales`. Use `\"Sales\"` to preserve case.
 - **`query` is read-only.** SELECT / WITH / EXPLAIN / SHOW / VALUES
   only. For DDL / DML use `execute`.
-- **Read-only mode** (`--read-only` flag on the server) disables:
-  `execute`, all `load_*`, writable `attach_database`, `save_query`,
-  `delete_query`, `set_table_metadata`, `copy_query`, `watch_directory`,
-  `unwatch_directory`, and the mutating KV tools (`kv_set`, `kv_delete`,
-  `kv_pop`, `kv_clear`). `query`, `describe`, `sample`, `inspect_file`,
-  `export`, `chart`, `status`, `list_attached_databases`, and
-  `get_readme` always work.
+- **Read-only mode** (`--read-only` flag on the server) guards exactly:
+  `execute`, `load_data`, `load_file`, `load_files`, `load_iceberg`,
+  `watch_directory`, `save_query`, `delete_query`, `set_table_metadata`,
+  `copy_query`, `kv_set`, `kv_set_many`, `kv_delete`, `kv_pop`, and
+  `kv_clear`. A writable `attach_database` or `on_missing: \"create\"` is
+  also guarded, while a read-only attachment remains available.
+  Queries and inspection, `chart`, and detach/list operations remain
+  available. unwatch_directory remains allowed; export formats, including
+  Hyper, remain allowed. Hyper export does not mutate its source database,
+  but it does create or replace its materialized destination file.
+- **Persistent-file contention:** only a reserved persistent attachment
+  lock is reported as `RESOURCE_BUSY`. Run `hyperdb-mcp doctor`, compare
+  client/daemon identities, close the possible owner (Hyper, Tableau, or
+  another process), or copy/select another `.hyper` file, then retry.
 - **Table names** in `load_*` and `query_data` / `query_file` accept
   unquoted identifiers; the server lowercases them.
 - **`copy_query` modes:** `create` requires the target not exist;
@@ -346,10 +346,10 @@ sample({ \"table\": \"sales\" })
 query({ \"sql\": \"SELECT region, SUM(amount) FROM sales GROUP BY region\" })
 
 // Cross-database join via attachment
-attach_database({ \"alias\": \"lookup\", \"path\": \"/data/dim.hyper\" })
+attach_database({ \"alias\": \"lookup\", \"kind\": \"local_file\", \"path\": \"/data/dim.hyper\" })
 query({
   \"sql\": \"SELECT s.region, d.country_name, SUM(s.amount) \
-          FROM sales s JOIN lookup.dim_region d ON s.region = d.code \
+          FROM sales s JOIN lookup.public.dim_region d ON s.region = d.code \
           GROUP BY s.region, d.country_name\"
 })
 
@@ -393,8 +393,9 @@ execute({
 // Chart
 chart({
   \"sql\": \"SELECT region, SUM(amount) AS total FROM sales GROUP BY region\",
-  \"path\": \"/tmp/sales_by_region.png\",
-  \"chart_type\": \"bar\"
+  \"chart_type\": \"bar\",
+  \"x\": \"region\",
+  \"y\": \"total\"
 })
 ```
 

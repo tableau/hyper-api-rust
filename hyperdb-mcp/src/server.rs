@@ -79,7 +79,7 @@ pub(crate) struct DoctorCatalogSnapshot {
 
 /// Body of the `hyper://schema/kv` resource: describes the `_hyperdb_kv_store`
 /// backing table behind the `kv_*` tools, its (indexless) shape, the
-/// ephemeral-vs-persistent durability rule, per-database isolation, and the
+/// local-vs-persistent durability rule, per-database isolation, and the
 /// LEFT JOIN enrichment pattern. Served verbatim as `text/plain`.
 const KV_SCHEMA_RESOURCE: &str = "\
 KV store backing table (managed by the kv_* tools):
@@ -99,10 +99,13 @@ the kv_* tools, which guarantee uniqueness within a session.
 
 DATABASE / DURABILITY: each database has its own _hyperdb_kv_store table. Every
 kv_* tool takes the same optional `database` parameter as the other tools. Omit it
-and the store lives in the EPHEMERAL database — convenient, but LOST when the
+and the store lives in the local database — convenient, but LOST when the
 server restarts. Pass \"persistent\" (or persist=true) to survive restarts, or any
 attached alias to target that database. A store in one database is invisible from
-another.
+another. Every user-attached KV target must be writable, even for readers,
+because opening a store may initialize this backing table. The global
+`--read-only` mode blocks KV mutators; KV readers remain allowed, subject to
+that attached-target writability requirement.
 
 Enrich an analytical table with KV metadata without ALTER TABLE. The KV table must
 be in the SAME database as the joined table (or fully qualify both) — a LEFT JOIN
@@ -189,7 +192,7 @@ pub struct QueryFileParams {
     pub json_extract_path: Option<String>,
 }
 
-/// Parameters for the `load_data` workspace tool.
+/// Parameters for the `load_data` database tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LoadDataParams {
     /// Target table name.
@@ -205,7 +208,7 @@ pub struct LoadDataParams {
     /// See the docs on `QueryDataParams` for the full spec.
     pub schema: Option<Value>,
     /// Target database alias. Omit (or pass `"local"`) to write to the
-    /// ephemeral primary. Pass `"persistent"` to write to the durable
+    /// local database. Pass `"persistent"` to write to the durable
     /// database that survives across sessions. Other values target a
     /// user-attached database (must be writable).
     pub database: Option<String>,
@@ -215,7 +218,7 @@ pub struct LoadDataParams {
     pub persist: Option<bool>,
 }
 
-/// Parameters for the `load_file` workspace tool.
+/// Parameters for the `load_file` database tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LoadFileParams {
     /// Target table name.
@@ -246,7 +249,7 @@ pub struct LoadFileParams {
     /// error if set for `replace` or `append`.
     pub merge_key: Option<MergeKey>,
     /// Target database alias. Omit (or pass `"local"`) to write to the
-    /// ephemeral primary. Pass `"persistent"` to write to the durable
+    /// local database. Pass `"persistent"` to write to the durable
     /// database. Other values target a user-attached writable database.
     pub database: Option<String>,
     /// Shorthand for `database: "persistent"`. If both `database` and
@@ -344,7 +347,7 @@ pub struct LoadFilesEntry {
     pub merge_key: Option<MergeKey>,
 }
 
-/// Parameters for the `load_files` workspace tool.
+/// Parameters for the `load_files` database tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LoadFilesParams {
     /// Batch of files to ingest in parallel. Each entry targets its own
@@ -358,7 +361,7 @@ pub struct LoadFilesParams {
     /// and can starve the primary connection.
     pub concurrency: Option<u32>,
     /// Target database alias. Omit (or pass `"local"`) to write to the
-    /// ephemeral primary. Pass `"persistent"` to write to the durable
+    /// local database. Pass `"persistent"` to write to the durable
     /// database. Other values target a user-attached writable database.
     /// Applies to every entry in the batch — multi-target batches are
     /// not supported.
@@ -400,7 +403,7 @@ fn validate_merge_args(
     }
 }
 
-/// Parameters for the `load_iceberg` workspace tool.
+/// Parameters for the local-only `load_iceberg` tool.
 ///
 /// An Iceberg table on disk is a *directory* containing a `metadata/`
 /// subdir and one or more `data/` parquet files — hyperd reads the
@@ -421,18 +424,18 @@ pub struct LoadIcebergParams {
     pub version_as_of: Option<i64>,
 }
 
-/// Parameters for the read-only `query` workspace tool.
+/// Parameters for the read-only `query` database tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct QueryParams {
     /// SQL SELECT / WITH / EXPLAIN / SHOW / VALUES statement (read-only)
     pub sql: String,
     /// Target database alias for unqualified name resolution. Omit to
-    /// query the ephemeral primary. Pass `"persistent"` to route to the
+    /// query the local database. Pass `"persistent"` to route to the
     /// durable database, or any user-attached alias.
     pub database: Option<String>,
 }
 
-/// Parameters for the mutating `execute` workspace tool.
+/// Parameters for the mutating `execute` database tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ExecuteParams {
     /// One or more DDL/DML SQL statements (CREATE, INSERT, UPDATE, DELETE,
@@ -454,7 +457,7 @@ pub struct ExecuteParams {
     ///   issue each DDL in its own `execute` call.
     pub sql: Vec<String>,
     /// Target database alias for unqualified name resolution. Omit to
-    /// run against the ephemeral primary. Pass `"persistent"` to write
+    /// run against the local database. Pass `"persistent"` to write
     /// to the durable database (or a writable user-attached alias).
     pub database: Option<String>,
 }
@@ -466,22 +469,21 @@ pub struct SampleParams {
     pub table: String,
     /// Number of rows to return (default: 5, max: 100)
     pub n: Option<u64>,
-    /// Target database alias. Omit to sample from the ephemeral primary;
+    /// Target database alias. Omit to sample from the local database;
     /// pass `"persistent"` or a user-attached alias to sample from there.
     pub database: Option<String>,
 }
 
 /// Parameters for the `describe` tool. Both fields are optional to preserve
 /// backward compatibility with callers that invoke `describe` with no args
-/// to get the full workspace listing.
+/// to get the full local-database listing.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct DescribeParams {
     /// If set, return the schema and row count for just this table. Omit to
-    /// list every public table in the workspace.
+    /// list every public table in the selected database.
     pub table: Option<String>,
-    /// Target database alias. Omit to describe tables in the ephemeral
-    /// primary; pass `"persistent"` or a user-attached alias to describe
-    /// tables in another database.
+    /// Target database alias. Omit to describe tables in the local database;
+    /// pass `"persistent"` or a user-attached alias for another database.
     pub database: Option<String>,
 }
 
@@ -522,11 +524,10 @@ pub struct ChartParams {
     pub height: Option<u32>,
     /// Number of bins for histograms (default 20)
     pub bins: Option<u32>,
-    /// Treat the x column as categorical rather than numeric. Auto-detected
-    /// from the first row's x value for line/scatter charts: DATE, TIMESTAMP,
-    /// TEXT, and other non-numeric types flip to categorical automatically.
-    /// Set explicitly to override auto-detection. Bar charts are always
-    /// categorical regardless of this flag.
+    /// Force the x column to evenly spaced categorical positions. By default,
+    /// line/scatter DATE, TIMESTAMP, and TIMESTAMPTZ values use proportional
+    /// temporal spacing; numeric values use a numeric axis and TEXT is
+    /// categorical. Bar charts are always categorical regardless of this flag.
     pub x_as_category: Option<bool>,
     /// Bar layout: "vertical" (default) or "horizontal". Invalid for
     /// line, scatter, and histogram charts.
@@ -563,11 +564,10 @@ pub struct ChartParams {
     /// Show the series legend. Defaults true; `label_points=true` still
     /// suppresses line/scatter legends.
     pub show_legend: Option<bool>,
-    /// Where to write the rendered image. Parent directory is created
-    /// automatically. If omitted, a file is auto-generated under the
-    /// system temp dir (`<temp>/hyperdb-charts/chart-<ts>-<pid>-<n>.<ext>`).
-    /// Combine with `inline=true` to receive the bytes inline AND write
-    /// a file; otherwise the file is the sole output.
+    /// Where to write the rendered image. Parent directories are created.
+    /// Omit for inline-only delivery (the default). With `inline=false`, an
+    /// omitted path is auto-generated under the system temp directory.
+    /// Supplying a path writes the file and, by default, also returns it inline.
     pub output_path: Option<String>,
     /// When true, include the PNG/SVG bytes inline in the tool result.
     /// Without `output_path` this also skips the disk write entirely
@@ -580,7 +580,7 @@ pub struct ChartParams {
     /// true (overwrite silently), matching the `export` tool.
     pub overwrite: Option<bool>,
     /// Target database alias for unqualified name resolution in the
-    /// chart's SQL. Omit to query the ephemeral primary. Pass
+    /// chart's SQL. Omit to query the local database. Pass
     /// `"persistent"` or a user-attached alias to chart from there.
     pub database: Option<String>,
 }
@@ -596,8 +596,8 @@ pub struct WatchDirectoryParams {
     /// Each in-flight ingest holds one connection to hyperd plus a transaction.
     #[serde(default)]
     pub max_concurrent: Option<u32>,
-    /// Target database alias. Omit (or pass `"local"`) for the ephemeral
-    /// primary. Pass `"persistent"` for the durable database, or any
+    /// Target database alias. Omit (or pass `"local"`) for the local
+    /// database. Pass `"persistent"` for the durable database, or any
     /// user-attached writable alias. The watcher's connection pool is
     /// built against the resolved target, so subsequent ingests land
     /// in the right database without per-file routing.
@@ -677,7 +677,7 @@ pub struct ExportParams {
     ///
     /// Ignored for `format = "hyper"` (which isn't a `COPY`).
     pub format_options: Option<Value>,
-    /// Source database alias. Omit to read from the ephemeral primary.
+    /// Source database alias. Omit to read from the local database.
     /// Pass `"persistent"` or a user-attached alias to export from there.
     /// In `table` mode, the table name is fully qualified against this
     /// database. In `sql` mode, unqualified names in the SQL resolve
@@ -695,9 +695,9 @@ pub struct ExportParams {
 /// * `hyper://queries/{name}/result` — re-runs the SQL on every read and
 ///   returns the rows + query stats.
 ///
-/// In ephemeral workspaces (no `--workspace`) saved queries live only for
-/// the life of the server process; in persistent workspaces they are
-/// stored in the `_hyperdb_saved_queries` meta-table and survive restarts.
+/// With the normal persistent attachment, saved queries are stored in
+/// `_hyperdb_saved_queries` and survive restarts. Under `--ephemeral-only`
+/// they live only for the server process lifetime.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SaveQueryParams {
     /// Unique name identifying the query. Becomes the path component of
@@ -755,13 +755,14 @@ pub struct AttachSpec {
 pub struct AttachDatabaseParams {
     /// Alias to register the attachment under. Must be a SQL identifier
     /// (`[A-Za-z_][A-Za-z0-9_]{0,62}`) and cannot be `local` (reserved
-    /// for the primary workspace).
+    /// for the local database).
     pub alias: String,
     /// Attachment kind. Only `"local_file"` is supported today.
     pub kind: String,
     /// Absolute path to a `.hyper` file. Required when `kind ==
-    /// "local_file"`. The file must be idle — another MCP server or
-    /// `hyperd` instance holding it will cause a `RESOURCE_BUSY` error.
+    /// "local_file"`. Attachment failures preserve Hyper diagnostics. The
+    /// specialized contention classification is reserved for startup of the
+    /// configured persistent attachment, not user attachments.
     pub path: Option<String>,
     /// If `true`, `copy_query` (and raw `execute`) may target this
     /// attachment. Defaults to `false` so sources stay safe from
@@ -790,10 +791,10 @@ pub struct DetachDatabaseParams {
 /// Parameters for the `copy_query` tool. Runs a read-only SELECT / WITH
 /// / VALUES statement and lands the result into a target table.
 ///
-/// The inner `sql` may reference tables in the primary workspace
+/// The inner `sql` may reference tables in the local database
 /// (unqualified) as well as tables in any attachment by its fully
 /// qualified form — e.g. `src.public.customers`. The destination is
-/// resolved via `target_database` (main workspace by default).
+/// resolved via `target_database` (local by default).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CopyQueryParams {
     /// Read-only SQL statement whose result rows will be inserted into
@@ -813,7 +814,7 @@ pub struct CopyQueryParams {
     /// * `"replace"` — drop (if any) and recreate, atomically.
     pub mode: String,
     /// Alias of the destination database. `None` and `"local"` both
-    /// mean the server's primary workspace. Any other value must refer
+    /// mean the server's local database. Any other value must refer
     /// to an attachment registered with `writable: true`.
     pub target_database: Option<String>,
     /// Optional list of databases to attach for the duration of this
@@ -831,16 +832,15 @@ pub struct CopyQueryParams {
 /// and cannot be set through this tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SetTableMetadataParams {
-    /// Target table name. Must already exist in the workspace and have a
-    /// catalog entry — load the table first (or run `execute CREATE
-    /// TABLE`) so the server auto-stubs the row.
+    /// Target table name. Must have an existing catalog entry — load the table
+    /// first (or run `execute CREATE TABLE`) so the server auto-stubs the row.
     pub table: String,
     /// Where the data came from (URL, S3 path, internal system name).
     pub source_url: Option<String>,
     /// Short description of the dataset (what's in the table, how to
     /// interpret it).
     pub source_description: Option<String>,
-    /// Why this data is in the workspace — what questions it's intended
+    /// Why this data is in the database — what questions it's intended
     /// to answer.
     pub purpose: Option<String>,
     /// License or attribution requirements for the source data.
@@ -852,12 +852,11 @@ pub struct SetTableMetadataParams {
     /// Enables mechanical refresh: the server can re-ingest the table
     /// from this URL + `load_params` without prose parsing.
     pub data_url: Option<String>,
-    /// Target database alias for the catalog write. Omit (or pass
-    /// `"local"` / `"persistent"`) to update the persistent catalog —
-    /// matches the default for the ephemeral primary's tables.
-    /// Pass any user-attached writable alias to update that DB's
-    /// per-database `_table_catalog` instead. Read-only attachments
-    /// are rejected with a clear "re-attach with writable:true"
+    /// Target database alias for the catalog write. Local and persistent tables
+    /// use one shared name-keyed persistent catalog; omit this field or pass
+    /// `"local"` / `"persistent"` to select it. A user-attached writable alias
+    /// selects that database's per-database `_table_catalog` instead. Read-only
+    /// attachments are rejected with a clear "re-attach with writable:true"
     /// message.
     pub database: Option<String>,
 }
@@ -870,8 +869,8 @@ pub struct KvKeyParams {
     pub store: String,
     /// Key to look up or delete within the store.
     pub key: String,
-    /// Target database alias. Omit (or pass `"local"`) to use the ephemeral
-    /// primary. Pass `"persistent"` to use the durable database that survives
+    /// Target database alias. Omit (or pass `"local"`) to use the local
+    /// database. Pass `"persistent"` to use the durable database that survives
     /// across sessions. Other values target a user-attached database (must be
     /// writable). Each database has its own isolated set of KV stores.
     pub database: Option<String>,
@@ -900,7 +899,7 @@ pub struct KvSetParams {
     /// existed:true`. Defaults to true (upsert).
     pub overwrite: Option<bool>,
     /// Target database alias. Omit (or pass `"local"`) to write to the
-    /// ephemeral primary. Pass `"persistent"` to write to the durable database
+    /// local database. Pass `"persistent"` to write to the durable database
     /// that survives across sessions. Other values target a user-attached
     /// database (must be writable). Each database has its own isolated stores.
     pub database: Option<String>,
@@ -933,7 +932,7 @@ pub struct KvSetManyParams {
     /// true (upsert).
     pub overwrite: Option<bool>,
     /// Target database alias. Omit (or pass `"local"`) to write to the
-    /// ephemeral primary. Pass `"persistent"` to write to the durable database
+    /// local database. Pass `"persistent"` to write to the durable database
     /// that survives across sessions. Other values target a user-attached
     /// database (must be writable). Each database has its own isolated stores.
     pub database: Option<String>,
@@ -948,9 +947,10 @@ pub struct KvSetManyParams {
 pub struct KvStoreParams {
     /// Namespace of the KV store to operate on.
     pub store: String,
-    /// Target database alias. Omit (or pass `"local"`) for the ephemeral
-    /// primary. Pass `"persistent"` for the durable database, or a
-    /// user-attached alias. Each database has its own isolated stores.
+    /// Target database alias. Omit (or pass `"local"`) for the local database.
+    /// Pass `"persistent"` for the durable database, or a user-attached alias
+    /// that was registered writable (required even for KV readers). Each
+    /// database has its own isolated stores.
     pub database: Option<String>,
     /// Shorthand for `database: "persistent"`. If both `database` and
     /// `persist` are set, `database` wins.
@@ -966,9 +966,10 @@ pub struct KvListParams {
     /// false or omitted, return only `keys` (the default behavior). Use
     /// `values:true` for whole-store reads without N×`kv_get`.
     pub values: Option<bool>,
-    /// Target database alias. Omit (or pass `"local"`) for the ephemeral
-    /// primary. Pass `"persistent"` for the durable database, or a
-    /// user-attached alias. Each database has its own isolated stores.
+    /// Target database alias. Omit (or pass `"local"`) for the local database.
+    /// Pass `"persistent"` for the durable database, or a user-attached alias
+    /// that was registered writable (required even for KV readers). Each
+    /// database has its own isolated stores.
     pub database: Option<String>,
     /// Shorthand for `database: "persistent"`. If both `database` and
     /// `persist` are set, `database` wins.
@@ -978,9 +979,10 @@ pub struct KvListParams {
 /// Parameters for `kv_list_stores` (enumerate every store in a database).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct KvListStoresParams {
-    /// Target database alias. Omit (or pass `"local"`) for the ephemeral
-    /// primary. Pass `"persistent"` for the durable database, or a
-    /// user-attached alias. Each database has its own isolated stores.
+    /// Target database alias. Omit (or pass `"local"`) for the local database.
+    /// Pass `"persistent"` for the durable database, or a user-attached alias
+    /// that was registered writable (required even for KV readers). Each
+    /// database has its own isolated stores.
     pub database: Option<String>,
     /// Shorthand for `database: "persistent"`. If both `database` and
     /// `persist` are set, `database` wins.
@@ -1110,25 +1112,23 @@ impl HyperMcpServer {
         })
     }
 
-    /// Create a server instance. Pass `Some(path)` for persistent workspace,
-    /// `None` for ephemeral (temp directory, auto-cleaned).
+    /// Create a server instance.
     ///
-    /// The saved-queries store is chosen to match the workspace mode:
-    /// persistent workspaces get a [`crate::saved_queries::WorkspaceStore`]
-    /// (backed by a meta-table in the `.hyper` file so queries survive
-    /// restarts), ephemeral workspaces get an in-memory
-    /// [`crate::saved_queries::SessionStore`].
+    /// Every instance has a fresh ephemeral local database, which remains the
+    /// default target. `Some(persistent_path)` also attaches the optional
+    /// persistent database under the reserved `"persistent"` alias; `None`
+    /// leaves that attachment disabled. Saved queries use persistent
+    /// database-backed storage when that attachment is configured and
+    /// in-memory session storage otherwise.
     ///
-    /// When `read_only` is `true`, the `execute`, `load_data`, `load_file`,
-    /// `save_query`, `delete_query`, and `set_table_metadata` tools return
-    /// a `ReadOnlyViolation` error, and exporting to the `hyper` format
-    /// (which is a raw file copy, harmless) remains allowed.
-    ///
-    /// When `bare` is `true`, the server does not create or maintain the
-    /// `_table_catalog` table, and saved queries fall back to the in-memory
-    /// [`crate::saved_queries::SessionStore`] regardless of `workspace_path`
-    /// `persistent_path` is the resolved path to the persistent database
-    /// (`Some`) or `None` for `--ephemeral-only` mode.
+    /// When `read_only` is `true`, the server guards `execute`, every `load_*`
+    /// tool, `watch_directory`, saved-query mutations, `set_table_metadata`,
+    /// `copy_query`, all KV mutators, and writable/create `attach_database`.
+    /// Queries and inspection, read-only attachment, detach/list,
+    /// `unwatch_directory`, `chart`, and every export format remain available.
+    /// Hyper export does not mutate its source database, but it creates or
+    /// replaces a destination database and materializes the source's user
+    /// tables into it.
     pub fn new(persistent_path: Option<String>, read_only: bool) -> Self {
         Self::with_options(persistent_path, read_only, false)
     }
@@ -1997,9 +1997,9 @@ impl HyperMcpServer {
         }
     }
 
-    /// Load inline data (JSON or CSV) into a named workspace table.
+    /// Load inline data (JSON or CSV) into a named database table.
     #[tool(
-        description = "Load inline data (JSON or CSV) into a named workspace table. Supports partial `schema` overrides keyed by column name — only list the columns you want to correct, the rest keep their inferred type. On SchemaMismatch / numeric overflow, follow the error's suggestion (typically widen an INT column to BIGINT or NUMERIC(38,0))."
+        description = "Load inline data (JSON or CSV) into a named table in local, persistent, or an attached database. Supports partial `schema` overrides keyed by column name — only list columns to correct; the rest keep their inferred type. On SchemaMismatch / numeric overflow, follow the error suggestion (typically widen INT to BIGINT or NUMERIC(38,0))."
     )]
     fn load_data(
         &self,
@@ -2091,9 +2091,9 @@ impl HyperMcpServer {
         }
     }
 
-    /// Load a file (CSV, JSON, JSONL, Parquet, Arrow IPC) into a named workspace table.
+    /// Load a file (CSV, JSON, JSONL, Parquet, Arrow IPC) into a named database table.
     #[tool(
-        description = "Load a CSV / JSON / JSONL / NDJSON / Parquet / Arrow IPC file into a named workspace table. Format is auto-detected from extension (or content for JSON vs CSV).\n\nWhen choosing a format for *new* data going into Hyper, prefer in this order:\n  1. **Parquet** (fastest, server-side): hyperd reads the file directly via `external()`. Types, NUMERIC precision, DATE / TIMESTAMP, and Snappy/ZSTD compression all preserved. This is the recommended format for large imports.\n  2. **CSV**: server-side `COPY FROM` — also fast, but types are inferred from a header + full-file numeric widening pass (CSV has no embedded type info), and empty unquoted cells load as SQL NULL per PostgreSQL CSV default.\n  3. **Arrow IPC** (.arrow / .ipc / .feather, File or Stream format, auto-detected): read in Rust and streamed into hyperd via the binary COPY protocol with zero value-level decoding. Fast but not quite as fast as Parquet, and schema overrides are rejected (the Arrow schema is authoritative).\n  4. **JSON / JSONL / NDJSON**: parsed in Rust (hyperd has no native JSON reader), with per-row insertion. Use for small / irregular data; large JSON should be converted to Parquet first.\n\nFor Apache Iceberg tables use `load_iceberg` instead — it takes a directory path rather than a single file.\n\nSupports partial `schema` overrides keyed by column name (`{\"col\":\"BIGINT\"}`) — only list columns you want to correct; unlisted columns keep their inferred type. Overrides are supported for Parquet, CSV, and JSON; rejected for Arrow IPC. Call `inspect_file` first when unsure about types or to debug a prior failure; the inspector reports per-column min/max/null_count using the exact same inference logic. Use `json_extract_path` to extract a nested data array from a JSON wrapper file — dot-separated path, numeric segments index into arrays, string values are parsed as JSON.\n\n**Mode**: `replace` (default — drops + recreates the table), `append` (adds rows to an existing table), or `merge` (upserts rows by `merge_key`). In merge mode, set `merge_key` to a column name (`\"job_id\"`) or list of names (`[\"cell\",\"job_id\"]`); rows with a matching key are replaced, rows with no match are inserted. New columns in the incoming file are auto-added via `ALTER TABLE ADD COLUMN`. Type changes on existing columns are rejected — use `replace` for breaking schema changes."
+        description = "Load a CSV / JSON / JSONL / NDJSON / Parquet / Arrow IPC file into a named table in local, persistent, or an attached database. Format is auto-detected from extension (or content for JSON vs CSV).\n\nWhen choosing a format for *new* data going into Hyper, prefer in this order:\n  1. **Parquet** (fastest, server-side): hyperd reads the file directly via `external()`. Types, NUMERIC precision, DATE / TIMESTAMP, and Snappy/ZSTD compression all preserved. This is the recommended format for large imports.\n  2. **CSV**: server-side `COPY FROM` — also fast, but types are inferred from a header + full-file numeric widening pass (CSV has no embedded type info), and empty unquoted cells load as SQL NULL per PostgreSQL CSV default.\n  3. **Arrow IPC** (.arrow / .ipc / .feather, File or Stream format, auto-detected): read in Rust and streamed into hyperd via the binary COPY protocol with zero value-level decoding. Fast but not quite as fast as Parquet, and schema overrides are rejected (the Arrow schema is authoritative).\n  4. **JSON / JSONL / NDJSON**: parsed in Rust (hyperd has no native JSON reader), with per-row insertion. Use for small / irregular data; large JSON should be converted to Parquet first.\n\nFor Apache Iceberg tables use `load_iceberg` instead — it takes a directory path rather than a single file.\n\nSupports partial `schema` overrides keyed by column name (`{\"col\":\"BIGINT\"}`) — only list columns you want to correct; unlisted columns keep their inferred type. Overrides are supported for Parquet, CSV, and JSON; rejected for Arrow IPC. Call `inspect_file` first when unsure about types or to debug a prior failure; the inspector reports per-column min/max/null_count using the exact same inference logic. Use `json_extract_path` to extract a nested data array from a JSON wrapper file — dot-separated path, numeric segments index into arrays, string values are parsed as JSON.\n\n**Mode**: `replace` (default — drops + recreates the table), `append` (adds rows to an existing table), or `merge` (upserts rows by `merge_key`). In merge mode, set `merge_key` to a column name (`\"job_id\"`) or list of names (`[\"cell\",\"job_id\"]`); rows with a matching key are replaced, rows with no match are inserted. New columns in the incoming file are auto-added via `ALTER TABLE ADD COLUMN`. Type changes on existing columns are rejected — use `replace` for breaking schema changes."
     )]
     fn load_file(
         &self,
@@ -2585,10 +2585,10 @@ impl HyperMcpServer {
         )
     }
 
-    /// Ingest an Apache Iceberg table directory into a workspace table
+    /// Ingest an Apache Iceberg table directory into a local table
     /// using hyperd's native `external(..., format => 'iceberg')` reader.
     #[tool(
-        description = "Ingest an Apache Iceberg table into a workspace table using hyperd's native Iceberg reader. `path` must be an absolute path to the Iceberg table *root directory* (the one containing the `metadata/` and `data/` subdirs). Hyperd resolves the latest snapshot by default; pass `metadata_filename` (e.g. `v2.metadata.json`) or `version_as_of` to pin a specific snapshot or version. Mode is `replace` (default) or `append`. Single SQL statement under the hood — no Rust-side Arrow decode, no per-row INSERTs."
+        description = "Ingest an Apache Iceberg table into a local database table using hyperd's native Iceberg reader. `path` must be an absolute table-root directory containing `metadata/` and `data/`. Hyperd resolves the latest snapshot by default; use `metadata_filename` or `version_as_of` to pin one. Mode is `replace` (default) or `append`."
     )]
     fn load_iceberg(
         &self,
@@ -2662,7 +2662,7 @@ impl HyperMcpServer {
 
     /// Run a read-only SQL query (SELECT, WITH, EXPLAIN, SHOW, VALUES).
     #[tool(
-        description = "Run a read-only SQL query (SELECT, WITH, EXPLAIN, SHOW, VALUES) against the workspace. For DDL/DML use the execute tool."
+        description = "Run a read-only SQL query (SELECT, WITH, EXPLAIN, SHOW, VALUES) against local (default), persistent, or an attached database. Successful results include canonical `resolved_database`. For DDL/DML use execute."
     )]
     fn query(
         &self,
@@ -2908,7 +2908,7 @@ impl HyperMcpServer {
 
     /// Render a chart (PNG or SVG) from a SQL query.
     #[tool(
-        description = "Render a chart (bar, line, scatter, or histogram) from a SQL query. Returns the PNG/SVG image inline by default so MCP clients can display it directly. Set `inline=false` to skip the inline bytes and write to disk only (keeps the MCP transcript small for batch workflows). Combine `inline=true` with `output_path` to get both.\n\n**Data shape:** The query must return long-format data with one numeric `y` column. For multi-series charts, use a `series` column to split by category. If your data is wide-format (multiple value columns), reshape it with `UNION ALL` into (label, series, value) tuples before charting.\n\n**DATE/TIMESTAMP x-axis:** Line and scatter charts auto-detect non-numeric x columns. DATE, TIMESTAMP, and TIMESTAMPTZ values render with a **proportional time axis** — gaps between data points reflect real wall-clock time (4.5 h gap and 17 h gap don't look the same). Tick labels are formatted in the input kind: `%Y-%m-%d` for DATE, `%Y-%m-%d %H:%M:%S` for TIMESTAMP, with the originating timezone offset preserved for TIMESTAMPTZ. TEXT x columns fall back to evenly-spaced categorical mode. Set `x_as_category: true` to force categorical layout on temporal data (useful when even spacing reads better than proportional gaps).\n\n- `output_path`: explicit destination file path. Parent directory is created automatically (no need to pre-create it). If omitted and `inline=true` (default), no file is written. If omitted and `inline=false`, a file is auto-generated under the system temp dir as `hyperdb-charts/chart-<ts>-<pid>-<n>.<ext>`.\n- `inline`: when true (default), return the image bytes inline. Without `output_path`, suppresses the disk write entirely. With `output_path`, writes to disk AND returns inline. Set to false for disk-only output.\n- `format`: \"png\" (default) or \"svg\". Auto-derived from `output_path` extension when omitted. A mismatch between `format` and the path extension returns `INVALID_ARGUMENT`.\n- `overwrite`: default true. Set false to refuse overwriting an existing file (returns `PERMISSION_DENIED`).\n- `x_range`: finite increasing x extent for line/scatter; ignored for categorical bars.\n- `y_range`: finite increasing data-role y extent, including bars; horizontal bars render it on the physical x axis.\n- `color_map`: stable per-series hex colors (e.g. {\"India\":\"#e41a1c\",\"China\":\"#ff7f0e\"}).\n- `bar_orientation`: \"vertical\" (default) or \"horizontal\" for bars.\n- `label_values=true`: label bars with each original y scalar.\n- `show_legend`: true by default; false hides the legend.\n- `y_scale`: \"linear\" (default) or strictly-positive \"log\" for the y measure; log histograms are unsupported and explicit log ranges must contain every value.\n- `label_points=true`: annotate each point with its series name instead of showing a legend — best when each series has exactly one point."
+        description = "Quick diagnostic: render one bar, line, scatter, or histogram from a SQL query. Returns PNG/SVG inline by default; `output_path` writes plus returns inline, while `inline=false` is disk-only.\n\n**Data shape:** Return long-format data with one numeric `y` column and optional `series`; reshape wide data with `UNION ALL`.\n\n**Temporal x:** Line/scatter DATE, TIMESTAMP, and TIMESTAMPTZ use proportional time spacing. TEXT is categorical; `x_as_category=true` deliberately forces even spacing. Bars are always categorical.\n\n- `format`: \"png\" (default) or \"svg\"; path extension and explicit format must agree.\n- `x_range` / `y_range`: finite, strictly increasing, representable extents; y applies to bars.\n- `bar_orientation`: \"vertical\" (default) or \"horizontal\" for bars.\n- `label_values=true`: label bars with each original y scalar.\n- `show_legend`: true by default; false hides the legend.\n- `y_scale`: \"linear\" or positive \"log\"; no log histograms, and explicit log ranges must contain every value.\n- `label_points=true`: label line/scatter points and suppress their legend."
     )]
     fn chart(
         &self,
@@ -3140,10 +3140,10 @@ impl HyperMcpServer {
         }
     }
 
-    /// Describe workspace tables. With `table` set, returns just that
+    /// Describe tables in the selected database. With `table` set, returns just that
     /// table's columns and row count; without it, lists every public table.
     #[tool(
-        description = "Describe workspace tables. With `table` set, returns that single table's columns and row count (TABLE_NOT_FOUND if missing). Without `table`, lists every public table."
+        description = "Describe tables in local (default), persistent, or an attached database. With `table`, returns that table's columns and row count; without it, lists every public table. Successful results include canonical `resolved_database`."
     )]
     fn describe(
         &self,
@@ -3289,7 +3289,7 @@ impl HyperMcpServer {
     /// exposed as two MCP resources — see the struct-level docs on
     /// [`SaveQueryParams`] for the full URI pattern.
     #[tool(
-        description = "Save a named read-only SQL query. Creates two resources: `hyper://queries/{name}/definition` (sql + metadata JSON) and `hyper://queries/{name}/result` (re-runs the SQL on every read). Persisted in the workspace when `--workspace` is set; session-only otherwise. Rejects non-read-only SQL and duplicate names; delete first to overwrite."
+        description = "Save a named read-only SQL query. Creates `hyper://queries/{name}/definition` and `/result` resources. With the normal persistent attachment it survives restarts; under `--ephemeral-only` it is session-only. Rejects non-read-only SQL and duplicate names; delete first to overwrite."
     )]
     fn save_query(
         &self,
@@ -3422,7 +3422,7 @@ impl HyperMcpServer {
 
     /// Read a value from the KV scratchpad by store + key.
     #[tool(
-        description = "Read a value from the KV scratchpad by store + key. Returns {found, value}; `value` is null when the key is absent (not an error). Omit `database` to read the ephemeral store; pass \"persistent\" (or persist=true) or an attached alias to read elsewhere."
+        description = "Read a value from the KV scratchpad by store + key. Returns {found, value}; `value` is null when the key is absent (not an error). Omit `database` to read the local store; pass \"persistent\" (or persist=true) or an attached alias to read elsewhere."
     )]
     fn kv_get(
         &self,
@@ -3443,9 +3443,9 @@ impl HyperMcpServer {
         }
     }
 
-    /// Save a value under store + key (upsert). Ephemeral unless routed.
+    /// Save a value under store + key (upsert). Local unless routed.
     #[tool(
-        description = "KV scratchpad. Save a variable, state, summary, or JSON config under store + key to remember later without creating a database table. IMPORTANT: without `database` the value is written to the EPHEMERAL database and is LOST when the server restarts. To persist across restarts, pass database=\"persistent\" (or persist=true). Returns {stored, created, value_bytes}; `created:false` means an existing value was overwritten. Pass overwrite=false to avoid clobbering (skips + returns stored:false, existed:true). Pass value_path=<absolute path> to store a file's contents server-side instead of `value` (exactly one of value/value_path; reads any server-readable path — no sandbox; files over 64 MiB are rejected before reading)."
+        description = "KV scratchpad. Save a variable, state, summary, or JSON config under store + key to remember later without creating a database table. IMPORTANT: without `database` the value is written to the local database and is LOST when the server restarts. To persist across restarts, pass database=\"persistent\" (or persist=true). Returns {stored, created, value_bytes}; `created:false` means an existing value was overwritten. Pass overwrite=false to avoid clobbering (skips + returns stored:false, existed:true). Pass value_path=<absolute path> to store a file's contents server-side instead of `value` (exactly one of value/value_path; reads any server-readable path — no sandbox; files over 64 MiB are rejected before reading)."
     )]
     fn kv_set(
         &self,
@@ -3528,7 +3528,7 @@ impl HyperMcpServer {
 
     /// Atomic batch write to the KV scratchpad.
     #[tool(
-        description = "Write multiple KV pairs atomically. All keys validated before the transaction opens, so an invalid key aborts the whole batch. Returns {stored, created, overwritten, total_bytes} when overwrite=true (default); returns {stored, created, skipped, total_bytes} when overwrite=false (guard mode — skips existing keys). Empty `entries` is an error. Omit `database` to write to the ephemeral store; pass \"persistent\" (or persist=true) or an attached alias to write elsewhere."
+        description = "Write multiple KV pairs atomically. All keys validated before the transaction opens, so an invalid key aborts the whole batch. Returns {stored, created, overwritten, total_bytes} when overwrite=true (default); returns {stored, created, skipped, total_bytes} when overwrite=false (guard mode — skips existing keys). Empty `entries` is an error. Omit `database` to write to the local store; pass \"persistent\" (or persist=true) or an attached alias to write elsewhere."
     )]
     fn kv_set_many(
         &self,
@@ -3566,7 +3566,7 @@ impl HyperMcpServer {
         // not type-check — a closure, like any block, needs one return type.
         // `total_bytes` and `warnings` are engine-independent (computed above),
         // so they are spliced into the object after the closure returns. This
-        // mirrors the single-type-closure pattern used by `kv_list` (Task 11).
+        // mirrors the single-type-closure pattern used by `kv_list`.
         let overwrite = p.overwrite.unwrap_or(true);
         let result = self.with_engine(|engine| {
             let db = self.resolve_db(engine, p.database.as_deref(), p.persist, true)?;
@@ -3603,7 +3603,7 @@ impl HyperMcpServer {
 
     /// Delete a key from the scratchpad.
     #[tool(
-        description = "Delete a key from the KV scratchpad. Returns {deleted: true} when the key existed, {deleted: false} otherwise (no error). Omit `database` for the ephemeral store, or route with \"persistent\"/persist=true/an attached alias."
+        description = "Delete a key from the KV scratchpad. Returns {deleted: true} when the key existed, {deleted: false} otherwise (no error). Omit `database` for the local store, or route with \"persistent\"/persist=true/an attached alias."
     )]
     fn kv_delete(
         &self,
@@ -3629,7 +3629,7 @@ impl HyperMcpServer {
 
     /// List all keys in a scratchpad store, sorted ascending.
     #[tool(
-        description = "List all keys in a KV scratchpad store, sorted ascending. Omit `database` for the ephemeral store, or route with \"persistent\"/persist=true/an attached alias. Pass values=true to return full (key, value) pairs as an `entries` array instead of just keys — useful for reading a whole store without N×kv_get."
+        description = "List all keys in a KV scratchpad store, sorted ascending. Omit `database` for the local store, or route with \"persistent\"/persist=true/an attached alias. Pass values=true to return full (key, value) pairs as an `entries` array instead of just keys — useful for reading a whole store without N×kv_get."
     )]
     fn kv_list(
         &self,
@@ -3669,7 +3669,7 @@ impl HyperMcpServer {
 
     /// List all scratchpad store namespaces that hold data in a database.
     #[tool(
-        description = "List all KV scratchpad store namespaces that currently hold data in a database. Omit `database` for the ephemeral store, or route with \"persistent\"/persist=true/an attached alias. Each database has its own isolated set of stores. A store drops off this list once its last key is removed — there is no separate registry."
+        description = "List all KV scratchpad store namespaces that currently hold data in a database. Omit `database` for the local store, or route with \"persistent\"/persist=true/an attached alias. Each database has its own isolated set of stores. A store drops off this list once its last key is removed — there is no separate registry."
     )]
     fn kv_list_stores(
         &self,
@@ -3695,7 +3695,7 @@ impl HyperMcpServer {
 
     /// Count the keys in a scratchpad store.
     #[tool(
-        description = "Returns {store, size, bytes} where `size` is the key count and `bytes` is the total `OCTET_LENGTH` of all values (0 for empty stores). Omit `database` for the ephemeral store, or route with \"persistent\"/persist=true/an attached alias."
+        description = "Returns {store, size, bytes} where `size` is the key count and `bytes` is the total `OCTET_LENGTH` of all values (0 for empty stores). Omit `database` for the local store, or route with \"persistent\"/persist=true/an attached alias."
     )]
     fn kv_size(
         &self,
@@ -3724,7 +3724,7 @@ impl HyperMcpServer {
     /// Destructively read-and-remove the lowest-keyed entry in lexicographic
     /// key order (atomic).
     #[tool(
-        description = "Destructively read-and-remove the lowest-keyed entry (lexicographic key order, not insertion order) from a KV store (peek+delete in one transaction, atomic within a single server process — useful as a work queue for one session; two separate server processes popping a shared persistent store could double-serve an entry). Returns {found, key, value}; {found: false} on an empty store. Omit `database` for the ephemeral store, or route with \"persistent\"/persist=true/an attached alias."
+        description = "Destructively read-and-remove the lowest-keyed entry (lexicographic key order, not insertion order) from a KV store (peek+delete in one transaction, atomic within a single server process — useful as a work queue for one session; two separate server processes popping a shared persistent store could double-serve an entry). Returns {found, key, value}; {found: false} on an empty store. Omit `database` for the local store, or route with \"persistent\"/persist=true/an attached alias."
     )]
     fn kv_pop(
         &self,
@@ -3753,7 +3753,7 @@ impl HyperMcpServer {
 
     /// Delete all keys in a scratchpad store.
     #[tool(
-        description = "Delete all keys in a KV scratchpad store. Returns the number of keys removed. Omit `database` for the ephemeral store, or route with \"persistent\"/persist=true/an attached alias."
+        description = "Delete all keys in a KV scratchpad store. Returns the number of keys removed. Omit `database` for the local store, or route with \"persistent\"/persist=true/an attached alias."
     )]
     fn kv_clear(
         &self,
@@ -3777,11 +3777,10 @@ impl HyperMcpServer {
         }
     }
 
-    /// Returns plugin health, workspace info, table count, total rows, disk
-    /// usage, the backing `hyperd` connection (mode, endpoint, daemon health
-    /// port), and the list of active directory watchers with their stats.
+    /// Returns installation identity, local/persistent database state, engine
+    /// health, attachments, watchers, and full or degraded statistics.
     #[tool(
-        description = "Returns plugin health, workspace info, table count, total rows, disk usage, the backing hyperd connection (engine.mode, engine.hyperd_endpoint, engine.daemon_health_port), and active directory watchers."
+        description = "Returns MCP/Rust API installation identity, `default_database: local`, read-only state, attachments, watchers, and Hyper/daemon health. `engine_busy:false` includes full SQL statistics; `engine_busy:true` is a prompt partial response, so omitted statistics and `hyperd_running:false` are inconclusive—retry later."
     )]
     fn status(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         // Use try_lock so `status` never hangs behind a stalled/slow data-plane
@@ -3852,7 +3851,7 @@ impl HyperMcpServer {
     /// Attach an additional `.hyper` database under a user-chosen
     /// alias so its tables can participate in cross-database queries.
     #[tool(
-        description = "Attach an additional .hyper database under a chosen alias. Tables in the attachment are addressable as `{alias}.public.{table}` in any subsequent SELECT; tables in the primary workspace remain addressable as `local.public.{table}` or by their file stem. Default is read-only; pass writable:true to allow mutations (still respects --read-only). Set on_missing='create' (with writable:true) to create an empty .hyper file at the target path first and then attach it — useful for scratch databases without a separate file-creation step; the parent directory must already exist. Only kind='local_file' is supported today; 'tcp' and 'grpc' (Data 360) are planned. The alias 'local' is reserved for the primary workspace."
+        description = "Attach a .hyper database under a canonical lowercase alias. Its tables are `{alias}.public.{table}`; local tables are `local.public.{table}` or unqualified. Default is read-only. `writable:true` and `on_missing:'create'` permit writes only when the server is not `--read-only`; read-only attachment remains available. Only `kind:'local_file'` is supported; `local` is reserved."
     )]
     fn attach_database(
         &self,
@@ -4022,7 +4021,7 @@ impl HyperMcpServer {
     /// `append`, `replace`) are explicit — the target's actual
     /// existence must match the chosen mode.
     #[tool(
-        description = "Run a SELECT (or WITH / VALUES) across local and attached databases and insert the result into a target table. Required `mode`: 'create' (target must not exist, creates via CREATE TABLE AS), 'append' (target must exist, INSERT INTO ... SELECT), or 'replace' (drops and recreates atomically). `target_database` defaults to the primary workspace ('local' also accepted); any other value must be an attachment registered with writable:true. Optional `temp_attach` attaches additional databases for this call only and detaches them on exit (even on failure). Disabled in read-only mode."
+        description = "Run SELECT/WITH/VALUES across local and attached databases and insert into a target table. `mode` is `create`, `append`, or `replace`. `target_database` defaults to local; another alias must be attached writable. `temp_attach` lasts only for this call. Success retains `target_database` and adds canonical `resolved_database`. Disabled in read-only mode."
     )]
     fn copy_query(
         &self,
@@ -4570,8 +4569,8 @@ impl HyperMcpServer {
     }
 
     /// Build the `hyper://readme` markdown body: a human-friendly overview
-    /// of the current workspace, its tables, and pointers to the other
-    /// resources and tools an LLM might reach for.
+    /// of the local and persistent databases, local tables, and pointers to
+    /// the other resources and tools an LLM might reach for.
     ///
     /// Designed to be dropped into an LLM context block so the model can
     /// orient itself in a single resource read without first calling
@@ -4582,15 +4581,10 @@ impl HyperMcpServer {
             .with_engine(super::engine::Engine::describe_tables)
             .unwrap_or_default();
 
-        let workspace_mode = if status
+        let has_persistent = status
             .get("has_persistent")
             .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
-            "persistent"
-        } else {
-            "ephemeral"
-        };
+            .unwrap_or(false);
         let persistent_path = status
             .get("persistent_path")
             .and_then(|v| v.as_str())
@@ -4598,16 +4592,21 @@ impl HyperMcpServer {
         let table_count = tables.len();
 
         let mut md = String::new();
-        md.push_str("# HyperDB workspace\n\n");
+        md.push_str("# HyperDB databases\n\n");
         let _ = writeln!(
             md,
-            "- Mode: **{workspace_mode}**{}\n",
+            "- Local database: **ephemeral** (default){}",
             if self.read_only { " (read-only)" } else { "" }
         );
-        if !persistent_path.is_empty() {
-            let _ = writeln!(md, "- Path: `{persistent_path}`\n");
+        if has_persistent {
+            md.push_str("- Persistent database: **attached**\n");
+            if !persistent_path.is_empty() {
+                let _ = writeln!(md, "- Persistent path: `{persistent_path}`");
+            }
+        } else {
+            md.push_str("- Persistent database: **disabled**\n");
         }
-        let _ = write!(md, "- Tables: **{table_count}**\n\n");
+        let _ = write!(md, "- Local tables: **{table_count}**\n\n");
 
         if tables.is_empty() {
             md.push_str(
@@ -4616,7 +4615,7 @@ impl HyperMcpServer {
                  first if you're unsure of the schema.\n",
             );
         } else {
-            md.push_str("## Tables\n\n");
+            md.push_str("## Local tables\n\n");
             md.push_str("| Table | Rows | Columns |\n");
             md.push_str("|---|---:|---|\n");
             for t in &tables {
@@ -4925,7 +4924,7 @@ Full SQL reference: https://developer.salesforce.com/docs/data/data-cloud-query-
         Ok(())
     }
 
-    /// List MCP resources: the workspace, the tables list, a markdown
+    /// List MCP resources: database status, the local tables list, a markdown
     /// readme, the KV store schema, and three entries per existing table
     /// (schema, JSON sample, CSV sample). Calling this lazily starts the
     /// engine, so it doubles as a "wake up" signal for MCP clients that
@@ -4938,9 +4937,13 @@ Full SQL reference: https://developer.salesforce.com/docs/data/data-cloud-query-
         let mut resources = vec![
             RawResource {
                 uri: "hyper://workspace".into(),
-                name: "Workspace Info".into(),
-                title: Some("Hyper Workspace".into()),
-                description: Some("Workspace mode, table count, total rows, disk usage".into()),
+                name: "Local and Persistent Database Info".into(),
+                title: Some("HyperDB local and persistent databases".into()),
+                description: Some(
+                    "Local/default database and persistent attachment state, table count, \
+                     total rows, and disk usage"
+                        .into(),
+                ),
                 mime_type: Some("application/json".into()),
                 size: None,
                 icons: None,
@@ -4960,11 +4963,11 @@ Full SQL reference: https://developer.salesforce.com/docs/data/data-cloud-query-
             .no_annotation(),
             RawResource {
                 uri: "hyper://readme".into(),
-                name: "Workspace Readme".into(),
-                title: Some("HyperDB workspace readme".into()),
+                name: "Database Readme".into(),
+                title: Some("HyperDB local and persistent database readme".into()),
                 description: Some(
-                    "Markdown overview of the workspace: tables, row counts, related \
-                     resources, and tool hints for LLMs orienting themselves."
+                    "Markdown overview of local/default and persistent databases: local \
+                     tables, row counts, related resources, and tool hints for LLMs."
                         .into(),
                 ),
                 mime_type: Some("text/markdown".into()),
@@ -4979,7 +4982,7 @@ Full SQL reference: https://developer.salesforce.com/docs/data/data-cloud-query-
                 title: Some("Key-value scratchpad schema".into()),
                 description: Some(
                     "Schema of the _hyperdb_kv_store table backing the kv_* tools, the \
-                     ephemeral-vs-persistent durability rule, and the LEFT JOIN enrichment \
+                     local-vs-persistent durability rule, and the LEFT JOIN enrichment \
                      pattern for joining KV metadata onto analytical tables."
                         .into(),
                 ),

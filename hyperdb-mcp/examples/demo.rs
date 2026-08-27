@@ -228,7 +228,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   {}", csv_path.display());
 
     // ── Step 1: spin up engine ─────────────────────────────────────────
-    section("Step 1 · Launch the engine (ephemeral workspace)");
+    section("Step 1 · Launch the engine (local database)");
     let engine = Engine::new(None)?;
     println!("   Ephemeral DB: {}", engine.ephemeral_path().display());
     println!("   Log dir:   {}", engine.log_dir().display());
@@ -263,7 +263,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── Step 3: describe ───────────────────────────────────────────────
-    section("Step 3 · Describe — what's in the workspace?");
+    section("Step 3 · Describe — what's in the local database?");
     let tables = engine.describe_tables()?;
     print_rows_as_table(&tables);
 
@@ -357,10 +357,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             format: ChartFormat::Png,
             width: 900,
             height: 400,
-            // `day` is a DATE column — plot it as categorical so the
-            // axis ticks render as ISO strings instead of failing
-            // numeric parse.
-            x_as_category: Some(true),
+            // `day` is a DATE column, so line charts automatically use
+            // a proportional temporal axis with ISO date tick labels.
             ..ChartOptions::default()
         },
     )?;
@@ -416,8 +414,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   · {}", line_path.display());
     println!("   · {}", scatter_path.display());
     println!();
-    println!("   The engine's temp workspace will be removed when this");
-    println!("   process exits (workspace is ephemeral, `is_persistent = false`).");
+    println!("   The engine's local temp database will be removed when this");
+    println!("   process exits (`is_persistent = false`).");
     println!();
 
     Ok(())

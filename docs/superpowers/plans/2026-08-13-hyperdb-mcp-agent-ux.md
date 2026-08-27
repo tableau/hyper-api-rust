@@ -255,7 +255,7 @@ is required.
   exit behavior.
 - [ ] Review spotlight: environment injection, secret/unknown-field leakage,
       Windows path/package behavior, and preservation of wrapper exit semantics.
-- [ ] Commit: `feat(mcp): report npm launcher identity`
+- [ ] Commit: `fix(mcp): report npm launcher identity`
 
 ### Task 3: Enrich daemon discovery without changing `DaemonInfo`
 
@@ -315,7 +315,7 @@ modules).
 - [ ] Review spotlight: exact flat fixtures, exhaustive-literal compatibility,
       takeover semver, both initial and restart write sites, serde
       forward/backward behavior, and path privacy.
-- [ ] Commit: `feat(mcp): enrich daemon discovery identity`
+- [ ] Commit: `fix(mcp): enrich daemon discovery identity`
 
 ### Task 4: Add side-effect-free doctor report and CLI
 
@@ -402,7 +402,7 @@ engineer (diagnostics/path/CLI).
   Expected: all tests PASS; manual JSON is valid and does not start `hyperd`.
 - [ ] Review spotlight: every filesystem mutation path, scan time bounds,
       truthful path-source labels, exit semantics, and tool count remaining 33.
-- [ ] Commit: `feat(mcp): add side-effect-free doctor command`
+- [ ] Commit: `fix(mcp): add side-effect-free doctor command`
 
 ### Task 5: Route daemon control messages to the effective health port
 
@@ -627,7 +627,7 @@ end-to-end MCP tests, and Hyper API process lifecycle test), engineer
   Expected: PASS for all five tool families.
 - [ ] Review spotlight: database precedence, alias lowercasing, special response
       shapes, strict old clients, and helper failure on non-object JSON.
-- [ ] Commit: `feat(mcp): report resolved database for query tools`
+- [ ] Commit: `fix(mcp): report resolved database for query tools`
 
 ### Task 9: Add `resolved_database` to ingest/export/watch/metadata results
 
@@ -672,7 +672,7 @@ end-to-end MCP tests, and Hyper API process lifecycle test), engineer
   Expected: PASS.
 - [ ] Review spotlight: parallel `load_files` top-level truth, watcher teardown,
       output-path behavior, and catalog routing side effects.
-- [ ] Commit: `feat(mcp): report resolved database for data tools`
+- [ ] Commit: `fix(mcp): report resolved database for data tools`
 
 ### Task 10: Complete routed metadata for KV and copy tools
 
@@ -718,7 +718,7 @@ end-to-end MCP tests, and Hyper API process lifecycle test), engineer
 - [ ] Review spotlight: every success branch including `found:false`, copy
       compatibility, no metadata on errors, and schema inventory false positives
       such as `target_database`-only tools.
-- [ ] Commit: `feat(mcp): complete resolved database result metadata`
+- [ ] Commit: `fix(mcp): complete resolved database result metadata`
 
 ### Task 11: Preserve chart API while fixing range/category behavior
 
@@ -833,7 +833,7 @@ end-to-end MCP tests, and Hyper API process lifecycle test), engineer
   Expected: PASS for PNG/SVG and schema budget.
 - [ ] Review spotlight: top-to-bottom order, negative linear bars, grouped
       offsets, label clipping, backend parity, and invalid option combinations.
-- [ ] Commit: `feat(mcp): add diagnostic chart presentation controls`
+- [ ] Commit: `fix(mcp): add diagnostic chart presentation controls`
 
 ### Task 13: Add positive logarithmic measure scale
 
@@ -887,7 +887,7 @@ end-to-end MCP tests, and Hyper API process lifecycle test), engineer
   rendering.
 - [ ] Review spotlight: subnormal/huge floats, auto-range equality, horizontal
       data-axis mapping, generic code complexity, and silent misrepresentation.
-- [ ] Commit: `feat(mcp): add positive logarithmic chart scale`
+- [ ] Commit: `fix(mcp): add positive logarithmic chart scale`
 
 ### Task 14: Align public documentation, terminology, and changelog
 
@@ -948,7 +948,7 @@ doc-editor agent (prose), followed by reviewer.
   Expected: PASS; 33 tools and catalog budget retained.
 - [ ] Review spotlight: code/doc truth, stale workspace terminology, exact tool
       guards, unsupported promises, and changelog policy.
-- [ ] Commit: `docs(mcp): align agent UX and diagnostics contracts`
+- [ ] Commit: `fix(mcp): align agent UX and diagnostics documentation`
 
 ### Task 15: Integrated verification, adversarial review, and durable memory
 
