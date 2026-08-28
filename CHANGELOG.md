@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.3](https://github.com/tableau/hyper-api-rust/compare/v0.7.2...v0.7.3) (2026-08-28)
+
+
+### Bug Fixes
+
+* **mcp:** improve diagnostics, daemon resilience, and chart UX ([#243](https://github.com/tableau/hyper-api-rust/issues/243)) ([44bdf1e](https://github.com/tableau/hyper-api-rust/commit/44bdf1e5551e8936a568a1ce6ca07ac4ca5e75c7))
+
 ## [0.7.2](https://github.com/tableau/hyper-api-rust/compare/v0.7.1...v0.7.2) (2026-08-26)
 
 
