@@ -19,6 +19,30 @@ const SECRET_SENTINEL: &str = "UNKNOWN_SECRET_SENTINEL_doctor_7d31e9";
 const MAX_REPORTED_STRING_BYTES: usize = 4 * 1024;
 const PUBLIC_README: &str = include_str!("../README.md");
 
+/// Canonicalize a path the way the `doctor` binary reports its own paths.
+///
+/// `std::fs::canonicalize` prepends the `\\?\` verbatim prefix on Windows,
+/// but the paths the running binary reports come from `current_dir` /
+/// `current_exe`, which are *un-prefixed*. Comparing a prefixed expected
+/// path against an un-prefixed reported one fails only on Windows. Strip the
+/// prefix (leaving genuine UNC paths, `\\?\UNC\...`, alone) so the expected
+/// paths match what the binary emits. On non-Windows this is a plain
+/// canonicalize.
+fn canonicalize_for_test(path: &Path) -> std::io::Result<PathBuf> {
+    let canonical = std::fs::canonicalize(path)?;
+    #[cfg(windows)]
+    {
+        if let Some(s) = canonical.to_str() {
+            let stripped = match s.strip_prefix(r"\\?\") {
+                Some(rest) if !rest.starts_with("UNC\\") => rest,
+                _ => s,
+            };
+            return Ok(PathBuf::from(stripped));
+        }
+    }
+    Ok(canonical)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum SnapshotNode {
     Directory,
@@ -45,7 +69,7 @@ impl DoctorSandbox {
     fn new() -> Self {
         let temp_dir = TempDir::new().expect("create isolated doctor test root");
         let root =
-            std::fs::canonicalize(temp_dir.path()).expect("canonicalize isolated doctor test root");
+            canonicalize_for_test(temp_dir.path()).expect("canonicalize isolated doctor test root");
         let isolated_daemon_listener = TcpListener::bind(("127.0.0.1", 0))
             .expect("reserve an OS-assigned foreign daemon-isolation port");
         let isolated_daemon_port = isolated_daemon_listener
@@ -908,8 +932,8 @@ fn doctor_cli_json_and_human_smoke_is_side_effect_free() {
             "required path must carry display + utf8 semantics: {expected}; paths={reported_paths:?}"
         );
     }
-    let current_exe =
-        std::fs::canonicalize(env!("CARGO_BIN_EXE_hyperdb-mcp")).expect("canonicalize test binary");
+    let current_exe = canonicalize_for_test(Path::new(env!("CARGO_BIN_EXE_hyperdb-mcp")))
+        .expect("canonicalize test binary");
     assert!(
         reported_paths.iter().any(|(display, encoding)| {
             display == current_exe.to_string_lossy().as_ref() && encoding == "utf8"
