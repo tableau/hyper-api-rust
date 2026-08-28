@@ -3560,12 +3560,14 @@ impl HyperMcpServer {
         }
 
         // Shape the outcome JSON *inside* each branch so the `with_engine`
-        // closure returns a single type (`Result<Value, McpError>`). The two
-        // batch primitives return different outcome structs (`BatchSetOutcome`
-        // vs `BatchGuardOutcome`), so a bare `if`/`else` returning both would
-        // not type-check — a closure, like any block, needs one return type.
+        // closure returns a single type
+        // (`Result<(Value, Option<String>), McpError>`). The two batch
+        // primitives return different outcome structs (`BatchSetOutcome` vs
+        // `BatchGuardOutcome`), so a bare `if`/`else` returning both would not
+        // type-check — a closure, like any block, needs one return type.
         // `total_bytes` and `warnings` are engine-independent (computed above),
-        // so they are spliced into the object after the closure returns. This
+        // so they are spliced into the object after the closure returns; the
+        // database alias is carried out for `resolved_database` metadata. This
         // mirrors the single-type-closure pattern used by `kv_list`.
         let overwrite = p.overwrite.unwrap_or(true);
         let result = self.with_engine(|engine| {
