@@ -239,6 +239,11 @@ fn hex_color_parse() {
     assert!(parse_hex_color("not-a-color").is_none());
     assert!(parse_hex_color("#gg0000").is_none()); // invalid hex digit
     assert!(parse_hex_color("#fff").is_none()); // too short
+                                                // Regression: a 6-*byte* string whose bytes are not all ASCII (here `é`
+                                                // is two UTF-8 bytes) has `len() == 6` but its byte offsets don't land on
+                                                // char boundaries — slicing `[0..2]` used to panic. It must be rejected.
+    assert!(parse_hex_color("1é234").is_none()); // 6 bytes, not 6 ASCII chars
+    assert!(parse_hex_color("#1é234").is_none()); // same, with a leading '#'
 }
 
 /// `x_range` and `y_range` fix the axis extents; the chart still renders with

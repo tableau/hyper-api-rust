@@ -87,6 +87,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   increasing, representable spans. Horizontal ordering/grouping/labels and
   extreme positive log ranges now render without zero baselines, collapsed
   endpoints, unbounded ticks, or silently misrepresented measures.
+- **Chart color parsing no longer panics on non-ASCII input.** A `color_map`
+  value that is six *bytes* but not six ASCII characters (e.g. `"1é234"`, where
+  `é` is two UTF-8 bytes) passed the length check and then panicked on a
+  non-char-boundary byte slice, aborting the request. `parse_hex_color` now
+  rejects any non-ASCII string up front and returns a normal "invalid color"
+  result instead.
 - **I/O error fidelity on `value_path` and `load_file`.** File-read errors now preserve `PermissionDenied` → `ErrorCode::PermissionDenied` instead of collapsing every I/O failure to `FileNotFound`. A missing file still maps to `FileNotFound`; any other I/O error becomes a generic `InternalError` with the OS message. (Implemented via `McpError::from_io_error` in `error.rs`.)
 - **Misleading JSON-error `suggestion` text corrected.** The "requires a structured data type" (`42601`) and `JSON_VALUE`-not-implemented (`0A000`) errors previously suggested splitting the statement, which was wrong; they now advise casting the TEXT value to `json` first (`value::json ->> 'field'`), the actual fix. Applies narrowly to JSON-related cases; other `42601` syntax errors carry a generic message without a misleading hint.
 - **Caller-fixable argument errors now return `INVALID_ARGUMENT`, not

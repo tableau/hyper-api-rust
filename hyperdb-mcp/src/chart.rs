@@ -1320,7 +1320,11 @@ fn series_color_for(series_name: &str, idx: usize, opts: &ChartOptions) -> RGBCo
 #[must_use]
 pub fn parse_hex_color(s: &str) -> Option<RGBColor> {
     let s = s.strip_prefix('#').unwrap_or(s);
-    if s.len() != 6 {
+    // Guard `is_ascii()` before the byte slices below: a 6-*byte* multi-byte
+    // string (e.g. "1é234", where `é` is two bytes) passes `len() != 6` but
+    // `&s[0..2]` would land mid-codepoint and panic. ASCII guarantees one
+    // byte per char, so every `[0..2]`/`[2..4]`/`[4..6]` is a char boundary.
+    if !s.is_ascii() || s.len() != 6 {
         return None;
     }
     let r = u8::from_str_radix(&s[0..2], 16).ok()?;
