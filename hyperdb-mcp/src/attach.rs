@@ -331,7 +331,13 @@ impl AttachRegistry {
             }
         };
 
-        engine.execute_command(&sql)?;
+        // Route the ATTACH through the attach-context error mapper so a
+        // lock conflict (another process already owns the file) surfaces as
+        // `RESOURCE_BUSY` with recovery guidance, not a generic `SqlError`.
+        let target_path = match &req.source {
+            AttachSource::LocalFile { path } => path.clone(),
+        };
+        engine.execute_attach_command(&sql, &target_path)?;
 
         // Hyper's default `schema_search_path = "$single"` stops
         // resolving unqualified names the moment the connection has

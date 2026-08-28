@@ -141,6 +141,18 @@ fn attach_default_persistent(
     Ok(PersistentAttachOutcome { file_was_created })
 }
 
+/// True when a Hyper error from an `ATTACH DATABASE`-class statement means
+/// the target `.hyper` file is locked or already owned by another process.
+///
+/// SQLSTATE `55006` carries this meaning only in the attach context — the
+/// generic `From<hyperdb_api::Error>` conversion in [`crate::error`]
+/// deliberately leaves it as `SqlError` elsewhere. Older hyperd versions
+/// omit the structured code and emit only a human-readable lock phrase, so
+/// both spellings are checked.
+fn is_attach_lock_conflict(err: &hyperdb_api::Error) -> bool {
+    err.sqlstate() == Some("55006") || crate::error::is_resource_busy(&err.to_string())
+}
+
 /// Converts a Hyper error from the reserved persistent-attachment path.
 ///
 /// SQLSTATE `55006` has enough meaning to be a lock conflict only here: the
@@ -148,8 +160,8 @@ fn attach_default_persistent(
 /// versions omit the structured SQLSTATE, so retain the established wording
 /// fallback for that boundary too.
 fn persistent_attach_error(err: hyperdb_api::Error, persistent_path: &Path) -> McpError {
-    let raw_error = err.to_string();
-    if err.sqlstate() == Some("55006") || crate::error::is_resource_busy(&raw_error) {
+    if is_attach_lock_conflict(&err) {
+        let raw_error = err.to_string();
         return McpError::new(
             ErrorCode::ResourceBusy,
             format!(
@@ -159,6 +171,22 @@ fn persistent_attach_error(err: hyperdb_api::Error, persistent_path: &Path) -> M
         )
         .with_suggestion(
             "The persistent database may be held by another process. Run `hyperdb-mcp doctor` to inspect the configuration and possible owner, then close the possible owner or copy the file before retrying.",
+        );
+    }
+
+    McpError::from(err)
+}
+
+/// Converts a Hyper error from a user-facing `attach_database` on a
+/// caller-supplied `.hyper` file. Mirrors [`persistent_attach_error`] for
+/// the user attach path so a lock conflict surfaces as
+/// [`ErrorCode::ResourceBusy`] — with the default doctor-oriented recovery
+/// suggestion from [`crate::error`] — instead of a generic `SqlError`.
+fn attach_lock_error(err: hyperdb_api::Error, path: &Path) -> McpError {
+    if is_attach_lock_conflict(&err) {
+        return McpError::new(
+            ErrorCode::ResourceBusy,
+            format!("Failed to attach database {}: {err}", path.display()),
         );
     }
 
@@ -733,6 +761,27 @@ impl Engine {
     /// dropped.
     pub fn execute_command(&self, sql: &str) -> Result<u64, McpError> {
         self.connection.execute_command(sql).map_err(McpError::from)
+    }
+
+    /// Execute an `ATTACH DATABASE` statement for a user-supplied `.hyper`
+    /// file, mapping a lock conflict (SQLSTATE `55006`, or a legacy
+    /// "already attached"/"file is locked" phrase from older hyperd) to
+    /// [`ErrorCode::ResourceBusy`] with actionable recovery guidance.
+    ///
+    /// The generic [`Engine::execute_command`] conversion deliberately
+    /// leaves `55006` as [`ErrorCode::SqlError`] because the code only means
+    /// "held by another owner" inside the attach context; this method is the
+    /// attach-context counterpart to `persistent_attach_error` for the
+    /// user-facing `attach_database` tool.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::ResourceBusy`] on a lock conflict, otherwise the
+    /// same error [`Engine::execute_command`] would produce.
+    pub fn execute_attach_command(&self, sql: &str, path: &Path) -> Result<u64, McpError> {
+        self.connection
+            .execute_command(sql)
+            .map_err(|err| attach_lock_error(err, path))
     }
 
     /// Run the given closure inside a database transaction.
@@ -2121,6 +2170,66 @@ mod statement_helper_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lock conflict on a user-facing `attach_database` call must surface
+    /// as `RESOURCE_BUSY` (with doctor-oriented guidance), mirroring the
+    /// reserved persistent-attach path — the generic `From` conversion leaves
+    /// such a `55006` as `SqlError`, so the attach-context mapper is the only
+    /// place that reclassifies it for the user attach path.
+    #[test]
+    fn user_attach_55006_maps_resource_busy() {
+        let attach_path = PathBuf::from("/tmp/task-user-attach.hyper");
+        let upstream = hyperdb_api::Error::server(
+            Some("55006".to_string()),
+            "database is already attached by another client connection",
+            None,
+            None,
+        );
+
+        let mapped = attach_lock_error(upstream, &attach_path);
+
+        assert_eq!(mapped.code, ErrorCode::ResourceBusy);
+        assert!(
+            mapped.message.contains("55006"),
+            "must retain SQLSTATE evidence: {}",
+            mapped.message
+        );
+        assert!(
+            mapped.message.contains("already attached"),
+            "must retain Hyper's raw diagnostic: {}",
+            mapped.message
+        );
+        assert!(
+            mapped.message.contains(attach_path.to_str().unwrap()),
+            "must name the attach path: {}",
+            mapped.message
+        );
+        let guidance = mapped
+            .suggestion
+            .expect("RESOURCE_BUSY needs recovery guidance");
+        assert!(
+            guidance.to_lowercase().contains("doctor"),
+            "guidance must direct callers to doctor: {guidance}"
+        );
+    }
+
+    /// An unrelated `55006` from ordinary SQL (not an attach) must keep its
+    /// generic mapping even through the attach-context mapper — only genuine
+    /// attach-lock phrasing / the attach call site should reclassify.
+    #[test]
+    fn user_attach_maps_non_lock_error_generically() {
+        let upstream = hyperdb_api::Error::server(
+            Some("42601".to_string()),
+            "syntax error at or near \"ATTACH\"",
+            None,
+            None,
+        );
+
+        let mapped = attach_lock_error(upstream, &PathBuf::from("/tmp/task-user-attach.hyper"));
+
+        assert_eq!(mapped.code, ErrorCode::SqlError);
+        assert_ne!(mapped.code, ErrorCode::ResourceBusy);
+    }
 
     /// SQLSTATE 55006 is only a lock conflict in the reserved persistent
     /// attachment path. The conversion must retain Hyper's diagnostics while

@@ -73,11 +73,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `daemon status --port` now probes that exact health port, discovered-daemon
   error reports target the effective health port, and best-effort health I/O
   no longer retains the engine mutex.
-- **Persistent attachment contention is actionable.** SQLSTATE `55006` in the
-  reserved persistent-attach context now returns `RESOURCE_BUSY` with the
+- **Attachment contention is actionable for persistent *and* user attaches.**
+  A lock conflict (SQLSTATE `55006`, or a legacy "already attached" / "file is
+  locked" phrase from older hyperd) now returns `RESOURCE_BUSY` with the
   effective path, preserved Hyper diagnostic/SQLSTATE, doctor guidance, and
-  non-accusatory possible-owner recovery; unrelated `55006` errors retain
-  their existing mapping.
+  non-accusatory possible-owner recovery. Previously only the reserved
+  persistent-attach path was reclassified, so a user `attach_database` on a
+  file another process already held surfaced as a generic `SqlError`; it now
+  routes through the same attach-context mapper. Unrelated `55006` errors
+  outside the attach context retain their existing mapping.
 - **Chart geometry, ranges, and positive-log rendering.** Bars always treat x
   as categorical, honor y ranges and in-range baselines, and validate finite,
   increasing, representable spans. Horizontal ordering/grouping/labels and
