@@ -1430,9 +1430,15 @@ async fn run_persistent_lock_mcp_child(workspace: PathBuf) -> TestResult {
         diagnostic.contains("55006"),
         "must retain SQLSTATE evidence: {diagnostic}"
     );
+    // `diagnostic` is the JSON-serialized error text, so on Windows the
+    // path's backslashes are JSON-escaped (`\` -> `\\`) and a raw `contains`
+    // against the un-escaped path misses. Match the JSON-escaped form; on
+    // Unix the path has no backslashes, so `escaped_path` equals the raw path
+    // and the check is unchanged there.
+    let escaped_path = effective_path.to_str().unwrap().replace('\\', "\\\\");
     assert!(
-        diagnostic.contains(effective_path.to_str().unwrap()),
-        "must name exact effective persistent path {}: {diagnostic}",
+        diagnostic.contains(&escaped_path),
+        "must name exact effective persistent path {} (JSON-escaped: {escaped_path}): {diagnostic}",
         effective_path.display()
     );
     let lower = diagnostic.to_lowercase();
