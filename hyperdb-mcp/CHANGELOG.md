@@ -99,6 +99,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   directory and process id, so it cannot identify a separate running MCP
   server's log directory. `doctor` now emits a warning making that explicit
   instead of implying the path locates a live session.
+- **npm launcher reports the correct manifest in the same-directory
+  fallback.** When the binary is resolved next to `bin.js` (rather than in a
+  platform subpackage), the launcher metadata's `platform.package_path`
+  pointed at a nonexistent platform-subdirectory `package.json`. It now
+  resolves the manifest that actually sits beside the binary, so
+  `doctor`/launcher diagnostics report a real path.
 - **I/O error fidelity on `value_path` and `load_file`.** File-read errors now preserve `PermissionDenied` → `ErrorCode::PermissionDenied` instead of collapsing every I/O failure to `FileNotFound`. A missing file still maps to `FileNotFound`; any other I/O error becomes a generic `InternalError` with the OS message. (Implemented via `McpError::from_io_error` in `error.rs`.)
 - **Misleading JSON-error `suggestion` text corrected.** The "requires a structured data type" (`42601`) and `JSON_VALUE`-not-implemented (`0A000`) errors previously suggested splitting the statement, which was wrong; they now advise casting the TEXT value to `json` first (`value::json ->> 'field'`), the actual fix. Applies narrowly to JSON-related cases; other `42601` syntax errors carry a generic message without a misleading hint.
 - **Caller-fixable argument errors now return `INVALID_ARGUMENT`, not

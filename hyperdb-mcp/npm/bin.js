@@ -66,7 +66,10 @@ function findBinary() {
       bin: localBin,
       dir: __dirname,
       pkg,
-      packagePath: sourcePackagePath,
+      // The manifest sits next to the binary in this branch — not in the
+      // platform subdirectory `sourcePackagePath` points at (that path does
+      // not exist here), so recompute it relative to __dirname.
+      packagePath: join(__dirname, 'package.json'),
     }
   }
 
