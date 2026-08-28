@@ -609,6 +609,17 @@ pub fn collect_doctor_report(
             "The persistent path came from deprecated --workspace; use --persistent-db.",
         ));
     }
+    if resolved.path.is_none() {
+        // No persistent path => `doctor_client_log_path(None)` falls back to
+        // `resolve_log_dir(None)`, which keys the log directory to *this*
+        // doctor process's PID. A separate running MCP server logs under its
+        // own per-process directory, so the reported path cannot correspond
+        // to any real session — surface that instead of presenting it as fact.
+        warnings.push(doctor_warning(
+            "ephemeral_client_log_path_illustrative",
+            "No persistent database is configured (ephemeral-only mode), so the reported client log path is derived from this doctor invocation's own temporary directory and process id. It is illustrative only: a running MCP server logs under its own per-process directory, which a separate doctor run cannot identify.",
+        ));
+    }
     if let Some(warning) = hyperd_resolution.warning {
         warnings.push(warning);
     }
