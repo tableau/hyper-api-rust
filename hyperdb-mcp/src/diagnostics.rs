@@ -17,8 +17,25 @@ use crate::daemon::discovery::{DaemonRecord, PortScan, RawDiscoveryRead};
 const MAX_LAUNCHER_INFO_BYTES: usize = 16 * 1024;
 const MAX_REPORTED_STRING_BYTES: usize = 4 * 1024;
 const MAX_STATUS_RESPONSE_BYTES: usize = 64 * 1024;
-const DOCTOR_DAEMON_TIMEOUT: Duration = Duration::from_millis(400);
-const DOCTOR_NETWORK_PHASE_TIMEOUT: Duration = Duration::from_millis(150);
+/// Global wall-clock ceiling for the whole daemon-discovery phase of `doctor`.
+///
+/// A `doctor` run that finds a live daemon returns as soon as it has the
+/// verified STATUS — this bound only caps how long discovery *waits* before
+/// giving up and reporting the daemon missing. It must stay comfortably below
+/// the 650ms watchdog the real-network tests assert (see
+/// `real_doctor_collector_enforces_global_deadline_against_slow_drip`), which
+/// is why this is 500ms and not higher.
+const DOCTOR_DAEMON_TIMEOUT: Duration = Duration::from_millis(500);
+/// Per-socket-operation ceiling (connect / write / read), also clamped to the
+/// remaining global budget. A single read is the binding constraint when a
+/// daemon is slow to *start accepting*: the OS completes the connection into
+/// the listen backlog immediately, but the PONG/STATUS reply doesn't arrive
+/// until the daemon's accept loop services it. On CPU-saturated CI runners
+/// (macOS-14 has ~3 cores) that startup latency routinely exceeded the old
+/// 150ms window, so `doctor` timed the read out and wrongly reported the
+/// daemon missing. 300ms gives that read ~2x the observed slack while still
+/// leaving room under the global deadline for the follow-up STATUS round-trip.
+const DOCTOR_NETWORK_PHASE_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// How an operating-system path was converted to its bounded display form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
