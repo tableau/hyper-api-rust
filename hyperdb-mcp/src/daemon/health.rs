@@ -152,7 +152,12 @@ impl HealthListener {
                     });
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(100));
+                    // Poll tightly: the doctor network phase budgets only a
+                    // few hundred ms for a STATUS round-trip, and on slow CI
+                    // runners a 100ms idle sleep between accepts can push the
+                    // accept past that window. 5ms keeps the listener
+                    // responsive without meaningfully raising idle CPU.
+                    std::thread::sleep(Duration::from_millis(5));
                 }
                 Err(e) => {
                     warn!(error = %e, "health listener accept error");
