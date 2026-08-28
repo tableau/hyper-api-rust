@@ -134,15 +134,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [0.5.0] - 2026-06-07
 
-### Fixed
-
-- Query results now preserve the sign of negative `NUMERIC`/`DECIMAL` values
-  with magnitude less than 1. Previously a value like `CAST(-0.5 AS
-  numeric(10,4))` was serialized to JSON as `0.5` because `row_value_to_json`
-  stringifies NUMERIC via `Numeric::to_string()`, whose `Display` impl dropped
-  the sign for sub-unit magnitudes (fixed in `hyperdb-api-core`). This silently
-  flipped the sign of correlations, 0–1 indices, and regression residuals.
-
 ### Added
 
 - The `status` tool now reports an `engine` block with the backing `hyperd`
@@ -358,6 +349,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   lowercases `target_database` after the `LOCAL_ALIAS` filter so the
   registry lookup AND the qualified-SQL build path agree on the
   canonical lowercase form.
+- Query results now preserve the sign of negative `NUMERIC`/`DECIMAL` values
+  with magnitude less than 1. Previously a value like `CAST(-0.5 AS
+  numeric(10,4))` was serialized to JSON as `0.5` because `row_value_to_json`
+  stringifies NUMERIC via `Numeric::to_string()`, whose `Display` impl dropped
+  the sign for sub-unit magnitudes (fixed in `hyperdb-api-core`). This silently
+  flipped the sign of correlations, 0–1 indices, and regression residuals.
 
 ## [0.1.1] - 2026-05-13
 
