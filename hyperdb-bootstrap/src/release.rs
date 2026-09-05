@@ -3,9 +3,9 @@
 
 //! A pinned `hyperd` release descriptor loaded from `hyperd-version.toml`.
 //!
-//! Each `PinnedRelease` records a specific `version` + `build_id` pair
-//! (the two components that make up a Hyper release tag) and the expected
-//! SHA-256 checksums for each platform.
+//! Each `PinnedRelease` records the release `version`, the wheel platform tag
+//! to request for each target, and the expected SHA-256 checksum of each
+//! platform's wheel.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -16,20 +16,23 @@ use crate::platform::Platform;
 
 const BUILTIN_TOML: &str = include_str!("../hyperd-version.toml");
 
-/// A concrete `hyperd` release pinned to a specific version and build, with
-/// optional per-platform SHA-256 checksums.
+/// A concrete `hyperd` release pinned to a specific version, with per-platform
+/// wheel tags and optional per-platform SHA-256 checksums.
 ///
 /// The "built-in" pin shipped with the crate lives in
-/// `hyperd-bootstrap/hyperd-version.toml` and is available via
+/// `hyperdb-bootstrap/hyperd-version.toml` and is available via
 /// [`PinnedRelease::builtin`]. Callers can override it by loading an
 /// external TOML file (see [`PinnedRelease::from_toml_file`]) or by passing
 /// a literal TOML string to [`PinnedRelease::from_toml_str`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PinnedRelease {
-    /// Upstream release version (for example, `"0.0.24457"`).
+    /// Upstream release version (for example, `"0.0.26479"`).
     pub version: String,
-    /// Upstream build identifier suffix (for example, `"rc36858b6"`).
-    pub build_id: String,
+    /// Wheel platform tag keyed by platform (for example,
+    /// `"macosx_13_0_arm64"`). Kept as pin data rather than hardcoded because
+    /// the tags are not stable across releases and a wrong tag 404s silently.
+    #[serde(default)]
+    pub wheel_tag: HashMap<Platform, String>,
     /// Expected SHA-256 digests keyed by platform. Empty strings are treated
     /// as "no digest" so that partially-filled tables skip verification for
     /// the missing targets instead of failing outright.
@@ -78,17 +81,24 @@ impl PinnedRelease {
     /// strings (common in pre-release metadata) are treated as absent.
     #[must_use]
     pub fn sha256_for(&self, platform: Platform) -> Option<&str> {
-        self.sha256
+        Self::lookup(&self.sha256, platform)
+    }
+
+    /// Returns the wheel platform tag for `platform` (for example,
+    /// `"macosx_13_0_arm64"`), or `None` if the pin does not carry one.
+    ///
+    /// Without a tag the wheel filename cannot be constructed, so callers
+    /// treat `None` as [`Error::MissingWheelTag`] rather than guessing.
+    #[must_use]
+    pub fn wheel_tag_for(&self, platform: Platform) -> Option<&str> {
+        Self::lookup(&self.wheel_tag, platform)
+    }
+
+    fn lookup(table: &HashMap<Platform, String>, platform: Platform) -> Option<&str> {
+        table
             .get(&platform)
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
-    }
-
-    /// Returns the full Hyper release tag — `version.build_id` — used in
-    /// download URLs and install directory names.
-    #[must_use]
-    pub fn version_tag(&self) -> String {
-        format!("{}.{}", self.version, self.build_id)
     }
 }
 
@@ -100,14 +110,29 @@ mod tests {
     fn builtin_parses() {
         let r = PinnedRelease::builtin();
         assert!(!r.version.is_empty());
-        assert!(!r.build_id.is_empty());
     }
 
     #[test]
-    fn empty_sha_is_ignored() {
+    fn builtin_pins_a_wheel_tag_and_digest_for_every_platform() {
+        let r = PinnedRelease::builtin();
+        for p in [
+            Platform::MacosArm64,
+            Platform::MacosX86_64,
+            Platform::LinuxX86_64,
+            Platform::WindowsX86_64,
+        ] {
+            assert!(r.wheel_tag_for(p).is_some(), "{p} has no wheel tag");
+            assert!(r.sha256_for(p).is_some(), "{p} has no sha256");
+        }
+    }
+
+    #[test]
+    fn empty_entries_are_ignored() {
         let toml_str = r#"
 version = "0.0.1"
-build_id = "rc1"
+[wheel_tag]
+"macos-arm64" = ""
+"linux-x86_64" = "manylinux2014_x86_64"
 [sha256]
 "macos-arm64" = ""
 "linux-x86_64" = "abc"
@@ -115,15 +140,17 @@ build_id = "rc1"
         let r = PinnedRelease::from_toml_str(toml_str).unwrap();
         assert!(r.sha256_for(Platform::MacosArm64).is_none());
         assert_eq!(r.sha256_for(Platform::LinuxX86_64), Some("abc"));
+        assert!(r.wheel_tag_for(Platform::MacosArm64).is_none());
+        assert_eq!(
+            r.wheel_tag_for(Platform::LinuxX86_64),
+            Some("manylinux2014_x86_64")
+        );
     }
 
     #[test]
-    fn version_tag_format() {
-        let r = PinnedRelease {
-            version: "0.0.24457".to_string(),
-            build_id: "rc36858b6".to_string(),
-            sha256: HashMap::new(),
-        };
-        assert_eq!(r.version_tag(), "0.0.24457.rc36858b6");
+    fn tables_default_to_empty_when_absent() {
+        let r = PinnedRelease::from_toml_str("version = \"0.0.1\"").unwrap();
+        assert!(r.wheel_tag_for(Platform::MacosArm64).is_none());
+        assert!(r.sha256_for(Platform::MacosArm64).is_none());
     }
 }

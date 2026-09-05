@@ -9,10 +9,14 @@ running `make download-hyperd` (or `.\build.ps1 download-hyperd`). The
 implementation lives in the [`hyperdb-bootstrap`](hyperdb-bootstrap/) crate;
 the pinned release is baked into
 [`hyperdb-bootstrap/hyperd-version.toml`](hyperdb-bootstrap/hyperd-version.toml).
-Bumping `hyperd` = edit that file (version + build_id + per-platform sha256s),
-then let the `fix(bootstrap):` commit drive the version via release-please (the
-crate uses `version.workspace = true` — don't hand-edit a crate version). The
-full repeatable procedure — verify the pin, run the suite, A/B benchmark
+Bumping `hyperd` = edit that file (`version` + the four `[wheel_tag]` entries +
+the four per-platform sha256s — there is no `build_id`), then let the
+`fix(bootstrap):` commit drive the version via release-please (the crate uses
+`version.workspace = true` — don't hand-edit a crate version). `hyperd` comes
+out of the PyPI `tableauhyperapi` wheels, so **you don't compute the digests**:
+read them straight off the JSON API with
+`curl -s https://pypi.org/pypi/tableauhyperapi/<version>/json | jq -r '.urls[] | "\(.filename)  \(.digests.sha256)"'`.
+The full repeatable procedure — verify the pin, run the suite, A/B benchmark
 against the previous pin, and log the result — is captured in the
 [`update-hyperd-release`](.claude/skills/update-hyperd-release/SKILL.md) skill.
 

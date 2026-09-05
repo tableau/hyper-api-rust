@@ -130,13 +130,14 @@ test-api-release:
 examples:
 	./run_all_examples.sh
 
-# Download hyperd from Tableau's Hyper C++ API release into .hyperd/current/
-# Forward extra flags via ARGS, e.g. `make download-hyperd ARGS="--latest"`.
+# Download hyperd from the PyPI tableauhyperapi wheel into .hyperd/current/
+# Forward extra flags via ARGS, e.g. `make download-hyperd ARGS="--force"`.
 download-hyperd:
 	cargo run --release -p hyperdb-bootstrap --bin hyperdb-bootstrap -- download $(ARGS)
 
-# Network-only check: HEAD each supported platform URL for the pinned
-# release. Intended for CI (nightly + on PRs touching hyperd-version.toml).
+# Network-only check: probe each supported platform's wheel URL for the pinned
+# release and cross-check its digest against PyPI. Intended for CI (nightly +
+# on PRs touching hyperd-version.toml).
 verify-hyperd-pin:
 	cargo run --release -p hyperdb-bootstrap --bin hyperdb-bootstrap -- verify $(ARGS)
 

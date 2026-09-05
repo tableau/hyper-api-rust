@@ -3,14 +3,18 @@
 
 //! ZIP-archive extraction for the Hyper API release bundle.
 //!
-//! The upstream archive nests `hyperd` plus its shared libraries inside a
-//! versioned top-level directory (e.g.
-//! `tableauhyperapi-java-macos-arm64-release-main.0.0.24457.rc36858b6/`) and
-//! then under `lib/hyper/` on Linux/macOS or `bin/hyper/` on Windows. This
-//! module flattens both layers so downstream consumers only see the
-//! `hyperd` runtime files. The layout is identical across the Java and C++
-//! bundles, so this extractor is agnostic to which binding we download
-//! (we use Java — see `url.rs` for why).
+//! The upstream archive nests `hyperd` plus its shared libraries inside one
+//! top-level directory and then under `lib/hyper/` or `bin/hyper/` inside it.
+//! This module flattens both layers so downstream consumers only see the
+//! `hyperd` runtime files.
+//!
+//! A wheel is a zip, and the same two-layer shape holds: the PyPI
+//! `tableauhyperapi` wheels put the executable at
+//! `tableauhyperapi/bin/hyper/hyperd` (plus `hyperd.exe` and
+//! `crashdumper.exe` on Windows), so the `tableauhyperapi` package directory
+//! lands in the "one optional top-level wrapper" slot and needs no special
+//! case. The `lib/hyper/` spelling is retained because Tableau's Java and C++
+//! zips use it on Linux/macOS.
 
 use std::fs::{self, File};
 use std::io;
@@ -18,9 +22,9 @@ use std::path::{Path, PathBuf};
 
 use crate::Error;
 
-/// Extract everything under `lib/hyper/` (or `bin/hyper/` on Windows) from
-/// the Hyper API zip into `dest_dir`, flattening the wrapper prefixes
-/// away. Returns the list of extracted file paths relative to `dest_dir`.
+/// Extract everything under `lib/hyper/` or `bin/hyper/` from the Hyper API
+/// archive into `dest_dir`, flattening the wrapper prefixes away. Returns the
+/// list of extracted file paths relative to `dest_dir`.
 ///
 /// # Errors
 ///
@@ -89,14 +93,13 @@ pub fn extract_hyperd(zip_path: &Path, dest_dir: &Path) -> Result<Vec<PathBuf>, 
 }
 
 /// Return the path stripped of a leading `lib/hyper/` or `bin/hyper/` prefix,
-/// or `None` if the entry is outside those directories. The Hyper API zip
-/// wraps everything in a top-level `tableauhyperapi-<binding>-...` directory and
-/// nests the runtime under `lib/hyper/` (Linux/macOS) or `bin/hyper/`
-/// (Windows) inside it.
+/// or `None` if the entry is outside those directories. The archive wraps
+/// everything in one top-level directory (`tableauhyperapi/` in a wheel) and
+/// nests the runtime under `bin/hyper/` — or `lib/hyper/` in Tableau's
+/// Linux/macOS zips — inside it.
 fn strip_lib_hyper_prefix(path: &Path) -> Option<PathBuf> {
     let mut comps = path.components();
-    // Skip one optional top-level wrapper component (e.g.
-    // `tableauhyperapi-java-macos-arm64-release-main.0.0.24457.rc36858b6`)
+    // Skip one optional top-level wrapper component (e.g. `tableauhyperapi`)
     // before looking for the `lib/hyper` or `bin/hyper` pair.
     let first = comps.next()?;
     let (a, b) = if first.as_os_str() == "lib" || first.as_os_str() == "bin" {
@@ -154,6 +157,153 @@ mod tests {
             None
         );
         assert_eq!(strip_lib_hyper_prefix(Path::new("other/file")), None);
+    }
+
+    /// Entry names taken verbatim from the real
+    /// `tableauhyperapi-0.0.26479-py3-none-macosx_13_0_arm64.whl` (42 entries;
+    /// this is the shape-representative subset). Guards the claim that the
+    /// wheel needs no extractor changes: the `tableauhyperapi` package
+    /// directory occupies the optional-wrapper slot, and `bin/hyper` is
+    /// already an accepted pair.
+    #[test]
+    fn strip_prefix_matches_real_wheel_entries() {
+        assert_eq!(
+            strip_lib_hyper_prefix(Path::new("tableauhyperapi/bin/hyper/hyperd")),
+            Some(PathBuf::from("hyperd"))
+        );
+        // `libtableauhyperapi.dylib` sits under `bin/` but NOT `bin/hyper/`:
+        // it is the Python binding's own library, not part of the engine.
+        assert_eq!(
+            strip_lib_hyper_prefix(Path::new("tableauhyperapi/bin/libtableauhyperapi.dylib")),
+            None
+        );
+        for outside in [
+            "tableauhyperapi/__init__.py",
+            "tableauhyperapi/impl/dll.py",
+            "tableauhyperapi-0.0.26479.dist-info/LICENSE",
+            "tableauhyperapi-0.0.26479.dist-info/RECORD",
+        ] {
+            assert_eq!(
+                strip_lib_hyper_prefix(Path::new(outside)),
+                None,
+                "{outside} should not be extracted"
+            );
+        }
+    }
+
+    /// The Windows wheel ships `crashdumper.exe` beside `hyperd.exe` under the
+    /// same `bin/hyper/` directory, so both must survive the flattening.
+    #[test]
+    fn strip_prefix_matches_windows_wheel_entries() {
+        assert_eq!(
+            strip_lib_hyper_prefix(Path::new("tableauhyperapi/bin/hyper/hyperd.exe")),
+            Some(PathBuf::from("hyperd.exe"))
+        );
+        assert_eq!(
+            strip_lib_hyper_prefix(Path::new("tableauhyperapi/bin/hyper/crashdumper.exe")),
+            Some(PathBuf::from("crashdumper.exe"))
+        );
+    }
+
+    /// End-to-end extraction over a fixture that mirrors the real macOS wheel
+    /// entry list, including the entries that must be skipped.
+    #[test]
+    fn extract_wheel_layout() -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Write;
+        let tmp = tempfile::tempdir()?;
+        let wheel_path = tmp
+            .path()
+            .join("tableauhyperapi-0.0.26479-py3-none-test.whl");
+        {
+            let file = File::create(&wheel_path)?;
+            let mut zw = zip::ZipWriter::new(file);
+            let opts = zip::write::SimpleFileOptions::default();
+            for (name, body) in [
+                ("tableauhyperapi/__init__.py", "python"),
+                ("tableauhyperapi/impl/dll.py", "python"),
+                (
+                    "tableauhyperapi/bin/libtableauhyperapi.dylib",
+                    "binding lib",
+                ),
+                ("tableauhyperapi/bin/hyper/hyperd", "fake hyperd"),
+                ("tableauhyperapi-0.0.26479.dist-info/LICENSE", "license"),
+                ("tableauhyperapi-0.0.26479.dist-info/RECORD", "record"),
+            ] {
+                zw.start_file(name, opts)?;
+                zw.write_all(body.as_bytes())?;
+            }
+            zw.finish()?;
+        }
+        let out = tmp.path().join("out");
+        let files = extract_hyperd(&wheel_path, &out)?;
+
+        assert_eq!(files, vec![PathBuf::from("hyperd")]);
+        assert_eq!(std::fs::read_to_string(out.join("hyperd"))?, "fake hyperd");
+        // Nothing outside bin/hyper/ leaks into the install dir.
+        for skipped in [
+            "__init__.py",
+            "libtableauhyperapi.dylib",
+            "LICENSE",
+            "RECORD",
+        ] {
+            assert!(!out.join(skipped).exists(), "{skipped} should be skipped");
+        }
+        Ok(())
+    }
+
+    /// The Windows wheel case, including `crashdumper.exe`.
+    #[test]
+    fn extract_windows_wheel_layout() -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Write;
+        let tmp = tempfile::tempdir()?;
+        let wheel_path = tmp
+            .path()
+            .join("tableauhyperapi-0.0.26479-py3-none-win_amd64.whl");
+        {
+            let file = File::create(&wheel_path)?;
+            let mut zw = zip::ZipWriter::new(file);
+            let opts = zip::write::SimpleFileOptions::default();
+            for name in [
+                "tableauhyperapi/bin/hyper/hyperd.exe",
+                "tableauhyperapi/bin/hyper/crashdumper.exe",
+                "tableauhyperapi/bin/tableauhyperapi.dll",
+            ] {
+                zw.start_file(name, opts)?;
+                zw.write_all(b"fake")?;
+            }
+            zw.finish()?;
+        }
+        let out = tmp.path().join("out");
+        let files = extract_hyperd(&wheel_path, &out)?;
+
+        assert!(files.iter().any(|p| p == Path::new("hyperd.exe")));
+        assert!(files.iter().any(|p| p == Path::new("crashdumper.exe")));
+        assert!(!out.join("tableauhyperapi.dll").exists());
+        Ok(())
+    }
+
+    /// A wheel with no engine inside must fail loudly rather than install an
+    /// empty directory.
+    #[test]
+    fn extract_errors_when_no_hyperd() -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Write;
+        let tmp = tempfile::tempdir()?;
+        let wheel_path = tmp.path().join("no-engine.whl");
+        {
+            let file = File::create(&wheel_path)?;
+            let mut zw = zip::ZipWriter::new(file);
+            zw.start_file(
+                "tableauhyperapi/__init__.py",
+                zip::write::SimpleFileOptions::default(),
+            )?;
+            zw.write_all(b"python")?;
+            zw.finish()?;
+        }
+        assert!(matches!(
+            extract_hyperd(&wheel_path, &tmp.path().join("out")),
+            Err(Error::HyperdNotInArchive)
+        ));
+        Ok(())
     }
 
     #[test]
