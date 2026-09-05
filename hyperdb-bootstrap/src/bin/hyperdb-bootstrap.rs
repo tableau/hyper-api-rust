@@ -1,7 +1,7 @@
 // Copyright (c) 2026, Salesforce, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! `hyperd-bootstrap` — CLI front-end for the library of the same name.
+//! `hyperdb-bootstrap` — CLI front-end for the library of the same name.
 //!
 //! Subcommands:
 //! - `download` — install `hyperd` under `.hyperd/<version>/` and refresh
@@ -166,7 +166,7 @@ fn run_which(args: WhichArgs) -> Result<()> {
         Ok(())
     } else {
         anyhow::bail!(
-            "no hyperd installed at {} (run `hyperd-bootstrap download` first)",
+            "no hyperd installed at {} (run `hyperdb-bootstrap download` first)",
             binary.display()
         );
     }

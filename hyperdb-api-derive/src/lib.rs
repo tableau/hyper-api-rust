@@ -115,7 +115,14 @@ pub fn table_derive(input: TokenStream) -> TokenStream {
 /// is emitted.
 ///
 /// Within a single file, struct-level derives always expand before
-/// function-body macros, so ordering within a file is not a concern.
+/// function-body macros, so ordering within a file is not a concern under
+/// `cargo`.
+///
+/// This ordering guarantee does **not** hold in rust-analyzer, whose
+/// `proc-macro-srv` is long-lived and expands lazily, out of order, and from
+/// cache — a `query_as!` can be re-expanded in a process where no derive has
+/// run. Validation therefore skips when the registry is entirely empty, so the
+/// editor does not report errors on code that compiles.
 #[proc_macro]
 pub fn query_as(input: TokenStream) -> TokenStream {
     match expand_query_as(&input.into()) {

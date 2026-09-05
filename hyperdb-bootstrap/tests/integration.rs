@@ -1,7 +1,7 @@
 // Copyright (c) 2026, Salesforce, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Integration tests for hyperd-bootstrap URL and install flows.
+//! Integration tests for hyperdb-bootstrap URL and install flows.
 
 use hyperdb_bootstrap::{
     InstallOptions, PinnedRelease, Platform, VersionSource, install, url::build_download_url,

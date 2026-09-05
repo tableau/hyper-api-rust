@@ -26,6 +26,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`AuthenticatedGrpcClient::get_table_labels` and `get_column_labels` now
+  report Arrow failures instead of returning a partial map.** Both iterated
+  record batches with `if let Ok(batch) = batch_result`, so a decode failure
+  mid-stream was discarded and the caller received a map covering only the
+  batches that happened to decode — indistinguishable from "this table defines
+  no labels", which is the worst failure mode for metadata used to render UI.
+  A schema mismatch was swallowed the same way, by the `downcast_ref` tuple in
+  the same `if let` chain.
+
+  Both now return `Err`. A batch projecting fewer than two columns is also
+  reported rather than panicking: `RecordBatch::column(1)` panics out of
+  bounds, which the previous code never guarded.
+
+  Callers that prefer the old behavior can keep it explicitly with
+  `.unwrap_or_default()`. The parsing itself is unchanged — JSON
+  `displayName` extraction, verbatim passthrough for plain descriptions, and
+  skipping NULL rows all behave as before, now covered by unit tests.
+
 - `text_from_hyper_binary` and `bytea_from_hyper_binary` no longer risk a
   `usize` overflow on 32-bit targets. Both read a `u32` length prefix, widened
   it to `usize`, and bounds-checked with `buf.len() < 4 + len`; where `usize`

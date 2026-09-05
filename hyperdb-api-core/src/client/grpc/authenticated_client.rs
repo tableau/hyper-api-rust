@@ -953,8 +953,6 @@ impl AuthenticatedGrpcClient {
         &mut self,
         schema: &str,
     ) -> Result<std::collections::HashMap<String, String>> {
-        let mut labels = std::collections::HashMap::new();
-
         let query = format!(
             r"SELECT c.relname as table_name,
                       COALESCE(d.description, c.relname) as label
@@ -966,56 +964,7 @@ impl AuthenticatedGrpcClient {
         );
 
         let result = self.execute_query(&query).await?;
-        let reader = arrow::ipc::reader::StreamReader::try_new(
-            std::io::Cursor::new(result.arrow_data()),
-            None,
-        )
-        .map_err(|e| crate::client::Error::other(format!("Failed to parse Arrow data: {e}")))?;
-
-        for batch_result in reader {
-            if let Ok(batch) = batch_result
-                && let (Some(name_arr), Some(label_arr)) = (
-                    batch
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<arrow::array::StringArray>(),
-                    batch
-                        .column(1)
-                        .as_any()
-                        .downcast_ref::<arrow::array::StringArray>(),
-                )
-            {
-                for i in 0..batch.num_rows() {
-                    use arrow::array::Array;
-                    if !name_arr.is_null(i) && !label_arr.is_null(i) {
-                        let table_name = name_arr.value(i).to_string();
-                        let label_raw = label_arr.value(i);
-
-                        // Parse JSON to extract displayName: {"displayName":"value"}
-                        let label = if label_raw.starts_with('{') {
-                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(label_raw)
-                            {
-                                value
-                                    .get("displayName")
-                                    .and_then(|v| v.as_str())
-                                    .map_or_else(
-                                        || label_raw.to_string(),
-                                        std::string::ToString::to_string,
-                                    )
-                            } else {
-                                label_raw.to_string()
-                            }
-                        } else {
-                            label_raw.to_string()
-                        };
-
-                        labels.insert(table_name, label);
-                    }
-                }
-            }
-        }
-
-        Ok(labels)
+        parse_label_pairs(&result.arrow_data())
     }
 
     /// Returns a map of column names to their display labels for a given table.
@@ -1040,8 +989,6 @@ impl AuthenticatedGrpcClient {
         schema: &str,
         table: &str,
     ) -> Result<std::collections::HashMap<String, String>> {
-        let mut labels = std::collections::HashMap::new();
-
         let query = format!(
             r"SELECT a.attname as column_name,
                       COALESCE(d.description, a.attname) as label
@@ -1054,56 +1001,7 @@ impl AuthenticatedGrpcClient {
         );
 
         let result = self.execute_query(&query).await?;
-        let reader = arrow::ipc::reader::StreamReader::try_new(
-            std::io::Cursor::new(result.arrow_data()),
-            None,
-        )
-        .map_err(|e| crate::client::Error::other(format!("Failed to parse Arrow data: {e}")))?;
-
-        for batch_result in reader {
-            if let Ok(batch) = batch_result
-                && let (Some(name_arr), Some(label_arr)) = (
-                    batch
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<arrow::array::StringArray>(),
-                    batch
-                        .column(1)
-                        .as_any()
-                        .downcast_ref::<arrow::array::StringArray>(),
-                )
-            {
-                for i in 0..batch.num_rows() {
-                    use arrow::array::Array;
-                    if !name_arr.is_null(i) && !label_arr.is_null(i) {
-                        let col_name = name_arr.value(i).to_string();
-                        let label_raw = label_arr.value(i);
-
-                        // Parse JSON to extract displayName: {"displayName":"value"}
-                        let label = if label_raw.starts_with('{') {
-                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(label_raw)
-                            {
-                                value
-                                    .get("displayName")
-                                    .and_then(|v| v.as_str())
-                                    .map_or_else(
-                                        || label_raw.to_string(),
-                                        std::string::ToString::to_string,
-                                    )
-                            } else {
-                                label_raw.to_string()
-                            }
-                        } else {
-                            label_raw.to_string()
-                        };
-
-                        labels.insert(col_name, label);
-                    }
-                }
-            }
-        }
-
-        Ok(labels)
+        parse_label_pairs(&result.arrow_data())
     }
 
     /// Ensures we have a valid DC JWT, refreshing if necessary.
@@ -1618,5 +1516,236 @@ impl AuthenticatedGrpcClientSync {
     ) -> Result<std::collections::HashMap<String, String>> {
         self.runtime
             .block_on(self.inner.get_column_labels(schema, table))
+    }
+}
+
+/// Parses an Arrow IPC stream of `(name, label)` text pairs into a map.
+///
+/// Shared by [`AuthenticatedGrpcClient::get_table_labels`] and
+/// [`AuthenticatedGrpcClient::get_column_labels`], whose queries project the
+/// same two `TEXT` columns and differ only in the catalog they read.
+///
+/// Data Cloud stores labels as JSON in `pg_description`
+/// (`{"displayName":"Label"}`). A label that is not a JSON object, or whose
+/// JSON lacks `displayName`, passes through verbatim — that fallback is
+/// intentional, since plain-text descriptions are valid.
+///
+/// Rows where either column is NULL are skipped: the queries `COALESCE` the
+/// description to the identifier, so a NULL means the catalog row itself is
+/// unusable rather than that the label is absent.
+///
+/// # Errors
+///
+/// Returns [`crate::client::Error`] if the stream cannot be opened, a record
+/// batch fails to decode, a batch projects fewer than two columns, or either
+/// of the first two columns is not a `StringArray`.
+///
+/// Each of those used to be swallowed — the decode error and the type
+/// mismatch by an `if let` chain, the short batch by an outright panic in
+/// `RecordBatch::column`. Swallowing them produced a partial map that a caller
+/// could not distinguish from "this table defines no labels", which is the
+/// worst possible failure for metadata used to render UI.
+fn parse_label_pairs(arrow_data: &[u8]) -> Result<std::collections::HashMap<String, String>> {
+    use arrow::array::{Array, StringArray};
+
+    let mut labels = std::collections::HashMap::new();
+
+    let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(arrow_data), None)
+        .map_err(|e| crate::client::Error::other(format!("Failed to parse Arrow data: {e}")))?;
+
+    for batch_result in reader {
+        let batch = batch_result.map_err(|e| {
+            crate::client::Error::other(format!("Failed to decode Arrow record batch: {e}"))
+        })?;
+
+        // `RecordBatch::column` panics out of bounds, so check before indexing.
+        if batch.num_columns() < 2 {
+            return Err(crate::client::Error::other(format!(
+                "label query must project 2 columns, got {}",
+                batch.num_columns()
+            )));
+        }
+
+        let downcast = |idx: usize| -> Result<&StringArray> {
+            batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    crate::client::Error::other(format!(
+                        "label query column {idx} must be TEXT, got {:?}",
+                        batch.column(idx).data_type()
+                    ))
+                })
+        };
+        let name_arr = downcast(0)?;
+        let label_arr = downcast(1)?;
+
+        for i in 0..batch.num_rows() {
+            if name_arr.is_null(i) || label_arr.is_null(i) {
+                continue;
+            }
+            let label_raw = label_arr.value(i);
+
+            // Only attempt JSON when it looks like an object; a bare
+            // description is the common case and need not go through serde.
+            let label = if label_raw.starts_with('{') {
+                serde_json::from_str::<serde_json::Value>(label_raw)
+                    .ok()
+                    .as_ref()
+                    .and_then(|v| v.get("displayName"))
+                    .and_then(serde_json::Value::as_str)
+                    .map_or_else(|| label_raw.to_string(), std::string::ToString::to_string)
+            } else {
+                label_raw.to_string()
+            };
+
+            labels.insert(name_arr.value(i).to_string(), label);
+        }
+    }
+
+    Ok(labels)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    use super::parse_label_pairs;
+
+    /// Encodes one record batch as an Arrow IPC stream, as the server would.
+    fn ipc_stream(batch: &RecordBatch) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buf, &batch.schema())
+                .expect("create IPC writer");
+            writer.write(batch).expect("write batch");
+            writer.finish().expect("finish stream");
+        }
+        buf
+    }
+
+    fn two_text_batch(names: Vec<&str>, labels: Vec<&str>) -> RecordBatch {
+        let schema = Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("label", DataType::Utf8, true),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(names)) as ArrayRef,
+                Arc::new(StringArray::from(labels)) as ArrayRef,
+            ],
+        )
+        .expect("build batch")
+    }
+
+    #[test]
+    fn extracts_display_name_from_json_and_passes_plain_text_through() {
+        let batch = two_text_batch(
+            vec!["accounts", "orders", "leads"],
+            vec![
+                r#"{"displayName":"Accounts"}"#,
+                "Plain Description",
+                // JSON object without displayName falls back to the raw text.
+                r#"{"other":"x"}"#,
+            ],
+        );
+        let labels = parse_label_pairs(&ipc_stream(&batch)).expect("valid stream parses");
+
+        assert_eq!(labels.get("accounts").map(String::as_str), Some("Accounts"));
+        assert_eq!(
+            labels.get("orders").map(String::as_str),
+            Some("Plain Description")
+        );
+        assert_eq!(
+            labels.get("leads").map(String::as_str),
+            Some(r#"{"other":"x"}"#),
+            "a JSON object without displayName must pass through verbatim"
+        );
+    }
+
+    #[test]
+    fn truncated_stream_is_an_error_not_a_partial_map() {
+        // The regression this guards: a decode failure used to be swallowed by
+        // `if let Ok(batch)`, yielding an empty map that a caller could not
+        // tell apart from "this table defines no labels".
+        let full = ipc_stream(&two_text_batch(vec!["accounts"], vec!["Accounts"]));
+        let truncated = &full[..full.len() / 2];
+
+        let err = parse_label_pairs(truncated)
+            .expect_err("a truncated Arrow stream must not silently yield a partial map");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Arrow"),
+            "error should name the Arrow failure, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn non_text_column_is_an_error() {
+        // Previously the `downcast_ref` tuple silently skipped the whole batch.
+        let schema = Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("label", DataType::Int32, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(vec!["accounts"])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+            ],
+        )
+        .expect("build batch");
+
+        let err = parse_label_pairs(&ipc_stream(&batch))
+            .expect_err("a non-TEXT label column must be reported, not skipped");
+        assert!(
+            format!("{err}").contains("must be TEXT"),
+            "error should explain the type mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn single_column_batch_errors_instead_of_panicking() {
+        // `RecordBatch::column(1)` panics out of bounds; the guard turns that
+        // into a diagnosable error.
+        let schema = Schema::new(vec![Field::new("name", DataType::Utf8, true)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(StringArray::from(vec!["accounts"])) as ArrayRef],
+        )
+        .expect("build batch");
+
+        let err = parse_label_pairs(&ipc_stream(&batch))
+            .expect_err("a one-column batch must error rather than panic");
+        assert!(
+            format!("{err}").contains("must project 2 columns"),
+            "error should name the column-count problem, got: {err}"
+        );
+    }
+
+    #[test]
+    fn null_rows_are_skipped_without_failing() {
+        let schema = Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("label", DataType::Utf8, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(vec![Some("accounts"), None])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("Accounts"), Some("Orphan")])) as ArrayRef,
+            ],
+        )
+        .expect("build batch");
+
+        let labels = parse_label_pairs(&ipc_stream(&batch)).expect("nulls are not an error");
+        assert_eq!(labels.len(), 1, "the NULL-name row should be skipped");
+        assert_eq!(labels.get("accounts").map(String::as_str), Some("Accounts"));
     }
 }

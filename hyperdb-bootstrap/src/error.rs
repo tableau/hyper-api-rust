@@ -1,7 +1,7 @@
 // Copyright (c) 2026, Salesforce, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Error types returned by the `hyperd-bootstrap` crate.
+//! Error types returned by the `hyperdb-bootstrap` crate.
 
 use thiserror::Error;
 

@@ -20,7 +20,7 @@ const BUILTIN_TOML: &str = include_str!("../hyperd-version.toml");
 /// optional per-platform SHA-256 checksums.
 ///
 /// The "built-in" pin shipped with the crate lives in
-/// `hyperd-bootstrap/hyperd-version.toml` and is available via
+/// `hyperdb-bootstrap/hyperd-version.toml` and is available via
 /// [`PinnedRelease::builtin`]. Callers can override it by loading an
 /// external TOML file (see [`PinnedRelease::from_toml_file`]) or by passing
 /// a literal TOML string to [`PinnedRelease::from_toml_str`].

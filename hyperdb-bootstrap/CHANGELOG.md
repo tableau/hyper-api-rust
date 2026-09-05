@@ -43,7 +43,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   thermally on a laptop. Verified native arm64 and all 1485 workspace tests pass;
   the macOS-14 CI runner is green (the deadlock is gone).
 
+- **Bump the pinned `hyperd` release to `0.0.26479` (`r96880f6a`).** Updates the
+  version, build id, and all four per-platform sha256s in `hyperd-version.toml`.
+  **Verified native arm64** — `file` reports `Mach-O 64-bit executable arm64`
+  for the `macos-arm64` bundle's `lib/hyper/hyperd`, so the reason this crate
+  pulls the Java bundle rather than the C++ one still holds. All four platform
+  URLs return HTTP 200 at the new pin, and all **1586** workspace tests pass
+  against the new engine. Performance (interleaved same-session A/B vs the
+  previous `0.0.26359` pin, medians of 5 runs per engine at 100M rows,
+  single-connection): the async Arrow insert path **more than doubles**
+  (`AsyncArrowInserter` **+127%**, 30.4 → 68.9 M rows/s), reproduced as **+75%**
+  at 10M rows. Everything else is flat — sync `Inserter` +0.1%, `ChunkSender`
+  +1.4%, and all four query paths within ±0.7%. The async insert gain survives
+  its own wide (±25–35%) run-to-run spread because the old and new sample
+  ranges do not overlap at either scale. Multi-connection (`× 4`) deltas are
+  **not** reported: on this 14-core laptop they throttle thermally and spread
+  17–41% run to run, enough to have read **+23% at 100M and −20% at 10M for the
+  same workload in the same session**.
+
 ### Fixed
+
+- The "no hyperd installed" error suggested `hyperd-bootstrap download`, but
+  the binary is `hyperdb-bootstrap` — the suggested command did not exist.
+  Doc comments across the crate carried the same pre-rename name, as did the
+  `hyperdb-bootstrap/hyperd-version.toml` path in `release.rs`.
 
 - **Download `hyperd` from the Java API bundle instead of the C++ bundle.**
   Tableau's C++ `macos-arm64` zip ships an **x86_64** `hyperd` (an upstream

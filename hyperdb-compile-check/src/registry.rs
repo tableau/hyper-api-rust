@@ -96,6 +96,21 @@ pub fn registered_names() -> Vec<String> {
     registry().lock().keys().cloned().collect()
 }
 
+/// Returns true if nothing has been registered in this process.
+///
+/// This distinguishes "the type is not registered" from "no `derive(Table)`
+/// has run here yet", which are very different situations. Under `cargo` the
+/// second cannot happen for a crate that has any registered struct: rustc
+/// expands a crate's macros in one host process, and struct-level derives
+/// expand before function-body macros. Under rust-analyzer it happens
+/// routinely, because `proc-macro-srv` is long-lived and expands lazily,
+/// out of order, and from cache — so a `query_as!` can be re-expanded in a
+/// process where no derive ever ran. Callers treat an empty registry as
+/// "cannot validate" and skip, rather than reporting a false error in the IDE.
+pub fn is_empty() -> bool {
+    registry().lock().is_empty()
+}
+
 /// The public `Registry` type — a thin newtype that provides the seeding
 /// interface against a live `CompileTimeDb`. Created from a lock guard by
 /// `validate_query_as`.

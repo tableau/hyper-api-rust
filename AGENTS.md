@@ -30,7 +30,7 @@ This is a **pure-Rust implementation** of the Hyper database API, using the Post
 **Key characteristics:**
 
 - 100% pure Rust (no FFI, no C dependencies)
-- High performance (25M rows/sec inserts, 31M rows/sec queries single-connection; 48M / 73M across 4 connections)
+- High performance on a single connection (100M-row benchmark, Apple M3 Max): 68.9M rows/sec inserts via the async `AsyncArrowInserter`, 25.0M rows/sec via the sync `Inserter`, 31.1M rows/sec full-scan queries via the sync path. See [docs/BENCHMARK_GUIDE.md](docs/BENCHMARK_GUIDE.md) for the multi-connection and per-platform figures.
 - Independent library (can be extracted from this repository)
 - Zero build system dependencies (uses standard Cargo)
 - **No feature flags on `hyperdb-api`** — every capability of the flagship crate (TLS, pooling, geography, transactions, chrono) is always available. A few companion crates do carry optional features; see [Feature Flags](#feature-flags) for the complete list.
@@ -147,25 +147,21 @@ HYPERD_PATH=~/dev/bin/hyperd cargo test -p hyperdb-mcp --test attach_tests
 
 ### Editor Setup (VS Code / Windsurf / Cursor)
 
-A few of our transitive deps (`rmcp`, `rmcp-macros`, `base64ct`, `clap_lex`) use `edition = "2024"`. Older copies of the rust-analyzer binary bundled with the VS Code extension reject that with:
+**The entire workspace is `edition = "2024"`** as of 1.0.0 — not just a few transitive deps. Older copies of the rust-analyzer binary bundled with the VS Code extension reject that outright:
 
-```
+```text
 failed to interpret `cargo metadata`'s json: unknown variant `2024`
 ```
 
-If you hit this, install rust-analyzer via rustup and point the extension at it from your **user** settings (not workspace settings — we intentionally don't commit this so contributors on newer extensions aren't forced to change anything):
-
-```bash
-rustup component add rust-analyzer
-```
-
-Then in your user `settings.json`:
+`rust-toolchain.toml` lists `rust-analyzer` in its `components`, so rustup installs a matching binary for you when the toolchain is provisioned — no manual `rustup component add` step. What you may still need is to point the extension at that binary rather than its bundled one, from your **user** settings (not workspace settings — we intentionally don't commit this, so contributors on newer extensions aren't forced to change anything):
 
 ```json
 "rust-analyzer.server.path": "rust-analyzer"
 ```
 
-The rustup-shipped binary tracks the active toolchain (1.85+ supports edition 2024) so it stays in lockstep with `cargo`. `"rust-analyzer"` with no path resolves via `$PATH` — the rustup shim under `~/.cargo/bin` on Unix or `%USERPROFILE%\.cargo\bin` on Windows.
+The rustup-shipped binary tracks the active toolchain, so it stays in lockstep with `cargo`. `"rust-analyzer"` with no path resolves via `$PATH` — the rustup shim under `~/.cargo/bin` on Unix or `%USERPROFILE%\.cargo\bin` on Windows.
+
+One rust-analyzer quirk worth knowing, unrelated to the edition: with the `compile-time` feature enabled, `query_as!` validation depends on `derive(Table)` having registered the type in the same proc-macro process. rust-analyzer expands macros lazily and from cache, so it can expand a `query_as!` in a process where no derive ran. Validation detects that and skips rather than reporting a false "not registered" error, so the editor should stay quiet on code that `cargo check` accepts.
 
 ### Common Commands
 
@@ -397,7 +393,7 @@ fail loudly when stale.
 
 - **Inserter API uses binary COPY protocol** - 10-100x faster than INSERT statements
 - **Streaming results** - Always process in chunks, never load all rows
-- **Arrow batching** - Use `ArrowInserter` for maximum throughput (30M rows/sec single-connection, 48M+ across 4)
+- **Arrow batching** - Use the async `AsyncArrowInserter` for maximum insert throughput: 68.9M rows/sec on a single connection, versus 25.0M rows/sec for the sync `Inserter`. Only the async variant is benchmarked at that rate — the sync `ArrowInserter` is not measured by the suite. Spending extra connections on an Arrow insert buys nothing on the benchmarked host.
 - **Release builds** - Use `--release` for benchmarks (debug is 10x+ slower)
 - **Connection pooling** - Use `pool` module for async high-concurrency scenarios
 
@@ -474,9 +470,9 @@ All commit messages **must** follow the format `<type>(<scope>): <subject>` — 
 
 8. **Update the *per-crate* `CHANGELOG.md` for user-visible crate-level
  changes.** When a PR adds, changes, or removes any public API surface in a
- publishable crate (`hyperdb-api`, `hyperdb-api-core`, `hyperdb-api-derive`,
- `hyperdb-api-node`, `hyperdb-api-salesforce`, `hyperdb-bootstrap`,
- `hyperdb-mcp`, `sea-query-hyperdb`), append a bullet to the
+ publishable crate (`hyperdb-api`, `hyperdb-api-core`, `hyperdb-compile-check`,
+ `hyperdb-api-derive`, `hyperdb-api-node`, `hyperdb-api-salesforce`,
+ `hyperdb-bootstrap`, `hyperdb-mcp`, `sea-query-hyperdb`), append a bullet to the
  `## [Unreleased]` section of that crate's `CHANGELOG.md` under the
  appropriate [Keep a Changelog](https://keepachangelog.com/) heading
  (`### Added`, `### Changed`, `### Deprecated`, `### Removed`, `### Fixed`,
@@ -486,7 +482,7 @@ All commit messages **must** follow the format `<type>(<scope>): <subject>` — 
  **Which changelog files you may edit** — this is the part that trips people up, because [CONTRIBUTING.md](CONTRIBUTING.md#what-contributors-do) says contributors do *not* hand-edit changelogs. Both rules are correct; they govern different files:
 
 - **Root [`CHANGELOG.md`](CHANGELOG.md) — never hand-edit.** It is release-please-generated, has no `## [Unreleased]` section, and is the only `changelog-path` in `release-please-config.json`.
-- **The eight per-crate `CHANGELOG.md` files — hand-maintained.** Each carries exactly one `## [Unreleased]` section and none appear in release-please's `packages` or `extra-files`. This reminder applies to these.
+- **The nine per-crate `CHANGELOG.md` files — hand-maintained.** Each carries exactly one `## [Unreleased]` section and none appear in release-please's `packages` or `extra-files`. This reminder applies to these. `hyperdb-compile-check` is the ninth: it is published (`release.yml` does so explicitly, since it declares its own `[workspace]` and `--workspace` cannot see it) but was missing from this list, which is why it had no changelog until 1.0.0.
 - **The npm sub-package changelogs** under `hyperdb-api-node/npm/*/` and `hyperdb-mcp/npm/*/` — leave alone; they have no `## [Unreleased]` section.
 
 1. **Never invent `hyperd` flags or engine parameters.** Obtain `hyperd` via
@@ -500,3 +496,41 @@ All commit messages **must** follow the format `<type>(<scope>): <subject>` — 
  appearing to "run."
 
 2. **Never report a test/build as passing without seeing real output.** Check exit codes. If a command produces no output for ~30s, treat it as **hanging/failed**, not passing, and say so explicitly. A green claim backed by no captured output is a defect, not a result — tests here start a real `hyperd` subprocess (`HyperProcess::drop()` stops it), so a misconfigured server hangs rather than erroring cleanly.
+
+3. **Run markdownlint on any Markdown you touch, before committing.** It is
+ **not** a CI gate, so nothing catches these for you — the only feedback is the
+ editor extension, and an agent working headless gets none at all.
+
+ ```bash
+ npx markdownlint-cli2
+ ```
+
+ No arguments: `.markdownlint-cli2.jsonc` supplies the globs and the path
+ exclusions. Rules live in `.markdownlint.json` (shared with the editor
+ extension); `.markdownlintignore` exists only because the extension reads it
+ and `markdownlint-cli2` does not.
+
+ **There is a pre-existing backlog**, so a nonzero count is not automatically
+ yours. Judge new findings against the file's prior state — `git show
+ upstream/main:<path>` and re-lint — rather than assuming, or you will "fix"
+ things that were never broken and miss the ones you introduced.
+
+ Three traps that have actually bitten:
+
+- **Duplicate `### Fixed` / `### Added` siblings under one `## [Unreleased]`**
+ (MD024). Changelogs here often already have the section further down. Merge
+ your bullet into the existing one instead of adding a second heading — that
+ also keeps [Keep a Changelog](https://keepachangelog.com/) ordering.
+- **Bare ``` fences** (MD040) need a language. Use `text` for command output,
+ ASCII diagrams, error messages, and templates.
+- **Never bulk-auto-fix fences with a naive script.** A language-tagged
+ opening fence does not match a bare-fence test, so the *closing* fence gets
+ mistaken for an opening one and tagged — silently turning a terminator into a
+ new block. This corrupted 176 fences across 22 files once. Any such pass must
+ track fence state; prefer `markdownlint-cli2 --fix`, which is safe, and note
+ that it cannot fix MD040 because choosing a language needs judgement.
+
+ Beware format-on-save: a Markdown formatter reformatting tables to satisfy
+ MD060 once stripped the README's badge links (`[![CI](img)](target)` became
+ `![CI](img)`) and split an inline link across a newline into two links. MD060
+ is disabled in `.markdownlint.json` for exactly this reason.

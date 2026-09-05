@@ -847,7 +847,7 @@ fn non_utf8_overlong_path(root: &Path) -> OsString {
 
     let mut wide: Vec<u16> = root.as_os_str().encode_wide().collect();
     wide.extend([u16::from(b'\\'), 0xD800, u16::from(b'-')]);
-    wide.extend(std::iter::repeat(u16::from(b'x')).take(5 * 1024));
+    wide.extend(std::iter::repeat_n(u16::from(b'x'), 5 * 1024));
     OsString::from_wide(&wide)
 }
 

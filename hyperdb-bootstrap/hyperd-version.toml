@@ -1,4 +1,4 @@
-# Pinned Hyper **Java** API release used by hyperd-bootstrap.
+# Pinned Hyper **Java** API release used by hyperdb-bootstrap.
 #
 # We pull `hyperd` from the Java binding's bundle, NOT the C++ one: the
 # C++ macos-arm64 zip ships an x86_64 `hyperd` (upstream packaging defect),
@@ -8,14 +8,14 @@
 #
 # Bump these values (and sha256s) when upgrading. Contributors without
 # an override get this exact release, so reproducibility depends on it.
-version  = "0.0.26359"
-build_id = "r07abb490"
+version  = "0.0.26479"
+build_id = "r96880f6a"
 
 # sha256 of each platform's .zip. Omit a platform to skip verification
 # for that platform (not recommended). Compute with:
 #   shasum -a 256 tableauhyperapi-java-<platform>-release-main.<version>.<build_id>.zip
 [sha256]
-"macos-arm64"    = "434a5e7f95d914a7b328ac333b872fa044fabc6e23ad2aac9d0c9b762032b5ab"
-"macos-x86_64"   = "cbf01253f3b2b4288085ecb01a6415219338573fb8b5e1f101c457e2a26d5672"
-"linux-x86_64"   = "40e488c01ddc1ecaa53123a88fcf4150161a5828e1c22b475dd73e1cd9cbbbed"
-"windows-x86_64" = "8546e67501ed3f15e97c9a0ed6a0dfc56fa9f070878bac435a7e5f7d1bfb6c99"
+"macos-arm64"    = "65bd021b3d3470ac74728ec287866a3ee0dfd806daf2589670feb3580955ee95"
+"macos-x86_64"   = "6690669c8a6a6c7c6794c101beb31b83e1589d76cb14b0c817523069591f694c"
+"linux-x86_64"   = "c20be5b6874d319c7db01dcec763d7e65ae2483c0becc75f2914a58accc4f932"
+"windows-x86_64" = "3a400508e79c67ce9dcd8bd317ab164a61b5aed8ca880031ed4bbe6621514e1d"

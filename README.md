@@ -45,7 +45,7 @@ executable, obtained with `make download-hyperd`. See
 ## Key Features
 
 - **Pure Rust** — no C library dependencies, standard `cargo build`
-- **High Performance** — 25M rows/sec inserts, 31M rows/sec queries on a single connection; 48M / 73M across 4 (100M row benchmark, Apple M3 Max — see [benchmarks](docs/BENCHMARK_GUIDE.md))
+- **High Performance** — on a single connection: 68.9M rows/sec inserts with the async `AsyncArrowInserter`, 25.0M rows/sec with the sync `Inserter`, and 31.1M rows/sec full-scan queries (100M row benchmark, Apple M3 Max — see [benchmarks](docs/BENCHMARK_GUIDE.md) for multi-connection and per-platform figures)
 - **Memory Safe** — streaming by default, constant memory for billion-row results
 - **Dual Architecture** — sync (`Connection`) and async (`AsyncConnection`) APIs
 - **Typed Row Mapping** — `#[derive(FromRow)]` structs, including streaming `stream_as` for constant-memory typed queries
@@ -174,7 +174,7 @@ fn main() -> Result<()> {
         .add_required_column("name", SqlType::text());
     Catalog::new(&conn).create_table(&table_def)?;
 
-    // Insert data (COPY protocol, 25M+ rows/sec)
+    // Insert data (sync Inserter, COPY protocol, ~25M rows/sec)
     {
         let mut inserter = Inserter::new(&conn, &table_def)?;
         inserter.add_row(&[&1i32, &"Alice"])?;

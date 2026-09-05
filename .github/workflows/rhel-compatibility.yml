@@ -30,6 +30,14 @@ on:
       - '.github/workflows/rhel-compatibility.yml'
   workflow_dispatch:
 
+# Serialize per ref: this job builds a container and the whole workspace, so
+# successive pushes to a PR would otherwise stack multi-minute runs. Matches
+# the pattern used by ci.yml, release.yml, release-please.yml and
+# npm-build-publish.yml.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -38,6 +46,12 @@ env:
   # prerequisites" step. Pinned to the version this workspace builds against
   # locally (libprotoc 35.1).
   PROTOC_VERSION: '35.1'
+  # sha256 of protoc-${PROTOC_VERSION}-linux-x86_64.zip. Upstream publishes no
+  # checksum file for its releases, so this is computed from the asset and
+  # pinned here. Refresh it alongside PROTOC_VERSION:
+  #   curl -fsSLO https://github.com/protocolbuffers/protobuf/releases/download/vX.Y/protoc-X.Y-linux-x86_64.zip
+  #   sha256sum protoc-X.Y-linux-x86_64.zip
+  PROTOC_SHA256: '6930ebf62bd4ea607b98fff052596c6ee564b9835b4ce172c75a3f53ae9d91b7'
 
 jobs:
   rhel-native:
@@ -88,10 +102,17 @@ jobs:
         # require a tool beyond cargo and rustc. The durable fix is to generate
         # the .rs files at publish time and vendor them into the crate; until
         # then CI supplies protoc explicitly.
+        #
+        # The archive is unpacked into /usr/local as root, so its integrity is
+        # verified first. Version-pinning alone does not help here: a retagged
+        # or compromised release would still be accepted.
         run: |
-          curl -fsSLO "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
-          unzip -q "protoc-${PROTOC_VERSION}-linux-x86_64.zip" -d /usr/local
-          rm "protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          set -euo pipefail
+          ZIP="protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          curl -fsSLO "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/${ZIP}"
+          echo "${PROTOC_SHA256}  ${ZIP}" | sha256sum -c -
+          unzip -q "${ZIP}" -d /usr/local
+          rm "${ZIP}"
           protoc --version
 
       - uses: actions/checkout@v7
@@ -123,4 +144,12 @@ jobs:
         env:
           RUSTFLAGS: ''
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
-        run: cargo check --workspace --locked --all-targets
+        run: |
+          set -euo pipefail
+          cargo check --workspace --locked --all-targets
+          # hyperdb-compile-check declares its own [workspace], so --workspace
+          # skips it -- yet release.yml publishes it, meaning the gate that
+          # proves "builds on Red Hat's toolchain with no rustup" would
+          # otherwise never cover a crate enterprise consumers can depend on.
+          cargo check --locked --all-targets \
+            --manifest-path hyperdb-compile-check/Cargo.toml

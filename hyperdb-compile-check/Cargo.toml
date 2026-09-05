@@ -33,6 +33,17 @@ tempfile = "3.20"
 [dev-dependencies]
 tempfile = "3.20"
 
+# Mirrors the root `[workspace.lints]` tables. This crate declares its own
+# `[workspace]` so it can build standalone, which means it *cannot* inherit
+# them with `lints.workspace = true` — the duplication is forced.
+#
+# Keep the two in sync by hand. They drifted once already: the root promoted
+# `missing_errors_doc` and `missing_panics_doc` to `deny` while this copy stayed
+# at `warn`, and nothing caught it because `cargo clippy --workspace` skips this
+# crate. Lint it explicitly:
+#
+#   cargo clippy --manifest-path hyperdb-compile-check/Cargo.toml \
+#     --all-targets -- -D warnings
 [lints.rust]
 unexpected_cfgs               = { level = "warn", check-cfg = ['cfg(kani)'] }
 unsafe_op_in_unsafe_fn        = "deny"
@@ -72,6 +83,6 @@ unreadable_literal        = "allow"
 items_after_statements    = "allow"
 match_same_arms           = "allow"
 match_wildcard_for_single_variants = "allow"
-missing_errors_doc        = "warn"
-missing_panics_doc        = "warn"
+missing_errors_doc        = "deny"
+missing_panics_doc        = "deny"
 multiple_crate_versions   = { level = "allow", priority = 1 }

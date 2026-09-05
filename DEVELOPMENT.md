@@ -664,25 +664,33 @@ in `hyperdb-api-core/src/types/special.rs`.
 
 ### Benchmark Results
 
-**100M rows, 4 columns, optimized hyperd:**
+[docs/BENCHMARK_GUIDE.md](docs/BENCHMARK_GUIDE.md) is the source of truth for
+throughput numbers, across every platform and both transports. The
+single-connection figures below are the headline subset, reproduced here so
+this document stands on its own — **100M rows, 4 columns, Apple M3 Max, the
+`hyperd` pin in `hyperd-version.toml`:**
 
 | Operation | Throughput | Notes |
 |-----------|-----------|-------|
-| Insert (single-threaded) | 22M rows/sec | `Inserter`, HyperBinary format |
-| Insert (multi-threaded) | 24M rows/sec | `ChunkSender`, 14 workers |
-| Full table scan | 18M rows/sec | Streaming, 64K row chunks |
-| Filtered query (10M rows) | 19M rows/sec | Single sensor_id filter |
-| Aggregation | 0.04s | Server-side GROUP BY |
+| Insert, async | 68.9M rows/sec | `AsyncArrowInserter`, Arrow batches |
+| Insert, sync | 25.0M rows/sec | `Inserter`, HyperBinary format |
+| Full table scan, sync | 31.1M rows/sec | Streaming, 64K row chunks |
+| Filtered query (10M rows), sync | 33.2M rows/sec | Single sensor_id filter |
+| Aggregation | 0.05s | Server-side GROUP BY |
 
-**Insert Comparison (100M rows):**
+Two things worth internalizing before you optimize against these:
 
-| Metric | Single-Threaded (`Inserter`) | Multi-Threaded (`ChunkSender`) |
-|--------|------------------------------|--------------------------------|
-| Time | ~4.5s | ~4.2s |
-| Throughput | ~22M rows/sec | ~24M rows/sec |
-| MB/sec | ~505 MB/sec | ~545 MB/sec |
-| Memory | ~23 MB | ~1.3 GB (queued chunks) |
-| Speedup | baseline | 1.08-1.10x |
+- **The async Arrow path is the fast insert path**, at roughly 2.7× the sync
+  `Inserter`. That gap is specific to `AsyncArrowInserter`; the sync
+  `ArrowInserter` is not measured by the suite, so do not assume it inherits
+  the number.
+- **Spending more workers on a sync insert no longer buys throughput.**
+  `ChunkSender` across 4 workers now lands at or just below the
+  single-connection `Inserter`, so the historical ~1.1× multi-threaded speedup
+  no longer reproduces. It still changes the memory profile substantially — see
+  below. Multi-connection figures in general carry a wide run-to-run spread on
+  laptop-class hardware; read them from the guide, which documents that spread,
+  rather than treating them as precise.
 
 **Memory Behavior:**
 
@@ -713,6 +721,14 @@ cargo test --release --test grpc_benchmark_tests benchmark_100m_complex -- --noc
 ```
 
 ### Performance Comparison: Rust vs C++
+
+> **Historical measurement — do not read the Rust column as current.** This
+> table was taken on an older `hyperd` pin and toolchain, and its Rust figures
+> no longer match the suite (see the table above). The C++ side has not been
+> re-measured since, so the Rust column is deliberately left as it was rather
+> than refreshed in place: mixing a current Rust number against a stale C++
+> number would make the comparison meaningless. Treat the *direction* as
+> indicative and the magnitudes as needing a fresh head-to-head run.
 
 **100M rows:**
 

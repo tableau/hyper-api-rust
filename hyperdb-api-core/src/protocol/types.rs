@@ -355,8 +355,9 @@ mod tests {
     /// trusted. `u32::MAX` is the interesting value: the previous
     /// implementation computed `4 + len`, which overflows `usize` on a 32-bit
     /// target and wraps to a small number, making the bounds check pass and
-    /// the subsequent slice index panic. `split_at_checked` plus
-    /// `slice::get` cannot overflow.
+    /// the subsequent slice index panic. `split_first_chunk::<4>` followed by
+    /// `slice::get` removes the arithmetic entirely, so there is nothing left
+    /// to overflow.
     #[test]
     fn oversized_declared_length_is_rejected() {
         let mut buf = BytesMut::new();

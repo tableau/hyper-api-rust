@@ -1,4 +1,4 @@
-.PHONY: clean clean-test-files clean-doc build build-api build-release build-api-release test test-api test-release test-api-release doc examples download-hyperd verify-hyperd-pin npm-pack check-rhel
+.PHONY: clean clean-test-files clean-doc build build-api build-release build-api-release test test-api test-release test-api-release doc examples download-hyperd verify-hyperd-pin npm-pack check-rhel help
 
 # Environment variables for runtime
 # HYPERD_PATH points to the Hyper server executable.
@@ -99,11 +99,22 @@ build-api-release:
 	cargo build --release -p hyperdb-api-core -p hyperdb-api
 
 # Run tests (debug) with proper environment
+# Mirrors the CI `test` job so a local pass means a CI pass. It previously
+# covered only 3 of the 8 crates, which made its pass count look like whole-
+# workspace coverage when it was a subset -- use `test-api` for the narrow run.
+#
+# Excludes match CI: hyperdb-api-node needs napi-rs plus a Node toolchain and
+# has its own workflow, and hyperdb-bootstrap runs separately below because it
+# does not need hyperd. hyperdb-compile-check declares its own [workspace], so
+# `--workspace` cannot see it -- and until this target included it, nothing in
+# CI or the Makefile ran that published crate's tests at all.
 test:
 	@echo "Environment:"
 	@echo "  HYPERD_PATH=$(HYPERD_PATH)"
 	@echo ""
-	cargo test -p hyperdb-api-core -p hyperdb-api -p hyperdb-mcp
+	cargo test --workspace --exclude hyperdb-api-node --exclude hyperdb-bootstrap
+	cargo test -p hyperdb-bootstrap
+	cargo test --manifest-path hyperdb-compile-check/Cargo.toml
 
 # Run tests (debug) - API only (no MCP/Node)
 test-api:

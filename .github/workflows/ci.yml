@@ -63,20 +63,36 @@ jobs:
       - run: cargo fmt --all --check
 
   clippy:
-    # Clippy lints are platform-independent, so a single runner is enough.
-    # If a lint ever diverges by target (rare), broaden the matrix.
-    name: clippy
-    runs-on: ubuntu-latest
+    # Most lints are platform-independent, but `cfg`-gated code is stripped
+    # before lints run, so a single runner leaves every `#[cfg(windows)]` block
+    # unlinted. That is not hypothetical: the edition-2024 sweep flattened 127
+    # `collapsible_if` sites and missed one inside a `#[cfg(windows)]` block in
+    # `process.rs`, because ubuntu never compiled it. Windows is the leg worth
+    # paying for — it carries a whole distinct Named Pipe transport path.
+    #
+    # macOS is deliberately omitted: it shares `cfg(unix)` with the Linux leg,
+    # so only `#[cfg(target_os = "macos")]` blocks remain unlinted, a much
+    # smaller surface than the Windows one.
+    name: clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7
-      - name: Install system libraries (fontconfig for plotters, mold for fast linking, protobuf)
+      - name: Install system libraries (Linux)
+        if: runner.os == 'Linux'
         run: sudo apt-get update -q && sudo apt-get install -y libfontconfig1-dev mold protobuf-compiler
+      - name: Install protobuf (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc -y
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
           components: clippy
-          cache-key: clippy
+          cache-key: clippy-${{ matrix.os }}
           # See fmt job for rationale; clippy enforces -D warnings via
           # the explicit `-- -D warnings` arg below, not via env.
           rustflags: ""
@@ -239,6 +255,15 @@ jobs:
         # hyperdb-api-node needs napi-rs + a Node.js toolchain; it gets
         # its own workflow when wired up. hyperdb-bootstrap has its own
         # coverage (next step) and doesn't need hyperd running.
+
+      - name: hyperdb-compile-check tests
+        # Declares its own [workspace], so the run above cannot see it. Nothing
+        # else ran this published crate's tests — the msrv and RHEL jobs only
+        # `cargo check` it.
+        shell: bash
+        env:
+          HYPERD_PATH: ${{ github.workspace }}/.hyperd/current
+        run: cargo test --manifest-path hyperdb-compile-check/Cargo.toml
 
       - name: hyperdb-bootstrap tests
         run: cargo test -p hyperdb-bootstrap

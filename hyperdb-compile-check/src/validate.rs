@@ -43,18 +43,28 @@ use crate::registry::{self, Registry};
 /// the result schema is missing columns the struct requires.
 pub fn validate_query_as(struct_name: &str, sql: &str) -> Result<(), ValidationError> {
     // Step 1: look up by struct ident (not SQL table name — they differ).
-    let (_table_name, entry) = registry::get_by_struct(struct_name).ok_or_else(|| {
-        ValidationError::StructNotRegistered {
-            struct_name: struct_name.to_owned(),
+    let Some((_table_name, entry)) = registry::get_by_struct(struct_name) else {
+        // An empty registry means no `derive(Table)` ran in this process, so we
+        // have no basis to claim the struct is unregistered. See
+        // `registry::is_empty`.
+        if registry::is_empty() {
+            return Ok(());
         }
-    })?;
+        return Err(ValidationError::StructNotRegistered {
+            struct_name: struct_name.to_owned(),
+        });
+    };
 
     let mut db = get_or_init().lock();
 
     // Step 2+4: dry-run with bounded seed-and-retry on 42P01.
-    let schema = run_dry_run_with_seed(sql, &mut db)?;
+    let outcome = run_dry_run_with_seed(sql, &mut db)?;
 
     drop(db);
+
+    let Some(schema) = outcome else {
+        return Ok(());
+    };
 
     // Step 3: name-subset diff.
     finish_name_check(struct_name, &entry.fields, &schema)
@@ -76,9 +86,13 @@ pub fn validate_query_as(struct_name: &str, sql: &str) -> Result<(), ValidationE
 pub fn validate_scalar_sql(sql: &str) -> Result<(), ValidationError> {
     let mut db = get_or_init().lock();
 
-    let schema = run_dry_run_with_seed(sql, &mut db)?;
+    let outcome = run_dry_run_with_seed(sql, &mut db)?;
 
     drop(db);
+
+    let Some(schema) = outcome else {
+        return Ok(());
+    };
 
     let col_count = schema.column_count();
     if col_count != 1 {
@@ -101,21 +115,28 @@ pub fn validate_scalar_sql(sql: &str) -> Result<(), ValidationError> {
 /// only the first missing table would be seeded per call.
 ///
 /// Stops early on syntax errors, missing-column errors, or unregistered tables.
+///
+/// Returns `Ok(None)` when validation cannot be performed because nothing is
+/// registered in this process — see [`registry::is_empty`]. Callers skip
+/// validation in that case instead of reporting a false diagnostic.
 fn run_dry_run_with_seed(
     sql: &str,
     db: &mut crate::db::CompileTimeDb,
-) -> Result<hyperdb_api::ResultSchema, ValidationError> {
+) -> Result<Option<hyperdb_api::ResultSchema>, ValidationError> {
     // Bound to prevent infinite loops on pathological SQL (e.g., a self-join
     // that repeatedly 42P01s on the same unregistered table after seeding).
     const MAX_SEED_ROUNDS: usize = 8;
 
     for _ in 0..MAX_SEED_ROUNDS {
         match dry_run(db, sql) {
-            Ok(schema) => return Ok(schema),
+            Ok(schema) => return Ok(Some(schema)),
             Err(e) => match classify(&e) {
                 ErrorClass::MissingTable(t) => match Registry::seed_if_known(&t, db) {
                     Ok(true) => {} // seeded successfully; loop iterates to retry the dry-run
                     Ok(false) => {
+                        if registry::is_empty() {
+                            return Ok(None);
+                        }
                         return Err(ValidationError::TablesNotRegistered { tables: vec![t] });
                     }
                     Err(seed_err) => {
@@ -188,12 +209,26 @@ mod tests {
 
     #[test]
     fn struct_not_registered_error() {
+        // Register first, deliberately. The diagnostic only fires when the
+        // registry is non-empty — an empty one means no `derive(Table)` ran in
+        // this process, which is not evidence that `Ghost` is unregistered.
+        // Without this the test would depend on which other test happened to
+        // register first, since tests share a process and run in parallel.
+        setup_users();
         let err = validate_query_as("Ghost", "SELECT 1").unwrap_err();
         assert!(
             matches!(err, ValidationError::StructNotRegistered { .. }),
             "expected StructNotRegistered, got: {err}"
         );
     }
+
+    // The empty-registry skip is deliberately not unit-tested here. Every test
+    // in this binary shares one process-global registry and they run in
+    // parallel, so any such test races: another test can register between the
+    // emptiness check and the call under test. `registry::is_empty` documents
+    // the behaviour, and the case it exists for — rust-analyzer expanding a
+    // `query_as!` in a process where no derive ran — is observable directly in
+    // the editor rather than from a test.
 
     #[test]
     #[ignore = "requires HYPERD_PATH; run manually"]

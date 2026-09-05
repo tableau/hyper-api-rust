@@ -18,16 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   that holds `&self` — use the `*_unguarded` methods added below. Migration
   recipe in [docs/TRANSACTIONS.md](../docs/TRANSACTIONS.md#unguarded-transaction-control).
 
-### Added
+### Fixed
 
-- `Connection::begin_transaction_unguarded`, `commit_unguarded` and
-  `rollback_unguarded`, plus the `AsyncConnection` equivalents. These are the
-  supported replacement for the removed deprecated methods and were previously
-  `pub(crate)` as `*_raw`. They are not deprecated, but they are not the
-  default path either: the caller owns pairing a begin with a commit or
-  rollback on **every** path, including panics and cancelled futures, since an
-  unmatched begin wedges the session in a way reconnect logic cannot clear.
-  Reach for them only when the guard's `&mut self` borrow is impossible.
+- The `HYPERD_PATH is not set` error suggested
+  `cargo run -p hyperd-bootstrap -- download`, a package that has not existed
+  since the rename to `hyperdb-bootstrap`. The command failed with
+  "package(s) `hyperd-bootstrap` not found in workspace", which is the first
+  thing a new user saw when `HYPERD_PATH` was unset.
 
 ### Changed
 
@@ -67,6 +64,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **BREAKING:** `KvStore::set`, `KvStore::set_as`, and `KvStore::set_batch` (plus their `AsyncKvStore` twins) now return `SetOutcome` or `BatchSetOutcome` instead of `Result<()>`, reporting whether each write created a new key or overwrote an existing one. The `created` signal eliminates silent data loss when an LLM accidentally clobbers existing KV data. Callers that ignored the `Result` (statement-position `set("k","v")?;`) — including `let _ = set(...)?;` — still compile unchanged. The genuinely breaking cases are callers that named the unit return (`let x: () = set(...)?;`) or that returned `set(...)` where a `Result<()>` was expected; these now see `SetOutcome`/`BatchSetOutcome` and must adapt.
 
 ### Added
+
+- `Connection::begin_transaction_unguarded`, `commit_unguarded` and
+  `rollback_unguarded`, plus the `AsyncConnection` equivalents. These are the
+  supported replacement for the removed deprecated methods and were previously
+  `pub(crate)` as `*_raw`. They are not deprecated, but they are not the
+  default path either: the caller owns pairing a begin with a commit or
+  rollback on **every** path, including panics and cancelled futures, since an
+  unmatched begin wedges the session in a way reconnect logic cannot clear.
+  Reach for them only when the guard's `&mut self` borrow is impossible.
 
 - `KvStore::set_if_absent` / `AsyncKvStore::set_if_absent` — guarded write that inserts only if the key is absent (no check-then-write race; single `INSERT ... WHERE NOT EXISTS`). Returns `true` if written, `false` if the key already existed (nothing written).
 - `KvStore::set_batch_if_absent` / `AsyncKvStore::set_batch_if_absent` — atomic batch variant of `set_if_absent`, returning `BatchGuardOutcome { written, skipped }`. All keys are validated before the transaction opens; an invalid key aborts the whole batch.

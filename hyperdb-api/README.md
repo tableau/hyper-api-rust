@@ -3,7 +3,10 @@
 A **pure-Rust** implementation of the Hyper database API. Create, read, and manipulate
 Hyper database files (`.hyper`) without any C library dependencies.
 
-- 22-24M rows/sec inserts, 18M rows/sec queries (100M row benchmark)
+- Single-connection throughput on a 100M row benchmark: 68.9M rows/sec inserts
+  with the async `AsyncArrowInserter`, 25.0M rows/sec with the sync `Inserter`,
+  31.1M rows/sec full-scan queries (see
+  [docs/BENCHMARK_GUIDE.md](../docs/BENCHMARK_GUIDE.md))
 - Streaming by default — constant memory for billion-row results
 - Both sync (`Connection`) and async (`AsyncConnection`) APIs
 - Built-in string-native key-value store (`KvStore` / `AsyncKvStore`)
@@ -279,7 +282,10 @@ from positional `row.get(0)` to streaming `stream_as`.
 
 ### Inserter (COPY Protocol)
 
-The high-performance `Inserter` uses HyperBinary COPY protocol for 22M+ rows/sec:
+The high-performance `Inserter` uses HyperBinary COPY protocol for roughly 25M
+rows/sec on a single connection. For the fastest insert path, use the async
+`AsyncArrowInserter` instead — see
+[docs/BENCHMARK_GUIDE.md](../docs/BENCHMARK_GUIDE.md).
 
 ```rust
 let mut inserter = Inserter::new(&conn, &table_def)?;

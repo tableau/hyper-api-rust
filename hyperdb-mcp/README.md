@@ -4,7 +4,7 @@
 
 An MCP (Model Context Protocol) server that turns the Hyper columnar database into an instant SQL analytics engine. Data flows in from other MCP plugins or files, lands in Hyper automatically, and becomes queryable with SQL — no setup, no schema files, no database management.
 
-Built on the pure-Rust [`hyperdb-api`](../hyperdb-api/) crate for maximum performance: 22M+ rows/sec inserts, 18M+ rows/sec queries, constant memory for billion-row results.
+Built on the pure-Rust [`hyperdb-api`](../hyperdb-api/) crate for maximum performance. On a single connection that crate benchmarks at 68.9M rows/sec inserts with the async `AsyncArrowInserter`, 25.0M rows/sec with the sync `Inserter`, and 31.1M rows/sec full-scan queries, with constant memory for billion-row results — see [docs/BENCHMARK_GUIDE.md](../docs/BENCHMARK_GUIDE.md).
 
 ---
 

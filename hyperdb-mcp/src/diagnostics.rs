@@ -990,8 +990,12 @@ fn resolve_doctor_hyperd() -> DoctorHyperdResolution {
 
 fn resolve_configured_hyperd(
     configured: &Path,
-    _configured_text: &str,
+    configured_text: &str,
 ) -> (Option<PathBuf>, Option<DoctorWarning>) {
+    // Only the Windows `.exe` fallback below reads the raw text form.
+    #[cfg(not(windows))]
+    let _ = configured_text; // silence the unused-variable lint off Windows
+
     #[cfg(windows)]
     const HYPERD_EXE: &str = "hyperd.exe";
     #[cfg(not(windows))]
@@ -1024,7 +1028,7 @@ fn resolve_configured_hyperd(
     }
     #[cfg(windows)]
     {
-        let executable = PathBuf::from(format!("{_configured_text}.exe"));
+        let executable = PathBuf::from(format!("{configured_text}.exe"));
         if executable.exists() {
             return (Some(executable), None);
         }

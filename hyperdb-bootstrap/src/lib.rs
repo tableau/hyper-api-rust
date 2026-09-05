@@ -6,7 +6,7 @@
 //! because the C++ `macos-arm64` zip ships an x86_64 `hyperd`; see the
 //! `url` module for the full rationale.)
 //!
-//! The crate ships both a CLI binary (`hyperd-bootstrap`) and a small
+//! The crate ships both a CLI binary (`hyperdb-bootstrap`) and a small
 //! library. The library is blocking (no async runtime required) and has
 //! no dependency on `tokio`, so it can be called from build scripts,
 //! `postinstall` hooks, or any sync Rust code.

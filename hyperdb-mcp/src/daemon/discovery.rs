@@ -468,7 +468,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::daemon::health::{DaemonState, HealthListener};
-    use crate::diagnostics::{PathEncoding, ReportedPath};
+    use crate::diagnostics::ReportedPath;
 
     use super::*;
 
@@ -756,6 +756,8 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStringExt;
+
+            use crate::diagnostics::PathEncoding;
 
             let non_utf8_path = tmp
                 .path()
