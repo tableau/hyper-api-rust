@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 //! High-level [`install()`] entry point: resolves a release, downloads and
-//! verifies the archive, extracts the executable into
-//! `<dest_root>/<version_tag>/`, then refreshes the
+//! verifies the wheel, extracts the executable into
+//! `<dest_root>/<version>/`, then refreshes the
 //! `<dest_root>/current/` pointer so downstream tooling can always find the
 //! active install at a stable path.
 
@@ -15,12 +15,11 @@ use crate::download::download_and_verify;
 use crate::extract::extract_hyperd;
 use crate::platform::Platform;
 use crate::release::PinnedRelease;
-use crate::scrape::scrape_latest;
-use crate::url::build_download_url;
+use crate::url::{build_download_url, wheel_filename};
 
 /// Default directory (relative to CWD) used when [`InstallOptions::dest_root`]
 /// is left at its default. Laid out as
-/// `.hyperd/<version_tag>/hyperd[.exe]` plus a mirror at `.hyperd/current/`.
+/// `.hyperd/<version>/hyperd[.exe]` plus a mirror at `.hyperd/current/`.
 pub const DEFAULT_DEST_ROOT: &str = ".hyperd";
 
 /// Which `hyperd` release [`install`] should resolve.
@@ -34,10 +33,8 @@ pub enum VersionSource {
     Builtin,
     /// Load pinned metadata from a specific TOML file.
     TomlFile(PathBuf),
-    /// Caller-supplied release (e.g. CLI `--version`/`--build-id` flags).
+    /// Caller-supplied release (e.g. the CLI `--version` flag).
     Explicit(PinnedRelease),
-    /// Best-effort scrape of the public releases page.
-    ScrapeLatest,
 }
 
 /// Configuration passed to [`install`].
@@ -71,10 +68,8 @@ pub struct InstalledHyperd {
     /// Absolute or relative path to the installed `hyperd` executable.
     /// Always under `<dest_root>/current/`.
     pub binary_path: PathBuf,
-    /// Installed release version (for example, `"0.0.24457"`).
+    /// Installed release version (for example, `"0.0.26479"`).
     pub version: String,
-    /// Installed release build id (for example, `"rc36858b6"`).
-    pub build_id: String,
     /// Host platform this install targets.
     pub platform: Platform,
     /// `true` if the versioned directory already existed and we skipped the
@@ -96,7 +91,7 @@ pub struct InstalledHyperd {
 /// # Errors
 ///
 /// Returns any [`Error`] variant produced by the phases it drives —
-/// platform detection, release resolution (TOML parsing or scraping),
+/// platform detection, release resolution (TOML parsing), URL construction,
 /// download, checksum verification, ZIP extraction, or filesystem
 /// operations under `dest_root`.
 pub fn install(opts: InstallOptions) -> Result<InstalledHyperd, Error> {
@@ -104,9 +99,8 @@ pub fn install(opts: InstallOptions) -> Result<InstalledHyperd, Error> {
         Some(p) => p,
         None => Platform::current()?,
     };
-    let release = resolve_release(&opts.version_source, platform)?;
-    let version_tag = release.version_tag();
-    let versioned_dir = opts.dest_root.join(&version_tag);
+    let release = resolve_release(&opts.version_source)?;
+    let versioned_dir = opts.dest_root.join(&release.version);
     let current_dir = opts.dest_root.join("current");
     let exe_name = platform.executable_name();
 
@@ -120,23 +114,21 @@ pub fn install(opts: InstallOptions) -> Result<InstalledHyperd, Error> {
         download_and_extract(&release, platform, &versioned_dir)?;
     }
 
-    refresh_current(&current_dir, &versioned_dir, &version_tag)?;
+    refresh_current(&current_dir, &versioned_dir, &release.version)?;
     let binary_path = current_dir.join(exe_name);
     Ok(InstalledHyperd {
         binary_path,
         version: release.version,
-        build_id: release.build_id,
         platform,
         cache_hit,
     })
 }
 
-fn resolve_release(source: &VersionSource, platform: Platform) -> Result<PinnedRelease, Error> {
+fn resolve_release(source: &VersionSource) -> Result<PinnedRelease, Error> {
     match source {
         VersionSource::Builtin => Ok(PinnedRelease::builtin()),
         VersionSource::TomlFile(path) => PinnedRelease::from_toml_file(path),
         VersionSource::Explicit(r) => Ok(r.clone()),
-        VersionSource::ScrapeLatest => scrape_latest(platform),
     }
 }
 
@@ -152,15 +144,15 @@ fn download_and_extract(
     fs::create_dir_all(versioned_dir)
         .map_err(|source| Error::io(format!("creating {}", versioned_dir.display()), source))?;
 
-    let url = build_download_url(release, platform);
+    let url = build_download_url(release, platform)?;
     let tmp = tempfile::tempdir().map_err(|source| Error::io("creating temp dir", source))?;
-    let zip_path = tmp.path().join("hyperapi-java.zip");
-    download_and_verify(&url, release.sha256_for(platform), &zip_path)?;
-    extract_hyperd(&zip_path, versioned_dir)?;
+    let wheel_path = tmp.path().join(wheel_filename(release, platform)?);
+    download_and_verify(&url, release.sha256_for(platform), &wheel_path)?;
+    extract_hyperd(&wheel_path, versioned_dir)?;
     Ok(())
 }
 
-fn refresh_current(current: &Path, source: &Path, version_tag: &str) -> Result<(), Error> {
+fn refresh_current(current: &Path, source: &Path, version: &str) -> Result<(), Error> {
     // current/ is a fresh file copy every run — avoids Windows symlink
     // privileges and keeps the Makefile auto-discovery path stable.
     if current.exists() {
@@ -170,7 +162,7 @@ fn refresh_current(current: &Path, source: &Path, version_tag: &str) -> Result<(
     fs::create_dir_all(current)
         .map_err(|source| Error::io(format!("creating {}", current.display()), source))?;
     copy_dir_contents(source, current)?;
-    fs::write(current.join("VERSION"), version_tag)
+    fs::write(current.join("VERSION"), version)
         .map_err(|source| Error::io(format!("writing {}/VERSION", current.display()), source))?;
     Ok(())
 }

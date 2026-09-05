@@ -6,8 +6,8 @@
 //! Subcommands:
 //! - `download` — install `hyperd` under `.hyperd/<version>/` and refresh
 //!   `.hyperd/current/`.
-//! - `verify`   — HEAD each platform URL for the pinned release to confirm
-//!   the CDN is still serving it (CI guard against silent yanks).
+//! - `verify`   — probe each platform's wheel URL and cross-check its pinned
+//!   digest against PyPI (CI guard against silent yanks and digest drift).
 //! - `which`    — print the path of the currently-installed `hyperd`.
 //! - `version`  — print the pinned release metadata.
 
@@ -36,8 +36,9 @@ struct Cli {
 enum Command {
     /// Download and install hyperd into `.hyperd/` (or --dest).
     Download(DownloadArgs),
-    /// HEAD every platform URL for the pinned release to check they're
-    /// still reachable. Useful as a CI guard against silent yanks.
+    /// Check every platform's wheel URL is still reachable and that its
+    /// pinned digest still matches what PyPI publishes. Useful as a CI
+    /// guard against silent yanks and digest drift.
     Verify(VerifyArgs),
     /// Print the path of the currently-installed hyperd (if any).
     Which(WhichArgs),
@@ -48,7 +49,7 @@ enum Command {
 #[derive(Args)]
 #[command(group(
     ArgGroup::new("version_src")
-        .args(["latest", "version", "version_file"])
+        .args(["version", "version_file"])
         .required(false)
         .multiple(false)
 ))]
@@ -61,18 +62,10 @@ struct DownloadArgs {
     #[arg(long)]
     force: bool,
 
-    /// Scrape the latest release from the Tableau releases page.
-    /// Best-effort; skips sha256 verification.
+    /// Explicit version to install (e.g. 0.0.26359). Reuses the pinned wheel
+    /// tags and skips sha256 verification, since digests are version-specific.
     #[arg(long)]
-    latest: bool,
-
-    /// Explicit version to install (e.g. 0.0.24457). Requires --build-id.
-    #[arg(long, requires = "build_id")]
     version: Option<String>,
-
-    /// Build id for --version (e.g. rc36858b6).
-    #[arg(long, requires = "version")]
-    build_id: Option<String>,
 
     /// Path to an external pinned-version TOML file.
     #[arg(long, value_name = "PATH")]
@@ -128,21 +121,21 @@ fn run_download(args: DownloadArgs) -> Result<()> {
 )]
 fn pick_version_source(args: &DownloadArgs) -> Result<VersionSource> {
     // Precedence:
-    //   1. --version + --build-id  (Explicit)
-    //   2. --latest                (ScrapeLatest)
-    //   3. --version-file PATH     (TomlFile)
-    //   4. ./hyperd-version.toml   (auto-discovered TomlFile)
-    //   5. builtin
-    if let (Some(v), Some(b)) = (&args.version, &args.build_id) {
+    //   1. --version X           (Explicit)
+    //   2. --version-file PATH   (TomlFile)
+    //   3. ./hyperd-version.toml (auto-discovered TomlFile)
+    //   4. builtin
+    if let Some(v) = &args.version {
+        // Inherit the builtin pin's wheel tags — they are stable across every
+        // release that publishes an arm64 wheel (0.0.19484 onward), so an
+        // ad-hoc version override does not also need to restate them. Drop the
+        // digests: they are specific to the pinned version's files.
         let release = PinnedRelease {
             version: v.clone(),
-            build_id: b.clone(),
+            wheel_tag: PinnedRelease::builtin().wheel_tag,
             sha256: std::collections::HashMap::default(),
         };
         return Ok(VersionSource::Explicit(release));
-    }
-    if args.latest {
-        return Ok(VersionSource::ScrapeLatest);
     }
     if let Some(path) = &args.version_file {
         return Ok(VersionSource::TomlFile(path.clone()));
@@ -178,9 +171,19 @@ fn run_which(args: WhichArgs) -> Result<()> {
 )]
 fn run_version() -> Result<()> {
     let r = PinnedRelease::builtin();
-    println!("pinned version:  {}", r.version);
-    println!("pinned build_id: {}", r.build_id);
-    println!("version tag:     {}", r.version_tag());
+    println!("pinned version: {}", r.version);
+    for platform in [
+        Platform::MacosArm64,
+        Platform::MacosX86_64,
+        Platform::LinuxX86_64,
+        Platform::WindowsX86_64,
+    ] {
+        println!(
+            "  {:<16} {}",
+            platform.to_string(),
+            r.wheel_tag_for(platform).unwrap_or("<no wheel tag pinned>")
+        );
+    }
     Ok(())
 }
 
@@ -190,51 +193,39 @@ fn run_verify(args: VerifyArgs) -> Result<()> {
             .with_context(|| format!("loading {}", path.display()))?,
         None => PinnedRelease::builtin(),
     };
-    println!("verifying hyperd {}...", release.version_tag());
-    let outcomes = verify_release(&release).context("HEAD requests failed")?;
+    println!("verifying hyperd {}...", release.version);
+    let outcomes = verify_release(&release).context("probing platform URLs failed")?;
     let mut all_ok = true;
     for o in &outcomes {
-        match (o.status, &o.error) {
-            (Some(status), _) if o.ok() => {
-                println!(
-                    "  OK    {:<16} [{status}] {}",
-                    o.platform.to_string(),
-                    o.url
-                );
-            }
-            (Some(status), _) => {
-                all_ok = false;
-                println!(
-                    "  FAIL  {:<16} [{status}] {}",
-                    o.platform.to_string(),
-                    o.url
-                );
-            }
-            (None, Some(err)) => {
-                all_ok = false;
-                println!(
-                    "  FAIL  {:<16} [network error] {} ({err})",
-                    o.platform.to_string(),
-                    o.url
-                );
-            }
-            (None, None) => unreachable!("verify_release always sets status or error"),
+        let label = if o.ok() { "OK  " } else { "FAIL" };
+        if !o.ok() {
+            all_ok = false;
         }
+        let http = match (o.status, &o.error) {
+            (Some(status), _) => format!("{status}"),
+            (None, Some(err)) => format!("network error: {err}"),
+            (None, None) => unreachable!("verify_release always sets status or error"),
+        };
+        println!(
+            "  {label}  {:<16} [{http}] {}",
+            o.platform.to_string(),
+            o.url
+        );
+        println!("        {}", o.digest);
     }
     if !all_ok {
-        anyhow::bail!("one or more platform URLs failed to resolve");
+        anyhow::bail!("one or more platforms failed URL or digest verification");
     }
-    println!("all platforms reachable.");
+    println!("all platforms reachable with matching digests.");
     Ok(())
 }
 
 fn print_installed(i: &InstalledHyperd) {
     let status = if i.cache_hit { "cached" } else { "installed" };
     println!(
-        "{status}: hyperd {version}.{build_id} ({platform}) -> {path}",
+        "{status}: hyperd {version} ({platform}) -> {path}",
         status = status,
         version = i.version,
-        build_id = i.build_id,
         platform = i.platform,
         path = i.binary_path.display(),
     );

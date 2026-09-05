@@ -23,8 +23,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  HYPERD_VERSION: "0.0.26359"
-  HYPERD_BUILD_ID: "r07abb490"
+  # hyperd is bundled from the PyPI `tableauhyperapi` wheel. This version and
+  # the per-platform wheel tags / sha256s in the build-npm matrix below must
+  # match hyperdb-bootstrap/hyperd-version.toml — enforced by
+  # .github/scripts/verify-npm-hyperd-pin.py.
+  HYPERD_VERSION: "0.0.26479"
 
 jobs:
   verify-ci:
@@ -92,27 +95,35 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # hyperd-wheel-tag is the PyPI platform tag for this slug. It is NOT
+          # derivable from HYPERD_VERSION, so it has to be carried explicitly;
+          # a wrong tag yields a 404 rather than a version mismatch.
+          # hyperd-sha256 is the digest of the downloaded .whl archive.
           - platform: darwin-arm64
             os: macos-14
             target: aarch64-apple-darwin
             hyperd-slug: macos-arm64
-            hyperd-sha256: "434a5e7f95d914a7b328ac333b872fa044fabc6e23ad2aac9d0c9b762032b5ab"
+            hyperd-wheel-tag: macosx_13_0_arm64
+            hyperd-sha256: "e80e4dac6d8437ad8c20f36add7e523b18bc06d90d4c605a256c57df8df2c118"
           # TODO: re-enable when macos-13 runners are more available
           # - platform: darwin-x64
           #   os: macos-13
           #   target: x86_64-apple-darwin
           #   hyperd-slug: macos-x86_64
-          #   hyperd-sha256: "d5d3dae60ce071aed45e534fb6a4fc6c7edce47e31d664d131af9f76d9b3a2aa"
+          #   hyperd-wheel-tag: macosx_10_11_x86_64
+          #   hyperd-sha256: "960e276028137847a3870695d9c2d5a1392c173b1e119ff1146d24a75deca71a"
           - platform: linux-x64-gnu
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             hyperd-slug: linux-x86_64
-            hyperd-sha256: "40e488c01ddc1ecaa53123a88fcf4150161a5828e1c22b475dd73e1cd9cbbbed"
+            hyperd-wheel-tag: manylinux2014_x86_64
+            hyperd-sha256: "9f5ff04c0dc3c17224b7a3f36f297775f2f49aae084da84614003cd6508213bc"
           - platform: win32-x64-msvc
             os: windows-latest
             target: x86_64-pc-windows-msvc
             hyperd-slug: windows-x86_64
-            hyperd-sha256: "8546e67501ed3f15e97c9a0ed6a0dfc56fa9f070878bac435a7e5f7d1bfb6c99"
+            hyperd-wheel-tag: win_amd64
+            hyperd-sha256: "7a4f96d2a22351e944fea6db5d03ab5272ad4c0577acc987bfcb3739ed639502"
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -154,16 +165,20 @@ jobs:
       - name: Download and verify hyperd
         env:
           SLUG: ${{ matrix.hyperd-slug }}
+          WHEEL_TAG: ${{ matrix.hyperd-wheel-tag }}
           EXPECTED_SHA256: ${{ matrix.hyperd-sha256 }}
         run: |
           set -euo pipefail
-          URL="https://downloads.tableau.com/tssoftware/tableauhyperapi-java-${SLUG}-release-main.${HYPERD_VERSION}.${HYPERD_BUILD_ID}.zip"
-          echo "Downloading: $URL"
-          curl --fail --silent --show-error --location --output hyperd-archive.zip "$URL"
+          # The engine ships inside the PyPI `tableauhyperapi` wheel, which is
+          # a zip. This URL 302-redirects to the content-addressed download.
+          URL="https://files.pythonhosted.org/packages/py3/t/tableauhyperapi/tableauhyperapi-${HYPERD_VERSION}-py3-none-${WHEEL_TAG}.whl"
+          echo "Downloading hyperd for ${SLUG}: $URL"
+          curl --fail --silent --show-error --location --output hyperd-archive.whl "$URL"
+          # Digest is over the downloaded archive, not the extracted binary.
           if command -v sha256sum &>/dev/null; then
-            ACTUAL_SHA256=$(sha256sum hyperd-archive.zip | awk '{print $1}')
+            ACTUAL_SHA256=$(sha256sum hyperd-archive.whl | awk '{print $1}')
           else
-            ACTUAL_SHA256=$(shasum -a 256 hyperd-archive.zip | awk '{print $1}')
+            ACTUAL_SHA256=$(shasum -a 256 hyperd-archive.whl | awk '{print $1}')
           fi
           if [[ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]]; then
             echo "::error::SHA256 mismatch: expected $EXPECTED_SHA256, got $ACTUAL_SHA256"
@@ -175,8 +190,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p hyperd-extracted
-          unzip -q hyperd-archive.zip -d hyperd-raw
-          # Find the lib/hyper or bin/hyper directory (matches extract.rs logic)
+          unzip -q hyperd-archive.whl -d hyperd-raw
+          # Find the lib/hyper or bin/hyper directory (matches extract.rs
+          # logic). The wheel lays the engine out at tableauhyperapi/bin/hyper/
+          # on every platform, so in practice the bin/hyper branch matches;
+          # the lib/hyper branch is kept for parity with extract.rs.
           HYPER_DIR=$(find hyperd-raw -type d -name "hyper" -path "*/lib/hyper" -o -type d -name "hyper" -path "*/bin/hyper" | head -1)
           if [[ -z "$HYPER_DIR" ]]; then
             echo "::error::Could not find lib/hyper or bin/hyper in archive"
@@ -195,6 +213,10 @@ jobs:
       - name: Extract LICENSE from hyperd archive
         run: |
           set -euo pipefail
+          # The wheel's tableauhyperapi-<version>.dist-info/ carries LICENSE,
+          # NOTICES.txt and HYPER_API_OSS_disclosure.txt, so this glob matches.
+          # The heredoc below is the fallback if that ever changes, so a miss
+          # is non-fatal.
           LICENSE_FILE=$(find hyperd-raw -iname "LICENSE*" -o -iname "NOTICE*" | head -1)
           if [[ -n "$LICENSE_FILE" ]]; then
             cp "$LICENSE_FILE" LICENSE-HYPERD

@@ -1,10 +1,12 @@
 // Copyright (c) 2026, Salesforce, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Download and install the `hyperd` executable from Tableau's Hyper Java
-//! API release packages. (The Java bundle is used rather than the C++ one
-//! because the C++ `macos-arm64` zip ships an x86_64 `hyperd`; see the
-//! `url` module for the full rationale.)
+//! Download and install the `hyperd` executable from the PyPI
+//! `tableauhyperapi` wheels. The wheel carries the same `hyperd` build as
+//! Tableau's Java/C++ API bundles, but its file name is constructible from
+//! the release version alone — no opaque build id, no page scraping — and
+//! PyPI publishes a sha256 per file. See the `url` module for the full
+//! rationale.
 //!
 //! The crate ships both a CLI binary (`hyperd-bootstrap`) and a small
 //! library. The library is blocking (no async runtime required) and has
@@ -21,8 +23,8 @@
 //! ```
 //!
 //! See [`InstallOptions`] and [`VersionSource`] for how to override the
-//! destination, pin a specific release, load metadata from an external
-//! TOML file, or scrape the latest release from the public releases page.
+//! destination, pin a specific release, or load metadata from an external
+//! TOML file.
 
 /// HTTP (via `curl`) download of release archives + SHA-256 verification.
 pub mod download;
@@ -36,16 +38,13 @@ pub mod install;
 pub mod platform;
 /// Pinned-release metadata loaded from `hyperd-version.toml`.
 pub mod release;
-/// Best-effort scraping of the public releases page to discover the latest
-/// version when no pin is supplied.
-pub mod scrape;
-/// URL construction for Tableau's public download endpoint.
+/// URL construction for the PyPI wheel download endpoint.
 pub mod url;
-/// Reachability probes that HEAD each platform URL of a pinned release.
+/// Reachability and digest checks for each platform of a pinned release.
 pub mod verify;
 
 pub use error::Error;
 pub use install::{DEFAULT_DEST_ROOT, InstallOptions, InstalledHyperd, VersionSource, install};
 pub use platform::Platform;
 pub use release::PinnedRelease;
-pub use verify::{VerifyOutcome, verify_release};
+pub use verify::{DigestStatus, VerifyOutcome, verify_release};

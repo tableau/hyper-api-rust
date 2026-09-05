@@ -1,21 +1,33 @@
-# Pinned Hyper **Java** API release used by hyperd-bootstrap.
+# Pinned Hyper API release used by hyperdb-bootstrap.
 #
-# We pull `hyperd` from the Java binding's bundle, NOT the C++ one: the
-# C++ macos-arm64 zip ships an x86_64 `hyperd` (upstream packaging defect),
-# which only runs under Rosetta on Apple Silicon. The Java macos-arm64
-# bundle carries a native arm64 `hyperd`. Same URL template and same
-# internal layout (lib/hyper/hyperd) — only the binding token + sha256s differ.
+# `hyperd` is extracted from the PyPI `tableauhyperapi` wheels. The wheel
+# carries the same `hyperd` build as Tableau's Java/C++ API bundles, but its
+# filename is fully constructible from `version` + the platform's wheel tag,
+# so bumping this pin needs no build id and no HTML scraping.
 #
-# Bump these values (and sha256s) when upgrading. Contributors without
-# an override get this exact release, so reproducibility depends on it.
-version  = "0.0.26359"
-build_id = "r07abb490"
+# Digests are copied verbatim from the PyPI JSON API — do not compute by hand:
+#   curl -s https://pypi.org/pypi/tableauhyperapi/<version>/json \
+#     | jq -r '.urls[]|"\(.filename) \(.digests.sha256)"'
+#
+# Contributors without an override get this exact release, so reproducibility
+# depends on it.
+version = "0.0.26479"
 
-# sha256 of each platform's .zip. Omit a platform to skip verification
-# for that platform (not recommended). Compute with:
-#   shasum -a 256 tableauhyperapi-java-<platform>-release-main.<version>.<build_id>.zip
+# Wheel platform tag per target. These are NOT derivable from the version and
+# are NOT stable across releases: arm64 wheels only exist from 0.0.19484, and a
+# future macOS floor bump would change `macosx_13_0_arm64`. A wrong tag yields a
+# silent 404, so the tag lives here — where changing it is a visible pin edit —
+# rather than hardcoded in Rust.
+[wheel_tag]
+"macos-arm64"    = "macosx_13_0_arm64"
+"macos-x86_64"   = "macosx_10_11_x86_64"
+"linux-x86_64"   = "manylinux2014_x86_64"
+"windows-x86_64" = "win_amd64"
+
+# sha256 of each platform's .whl, as published by PyPI. Omit a platform to skip
+# verification for that platform (not recommended).
 [sha256]
-"macos-arm64"    = "434a5e7f95d914a7b328ac333b872fa044fabc6e23ad2aac9d0c9b762032b5ab"
-"macos-x86_64"   = "cbf01253f3b2b4288085ecb01a6415219338573fb8b5e1f101c457e2a26d5672"
-"linux-x86_64"   = "40e488c01ddc1ecaa53123a88fcf4150161a5828e1c22b475dd73e1cd9cbbbed"
-"windows-x86_64" = "8546e67501ed3f15e97c9a0ed6a0dfc56fa9f070878bac435a7e5f7d1bfb6c99"
+"macos-arm64"    = "e80e4dac6d8437ad8c20f36add7e523b18bc06d90d4c605a256c57df8df2c118"
+"macos-x86_64"   = "960e276028137847a3870695d9c2d5a1392c173b1e119ff1146d24a75deca71a"
+"linux-x86_64"   = "9f5ff04c0dc3c17224b7a3f36f297775f2f49aae084da84614003cd6508213bc"
+"windows-x86_64" = "7a4f96d2a22351e944fea6db5d03ab5272ad4c0577acc987bfcb3739ed639502"

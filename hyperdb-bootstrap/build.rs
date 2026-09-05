@@ -3,9 +3,9 @@
 
 //! Compile-time sanity check for the pinned release metadata.
 //!
-//! If `hyperd-version.toml` fails to parse, is missing `version`/`build_id`,
-//! or has a shape the runtime code can't handle, the build fails here —
-//! before any contributor ships a broken bump.
+//! If `hyperd-version.toml` fails to parse, is missing `version`, lacks a
+//! wheel tag for a supported platform, or has a shape the runtime code can't
+//! handle, the build fails here — before any contributor ships a broken bump.
 //!
 //! Keep this in sync with `release.rs` / `platform.rs`. The check is
 //! deliberately lightweight (no network, no crates-io deps beyond what
@@ -73,20 +73,10 @@ fn main() {
         "{}: `version` is empty",
         pin_path.display()
     );
-    assert!(
-        !pin.build_id.trim().is_empty(),
-        "{}: `build_id` is empty",
-        pin_path.display()
-    );
     // Reject stray whitespace / accidental newlines in the URL components.
     assert!(
         !pin.version.contains(char::is_whitespace),
         "{}: `version` contains whitespace",
-        pin_path.display()
-    );
-    assert!(
-        !pin.build_id.contains(char::is_whitespace),
-        "{}: `build_id` contains whitespace",
         pin_path.display()
     );
 
@@ -96,13 +86,43 @@ fn main() {
         "linux-x86_64",
         "windows-x86_64",
     ];
-    for key in pin.sha256.keys() {
+    for (table, keys) in [
+        ("wheel_tag", pin.wheel_tag.keys()),
+        ("sha256", pin.sha256.keys()),
+    ] {
+        for key in keys {
+            assert!(
+                SUPPORTED.contains(&key.as_str()),
+                "{}: unknown platform key `{}` in [{}]; supported: {:?}",
+                pin_path.display(),
+                key,
+                table,
+                SUPPORTED
+            );
+        }
+    }
+
+    // Every supported platform needs a wheel tag: without one the wheel file
+    // name is not constructible, so `download` would fail at runtime on that
+    // platform only — exactly the kind of break that should not reach a
+    // contributor's machine.
+    for platform in SUPPORTED {
+        let tag = pin
+            .wheel_tag
+            .get(*platform)
+            .map(|t| t.trim())
+            .unwrap_or_default();
         assert!(
-            SUPPORTED.contains(&key.as_str()),
-            "{}: unknown platform key `{}` in [sha256]; supported: {:?}",
+            !tag.is_empty(),
+            "{}: no [wheel_tag] entry for `{}`; every supported platform needs one",
             pin_path.display(),
-            key,
-            SUPPORTED
+            platform
+        );
+        assert!(
+            !tag.contains(char::is_whitespace),
+            "{}: wheel tag for `{}` contains whitespace",
+            pin_path.display(),
+            platform
         );
     }
     for (plat, sha) in &pin.sha256 {
@@ -129,7 +149,8 @@ fn main() {
 #[derive(serde::Deserialize)]
 struct PinCheck {
     version: String,
-    build_id: String,
+    #[serde(default)]
+    wheel_tag: HashMap<String, String>,
     #[serde(default)]
     sha256: HashMap<String, String>,
 }

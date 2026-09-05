@@ -1,8 +1,9 @@
 name: verify-hyperd-pin
 
-# HEAD every platform URL for the pinned Hyper release. Catches
-# Tableau yanking / renaming an archive, and catches typos in
-# hyperd-version.toml on PRs that touch the pin.
+# HEAD every platform URL for the pinned Hyper release. The archives are the
+# PyPI `tableauhyperapi` wheels, so this catches a wheel being yanked and
+# catches typos in hyperd-version.toml (version or wheel tag — a wrong tag is
+# just a URL that 404s) on PRs that touch the pin.
 
 on:
   push:
@@ -46,7 +47,8 @@ jobs:
 
       - name: Verify npm-build-publish.yml hyperd pin matches the toml
         # The release workflow bundles hyperd into the npm packages from its
-        # OWN hardcoded version/build_id/sha256s, decoupled from the toml.
+        # OWN hardcoded version + per-platform wheel tags/sha256s, decoupled
+        # from the toml.
         # 0.7.1 shipped npm with the stale 0.0.25080 engine because only the
         # toml was bumped. This guard fails the build if they ever drift again.
         run: python3 .github/scripts/verify-npm-hyperd-pin.py

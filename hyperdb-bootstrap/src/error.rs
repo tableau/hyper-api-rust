@@ -8,9 +8,9 @@ use thiserror::Error;
 /// Errors produced while downloading, verifying, and installing `hyperd`.
 ///
 /// Every fallible function in this crate returns a `Result<T, Error>`. The
-/// variants line up with the phases of bootstrap: platform detection,
-/// HTTP/curl fetching, TOML parsing, archive extraction, and checksum
-/// verification.
+/// variants line up with the phases of bootstrap: platform detection, URL
+/// construction, `curl` fetching, TOML parsing, archive extraction, and
+/// checksum verification.
 #[derive(Debug, Error)]
 pub enum Error {
     /// The host (`os` / `arch` combination) has no published `hyperd` build.
@@ -36,20 +36,17 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    /// A `reqwest` HTTP client error (connection failure, TLS issue, etc.).
-    #[error("HTTP error: {0}")]
-    Http(#[source] reqwest::Error),
-
-    /// A server returned a non-success HTTP status while fetching `url`.
-    #[error("HTTP {status} when fetching {url}")]
-    HttpStatus {
-        /// URL that was being fetched when the failure occurred.
-        url: String,
-        /// HTTP response status code.
-        status: u16,
+    /// The pinned release carries no wheel tag for this platform, so the
+    /// wheel file name cannot be constructed.
+    #[error(
+        "no wheel tag pinned for platform {platform}; add it to the [wheel_tag] table in hyperd-version.toml"
+    )]
+    MissingWheelTag {
+        /// Platform whose `[wheel_tag]` entry is missing.
+        platform: crate::platform::Platform,
     },
 
-    /// The fallback `curl` subprocess exited with a non-zero status.
+    /// The `curl` subprocess exited with a non-zero status.
     #[error("curl exited with code {code} when fetching {url}")]
     CurlFailed {
         /// URL passed to `curl`.
@@ -78,10 +75,6 @@ pub enum Error {
     /// The archive did not contain a recognizable `hyperd` executable.
     #[error("hyperd executable not found in extracted archive")]
     HyperdNotInArchive,
-
-    /// Scraping the public releases page for the latest version failed.
-    #[error("failed to scrape latest release: {0}")]
-    ScrapeFailed(&'static str),
 }
 
 impl Error {
@@ -106,12 +99,10 @@ impl Error {
         }
     }
 
-    /// Constructs an [`Self::HttpStatus`] error.
-    pub fn http_status(url: impl Into<String>, status: u16) -> Self {
-        Error::HttpStatus {
-            url: url.into(),
-            status,
-        }
+    /// Constructs an [`Self::MissingWheelTag`] error.
+    #[must_use]
+    pub fn missing_wheel_tag(platform: crate::platform::Platform) -> Self {
+        Error::MissingWheelTag { platform }
     }
 
     /// Constructs an [`Self::CurlFailed`] error.

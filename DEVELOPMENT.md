@@ -384,10 +384,9 @@ in companion crates:
    This installs `hyperd` at `.hyperd/current/hyperd` (auto-discovered by
    `make`/`build.ps1` — no `HYPERD_PATH` needed). The pinned release is
    baked into [`hyperdb-bootstrap/hyperd-version.toml`](hyperdb-bootstrap/hyperd-version.toml);
-   to upgrade, edit that file (version + build_id + per-platform sha256s)
-   and bump the crate version. Pass `ARGS="--latest"` to fetch the newest
-   release via best-effort scraping, or `ARGS="--version X --build-id Y"`
-   for an ad-hoc pin.
+   to upgrade, edit that file (version + the four `[wheel_tag]` entries +
+   per-platform sha256s) and bump the crate version. Pass
+   `ARGS="--version X"` for an ad-hoc pin.
 
    If you already have a `hyperd` elsewhere, set `HYPERD_PATH` instead:
 
@@ -420,11 +419,9 @@ in companion crates:
    after the `build.ps1 download-hyperd` command):
 
    ```bash
-   # Best-effort scrape of the latest release (skips sha256 verification).
-   make download-hyperd ARGS="--latest"
-
-   # Pin to a specific release ad-hoc.
-   make download-hyperd ARGS="--version 0.0.24457 --build-id rc36858b6"
+   # Pin to a specific release ad-hoc. Inherits the builtin pin's wheel tags
+   # and carries no digests, so the download is unverified (logs a WARN).
+   make download-hyperd ARGS="--version 0.0.26359"
 
    # Install to a custom location, e.g. shared across repos.
    make download-hyperd ARGS="--dest /opt/hyperd"
@@ -435,9 +432,10 @@ in companion crates:
 
    Bumping the baked-in pin is an edit to
    [`hyperdb-bootstrap/hyperd-version.toml`](hyperdb-bootstrap/hyperd-version.toml)
-   (version + build_id + per-platform sha256s) plus a crate version bump.
-   `build.rs` validates the file on every compile, and the
-   `verify-hyperd-pin` CI workflow confirms the URLs resolve.
+   (version + the four `[wheel_tag]` entries + per-platform sha256s, all read
+   off the PyPI JSON API) plus a crate version bump. `build.rs` validates the
+   file on every compile, and the `verify-hyperd-pin` CI workflow confirms the
+   URLs resolve and that each pinned digest matches the one PyPI publishes.
 
 4. **Windows only**: Install Visual Studio Build Tools with "Desktop development with C++"
    workload (provides the MSVC linker, not for C++ compilation).
