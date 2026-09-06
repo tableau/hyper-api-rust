@@ -66,7 +66,7 @@ serde_json = { workspace = true }
 
 # Salesforce OAuth authentication (optional, via standalone crate)
 # x-release-please-start-version
-hyperdb-api-salesforce = { path = "../hyperdb-api-salesforce", version = "=1.0.0-rc.1", optional = true }
+hyperdb-api-salesforce = { path = "../hyperdb-api-salesforce", version = "=1.0.0-rc.2", optional = true }
 # x-release-please-end
 
 # Arrow parsing for catalog operations (optional, used by authenticated_client)

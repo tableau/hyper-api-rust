@@ -1,5 +1,71 @@
 # Changelog
 
+## [1.0.0-rc.2](https://github.com/tableau/hyper-api-rust/compare/v1.0.0-rc.1...v1.0.0-rc.2) (2026-09-06)
+
+
+### ⚠ BREAKING CHANGES
+
+* **mcp:** `hyperdb-mcp` is published to crates.io, and this reshapes its library surface: `Engine::execute_in_transaction` takes `&mut self` and yields `EngineTransaction` rather than `&Engine`, the seven ingest entry points and `merge_via_temp_table` take `&mut Engine`, and `Engine::with_search_path` is new. The `missing_docs` allow reason on `src/lib.rs` claimed the crate is not published; corrected in passing.
+* **core:** bind scaled Numeric and Geography as text parameters ([#257](https://github.com/tableau/hyper-api-rust/issues/257))
+* **bootstrap:** source hyperd from the PyPI tableauhyperapi wheels ([#254](https://github.com/tableau/hyper-api-rust/issues/254))
+* **bootstrap:** hyperdb-bootstrap no longer has a build id or a releases-page scraper, because a wheel URL is fully constructible from the version alone. Removed public API:
+    - `PinnedRelease::build_id` and `InstalledHyperd::build_id` — use `.version`,
+      now the only release identifier, plus the new
+      `PinnedRelease::wheel_tag_for(Platform)` for the per-platform wheel tag.
+    - `PinnedRelease::version_tag()` — use `.version`. It existed only to join the
+      version and the build id into `0.0.26479.r96880f6a`; there is no build id
+      left to join.
+    - `VersionSource::ScrapeLatest` and the `scrape` module — deleted with no
+      replacement. With a constructible URL and PyPI-published digests there is
+      nothing left to discover.
+    - `Error::Http`, `Error::HttpStatus` and `Error::ScrapeFailed` — all three
+      existed only to serve the scraper. `Error::MissingWheelTag` is new, because
+      `url::build_download_url` is now fallible.
+    - the `--latest` CLI flag — no replacement, it is deleted along with the
+      scraper it drove. Pass `--version X` or `--version-file PATH` instead.
+    - the `--build-id` CLI flag — it simply goes away. Wheel URLs need no build
+      id, so `--version X` on its own is now a complete version source: it
+      inherits the builtin pin's `[wheel_tag]` values and carries no digests, so
+      the download is unverified and logs a WARN. Use `--version-file` with a full
+      pin when you need verified bytes.
+    - the `regex`, `reqwest` and `rustls` dependencies — no in-process HTTP client
+      remains, which also retires the rustls crypto-provider workaround.
+* **grpc:** report Arrow failures in label lookups instead of a partial map
+
+### Features
+
+* **api:** constraint-preserving table copy for hyper export ([#258](https://github.com/tableau/hyper-api-rust/issues/258)) ([4eb61d5](https://github.com/tableau/hyper-api-rust/commit/4eb61d56fa3c13a6abaee202d997a998fedefd9a))
+* **bootstrap:** source hyperd from the PyPI tableauhyperapi wheels ([cb2b63d](https://github.com/tableau/hyper-api-rust/commit/cb2b63d8ae481596a14a6ce5131ec88305da7a43))
+* **bootstrap:** source hyperd from the PyPI tableauhyperapi wheels ([#254](https://github.com/tableau/hyper-api-rust/issues/254)) ([fa35a45](https://github.com/tableau/hyper-api-rust/commit/fa35a45b5a9072e386f607cdda7527a306929292))
+* **core:** bind scaled Numeric and Geography as text parameters ([#257](https://github.com/tableau/hyper-api-rust/issues/257)) ([8a443c6](https://github.com/tableau/hyper-api-rust/commit/8a443c6f95b15fb92bdd2c89d013df651a95f0db))
+* **mcp:** report the hyperd connection descriptor in status ([#259](https://github.com/tableau/hyper-api-rust/issues/259)) ([5333bd0](https://github.com/tableau/hyper-api-rust/commit/5333bd08f8500b98f79d25cd6e2929e0719b2042))
+* **mcp:** report the hyperd endpoint in connectable form in status ([5333bd0](https://github.com/tableau/hyper-api-rust/commit/5333bd08f8500b98f79d25cd6e2929e0719b2042))
+
+
+### Bug Fixes
+
+* **api:** add missing #[must_use] on the Windows-gated pipe_name ([56fb280](https://github.com/tableau/hyper-api-rust/commit/56fb280ae2379e5168128288d248d37e9392984e))
+* **bench:** report decimal MB, not MiB under an MB label ([1684bfc](https://github.com/tableau/hyper-api-rust/commit/1684bfc21aaa3614904cb737ccbff8813b1c174c))
+* **bootstrap:** bump pinned hyperd to 0.0.26479 (r96880f6a) ([8c99d20](https://github.com/tableau/hyper-api-rust/commit/8c99d20d15af016b42647e6a826ad0a49c4a9082))
+* **bootstrap:** use the post-rename crate name in module docs and errors ([d7da987](https://github.com/tableau/hyper-api-rust/commit/d7da987ba4045a4a4a1965e091ce40a5810f52d3))
+* **compile-check:** stop false "not registered" errors in rust-analyzer ([22b0a7a](https://github.com/tableau/hyper-api-rust/commit/22b0a7ab111f04f0d45d4ed69b5f2078e1b23f1d))
+* correct the pre-rename hyperd-bootstrap name in user-facing errors ([0cc65e2](https://github.com/tableau/hyper-api-rust/commit/0cc65e2b997aafcd2a607bda022eb59fade2f58f))
+* **grpc:** report Arrow failures in label lookups instead of a partial map ([1cbdd4d](https://github.com/tableau/hyper-api-rust/commit/1cbdd4d61f8f60cfb2cf9fcd7ed8f0f5024d723f))
+* identify hyperd by executable path, and report decimal MB in the bench harness ([#256](https://github.com/tableau/hyper-api-rust/issues/256)) ([816ecbb](https://github.com/tableau/hyper-api-rust/commit/816ecbb5576e1ae71b28755d5a73bdc3aefc7124))
+* **mcp:** identify hyperd by executable, not thread name ([14dd334](https://github.com/tableau/hyper-api-rust/commit/14dd33419692fae4f6f79d29ec761ba10d136e83))
+* **mcp:** scope a Unix-only test import so Windows sees no unused import ([6d2a0b5](https://github.com/tableau/hyper-api-rust/commit/6d2a0b5dac12bb846f37a10596187d1b14a8aced))
+
+
+### Miscellaneous Chores
+
+* release 1.0.0-rc.2 ([a9fe1b0](https://github.com/tableau/hyper-api-rust/commit/a9fe1b04dd2e2c2aafb12346c0b5b41436f0d787))
+* release 1.0.0-rc.2 ([099ad49](https://github.com/tableau/hyper-api-rust/commit/099ad49a5c17f1c8274e91a0821aa3657e19a0c1))
+
+
+### Code Refactoring
+
+* **mcp:** drive Engine transactions with the RAII guard, and flatten client::Error ([#261](https://github.com/tableau/hyper-api-rust/issues/261)) ([68ff688](https://github.com/tableau/hyper-api-rust/commit/68ff688ebd22b29494ff69479133a4bb35db7f63))
+
 ## [1.0.0-rc.1](https://github.com/tableau/hyper-api-rust/compare/v0.7.3...v1.0.0-rc.1) (2026-09-05)
 
 
