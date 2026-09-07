@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.0.0-rc.3](https://github.com/tableau/hyper-api-rust/compare/v1.0.0-rc.2...v1.0.0-rc.3) (2026-09-07)
+
+
+### Bug Fixes
+
+* **mcp:** export RESOURCE_BUSY regression, chart x-axis precision, histogram x_range, and a false lint reason ([#281](https://github.com/tableau/hyper-api-rust/issues/281)) ([734f973](https://github.com/tableau/hyper-api-rust/commit/734f97395efbd4aaab7946339580d89c746386f6))
+* **mcp:** publish a restarted hyperd endpoint to daemon.json before STATUS ([#286](https://github.com/tableau/hyper-api-rust/issues/286)) ([b54103c](https://github.com/tableau/hyper-api-rust/commit/b54103c3c497a6de50a4cc17fda16f99bfc06315)), closes [#284](https://github.com/tableau/hyper-api-rust/issues/284)
+* **mcp:** reject daemon port 0 at the flag and the environment variable ([#290](https://github.com/tableau/hyper-api-rust/issues/290)) ([1b0ea17](https://github.com/tableau/hyper-api-rust/commit/1b0ea17d79c5223f2dd35d6579027d073351ef10)), closes [#275](https://github.com/tableau/hyper-api-rust/issues/275)
+* **mcp:** restrict daemon state files to the owning user ([#295](https://github.com/tableau/hyper-api-rust/issues/295)) ([9856f60](https://github.com/tableau/hyper-api-rust/commit/9856f606cba0487da62e4947344a55c77940552f))
+* recover from panic/cancellation-induced mutex poisoning and leaked transactions ([#280](https://github.com/tableau/hyper-api-rust/issues/280)) ([61fc766](https://github.com/tableau/hyper-api-rust/commit/61fc7669840b52a2a2e7d578229303e76c64c163)), closes [#266](https://github.com/tableau/hyper-api-rust/issues/266) [#263](https://github.com/tableau/hyper-api-rust/issues/263)
+
+
+### Performance Improvements
+
+* **mcp:** wait on the health listener socket instead of polling it every 5 ms ([#289](https://github.com/tableau/hyper-api-rust/issues/289)) ([dd1ec64](https://github.com/tableau/hyper-api-rust/commit/dd1ec64f1b2459ce7f9827e7c98d9d09f68fa63a))
+
 ## [1.0.0-rc.2](https://github.com/tableau/hyper-api-rust/compare/v1.0.0-rc.1...v1.0.0-rc.2) (2026-09-06)
 
 
