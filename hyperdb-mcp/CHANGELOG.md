@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.0-rc.4] - 2026-09-08
+
 ### Changed
 
 - **The daemon now connects to its `hyperd` engine over a local IPC channel

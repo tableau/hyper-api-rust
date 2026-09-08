@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.0-rc.4] - 2026-09-08
+
 ### Fixed
 
 - **IPC transport: a process that spawns several IPC `HyperProcess` instances
