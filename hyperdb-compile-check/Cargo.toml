@@ -7,7 +7,7 @@
 [package]
 name = "hyperdb-compile-check"
 # x-release-please-start-version
-version = "1.0.0-rc.3"
+version = "1.0.0-rc.4"
 # x-release-please-end
 edition = "2024"
 rust-version = "1.88"
@@ -25,7 +25,7 @@ categories = ["database", "development-tools"]
 
 [dependencies]
 # x-release-please-start-version
-hyperdb-api = { path = "../hyperdb-api", version = "=1.0.0-rc.3" }
+hyperdb-api = { path = "../hyperdb-api", version = "=1.0.0-rc.4" }
 # x-release-please-end
 parking_lot = "0.12"
 tempfile = "3.20"

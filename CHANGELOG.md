@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.0.0-rc.4](https://github.com/tableau/hyper-api-rust/compare/v1.0.0-rc.3...v1.0.0-rc.4) (2026-09-08)
+
+
+### Features
+
+* **mcp:** connect the daemon to its engine over IPC ([#304](https://github.com/tableau/hyper-api-rust/issues/304)) ([bcd88fd](https://github.com/tableau/hyper-api-rust/commit/bcd88fd299ce2ccb49d4a1bbbaf8497b4a1b3dd4))
+
+
+### Miscellaneous Chores
+
+* release 1.0.0-rc.4 ([d59fa0e](https://github.com/tableau/hyper-api-rust/commit/d59fa0e758000cea76ea68253ca62a9ad40bcd58))
+
 ## [1.0.0-rc.3](https://github.com/tableau/hyper-api-rust/compare/v1.0.0-rc.2...v1.0.0-rc.3) (2026-09-07)
 
 
