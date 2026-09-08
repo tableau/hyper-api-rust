@@ -1778,7 +1778,7 @@ dependencies = [
 
 [[package]]
 name = "hyperdb-api"
-version = "1.0.0-rc.3"
+version = "1.0.0-rc.4"
 dependencies = [
  "arrow",
  "async-stream",
@@ -1803,7 +1803,7 @@ dependencies = [
 
 [[package]]
 name = "hyperdb-api-core"
-version = "1.0.0-rc.3"
+version = "1.0.0-rc.4"
 dependencies = [
  "arrow",
  "base64 0.23.1",
@@ -1844,7 +1844,7 @@ dependencies = [
 
 [[package]]
 name = "hyperdb-api-derive"
-version = "1.0.0-rc.3"
+version = "1.0.0-rc.4"
 dependencies = [
  "hyperdb-api",
  "hyperdb-compile-check",
@@ -1856,7 +1856,7 @@ dependencies = [
 
 [[package]]
 name = "hyperdb-api-node"
-version = "1.0.0-rc.3"
+version = "1.0.0-rc.4"
 dependencies = [
  "hyperdb-api",
  "napi",
@@ -1868,7 +1868,7 @@ dependencies = [
 
 [[package]]
 name = "hyperdb-api-salesforce"
-version = "1.0.0-rc.3"
+version = "1.0.0-rc.4"
 dependencies = [
  "arrow",
  "base64 0.23.1",
@@ -1890,7 +1890,7 @@ dependencies = [
 
 [[package]]
 name = "hyperdb-bootstrap"
-version = "1.0.0-rc.3"
+version = "1.0.0-rc.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -1907,7 +1907,7 @@ dependencies = [
 
 [[package]]
 name = "hyperdb-compile-check"
-version = "1.0.0-rc.3"
+version = "1.0.0-rc.4"
 dependencies = [
  "hyperdb-api",
  "parking_lot",
@@ -1916,7 +1916,7 @@ dependencies = [
 
 [[package]]
 name = "hyperdb-mcp"
-version = "1.0.0-rc.3"
+version = "1.0.0-rc.4"
 dependencies = [
  "arrow",
  "base64 0.23.1",
@@ -3591,7 +3591,7 @@ dependencies = [
 
 [[package]]
 name = "sea-query-hyperdb"
-version = "1.0.0-rc.3"
+version = "1.0.0-rc.4"
 dependencies = [
  "sea-query",
 ]
