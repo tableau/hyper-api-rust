@@ -125,7 +125,7 @@ jobs:
           ref: ${{ steps.branch.outputs.name }}
           token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
         if: ${{ steps.release.outputs.pr != '' }}
         with:
           toolchain: stable
