@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.0.0-rc.5](https://github.com/tableau/hyper-api-rust/compare/v1.0.0-rc.4...v1.0.0-rc.5) (2026-09-19)
+
+
+### Bug Fixes
+
+* **deps:** clear qs Dependabot alerts + drop stale advisory waivers ([#330](https://github.com/tableau/hyper-api-rust/issues/330)) ([59e8d60](https://github.com/tableau/hyper-api-rust/commit/59e8d60554f6ea6a548a45261ea52407292d0a1f))
+* **mcp:** reduce LLM-facing tool friction, token cost, and a scratch-table leak ([#332](https://github.com/tableau/hyper-api-rust/issues/332)) ([50f7214](https://github.com/tableau/hyper-api-rust/commit/50f7214d17423298531c100c8b90740f4c05f9b8))
+* **mcp:** upgrade rmcp dependency from 1.x to 3.4 ([#331](https://github.com/tableau/hyper-api-rust/issues/331)) ([0e2dd41](https://github.com/tableau/hyper-api-rust/commit/0e2dd418044b4f8917b28c18cb06136ce554c4f2))
+* unblock Dependabot CI (rustls advisory + changelog-window test regression) ([#328](https://github.com/tableau/hyper-api-rust/issues/328)) ([a09d229](https://github.com/tableau/hyper-api-rust/commit/a09d2293093ac6fd6e729abd3a63f0c97443f0b0))
+
 ## [1.0.0-rc.4](https://github.com/tableau/hyper-api-rust/compare/v1.0.0-rc.3...v1.0.0-rc.4) (2026-09-08)
 
 
