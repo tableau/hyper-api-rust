@@ -102,6 +102,11 @@ pub struct DaemonState {
     /// Whether a [`HealthListener::run`] loop is currently serving
     /// [`Self::endpoint`] and so can be woken by connecting to it.
     listener_registered: AtomicBool,
+    /// Wakes `run_daemon`'s main loop the moment shutdown is requested, so the
+    /// record is removed and `hyperd` released at once instead of at the next
+    /// poll of the `hyperd` monitor (every 5 s). `notify_one` stores a permit,
+    /// so a request that lands before the loop first awaits is not lost.
+    shutdown_notify: tokio::sync::Notify,
 }
 
 impl DaemonState {
@@ -114,6 +119,7 @@ impl DaemonState {
             restart_requested: AtomicBool::new(false),
             endpoint,
             listener_registered: AtomicBool::new(false),
+            shutdown_notify: tokio::sync::Notify::new(),
         }
     }
 
@@ -168,7 +174,14 @@ impl DaemonState {
     /// `xchg` on two cold paths.
     pub fn request_shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        self.shutdown_notify.notify_one();
         self.wake_accept_loop();
+    }
+
+    /// Resolves once [`Self::request_shutdown`] has been called, including a
+    /// call made before this was first awaited.
+    pub async fn shutdown_requested(&self) {
+        self.shutdown_notify.notified().await;
     }
 
     /// Nudge the listening endpoint so a waiting accept returns and the loop

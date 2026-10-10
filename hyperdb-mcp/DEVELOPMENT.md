@@ -271,11 +271,23 @@ it spawns only when the lock is free, after removing any stale record.
 **Version takeover.** When discovery finds a running daemon, `maybe_take_over`
 compares the client's `version::MCP_VERSION` against the daemon's reported
 version via the pure `client_should_take_over` helper (`semver`). If the client
-is *strictly newer* it sends `STOP` (which drops the daemon's `HyperProcess`,
-stopping `hyperd`), waits for the health endpoint to stop answering the identity
-ping, then respawns a fresh daemon on the same endpoint. Equal/older/unparseable
-versions reuse the daemon — never a downgrade-kill. This makes upgrades take
-effect immediately instead of waiting for the old daemon to disappear.
+is *strictly newer* it sends `STOP`, then waits until the old daemon has
+released the daemon lock (`wait_for_lock_release`, bounded by `STOP_WAIT` = 15 s),
+and only then spawns a fresh daemon. The lock is the right signal because the
+daemon releases it last, after `hyperd` has exited; the health endpoint goes
+quiet within milliseconds, long before `hyperd` is gone, and a successor started
+then would fail its `hyperd` socket pre-flight. If the old daemon still holds the
+lock after `STOP_WAIT`, the takeover gives up and the client runs in local mode.
+Equal/older/unparseable versions reuse the daemon — never a downgrade-kill.
+
+On `STOP` the daemon acts at once: `DaemonState::request_shutdown` stores a
+`tokio::sync::Notify` permit that `run_daemon`'s `select!` awaits, so the record
+is removed, the listener joined, `hyperd` dropped and the lock released in that
+order without waiting for the 5 s `hyperd` monitor poll. A daemon started while
+its predecessor is still exiting retries the lock and the `hyperd` socket
+pre-flight within `STARTUP_WAIT` (10 s); `SPAWN_TIMEOUT` (20 s) covers that wait
+plus `hyperd`'s own start. `hyperdb-mcp daemon stop` waits for the same lock and
+reports success only once it is free.
 
 **Idle shutdown is opt-in.** `DaemonConfig.idle_timeout` is `Option<Duration>`,
 set only when `--idle-timeout` or `HYPERDB_DAEMON_IDLE_TIMEOUT` is provided

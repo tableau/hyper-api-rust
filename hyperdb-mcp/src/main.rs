@@ -219,7 +219,13 @@ async fn run_daemon_mode(idle_timeout: Option<u64>) -> Result<(), Box<dyn std::e
         .init();
 
     let config = DaemonConfig::from_args(idle_timeout);
-    daemon::run::run_daemon(config).await
+    let result = daemon::run::run_daemon(config).await;
+    // A spawned daemon's stderr is /dev/null, so the log file is the only place
+    // a failed start (lock, pre-flight, hyperd) can be read afterwards.
+    if let Err(error) = &result {
+        tracing::error!(%error, "daemon exited with an error");
+    }
+    result
 }
 
 async fn run_mcp_mode(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
@@ -355,6 +361,24 @@ fn daemon_stop() {
         }
         Err(e) => {
             eprintln!("No daemon running at {endpoint} (or cannot connect): {e}");
+            std::process::exit(1);
+        }
+    }
+    // Success means the daemon is gone, not merely that it acknowledged: it
+    // releases the lock only after `hyperd` has exited.
+    let dir = match discovery::state_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!(
+                "The daemon acknowledged STOP, but its state directory cannot be resolved to confirm it exited: {e}"
+            );
+            std::process::exit(1);
+        }
+    };
+    match daemon::spawn::wait_for_lock_release(&dir, daemon::spawn::STOP_WAIT) {
+        Ok(()) => println!("Daemon stopped."),
+        Err(e) => {
+            eprintln!("The daemon acknowledged STOP but did not exit: {e}");
             std::process::exit(1);
         }
     }

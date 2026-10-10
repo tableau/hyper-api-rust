@@ -1329,10 +1329,14 @@ fn daemon_cli_reaches_a_live_daemon_whose_record_is_missing() {
     let endpoint = HealthEndpoint::for_new_daemon(state.path()).unwrap();
     let info = test_daemon_info(&endpoint);
     // No record is written. The held lock stands in for the live daemon.
-    let _lock = DaemonLock::try_acquire(state.path())
+    let lock = DaemonLock::try_acquire(state.path())
         .unwrap()
         .expect("fresh state directory has a free lock");
-    let mut peer = FakeHealthPeer::start_at(&endpoint, scripted_daemon(&info));
+    let stop_seen = Arc::new(AtomicBool::new(false));
+    let mut peer = FakeHealthPeer::start_at(
+        &endpoint,
+        scripted_daemon_noting_stop(&info, Arc::clone(&stop_seen)),
+    );
 
     let status = run_cli_bounded(&["daemon", "status"], state.path(), Duration::from_secs(10));
     assert!(
@@ -1341,7 +1345,16 @@ fn daemon_cli_reaches_a_live_daemon_whose_record_is_missing() {
         status.status,
         String::from_utf8_lossy(&status.stderr)
     );
+    // `daemon stop` succeeds only once the lock is free, so let go of it a
+    // moment after the peer has actually received STOP (not on a fixed delay
+    // that a loaded machine could outrun).
+    let releaser = std::thread::spawn(move || {
+        wait_for_flag(&stop_seen, Duration::from_secs(30));
+        std::thread::sleep(Duration::from_millis(300));
+        drop(lock);
+    });
     let stop = run_cli_bounded(&["daemon", "stop"], state.path(), Duration::from_secs(10));
+    releaser.join().unwrap();
     assert!(
         stop.status.success(),
         "`daemon stop` failed: {}\nstderr:\n{}",
@@ -1352,6 +1365,52 @@ fn daemon_cli_reaches_a_live_daemon_whose_record_is_missing() {
         peer.stop_and_join().iter().any(|command| command == "STOP"),
         "the peer never received STOP"
     );
+}
+
+/// `daemon stop` returns only once the daemon has let go of its lock, not when
+/// it merely acknowledges `STOP`. The fake daemon acknowledges at once but
+/// releases the lock 1.5 s later; the CLI must not have returned before that.
+#[cfg(unix)]
+#[test]
+fn daemon_stop_cli_returns_only_after_the_lock_is_free() {
+    let state = TempDir::new().unwrap();
+    let endpoint = HealthEndpoint::for_new_daemon(state.path()).unwrap();
+    let info = test_daemon_info(&endpoint);
+    write_record(state.path(), &info);
+    let lock = DaemonLock::try_acquire(state.path())
+        .unwrap()
+        .expect("fresh state directory has a free lock");
+    let stop_seen = Arc::new(AtomicBool::new(false));
+    let mut peer = FakeHealthPeer::start_at(
+        &endpoint,
+        scripted_daemon_noting_stop(&info, Arc::clone(&stop_seen)),
+    );
+
+    let lock_released = Arc::new(AtomicBool::new(false));
+    let released_by_thread = Arc::clone(&lock_released);
+    let freer = std::thread::spawn(move || {
+        // Hold the lock for 1.5 s after STOP arrives: the CLI must outwait it.
+        wait_for_flag(&stop_seen, Duration::from_secs(30));
+        std::thread::sleep(Duration::from_millis(1500));
+        released_by_thread.store(true, Ordering::SeqCst);
+        drop(lock);
+    });
+    let output = run_cli_bounded(&["daemon", "stop"], state.path(), Duration::from_secs(20));
+    let released_when_cli_returned = lock_released.load(Ordering::SeqCst);
+    freer.join().unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "`daemon stop` failed: {stderr}");
+    assert!(
+        released_when_cli_returned,
+        "`daemon stop` returned while the daemon still held the lock"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Daemon stopped."),
+        "stdout was {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(peer.stop_and_join().iter().any(|command| command == "STOP"));
 }
 
 /// A held lock with no record and nothing answering gets a clear message, not
@@ -1893,6 +1952,33 @@ fn scripted_daemon(info: &DaemonInfo) -> impl Fn(&str) -> Vec<u8> + Send + 'stat
     }
 }
 
+/// [`scripted_daemon`] that also raises `stop_seen` the moment it is sent `STOP`,
+/// so a test can release the daemon lock only after the CLI really asked.
+fn scripted_daemon_noting_stop(
+    info: &DaemonInfo,
+    stop_seen: Arc<AtomicBool>,
+) -> impl Fn(&str) -> Vec<u8> + Send + 'static {
+    let inner = scripted_daemon(info);
+    move |command| {
+        if command == "STOP" {
+            stop_seen.store(true, Ordering::SeqCst);
+        }
+        inner(command)
+    }
+}
+
+/// Block until `flag` is raised, failing the test after `budget`.
+fn wait_for_flag(flag: &AtomicBool, budget: Duration) {
+    let started = Instant::now();
+    while !flag.load(Ordering::SeqCst) {
+        assert!(
+            started.elapsed() < budget,
+            "flag not raised within {budget:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// Name of the file whose presence proves a daemon lock was taken.
 #[cfg(unix)]
 fn control_lock_name() -> &'static str {
@@ -2137,6 +2223,50 @@ fn preserve_child_runtime_environment(command: &mut std::process::Command) {
         if let Some(value) = std::env::var_os(key) {
             command.env(key, value);
         }
+    }
+}
+
+/// Run `run_daemon` on its own thread and runtime, for the state directory
+/// named by `HYPERDB_STATE_DIR`. Caller MUST hold `ENV_LOCK`.
+fn spawn_daemon_thread() -> std::thread::JoinHandle<Result<(), String>> {
+    std::thread::spawn(move || -> Result<(), String> {
+        let rt = tokio::runtime::Runtime::new().map_err(|e| format!("rt: {e}"))?;
+        rt.block_on(async {
+            let config = hyperdb_mcp::daemon::run::DaemonConfig {
+                idle_timeout: Some(Duration::from_secs(300)),
+            };
+            hyperdb_mcp::daemon::run::run_daemon(config)
+                .await
+                .map_err(|e| format!("run_daemon: {e}"))
+        })
+    })
+}
+
+/// Wait up to `budget` for a daemon in `state_dir` whose `started_at` differs
+/// from `not_started_at` to become discoverable. Panics with the thread's
+/// error if `handle`'s daemon exits first.
+fn wait_for_new_daemon(
+    handle: &std::thread::JoinHandle<Result<(), String>>,
+    state_dir: &Path,
+    not_started_at: Option<&str>,
+    budget: Duration,
+) -> DaemonInfo {
+    let start = Instant::now();
+    loop {
+        if let Some(info) = discovery::discover_in(state_dir)
+            && Some(info.started_at.as_str()) != not_started_at
+        {
+            return info;
+        }
+        assert!(
+            !handle.is_finished(),
+            "the daemon thread exited before it became discoverable"
+        );
+        assert!(
+            start.elapsed() <= budget,
+            "no new daemon became discoverable within {budget:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -2424,5 +2554,111 @@ impl Drop for EnvGuard {
             // SAFETY: see EnvGuard::set; the guard's owner holds ENV_LOCK.
             None => unsafe { std::env::remove_var(&self.key) },
         }
+    }
+}
+
+// ─── Takeover: a successor starts right behind a STOP ─────────────────────────
+
+/// Two daemons in sequence on ONE state directory. Daemon B is started the
+/// instant `STOP` has been sent to daemon A, while A's `hyperd` is still
+/// winding down. B must wait out A (lock, then `hyperd` socket) within its
+/// `STARTUP_WAIT`, become discoverable with a new `started_at`, serve a query
+/// through its engine, and A's thread must exit cleanly. Without the
+/// lock wait B failed on the lock or the `hyperd` socket pre-flight and no
+/// daemon ran; without the prompt STOP, B is not discoverable within 3 s.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "flaky on macOS CI — daemon startup exceeds 150s timeout"
+)]
+fn a_daemon_started_right_after_stop_takes_over_the_state_directory() {
+    let _lock = acquire_env_lock();
+    let tmp = TempDir::new().unwrap();
+    let state_dir = tmp.path().to_path_buf();
+    let _state_dir_guard = EnvGuard::set("HYPERDB_STATE_DIR", state_dir.to_str().unwrap());
+
+    let daemon_a = spawn_daemon_thread();
+    let info_a = wait_for_new_daemon(&daemon_a, &state_dir, None, Duration::from_secs(150));
+    let endpoint = HealthEndpoint::from_record(&info_a.health_endpoint, &state_dir)
+        .expect("a discovered record names this state directory's endpoint");
+
+    // B must be discoverable well inside the old daemon's 5 s `hyperd_monitor`
+    // poll (measured: ~0.3 s with the prompt STOP, ~5.2 s without it), so this
+    // fails if STOP is only acted on at the next poll.
+    let bound = Duration::from_secs(3);
+    let exit_bound = Duration::from_secs(15);
+    let started = Instant::now();
+    let response = health::send_command(&endpoint, "STOP").expect("STOP reaches daemon A");
+    assert_eq!(response.trim(), "STOPPING");
+    let daemon_b = spawn_daemon_thread();
+
+    let info_b = wait_for_new_daemon(&daemon_b, &state_dir, Some(&info_a.started_at), bound);
+    assert_ne!(info_b.started_at, info_a.started_at);
+
+    // B serves a query through an engine that reached it.
+    let db = tmp.path().join("takeover.hyper");
+    let engine = hyperdb_mcp::engine::Engine::new(Some(db.to_str().unwrap().to_string()))
+        .expect("engine connects to daemon B");
+    let engine_endpoint = engine
+        .hyperd_endpoint()
+        .expect("engine reports its hyperd endpoint")
+        .clone();
+    assert_eq!(
+        engine_endpoint, info_b.hyperd_endpoint,
+        "the engine must be in daemon mode against B, not local mode"
+    );
+    let rows = engine
+        .execute_query_to_json("SELECT 1 AS one")
+        .expect("daemon B serves a query");
+    assert_eq!(rows.len(), 1);
+    drop(engine);
+
+    // A exited cleanly, within the bound.
+    while !daemon_a.is_finished() {
+        assert!(
+            started.elapsed() <= exit_bound,
+            "daemon A did not exit within {exit_bound:?} of STOP"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    daemon_a
+        .join()
+        .expect("daemon A thread must not panic")
+        .expect("daemon A must exit cleanly");
+
+    // Tear B down and wait for its lock, as TestDaemon does.
+    let endpoint_b = HealthEndpoint::from_record(&info_b.health_endpoint, &state_dir).unwrap();
+    let _ = health::send_command(&endpoint_b, "STOP");
+    hyperdb_mcp::daemon::spawn::wait_for_lock_release(&state_dir, Duration::from_secs(15))
+        .expect("daemon B releases the lock after STOP");
+    daemon_b
+        .join()
+        .expect("daemon B thread must not panic")
+        .expect("daemon B must exit cleanly");
+}
+
+/// `STOP` is acted on at once: the record is gone within a second, not at the
+/// next 5 s `hyperd` monitor poll. Measured on the record, because
+/// `run_daemon` itself only returns after `hyperd` has been dropped.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "flaky on macOS CI — daemon startup exceeds 150s timeout"
+)]
+fn stop_removes_the_daemon_record_promptly() {
+    let _lock = acquire_env_lock();
+    let daemon = TestDaemon::start();
+    let record = daemon.state_dir.join("daemon.json");
+    assert!(record.exists(), "a running daemon has a record");
+
+    let sent = Instant::now();
+    health::send_command(&daemon.endpoint, "STOP").expect("STOP reaches the daemon");
+    while record.exists() {
+        assert!(
+            sent.elapsed() < Duration::from_secs(1),
+            "the record was still there {:?} after STOP",
+            sent.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(10));
     }
 }

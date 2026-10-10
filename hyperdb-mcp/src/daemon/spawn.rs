@@ -20,8 +20,16 @@ use super::discovery::{self, DaemonInfo};
 use super::legacy;
 use super::lock::DaemonLock;
 
-/// Maximum time to wait for the daemon to write its discovery file after spawning.
-const SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum time to wait for the daemon to write its discovery file after
+/// spawning. It covers a [`STARTUP_WAIT`](super::run::STARTUP_WAIT) spent
+/// waiting out a predecessor's shutdown plus `hyperd`'s own start.
+const SPAWN_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Maximum time to wait, after sending `STOP`, for the old daemon to let go of
+/// the daemon lock. The lock is released last, after `hyperd` has exited
+/// (`HyperProcess`'s drop takes up to about 5 s), so a free lock means a
+/// successor can start without colliding with it.
+pub const STOP_WAIT: Duration = Duration::from_secs(15);
 
 /// Polling interval while waiting for the discovery file.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -40,7 +48,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// period.
 pub fn ensure_daemon() -> io::Result<DaemonInfo> {
     let dir = discovery::state_dir()?;
-    ensure_daemon_in(&dir, spawn_detached, SPAWN_TIMEOUT, legacy::STOP_WAIT)
+    ensure_daemon_in(&dir, spawn_detached, SPAWN_TIMEOUT, STOP_WAIT)
 }
 
 /// [`ensure_daemon`] for an explicit state directory, spawner and wait budget.
@@ -48,7 +56,7 @@ fn ensure_daemon_in(
     dir: &Path,
     spawn: impl FnOnce() -> io::Result<()>,
     timeout: Duration,
-    legacy_stop_wait: Duration,
+    stop_wait: Duration,
 ) -> io::Result<DaemonInfo> {
     match super::state_perms::verify_state_dir_trusted(dir) {
         Ok(()) => {}
@@ -60,7 +68,7 @@ fn ensure_daemon_in(
     let start = Instant::now();
     loop {
         if let Some(info) = discovery::discover_in(dir) {
-            return maybe_take_over(info, dir);
+            return maybe_take_over(info, dir, spawn, timeout, stop_wait);
         }
 
         // The state directory may not exist yet; the daemon creates it.
@@ -78,7 +86,7 @@ fn ensure_daemon_in(
             // A pre-1.0 daemon holds no lock, so it is retired first; if it
             // will not stop, return without spawning (the caller runs in
             // local mode).
-            legacy::retire_under_lock(dir, legacy_stop_wait)?;
+            legacy::retire_under_lock(dir, stop_wait)?;
             discovery::remove_stale_record(dir);
             drop(lock);
             info!("no running daemon detected, spawning one");
@@ -184,13 +192,62 @@ pub fn client_should_take_over(client_ver: &str, daemon_ver: &str) -> bool {
     client > daemon
 }
 
-/// Decide whether to reuse the running daemon or take it over with a newer version.
-/// If the client is newer, we send STOP to the old daemon, wait for it to stop
-/// answering, then spawn a fresh daemon. Otherwise we reuse the existing daemon.
+/// Wait until nothing holds the daemon lock in `dir`, polling for up to
+/// `timeout`. A missing state directory counts as free.
+///
+/// The daemon releases the lock last, after its record, listener, socket and
+/// `hyperd` are gone, so this is the reliable sign that a daemon has fully
+/// exited.
+///
+/// # Errors
+/// Returns [`io::ErrorKind::TimedOut`] if the lock is still held after
+/// `timeout`, or the error from probing the lock.
+pub fn wait_for_lock_release(dir: &Path, timeout: Duration) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match DaemonLock::try_acquire(dir) {
+            Ok(Some(lock)) => {
+                drop(lock);
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "the daemon in {} still holds its lock {} seconds after STOP",
+                    dir.display(),
+                    timeout.as_secs()
+                ),
+            ));
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Decide whether to reuse the running daemon or take it over with a newer
+/// version. If the client is newer, it sends `STOP` to the old daemon, waits
+/// until the old daemon has released the daemon lock (so its `hyperd` is gone
+/// too), then spawns a fresh daemon. Otherwise the existing daemon is reused.
 ///
 /// The health endpoint is the same for the old and the new daemon (it is derived
-/// from the state directory), so a fresh daemon is told apart by its pid.
-fn maybe_take_over(info: DaemonInfo, dir: &Path) -> io::Result<DaemonInfo> {
+/// from the state directory), so a fresh daemon is told apart by its pid and
+/// start time, and the lock, not the endpoint, says when the old one is gone.
+///
+/// # Errors
+/// If the old daemon still holds the lock after `stop_wait` the takeover gives
+/// up with [`io::ErrorKind::TimedOut`] (the caller then runs in local mode)
+/// rather than reuse a daemon that is shutting down.
+fn maybe_take_over(
+    info: DaemonInfo,
+    dir: &Path,
+    spawn: impl FnOnce() -> io::Result<()>,
+    timeout: Duration,
+    stop_wait: Duration,
+) -> io::Result<DaemonInfo> {
     let client_ver = crate::version::MCP_VERSION;
 
     if !client_should_take_over(client_ver, &info.version) {
@@ -226,44 +283,31 @@ fn maybe_take_over(info: DaemonInfo, dir: &Path) -> io::Result<DaemonInfo> {
     // Send STOP (best-effort; ignore error if daemon is already dying).
     let _ = super::health::send_command(&endpoint, "STOP");
 
-    // Wait for the old daemon to stop answering.
-    let deadline = Instant::now() + SPAWN_TIMEOUT;
-    while Instant::now() < deadline {
-        if super::health::ping_identified(
-            &endpoint,
-            Duration::from_millis(200),
-            Duration::from_millis(200),
-        )
-        .is_none()
-        {
-            // The old daemon is gone, so spawn the new one.
-            //
-            // Another client could observe the same and spawn concurrently.
-            // That is safe: the daemon lock lets exactly one daemon through, the
-            // loser exits (or waits for the winner), and `wait_for_daemon`
-            // converges on whichever daemon won.
-            //
-            // Narrowing that window: if a concurrent takeover has already
-            // published a fresh daemon, adopt it instead of spawning.
-            if let Some(fresh) = discovery::discover_in(dir)
-                && fresh.pid != info.pid
-            {
-                return Ok(fresh);
-            }
-            spawn_detached()?;
-            return wait_for_daemon(dir, SPAWN_TIMEOUT);
-        }
-        std::thread::sleep(POLL_INTERVAL);
+    // Wait for the old daemon to let go of the lock.
+    if let Err(error) = wait_for_lock_release(dir, stop_wait) {
+        warn!(
+            endpoint = %info.health_endpoint,
+            timeout_secs = stop_wait.as_secs(),
+            %error,
+            "old daemon did not exit after STOP, not taking over"
+        );
+        return Err(error);
     }
 
-    // Old daemon didn't die within the deadline — log a warning and reuse it
-    // rather than fail the client.
-    warn!(
-        endpoint = %info.health_endpoint,
-        timeout_secs = SPAWN_TIMEOUT.as_secs(),
-        "old daemon did not stop within timeout, reusing it"
-    );
-    Ok(info)
+    // The old daemon is gone, so spawn the new one.
+    //
+    // Another client could observe the same and spawn concurrently. That is
+    // safe: the daemon lock lets exactly one daemon through, and the loser
+    // waits for the winner (`run_daemon`) or exits. Narrowing that window: if a
+    // concurrent takeover has already published a fresh daemon, adopt it
+    // instead of spawning.
+    if let Some(fresh) = discovery::discover_in(dir)
+        && (fresh.pid != info.pid || fresh.started_at != info.started_at)
+    {
+        return Ok(fresh);
+    }
+    spawn()?;
+    wait_for_daemon(dir, timeout)
 }
 
 #[cfg(test)]
@@ -670,5 +714,151 @@ mod tests {
         assert_eq!(calls.get(), 0, "the spawner must never run");
         assert!(record.exists());
         assert_eq!(stops(&peer.received()), 1);
+    }
+
+    // ─── Takeover waits on the lock ─────────────────────────────────────
+
+    use crate::daemon::health::{DaemonState, HealthListener};
+
+    /// A stand-in for an old daemon: holds the lock, serves the health
+    /// channel, and on `STOP` removes its record, closes the listener and
+    /// (optionally) releases the lock after a pause, as the real one does
+    /// while `hyperd` winds down.
+    struct FakeOldDaemon {
+        state: Arc<DaemonState>,
+        quit: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl FakeOldDaemon {
+        fn start(dir: &Path, release_after: Option<Duration>) -> Self {
+            let lock = DaemonLock::try_acquire(dir)
+                .expect("lock probe")
+                .expect("fresh dir is lockable");
+            let endpoint = HealthEndpoint::for_new_daemon(dir).expect("derive endpoint");
+            let listener = HealthListener::bind(&endpoint).expect("bind fake health listener");
+            let info = DaemonInfo {
+                pid: 1,
+                hyperd_endpoint: "127.0.0.1:1".to_string(),
+                health_endpoint: endpoint.as_str().to_string(),
+                started_at: "2026-01-01T00:00:00Z".to_string(),
+                version: "0.0.1".to_string(),
+            };
+            let record = dir.join("daemon.json");
+            std::fs::write(&record, serde_json::to_vec(&info).expect("serialize")).expect("write");
+
+            let state = Arc::new(DaemonState::new(endpoint));
+            let quit = Arc::new(AtomicBool::new(false));
+            let listener_state = Arc::clone(&state);
+            let listener_thread = std::thread::spawn(move || {
+                listener.run(listener_state, Arc::new(Mutex::new(info)));
+            });
+            let watch_state = Arc::clone(&state);
+            let watch_quit = Arc::clone(&quit);
+            let handle = std::thread::spawn(move || {
+                while !watch_state.should_shutdown() && !watch_quit.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let _ = std::fs::remove_file(&record);
+                let _ = listener_thread.join();
+                match release_after {
+                    Some(pause) => std::thread::sleep(pause),
+                    None => {
+                        while !watch_quit.load(Ordering::SeqCst) {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                }
+                drop(lock);
+            });
+            Self {
+                state,
+                quit,
+                handle: Some(handle),
+            }
+        }
+    }
+
+    impl Drop for FakeOldDaemon {
+        fn drop(&mut self) {
+            self.quit.store(true, Ordering::SeqCst);
+            self.state.request_shutdown();
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    /// The takeover must not spawn while the old daemon still holds the lock
+    /// (its `hyperd` is still exiting). Red if the lock wait is removed: the
+    /// spawner would then see the lock held.
+    #[test]
+    fn takeover_spawns_only_after_the_old_daemon_released_the_lock() {
+        let dir = tempfile::tempdir().expect("state dir");
+        let _old = FakeOldDaemon::start(dir.path(), Some(Duration::from_millis(500)));
+        let calls = Cell::new(0);
+        let lock_was_free = Cell::new(false);
+        let started = Instant::now();
+
+        let error = ensure_daemon_in(
+            dir.path(),
+            || {
+                calls.set(calls.get() + 1);
+                // Probing and dropping the lock here is the check itself.
+                lock_was_free.set(
+                    DaemonLock::try_acquire(dir.path())
+                        .expect("lock probe")
+                        .is_some(),
+                );
+                Ok(())
+            },
+            Duration::from_millis(200),
+            Duration::from_secs(10),
+        )
+        .expect_err("the fake spawner publishes no daemon");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(calls.get(), 1);
+        assert!(
+            lock_was_free.get(),
+            "spawned while the old daemon held the lock"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(500));
+    }
+
+    /// An old daemon that never releases the lock: no spawn, a `TimedOut`
+    /// error (the caller runs in local mode).
+    #[test]
+    fn takeover_gives_up_without_spawning_if_the_lock_stays_held() {
+        let dir = tempfile::tempdir().expect("state dir");
+        let _old = FakeOldDaemon::start(dir.path(), None);
+        let calls = Cell::new(0);
+
+        let error = ensure_daemon_in(
+            dir.path(),
+            counting_spawner(&calls),
+            Duration::from_millis(200),
+            Duration::from_millis(400),
+        )
+        .expect_err("a daemon that keeps the lock must not be replaced");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(calls.get(), 0, "the spawner must never run");
+    }
+
+    #[test]
+    fn wait_for_lock_release_times_out_while_held_and_accepts_a_missing_dir() {
+        let dir = tempfile::tempdir().expect("state dir");
+        let held = DaemonLock::try_acquire(dir.path())
+            .expect("lock probe")
+            .expect("fresh dir is lockable");
+        let error = wait_for_lock_release(dir.path(), Duration::from_millis(200))
+            .expect_err("a held lock must time out");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+
+        drop(held);
+        wait_for_lock_release(dir.path(), Duration::from_millis(200)).expect("free lock");
+        wait_for_lock_release(&dir.path().join("missing"), Duration::from_millis(200))
+            .expect("a missing directory has nothing to wait for");
     }
 }

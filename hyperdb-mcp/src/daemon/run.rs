@@ -243,6 +243,11 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), Box<dyn std::error::
         () = shutdown_signal() => {
             info!("received shutdown signal");
         }
+        // A `STOP` from a client: act now rather than at the next 5 s monitor
+        // poll, so a successor waiting on the lock is not kept waiting.
+        () = state.shutdown_requested() => {
+            info!("shutdown requested");
+        }
     }
     state.request_shutdown();
 
@@ -321,12 +326,9 @@ fn build_params(state_dir: &Path) -> std::io::Result<Parameters> {
     // this block compiles out (`domain_socket_directory` is Unix-only).
     #[cfg(unix)]
     {
-        // Landmine for PR B: the basename here must NOT start with `hyper-`.
-        // `HyperProcess::drop` (`hyperdb-api/src/process.rs`) `remove_dir_all`s
-        // any caller-supplied socket directory whose basename
-        // `starts_with("hyper-")`, treating it as a temp dir it owns. `sockets`
-        // is safe; renaming it to e.g. `hyper-sockets` would make Drop delete
-        // the daemon's persistent state directory contents.
+        // `HyperProcess` tracks whether it created the socket directory
+        // (`owns_socket_directory`) and only removes one it created, so a
+        // caller-supplied `sockets` directory is never deleted on drop.
         let socket_dir = state_dir.join("sockets");
         super::state_perms::ensure_owner_only_dir(&socket_dir)?;
 
@@ -335,12 +337,15 @@ fn build_params(state_dir: &Path) -> std::io::Result<Parameters> {
         // this guard hyperd would die with "unable to listen on domain socket:
         // domain socket is in use" while `HyperProcess::new` masked it as a
         // 60-second "Timeout waiting for Hyper to connect to callback listener".
-        // Reachable only when a previous daemon's hyperd has outlived it
-        // (`build_params_waiting` retries on this). A refused/missing socket
-        // (stale file, dead owner) is fine: proceed and let hyperd's pid-liveness staleness check reclaim it. This
-        // keeps the crash-restart path safe: `try_restart_hyperd` reaps the
-        // SIGKILLed child (`guard.hyper = None`) before calling `build_params`,
-        // so here the connect is refused and we proceed to rebind.
+        // Reachable whenever a previous daemon's hyperd has not exited yet:
+        // a takeover or a manual start right after a `STOP`, or two daemons
+        // racing for the same state directory (`build_params_waiting` retries
+        // on this within `STARTUP_WAIT`). A refused/missing socket (stale file,
+        // dead owner) is fine: proceed and let hyperd's pid-liveness staleness
+        // check reclaim it. This keeps the crash-restart path safe:
+        // `try_restart_hyperd` reaps the SIGKILLed child (`guard.hyper = None`)
+        // before calling `build_params`, so there the connect is refused and
+        // we proceed to rebind.
         let socket_path = socket_dir.join("hyper");
         if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
             return Err(std::io::Error::new(

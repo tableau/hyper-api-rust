@@ -406,8 +406,9 @@ different ports is wrong.
    `request_shutdown` calls `notify_one()` (which stores a permit, so a STOP
    that lands before the branch is polled is not lost). `run_daemon`'s
    `select!` gets a branch awaiting it. Shutdown then runs immediately:
-   remove the record, join the listener, drop hyperd (`HyperProcess::drop`,
-   up to about 5.1 s), remove the socket file, and only then drop the lock.
+   remove the record, join the listener (which removes the health socket),
+   drop hyperd (`HyperProcess::drop`, up to about 5.1 s), and only then drop
+   the lock.
 2. **Whoever sends STOP waits for the lock.** `maybe_take_over` and
    `hyperdb-mcp daemon stop` send `STOP` and then wait until the lock is free
    (the old daemon and its hyperd are gone), bounded by `STOP_WAIT` = 15 s.

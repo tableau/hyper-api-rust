@@ -64,6 +64,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Version takeover starts the new daemon reliably.** A newer client used to
+  spawn the replacement as soon as the old daemon's health channel went quiet,
+  while the old `hyperd` still held its socket; the new daemon then died
+  silently and clients ran in local mode with no daemon at all. The old daemon
+  now shuts down immediately on `STOP` instead of at its next 5 s poll, the
+  takeover waits until the old daemon has released the daemon lock, and
+  `SPAWN_TIMEOUT` rises from 10 s to 20 s. Behaviour change: a takeover that
+  times out (15 s) waiting for the old daemon to exit now falls back to local
+  mode instead of reusing the dying daemon.
+- **`hyperdb-mcp daemon stop` waits for the daemon to exit**, and reports an
+  error if it is still running 15 s after acknowledging `STOP`, instead of
+  returning as soon as the daemon replied.
+- **A daemon that fails to start now says why.** The reason is logged to
+  `hyperdb-daemon.log` (a spawned daemon's stderr is discarded), and a client
+  falling back to local mode logs it at `warn` instead of `debug`.
 - **`query_data`, `query_file` and `export` now accept only read-only SQL**,
   with or without `--read-only`. They used to run any statement, so
   `query_data(sql: "DROP TABLE persistent.public.t")` dropped a persistent

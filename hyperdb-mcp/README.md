@@ -286,7 +286,7 @@ The daemon is normally invisible — it auto-spawns on first use and stays resid
 
 ```bash
 hyperdb-mcp daemon status   # Show running daemon (PID, endpoint, started_at, version)
-hyperdb-mcp daemon stop     # Gracefully shut down the daemon
+hyperdb-mcp daemon stop     # Gracefully shut down the daemon (returns once it has fully exited)
 hyperdb-mcp daemon          # Run as a daemon explicitly (rarely needed)
 ```
 

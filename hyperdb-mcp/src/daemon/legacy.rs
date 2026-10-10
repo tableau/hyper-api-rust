@@ -23,7 +23,7 @@
 //! record is stale.
 //!
 //! Caveats, accepted: a legacy daemon that ignores `STOP` costs up to
-//! [`STOP_WAIT`] and another `STOP` on every client start until it exits; the
+//! [`STOP_WAIT`](super::spawn::STOP_WAIT) and another `STOP` on every client start until it exits; the
 //! old daemon removes its own record during its shutdown, which can race this
 //! module's removal (harmless, both only delete the same legacy file); each
 //! command uses its own connection; a probe costs about a second at worst; and
@@ -43,9 +43,6 @@ use tracing::{info, warn};
 
 use super::discovery;
 use super::health::PONG_TOKEN;
-
-/// How long to wait, after `STOP`, for the old daemon's port to stop answering.
-pub(super) const STOP_WAIT: Duration = Duration::from_secs(15);
 
 /// Budget for one probe (connect, or the whole request/reply exchange).
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);

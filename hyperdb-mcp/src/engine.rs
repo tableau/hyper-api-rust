@@ -610,7 +610,7 @@ impl Engine {
         let info = match daemon::spawn::ensure_daemon() {
             Ok(info) => info,
             Err(e) => {
-                tracing::debug!(error = %e, "daemon unavailable, falling back to local mode");
+                tracing::warn!(error = %e, "daemon unavailable, falling back to local mode");
                 return Ok(None);
             }
         };
