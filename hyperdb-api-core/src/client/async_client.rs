@@ -456,7 +456,6 @@ impl AsyncClient {
     pub async fn cancel(&self) -> Result<()> {
         use crate::protocol::message::frontend;
         use bytes::BytesMut;
-        use tokio::io::AsyncWriteExt;
 
         info!(
             target: "hyperdb_api",
@@ -478,6 +477,8 @@ impl AsyncClient {
             }
             #[cfg(unix)]
             ConnectionEndpoint::DomainSocket { directory, name } => {
+                use tokio::io::AsyncWriteExt;
+
                 let socket_path = directory.join(name);
                 let mut stream = UnixStream::connect(&socket_path).await.map_err(|e| {
                     warn!(
