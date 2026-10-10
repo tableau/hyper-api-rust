@@ -237,35 +237,43 @@ existing daemon via `~/.hyperdb/daemon.json` (overridable via
 `HYPERDB_STATE_DIR` — see `daemon::state_perms`, which restricts that directory
 and the files in it to the owning user, and which needs the override to name a
 path that can carry those permissions: inside `%USERPROFILE%` on Windows, on a
-mode-supporting filesystem on Unix), else scans the port range for a running
-daemon, else
-auto-spawns one on the first free port as a detached background process. The
-Engine then connects via TCP (`Connection::connect(endpoint, …)`) without
-owning any `HyperProcess`, and records the daemon's `health_port` so the
-server's debounced `HEARTBEAT` targets the actual discovered port rather than
-re-resolving.
+mode-supporting filesystem on Unix), else auto-spawns one as a detached
+background process. The Engine then connects via TCP
+(`Connection::connect(endpoint, …)`) without owning any `HyperProcess`, and
+records the daemon's `health_endpoint` so the server's debounced `HEARTBEAT`
+targets the discovered endpoint rather than re-resolving.
 
-Falls back to local mode (per-session `hyperd` via `HyperProcess::new`) when the daemon can't be reached (including `AllOccupied` — the whole scan range is held by foreign processes), or always when `--no-daemon` is passed.
+Falls back to local mode (per-session `hyperd` via `HyperProcess::new`) when the daemon can't be reached (including a state directory that is not owned by the user or is group/other-writable), or always when `--no-daemon` is passed.
 
-**Port resolution + identity.** `resolve_port_scan()` returns a
-`PortScan { base, span }`: when `HYPERDB_DAEMON_PORT` is set it pins that exact
-port (`span = 1`); otherwise it scans `span = DAEMON_PORT_SCAN_SPAN` (16) ports
-up from `DEFAULT_DAEMON_BASE_PORT` (7485 — deliberately *not* 7484, which is
-hyperd's conventional gRPC port). `probe_port` classifies each port as
-`OurDaemon` / `Camped` / `Refused`: liveness is no longer a bare TCP connect
-but an identity handshake — `health::ping_identified` sends `PING` and requires
-the reply's first two tokens to be exactly `PONG` and `hyperdb-mcp` (the third
-token is the daemon version). A foreign process that merely accepts TCP is
-`Camped` and skipped; only a `Refused` (connection-refused) port is treated as
-free to spawn on. `discover()` applies the same identity check before trusting
-`daemon.json`, so a stale or foreign-owned file is detected and removed.
+**Health channel + identity.** The health channel is not a TCP port. It is
+`<state dir>/daemon.sock` (Unix, mode `0600`) or a per-user named pipe
+(Windows), implemented in `daemon::control` (`HealthEndpoint`,
+`ControlListener`, `ControlStream`, `connect`). `daemon.json` carries it as
+`health_endpoint`; a client accepts the recorded value only if
+`HealthEndpoint::from_record` finds it equals the endpoint its own state
+directory implies, so a tampered record can never redirect it. Liveness is an
+identity handshake: `health::ping_identified` sends `PING` and requires the
+reply's first two tokens to be exactly `PONG` and `hyperdb-mcp` (the third is
+the daemon version). `discover()` is a pure read (record + identified `PING`);
+stale-record removal lives in `ensure_daemon`, under the lock.
+
+**Single instance.** `daemon::lock::DaemonLock` is an `flock` (Windows: a locked
+file region) on `<state dir>/daemon.lock`, never unlinked. `run_daemon` creates
+and checks the state directory (`state_perms::verify_state_dir_trusted`: owned
+by the effective user, no group/other write), takes the lock (retrying up to
+`STARTUP_WAIT`; a daemon that answers an identified `PING` continuously for
+`ALREADY_RUNNING_DEBOUNCE` is reported as already running), binds the endpoint,
+starts `hyperd`, then writes the record. On exit it removes the record, joins
+the listener, drops `hyperd`, then releases the lock. `ensure_daemon` therefore
+treats a held lock with no usable record as "a daemon is starting" and waits;
+it spawns only when the lock is free, after removing any stale record.
 
 **Version takeover.** When discovery finds a running daemon, `maybe_take_over`
 compares the client's `version::MCP_VERSION` against the daemon's reported
 version via the pure `client_should_take_over` helper (`semver`). If the client
 is *strictly newer* it sends `STOP` (which drops the daemon's `HyperProcess`,
-stopping `hyperd`), waits for the health port to stop answering the identity
-ping, then respawns a fresh daemon on the same port. Equal/older/unparseable
+stopping `hyperd`), waits for the health endpoint to stop answering the identity
+ping, then respawns a fresh daemon on the same endpoint. Equal/older/unparseable
 versions reuse the daemon — never a downgrade-kill. This makes upgrades take
 effect immediately instead of waiting for the old daemon to disappear.
 
@@ -281,7 +289,7 @@ and only matter when the timeout is enabled. The hyperd restart-limit shutdown
 
 ### hyperd liveness monitoring and restart
 
-A second monitor task in `run.rs::hyperd_monitor` polls the owned `HyperProcess` every 5 seconds via `HyperProcess::has_exited` (a `Child::try_wait()` call — zero SQL, correct on Unix and Windows, reaps zombies as a side effect). When the process is detected dead — or when a client sends `REPORT_HYPERD_ERROR` to the health port via `daemon::health::report_hyperd_error_to_daemon` — the monitor enters `try_restart_hyperd`:
+A second monitor task in `run.rs::hyperd_monitor` polls the owned `HyperProcess` every 5 seconds via `HyperProcess::has_exited` (a `Child::try_wait()` call — zero SQL, correct on Unix and Windows, reaps zombies as a side effect). When the process is detected dead — or when a client sends `REPORT_HYPERD_ERROR` to the health endpoint via `daemon::health::report_hyperd_error_to_daemon` — the monitor enters `try_restart_hyperd`:
 
 1. Prune the rolling restart-history vector to entries within `RESTART_WINDOW` (60s); reject if `RESTART_LIMIT` (3) attempts have already happened.
 2. Drop the old `HyperProcess` (its `Drop` impl waits up to 5s for graceful shutdown — near-instant for an already-exited process).

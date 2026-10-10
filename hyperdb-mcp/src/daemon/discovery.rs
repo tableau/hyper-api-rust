@@ -3,9 +3,12 @@
 
 //! Discovery file management for the single-instance daemon.
 //!
-//! The daemon writes a JSON file to `~/.hyperdb/daemon.json` containing its
-//! PID and the `hyperd` endpoint. Clients read this file to locate the running
-//! daemon, validating liveness via a TCP health check before trusting it.
+//! The daemon writes a JSON file to `<state dir>/daemon.json` (by default
+//! `~/.hyperdb/daemon.json`) containing its PID, the `hyperd` endpoint and its
+//! health endpoint. Clients read this file to locate the running daemon,
+//! validating liveness via an identified `PING` on the health endpoint before
+//! trusting it. The file is a locator, not a lock: whether a daemon is running
+//! is decided by [`super::lock::DaemonLock`].
 
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
@@ -13,7 +16,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::{DAEMON_PORT_SCAN_SPAN, DEFAULT_DAEMON_BASE_PORT};
+use super::control::HealthEndpoint;
 
 const MAX_DISCOVERY_FILE_BYTES: usize = 64 * 1024;
 
@@ -24,8 +27,11 @@ pub struct DaemonInfo {
     pub pid: u32,
     /// The `hyperd` libpq endpoint clients should connect to (e.g. `127.0.0.1:54321`).
     pub hyperd_endpoint: String,
-    /// The TCP port the daemon's health listener is bound to.
-    pub health_port: u16,
+    /// Where the daemon's health listener is bound: a Unix socket path, or a
+    /// named-pipe name on Windows. Clients accept it only if it is the
+    /// endpoint their own state directory implies (see
+    /// [`HealthEndpoint::from_record`]).
+    pub health_endpoint: String,
     /// ISO-8601 timestamp when the daemon started.
     pub started_at: String,
     /// Version of the daemon binary.
@@ -318,9 +324,28 @@ fn write_discovery_record(record: &(impl Serialize + ?Sized)) -> io::Result<()> 
 }
 
 /// Read the discovery file and validate that the daemon is still alive.
-/// Returns `None` if no daemon is running (file missing, stale, or unreachable).
+/// Returns `None` if no daemon is running (file missing, state directory not
+/// trusted, health endpoint not the one this state directory implies, or the
+/// daemon does not answer an identified `PING`).
+///
+/// Side-effect free: a stale record is left for `remove_stale_record`, which
+/// runs under the daemon lock where it cannot race a starting daemon.
 pub fn discover() -> Option<DaemonInfo> {
-    let discovery_path = discovery_file_path().ok()?;
+    discover_in(&state_dir().ok()?)
+}
+
+/// [`discover`] for an explicit state directory.
+pub fn discover_in(dir: &Path) -> Option<DaemonInfo> {
+    // A state directory another user can write to could hold a record that
+    // points this client at an endpoint of someone else's choosing.
+    match super::state_perms::verify_state_dir_trusted(dir) {
+        Ok(()) => {}
+        Err(error) => {
+            tracing::debug!(kind = ?error.kind(), "daemon state directory is not usable for discovery");
+            return None;
+        }
+    }
+    let discovery_path = dir.join("daemon.json");
     // Preserve the historical client-discovery contract: normal discovery
     // follows symlinks and accepts any valid record size. Doctor uses the
     // separate bounded, no-follow raw reader above because it must never
@@ -329,16 +354,12 @@ pub fn discover() -> Option<DaemonInfo> {
     // The `RawDiscoveryRead` classification below chooses a debug-log message
     // and short-circuits a missing/unreadable file. It must never gate whether
     // a *live* daemon is discovered: an unrecognized, reshaped, or absent
-    // `identity` block is forward-compatible noise to this fast path — see
-    // docs/superpowers/specs/2026-08-13-hyperdb-mcp-agent-ux-design.md
-    // ("Unknown fields remain forward compatible"). So when the strict
-    // `DaemonRecord` parse fails, we don't give up: we re-parse the bytes the
-    // classification already carries as a tolerant `DaemonInfo`, which ignores
-    // unknown fields and never fails on a nested object (like `identity`) that
-    // this fast path doesn't need. (The doctor's raw reader keeps the strict
-    // `DaemonRecord` contract because it deliberately wants to know about a
-    // malformed `identity` block.)
-    let (info, from_fallback) = match read_discovery_file_legacy(&discovery_path) {
+    // `identity` block is forward-compatible noise to this fast path (see
+    // docs/superpowers/specs/2026-08-13-hyperdb-mcp-agent-ux-design.md,
+    // "Unknown fields remain forward compatible"). So when the strict
+    // `DaemonRecord` parse fails, re-parse the bytes the classification already
+    // carries as a tolerant `DaemonInfo`, which ignores unknown fields.
+    let info = match read_discovery_file_legacy(&discovery_path) {
         RawDiscoveryRead::Missing { path } => {
             tracing::debug!(encoding = ?path.encoding, "daemon discovery file is missing");
             return None;
@@ -349,48 +370,47 @@ pub fn discover() -> Option<DaemonInfo> {
         }
         // `read_discovery_file_legacy` applies no size cap, so it does not
         // produce `Oversized` today. Folding it in with `Malformed` keeps that
-        // from mattering: were this reader ever given a cap, a large-but-valid
-        // record would take the tolerant fallback rather than silently
-        // becoming an undiscoverable daemon — the exact defect this fallback
-        // exists to prevent.
+        // from mattering.
         RawDiscoveryRead::Oversized { path, contents }
         | RawDiscoveryRead::Malformed { path, contents } => {
             let Ok(info) = serde_json::from_slice::<DaemonInfo>(contents.as_slice()) else {
                 tracing::debug!(encoding = ?path.encoding, "daemon discovery file is malformed");
                 return None;
             };
-            tracing::debug!(encoding = ?path.encoding, "daemon discovery file failed the strict parse; accepted as legacy DaemonInfo");
-            (info, true)
+            tracing::debug!(encoding = ?path.encoding, "daemon discovery file failed the strict parse; accepted as DaemonInfo");
+            info
         }
         RawDiscoveryRead::Parsed { path, record } => {
             tracing::debug!(encoding = ?path.encoding, "daemon discovery file parsed (enriched)");
-            (record.info().clone(), false)
+            record.info().clone()
         }
     };
 
-    // Validate liveness by connecting to the health port
-    if is_daemon_alive(info.health_port) {
-        return Some(info);
+    let endpoint = HealthEndpoint::from_record(&info.health_endpoint, dir)?;
+    if is_daemon_alive(&endpoint) {
+        Some(info)
+    } else {
+        None
     }
+}
 
-    if from_fallback {
-        // Never stale-clean a record we could not strictly parse. This branch
-        // exists precisely because a *newer* daemon may write a record this
-        // client cannot fully understand, and a single failed 300 ms PING is
-        // not grounds for destroying it: the daemon rewrites `daemon.json`
-        // only on `hyperd` restart, so deleting here would hide a live newer
-        // daemon from every client, not just this one. Leaving it also keeps
-        // the promise doctor already makes to operators about a record it
-        // could not parse ("it was left unchanged").
-        tracing::debug!(
-            "leaving the leniently parsed discovery record in place after a failed health check"
-        );
-        return None;
+/// Delete a daemon record that a dead daemon left behind.
+///
+/// The caller must hold the [`DaemonLock`](super::lock::DaemonLock) for
+/// `dir`: a held lock proves no daemon of this shape is running, and holding
+/// it keeps one from starting while the record is judged. Only a record of the
+/// current shape (it carries `health_endpoint`) is removed. A record in
+/// another shape may belong to a daemon from a release that does not take the
+/// lock, and is left alone.
+pub(super) fn remove_stale_record(dir: &Path) {
+    let path = dir.join("daemon.json");
+    // `Parsed` requires `health_endpoint`, which no earlier shape carries.
+    if matches!(
+        read_discovery_file_raw(&path),
+        RawDiscoveryRead::Parsed { .. }
+    ) {
+        let _ = std::fs::remove_file(&path);
     }
-
-    // Stale file — daemon crashed. Clean up.
-    let _ = std::fs::remove_file(&discovery_path);
-    None
 }
 
 /// Remove the discovery file (called during graceful shutdown).
@@ -400,57 +420,15 @@ pub fn remove_discovery_file() {
     }
 }
 
-/// Check if the daemon is alive by sending PING and verifying the identifying token.
-/// No longer accepts a bare TCP connect (prevents collisions with foreign services).
-fn is_daemon_alive(port: u16) -> bool {
-    super::health::ping_identified(port, Duration::from_millis(300), Duration::from_millis(300))
-        .is_some()
-}
-
-/// Port scan configuration: a base port and the number of ports to scan.
-/// When `span == 1`, the port is pinned (no scan). Used by the later
-/// port-scanning stage to discover or spawn a daemon across a range.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PortScan {
-    pub base: u16,
-    pub span: u16,
-}
-
-/// Resolve the daemon health port scan configuration from environment or default.
-/// If `HYPERDB_DAEMON_PORT` is set and valid, returns a pinned scan (span=1) at
-/// that exact port. Otherwise, returns the default base port with the full scan span.
-///
-/// `0` is not a valid value here even though `"0".parse::<u16>()` succeeds, and
-/// is rejected into the same default fallback as unparseable input. A pinned
-/// `PortScan { base: 0, span: 1 }` is unsatisfiable by construction: `bind`
-/// would take an OS-assigned *ephemeral* port rather than port 0, while every
-/// client's scan would keep probing port 0, get a connection error, and read
-/// `ProbeResult::Refused` as "free" — so each client that missed the discovery
-/// fast path would spawn another daemon-and-`hyperd` pair on another ephemeral
-/// port that no scan can find, accumulating them silently.
-pub fn resolve_port_scan() -> PortScan {
-    if let Some(port) = std::env::var(super::ENV_DAEMON_PORT)
-        .ok()
-        .and_then(|v| v.parse::<u16>().ok())
-        .filter(|port| *port != 0)
-    {
-        PortScan {
-            base: port,
-            span: 1,
-        }
-    } else {
-        PortScan {
-            base: DEFAULT_DAEMON_BASE_PORT,
-            span: DAEMON_PORT_SCAN_SPAN,
-        }
-    }
-}
-
-/// Resolve the daemon health port from environment or default. Back-compat
-/// wrapper for single-port callers; returns the base port from [`resolve_port_scan`].
-/// New code that needs scan-aware logic should call [`resolve_port_scan`] directly.
-pub fn resolve_port() -> u16 {
-    resolve_port_scan().base
+/// Check if the daemon is alive by sending PING and verifying the identifying
+/// token. Connecting alone is not enough: any program can hold a socket.
+fn is_daemon_alive(endpoint: &HealthEndpoint) -> bool {
+    super::health::ping_identified(
+        endpoint,
+        Duration::from_millis(300),
+        Duration::from_millis(300),
+    )
+    .is_some()
 }
 
 /// Cross-platform home directory resolution.
@@ -475,108 +453,6 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Result of probing a single port: either our daemon, something else, or refused.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProbeResult {
-    /// A hyperdb-mcp daemon answered with valid STATUS.
-    OurDaemon(Box<DaemonInfo>),
-    /// The port accepted TCP but isn't our daemon (foreign service or broken STATUS).
-    Camped,
-    /// Connection refused (port is free).
-    Refused,
-}
-
-/// Probe a single port to determine if it's occupied by our daemon, a foreign service, or free.
-fn probe_port(port: u16) -> ProbeResult {
-    let ping_timeout = Duration::from_millis(300);
-
-    if let Some(_version) = super::health::ping_identified(port, ping_timeout, ping_timeout) {
-        // PING succeeded — something is answering with our token. Now send STATUS
-        // to retrieve the full daemon info. If STATUS fails we can't trust this
-        // process (might be a test stub or a broken daemon), so treat it as Camped.
-        match super::health::send_command_with_timeout(port, "STATUS", ping_timeout, ping_timeout) {
-            Ok(response) => {
-                if let Ok(info) = serde_json::from_str::<DaemonInfo>(response.trim()) {
-                    ProbeResult::OurDaemon(Box::new(info))
-                } else {
-                    // Parsed PING but STATUS is malformed — treat as Camped.
-                    ProbeResult::Camped
-                }
-            }
-            Err(_) => ProbeResult::Camped,
-        }
-    } else {
-        // PING failed or returned no identifying token. Distinguish "refused"
-        // from "camped non-daemon" via a raw TCP connect attempt.
-        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-        match std::net::TcpStream::connect_timeout(&addr, ping_timeout) {
-            Ok(_) => ProbeResult::Camped, // TCP accepted but PING failed → foreign
-            Err(_) => ProbeResult::Refused, // Connection refused → port is free
-        }
-    }
-}
-
-/// The outcome of scanning a port range for a running daemon or a free port to spawn on.
-#[derive(Debug)]
-pub enum ScanOutcome {
-    /// Found a running hyperdb-mcp daemon.
-    Found(Box<DaemonInfo>),
-    /// No daemon found, but this port is free (can spawn here).
-    FreePort(u16),
-    /// All ports in the range are occupied (either by our daemon, foreign services, or both).
-    AllOccupied,
-}
-
-/// Scan the configured port range to find a running daemon or identify a free port.
-/// If any port in the range answers identified-PING and returns valid STATUS, we return
-/// `Found` immediately (first wins). Otherwise, we return `FreePort` with the first
-/// refused port encountered, or `AllOccupied` if everything is in use.
-///
-/// Product decision: prefer finding an existing daemon anywhere in range over
-/// spawning a new one. Only spawn if no daemon exists.
-pub fn scan_for_daemon(scan: PortScan) -> ScanOutcome {
-    let mut first_free: Option<u16> = None;
-
-    for offset in 0..scan.span {
-        let Some(port) = scan.base.checked_add(offset) else {
-            break; // Overflow guard: stop at u16::MAX
-        };
-
-        match probe_port(port) {
-            ProbeResult::OurDaemon(info) => {
-                // Found a running daemon — return immediately.
-                return ScanOutcome::Found(info);
-            }
-            ProbeResult::Refused => {
-                // Port is free. Remember the first one we see.
-                if first_free.is_none() {
-                    first_free = Some(port);
-                }
-            }
-            ProbeResult::Camped => {
-                // Port is occupied by something else. Keep scanning.
-            }
-        }
-    }
-
-    // No daemon found. Return the first free port, or AllOccupied if none.
-    match first_free {
-        Some(port) => ScanOutcome::FreePort(port),
-        None => ScanOutcome::AllOccupied,
-    }
-}
-
-/// Discover a running daemon via the discovery file, or by scanning the configured
-/// port range. Returns `None` if no daemon is found in either place.
-///
-/// Used by CLI commands (status/stop) that want to find a daemon but not spawn one.
-pub fn find_running_daemon() -> Option<DaemonInfo> {
-    discover().or_else(|| match scan_for_daemon(resolve_port_scan()) {
-        ScanOutcome::Found(info) => Some(*info),
-        _ => None,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::ffi::{OsStr, OsString};
@@ -595,7 +471,7 @@ mod tests {
         DaemonInfo {
             pid: 4242,
             hyperd_endpoint: "127.0.0.1:54321".to_string(),
-            health_port: 7485,
+            health_endpoint: "/run/hyperdb/daemon.sock".to_string(),
             started_at: "2026-08-13T12:34:56Z".to_string(),
             version: "0.7.0".to_string(),
         }
@@ -691,7 +567,7 @@ mod tests {
         let old_wire = json!({
             "pid": 4242,
             "hyperd_endpoint": "127.0.0.1:54321",
-            "health_port": 7485,
+            "health_endpoint": "/run/hyperdb/daemon.sock",
             "started_at": "2026-08-13T12:34:56Z",
             "version": "0.7.0"
         });
@@ -702,7 +578,7 @@ mod tests {
         let expected_new_wire = json!({
             "pid": 4242,
             "hyperd_endpoint": "127.0.0.1:54321",
-            "health_port": 7485,
+            "health_endpoint": "/run/hyperdb/daemon.sock",
             "started_at": "2026-08-13T12:34:56Z",
             "version": "0.7.0",
             "identity": {
@@ -788,22 +664,79 @@ mod tests {
         );
     }
 
-    /// Exercises the actual scan, health check, and cleanup logic across a
-    /// process boundary so `discover()`'s `HYPERDB_STATE_DIR` env override
-    /// can't race other tests in this binary.
-    fn run_identity_forward_compat_scenario() {
-        assert!(
-            std::env::var_os("HYPERDB_STATE_DIR").is_some(),
-            "child scenario requires an isolated state directory"
-        );
+    /// A live daemon: a real `HealthListener` on a state directory's endpoint.
+    struct LiveDaemon {
+        state: Arc<DaemonState>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
 
+    impl LiveDaemon {
+        fn start(dir: &Path, info: &DaemonInfo) -> Self {
+            // Serve exactly the endpoint the record names: deriving a second
+            // endpoint here would mint a different random pipe name on Windows.
+            let endpoint = HealthEndpoint::from_record(&info.health_endpoint, dir)
+                .expect("record names the endpoint of its own state directory");
+            let listener = HealthListener::bind(&endpoint).unwrap();
+            let state = Arc::new(DaemonState::new(endpoint));
+            let info = Arc::new(Mutex::new(info.clone()));
+            let run_state = Arc::clone(&state);
+            let thread = std::thread::spawn(move || listener.run(run_state, info));
+            Self {
+                state,
+                thread: Some(thread),
+            }
+        }
+
+        fn stop(&mut self) {
+            self.state.request_shutdown();
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    impl Drop for LiveDaemon {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+
+    /// A per-test state directory short enough for a Unix socket path.
+    fn short_state_dir() -> TempDir {
+        TempDir::new().unwrap()
+    }
+
+    /// Info whose `health_endpoint` is the endpoint `dir` implies.
+    fn info_for(dir: &Path, pid: u32) -> DaemonInfo {
+        DaemonInfo {
+            pid,
+            health_endpoint: HealthEndpoint::for_new_daemon(dir)
+                .unwrap()
+                .as_str()
+                .to_string(),
+            ..legacy_info()
+        }
+    }
+
+    fn wire_of(info: &DaemonInfo, identity: &Value) -> Value {
+        json!({
+            "pid": info.pid,
+            "hyperd_endpoint": info.hyperd_endpoint,
+            "health_endpoint": info.health_endpoint,
+            "started_at": info.started_at,
+            "version": info.version,
+            "identity": identity,
+        })
+    }
+
+    #[test]
+    fn discover_tolerates_forward_incompatible_identity_shapes() {
         // Three real-world shapes a client fast path must still discover a
         // live daemon through, per the forward-compatibility contract in
         // docs/superpowers/specs/2026-08-13-hyperdb-mcp-agent-ux-design.md
         // ("Unknown fields remain forward compatible"). None of these is
         // valid input for `DaemonBuildIdentity`, so a strict `DaemonRecord`
-        // parse of the whole file must fail for every one of them — that's
-        // asserted below as the fixture sanity check.
+        // parse must fail for every one of them (fixture sanity check).
         let shapes: [(&str, Value); 3] = [
             ("identity retyped as a string", json!("not-an-object")),
             (
@@ -821,24 +754,10 @@ mod tests {
 
         let mut failures = Vec::new();
         for (index, (label, identity_json)) in shapes.into_iter().enumerate() {
+            let tmp = short_state_dir();
             let pid = 9_000 + u32::try_from(index).expect("fixture index fits in u32");
-            let health_listener = HealthListener::bind(0).unwrap();
-            let info = DaemonInfo {
-                pid,
-                hyperd_endpoint: "127.0.0.1:54321".to_string(),
-                health_port: health_listener.port,
-                started_at: "2026-08-13T12:34:56Z".to_string(),
-                version: "0.7.0".to_string(),
-            };
-
-            let wire = json!({
-                "pid": info.pid,
-                "hyperd_endpoint": info.hyperd_endpoint,
-                "health_port": info.health_port,
-                "started_at": info.started_at,
-                "version": info.version,
-                "identity": identity_json,
-            });
+            let info = info_for(tmp.path(), pid);
+            let wire = wire_of(&info, &identity_json);
 
             if serde_json::from_value::<DaemonRecord>(wire.clone()).is_ok() {
                 failures.push(format!(
@@ -846,32 +765,24 @@ mod tests {
                      it no longer exercises the forward-compatibility regression"
                 ));
             }
+            std::fs::write(
+                tmp.path().join("daemon.json"),
+                serde_json::to_vec(&wire).unwrap(),
+            )
+            .unwrap();
 
-            std::fs::create_dir_all(state_dir().unwrap()).unwrap();
-            let path = discovery_file_path().unwrap();
-            std::fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
-
-            let health_state = Arc::new(DaemonState::new());
-            let health_info = Arc::new(Mutex::new(info.clone()));
-            let run_state = Arc::clone(&health_state);
-            let run_info = Arc::clone(&health_info);
-            let health_server =
-                std::thread::spawn(move || health_listener.run(run_state, run_info));
-
-            match discover() {
+            let mut daemon = LiveDaemon::start(tmp.path(), &info);
+            match discover_in(tmp.path()) {
                 Some(discovered) if discovered == info => {}
                 Some(other) => failures.push(format!(
-                    "{label}: discover() returned different facts than the live daemon: {other:?}"
+                    "{label}: discover_in returned different facts than the live daemon: {other:?}"
                 )),
                 None => failures.push(format!(
-                    "{label}: discover() returned None for a live, healthy daemon whose only \
+                    "{label}: discover_in returned None for a live, healthy daemon whose only \
                      defect is an unrecognized `identity` block"
                 )),
             }
-
-            health_state.request_shutdown();
-            health_server.join().unwrap();
-            let _ = std::fs::remove_file(&path);
+            daemon.stop();
         }
 
         assert!(
@@ -881,133 +792,112 @@ mod tests {
         );
     }
 
+    /// `discover_in` never mutates: a stale record (nothing listening) is left
+    /// in place for `remove_stale_record`, which runs under the daemon lock.
     #[test]
-    fn discover_tolerates_forward_incompatible_identity_shapes() {
-        const CHILD_SENTINEL_ENV: &str = "HYPERDB_MCP_IDENTITY_FORWARD_COMPAT_CHILD";
-        const TEST_NAME: &str =
-            "daemon::discovery::tests::discover_tolerates_forward_incompatible_identity_shapes";
+    fn discover_in_leaves_a_stale_record_alone() {
+        let tmp = short_state_dir();
+        let info = info_for(tmp.path(), 9_101);
+        write_record_for_test(tmp.path(), &info);
+        let path = tmp.path().join("daemon.json");
+        let before = std::fs::read(&path).unwrap();
 
-        let _process_guard = crate::diagnostics::real_network_test_guard();
-        if let Some(marker) = std::env::var_os(CHILD_SENTINEL_ENV) {
-            std::fs::write(std::path::PathBuf::from(marker), b"started").unwrap();
-            run_identity_forward_compat_scenario();
-            return;
-        }
-        run_discovery_compatibility_child(TEST_NAME, CHILD_SENTINEL_ENV);
+        assert!(discover_in(tmp.path()).is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
-    /// Returns a port that nothing is listening on, by binding one and
-    /// releasing it immediately. Anything that later camps on it still fails
-    /// `ping_identified` (no PONG token), so the port reads as dead either way.
-    fn released_port() -> u16 {
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        listener.local_addr().unwrap().port()
+    fn write_record_for_test(dir: &Path, info: &DaemonInfo) {
+        std::fs::write(
+            dir.join("daemon.json"),
+            serde_json::to_vec_pretty(info).unwrap(),
+        )
+        .unwrap();
     }
 
-    fn run_lenient_stale_cleanup_scenario() {
-        assert!(
-            std::env::var_os("HYPERDB_STATE_DIR").is_some(),
-            "child scenario requires an isolated state directory"
-        );
-
-        let path = discovery_file_path().unwrap();
-        let mut failures = Vec::new();
-
-        // A record whose `identity` block this client cannot understand, but
-        // whose legacy fields are perfectly readable — exactly what a *newer*
-        // daemon looks like to an older client, which is the only reason the
-        // lenient fallback exists.
-        let lenient_wire = json!({
-            "pid": 9_100,
-            "hyperd_endpoint": "127.0.0.1:54321",
-            "health_port": released_port(),
-            "started_at": "2026-08-13T12:34:56Z",
-            "version": "0.7.0",
-            "identity": "not-an-object",
-        });
-        if serde_json::from_value::<DaemonRecord>(lenient_wire.clone()).is_ok() {
-            failures.push(
-                "fixture satisfied the strict DaemonRecord parse; it no longer reaches the \
-                 lenient fallback this test is about"
-                    .to_string(),
-            );
-        }
-        if serde_json::from_value::<DaemonInfo>(lenient_wire.clone()).is_err() {
-            failures.push(
-                "fixture is not readable as a legacy DaemonInfo either; it would be rejected \
-                 before the branch this test pins"
-                    .to_string(),
-            );
-        }
-
-        std::fs::create_dir_all(state_dir().unwrap()).unwrap();
+    /// A record only the lenient `DaemonInfo` fallback can read must survive
+    /// stale cleanup (it may belong to a newer daemon), while a current-shape
+    /// record is removed: the guard is narrow, not a blanket disable.
+    #[test]
+    fn remove_stale_record_preserves_a_leniently_parsed_record() {
+        let tmp = short_state_dir();
+        let path = tmp.path().join("daemon.json");
+        let info = info_for(tmp.path(), 9_100);
+        let lenient_wire = wire_of(&info, &json!("not-an-object"));
+        assert!(serde_json::from_value::<DaemonRecord>(lenient_wire.clone()).is_err());
+        assert!(serde_json::from_value::<DaemonInfo>(lenient_wire.clone()).is_ok());
         let lenient_bytes = serde_json::to_vec(&lenient_wire).unwrap();
         std::fs::write(&path, &lenient_bytes).unwrap();
 
-        if let Some(info) = discover() {
-            failures.push(format!(
-                "discover() reported a live daemon on a released port: {info:?}"
-            ));
-        }
-        // The pin: a failed health check must not destroy a record this
-        // client could only read leniently. The daemon rewrites `daemon.json`
-        // only on `hyperd` restart, so deleting it here would hide a live,
-        // newer daemon from every client on the machine.
-        match std::fs::read(&path) {
-            Ok(after) if after == lenient_bytes => {}
-            Ok(_) => {
-                failures.push("discover() changed the leniently parsed record's bytes".to_string());
-            }
-            Err(error) => failures.push(format!(
-                "discover() removed the leniently parsed discovery record it could not \
-                 strictly parse: {error}"
-            )),
-        }
-
-        // Contrast: a strictly parseable record on a dead port is still
-        // stale-cleaned, so the guard above is narrow rather than a blanket
-        // disabling of cleanup.
-        let mut strict_info = legacy_info();
-        strict_info.pid = 9_101;
-        strict_info.health_port = released_port();
-        write_discovery_file(&strict_info).unwrap();
-        if let Some(info) = discover() {
-            failures.push(format!(
-                "discover() reported a live daemon for the strict record on a released port: {info:?}"
-            ));
-        }
-        if path.exists() {
-            failures.push(
-                "discover() did not stale-clean a strictly parsed record on a dead port"
-                    .to_string(),
-            );
-        }
-
-        assert!(
-            failures.is_empty(),
-            "lenient stale-cleanup failures:\n{}",
-            failures.join("\n")
+        assert!(discover_in(tmp.path()).is_none());
+        remove_stale_record(tmp.path());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            lenient_bytes,
+            "a record this client could only read leniently must not be deleted"
         );
+
+        write_record_for_test(tmp.path(), &info);
+        remove_stale_record(tmp.path());
+        assert!(!path.exists(), "a strict current-shape record is stale");
     }
 
-    /// A record that only the lenient `DaemonInfo` fallback could read must
-    /// survive a failed health check. Before the fallback existed, a strict
-    /// parse failure returned from `discover()` before ever reaching the
-    /// stale-cleanup `remove_file`, so tolerating the record must not also
-    /// start deleting it.
+    /// A record in a shape without `health_endpoint` (an earlier release) is
+    /// not this build's to delete.
     #[test]
-    fn discover_preserves_a_leniently_parsed_stale_record() {
-        const CHILD_SENTINEL_ENV: &str = "HYPERDB_MCP_LENIENT_STALE_CLEANUP_CHILD";
-        const TEST_NAME: &str =
-            "daemon::discovery::tests::discover_preserves_a_leniently_parsed_stale_record";
+    fn remove_stale_record_leaves_a_legacy_shaped_record() {
+        let tmp = short_state_dir();
+        let path = tmp.path().join("daemon.json");
+        let bytes = serde_json::to_vec(&json!({
+            "pid": 4242,
+            "hyperd_endpoint": "127.0.0.1:54321",
+            "health_port": 7485,
+            "started_at": "2026-08-13T12:34:56Z",
+            "version": "0.7.0"
+        }))
+        .unwrap();
+        std::fs::write(&path, &bytes).unwrap();
 
-        let _process_guard = crate::diagnostics::real_network_test_guard();
-        if let Some(marker) = std::env::var_os(CHILD_SENTINEL_ENV) {
-            std::fs::write(std::path::PathBuf::from(marker), b"started").unwrap();
-            run_lenient_stale_cleanup_scenario();
-            return;
-        }
-        run_discovery_compatibility_child(TEST_NAME, CHILD_SENTINEL_ENV);
+        assert!(discover_in(tmp.path()).is_none());
+        remove_stale_record(tmp.path());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    /// A record pointing at an endpoint this state directory does not imply is
+    /// never connected to, even if something answers there.
+    #[test]
+    fn discover_in_rejects_a_foreign_endpoint() {
+        let live_dir = short_state_dir();
+        let other_dir = short_state_dir();
+        let live_info = info_for(live_dir.path(), 9_200);
+        let _daemon = LiveDaemon::start(live_dir.path(), &live_info);
+
+        // `other_dir`'s record names `live_dir`'s live socket.
+        write_record_for_test(other_dir.path(), &live_info);
+        assert!(discover_in(other_dir.path()).is_none());
+        // And the live daemon is found through its own directory.
+        write_record_for_test(live_dir.path(), &live_info);
+        assert_eq!(discover_in(live_dir.path()), Some(live_info));
+    }
+
+    /// A state directory another account can write to is not trusted.
+    #[cfg(unix)]
+    #[test]
+    fn discover_in_ignores_an_untrusted_state_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = short_state_dir();
+        let info = info_for(tmp.path(), 9_300);
+        let mut daemon = LiveDaemon::start(tmp.path(), &info);
+        write_record_for_test(tmp.path(), &info);
+        assert_eq!(discover_in(tmp.path()), Some(info));
+
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(
+            discover_in(tmp.path()).is_none(),
+            "a group-writable state directory must not be trusted"
+        );
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        daemon.stop();
     }
 
     #[test]
@@ -1027,7 +917,7 @@ mod tests {
         let parsed_bytes = serde_json::to_vec(&json!({
             "pid": 4242,
             "hyperd_endpoint": "127.0.0.1:54321",
-            "health_port": 7485,
+            "health_endpoint": "/run/hyperdb/daemon.sock",
             "started_at": "2026-08-13T12:34:56Z",
             "version": "0.7.0"
         }))
@@ -1162,7 +1052,7 @@ mod tests {
         let base_bytes = serde_json::to_vec(&json!({
             "pid": 4242,
             "hyperd_endpoint": "127.0.0.1:54321",
-            "health_port": 7485,
+            "health_endpoint": "/run/hyperdb/daemon.sock",
             "started_at": "2026-08-13T12:34:56Z",
             "version": "0.7.0",
             "ignored_padding": ""
@@ -1229,146 +1119,48 @@ mod tests {
         );
     }
 
-    fn run_oversized_discovery_compatibility_scenario() {
+    /// A valid record larger than the doctor's raw-read cap is still a live
+    /// daemon for the client fast path, and is never rewritten by it.
+    #[test]
+    fn discover_in_accepts_a_live_oversized_record() {
         const RAW_DOCTOR_LIMIT_BYTES: usize = 64 * 1024;
 
-        assert!(
-            std::env::var_os("HYPERDB_STATE_DIR").is_some(),
-            "child scenario requires an isolated state directory"
-        );
-        let health_listener = HealthListener::bind(0).unwrap();
-        let health_port = health_listener.port;
-        let oversized_info = DaemonInfo {
-            pid: 5_252,
-            hyperd_endpoint: "127.0.0.1:54321".to_string(),
-            health_port,
-            started_at: "2026-08-13T12:34:56Z".to_string(),
-            version: "v".repeat(RAW_DOCTOR_LIMIT_BYTES + 1),
-        };
-        write_discovery_file(&oversized_info).unwrap();
-        let path = discovery_file_path().unwrap();
-        let original_bytes = std::fs::read(&path).unwrap();
-        let mut failures = Vec::new();
+        let tmp = short_state_dir();
+        let mut oversized = info_for(tmp.path(), 5_252);
+        oversized.version = "v".repeat(RAW_DOCTOR_LIMIT_BYTES + 1);
+        let path = tmp.path().join("daemon.json");
+        write_record_for_test(tmp.path(), &oversized);
+        let original = std::fs::read(&path).unwrap();
+        assert!(original.len() > RAW_DOCTOR_LIMIT_BYTES);
 
-        if original_bytes.len() <= RAW_DOCTOR_LIMIT_BYTES {
-            failures.push(format!(
-                "public writer produced only {} bytes, expected more than {RAW_DOCTOR_LIMIT_BYTES}",
-                original_bytes.len()
-            ));
-        }
-        match serde_json::from_slice::<DaemonInfo>(&original_bytes) {
-            Ok(parsed) if parsed == oversized_info => {}
-            Ok(_) => {
-                failures.push("oversized public DaemonInfo did not round-trip exactly".to_string());
-            }
-            Err(error) => failures.push(format!(
-                "public writer did not produce valid oversized DaemonInfo JSON: {error}"
-            )),
-        }
-        match read_discovery_file_raw(&path) {
-            RawDiscoveryRead::Oversized { path: reported, .. }
-                if reported == ReportedPath::from_os_str(path.as_os_str()) => {}
-            RawDiscoveryRead::Missing { .. } => {
-                failures
-                    .push("doctor raw reader reported the oversized record missing".to_string());
-            }
-            RawDiscoveryRead::Unreadable { kind, .. } => failures.push(format!(
-                "doctor raw reader reported the oversized record unreadable: {kind:?}"
-            )),
-            RawDiscoveryRead::Malformed { .. } => {
-                failures.push(
-                    "doctor raw reader misclassified the well-formed oversized record as malformed"
-                        .to_string(),
-                );
-            }
-            RawDiscoveryRead::Oversized { .. } => {
-                failures.push("doctor raw reader reported the wrong oversized path".to_string());
-            }
-            RawDiscoveryRead::Parsed { .. } => {
-                failures.push("doctor raw reader accepted the oversized record".to_string());
-            }
-        }
-        match std::fs::read(&path) {
-            Ok(after) if after == original_bytes => {}
-            Ok(_) => failures.push("doctor raw reader changed oversized bytes".to_string()),
-            Err(error) => failures.push(format!(
-                "doctor raw reader removed the oversized record: {error}"
-            )),
-        }
+        assert!(matches!(
+            read_discovery_file_raw(&path),
+            RawDiscoveryRead::Oversized { .. }
+        ));
+        let mut daemon = LiveDaemon::start(tmp.path(), &oversized);
+        assert_eq!(discover_in(tmp.path()), Some(oversized));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
 
-        let health_state = Arc::new(DaemonState::new());
-        let health_info = Arc::new(Mutex::new(oversized_info.clone()));
-        let run_state = Arc::clone(&health_state);
-        let run_info = Arc::clone(&health_info);
-        let health_server = std::thread::spawn(move || health_listener.run(run_state, run_info));
-
-        match discover() {
-            Some(info) if info == oversized_info => {}
-            Some(_) => {
-                failures
-                    .push("normal discover returned different live oversized facts".to_string());
-            }
-            None => failures
-                .push("normal discover did not accept the live oversized record".to_string()),
-        }
-        match std::fs::read(&path) {
-            Ok(after) if after == original_bytes => {}
-            Ok(_) => failures.push("live discover changed oversized bytes".to_string()),
-            Err(error) => failures.push(format!(
-                "live discover removed the oversized record: {error}"
-            )),
-        }
-
-        health_state.request_shutdown();
-        health_server.join().unwrap();
-        if discover().is_some() {
-            failures.push("stopped oversized record was incorrectly retained as live".to_string());
-        }
-        if path.exists() {
-            failures
-                .push("normal discover did not stale-clean the valid oversized record".to_string());
-        }
-
-        assert!(
-            failures.is_empty(),
-            "oversized legacy discover failures:\n{}",
-            failures.join("\n")
-        );
+        daemon.stop();
+        assert!(discover_in(tmp.path()).is_none());
+        // Oversized records are not the current-shape fast path: left alone.
+        remove_stale_record(tmp.path());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 
-    #[test]
-    fn discover_preserves_legacy_oversized_stale_cleanup() {
-        const CHILD_SENTINEL_ENV: &str = "HYPERDB_MCP_OVERSIZED_DISCOVERY_COMPATIBILITY_CHILD";
-        const TEST_NAME: &str =
-            "daemon::discovery::tests::discover_preserves_legacy_oversized_stale_cleanup";
-
-        let _process_guard = crate::diagnostics::real_network_test_guard();
-        if let Some(marker) = std::env::var_os(CHILD_SENTINEL_ENV) {
-            std::fs::write(std::path::PathBuf::from(marker), b"started").unwrap();
-            run_oversized_discovery_compatibility_scenario();
-            return;
-        }
-        run_discovery_compatibility_child(TEST_NAME, CHILD_SENTINEL_ENV);
-    }
-
+    /// The client fast path follows a discovery symlink; the doctor reader
+    /// rejects it without touching either the link or its target.
     #[cfg(unix)]
-    fn run_symlink_discovery_compatibility_scenario() {
-        assert!(
-            std::env::var_os("HYPERDB_STATE_DIR").is_some(),
-            "child scenario requires an isolated state directory"
-        );
-        let health_listener = HealthListener::bind(0).unwrap();
-        let health_port = health_listener.port;
-        let mut linked_info = legacy_info();
-        linked_info.pid = 6_363;
-        linked_info.health_port = health_port;
-        write_discovery_file(&linked_info).unwrap();
-        let link_path = discovery_file_path().unwrap();
-        let target_path = link_path.with_file_name("legacy-daemon-target.json");
+    #[test]
+    fn discover_in_follows_a_live_discovery_symlink() {
+        let tmp = short_state_dir();
+        let linked = info_for(tmp.path(), 6_363);
+        write_record_for_test(tmp.path(), &linked);
+        let link_path = tmp.path().join("daemon.json");
+        let target_path = tmp.path().join("legacy-daemon-target.json");
         std::fs::rename(&link_path, &target_path).unwrap();
         std::os::unix::fs::symlink(&target_path, &link_path).unwrap();
         let target_bytes = std::fs::read(&target_path).unwrap();
-        let mut failures = Vec::new();
 
         match read_discovery_file_raw(&link_path) {
             RawDiscoveryRead::Unreadable {
@@ -1376,90 +1168,29 @@ mod tests {
                 kind,
             } if reported == ReportedPath::from_os_str(link_path.as_os_str())
                 && kind != io::ErrorKind::NotFound => {}
-            other => failures.push(format!(
-                "doctor raw reader did not reject the symlink without following it: {other:?}"
-            )),
-        }
-        match std::fs::symlink_metadata(&link_path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {}
-            Ok(metadata) => failures.push(format!(
-                "doctor raw reader replaced the link with {:?}",
-                metadata.file_type()
-            )),
-            Err(error) => failures.push(format!(
-                "doctor raw reader removed the discovery symlink: {error}"
-            )),
-        }
-        match std::fs::read(&target_path) {
-            Ok(after) if after == target_bytes => {}
-            Ok(_) => failures.push("doctor raw reader changed symlink target bytes".to_string()),
-            Err(error) => failures.push(format!(
-                "doctor raw reader removed the symlink target: {error}"
-            )),
+            other => panic!("doctor reader did not reject the symlink: {other:?}"),
         }
 
-        let health_state = Arc::new(DaemonState::new());
-        let health_info = Arc::new(Mutex::new(linked_info.clone()));
-        let run_state = Arc::clone(&health_state);
-        let run_info = Arc::clone(&health_info);
-        let health_server = std::thread::spawn(move || health_listener.run(run_state, run_info));
-
-        match discover() {
-            Some(info) if info == linked_info => {}
-            other => failures.push(format!(
-                "normal discover did not follow the live valid symlink: {other:?}"
-            )),
-        }
-        match std::fs::symlink_metadata(&link_path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {}
-            Ok(_) => failures.push("live discover replaced the discovery symlink".to_string()),
-            Err(error) => failures.push(format!(
-                "live discover removed the discovery symlink: {error}"
-            )),
-        }
-
-        health_state.request_shutdown();
-        health_server.join().unwrap();
-        if discover().is_some() {
-            failures.push("stopped symlinked record was incorrectly retained as live".to_string());
-        }
-        match std::fs::symlink_metadata(&link_path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Ok(_) => failures
-                .push("normal discover did not remove the stale discovery symlink".to_string()),
-            Err(error) => failures.push(format!(
-                "stale discovery symlink cleanup failed unexpectedly: {error}"
-            )),
-        }
-        match std::fs::read(&target_path) {
-            Ok(after) if after == target_bytes => {}
-            Ok(_) => failures.push("normal discover changed symlink target bytes".to_string()),
-            Err(error) => failures.push(format!(
-                "normal discover removed the symlink target instead of the link: {error}"
-            )),
-        }
-
+        let mut daemon = LiveDaemon::start(tmp.path(), &linked);
+        assert_eq!(discover_in(tmp.path()), Some(linked));
         assert!(
-            failures.is_empty(),
-            "symlink legacy discover failures:\n{}",
-            failures.join("\n")
+            std::fs::symlink_metadata(&link_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
-    }
 
-    #[cfg(unix)]
-    #[test]
-    fn discover_preserves_legacy_symlink_stale_cleanup() {
-        const CHILD_SENTINEL_ENV: &str = "HYPERDB_MCP_SYMLINK_DISCOVERY_COMPATIBILITY_CHILD";
-        const TEST_NAME: &str =
-            "daemon::discovery::tests::discover_preserves_legacy_symlink_stale_cleanup";
-
-        let _process_guard = crate::diagnostics::real_network_test_guard();
-        if let Some(marker) = std::env::var_os(CHILD_SENTINEL_ENV) {
-            std::fs::write(std::path::PathBuf::from(marker), b"started").unwrap();
-            run_symlink_discovery_compatibility_scenario();
-            return;
-        }
-        run_discovery_compatibility_child(TEST_NAME, CHILD_SENTINEL_ENV);
+        daemon.stop();
+        assert!(discover_in(tmp.path()).is_none());
+        // Cleanup refuses to follow or remove a symlinked record.
+        remove_stale_record(tmp.path());
+        assert!(
+            std::fs::symlink_metadata(&link_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&target_path).unwrap(), target_bytes);
     }
 
     #[cfg(unix)]

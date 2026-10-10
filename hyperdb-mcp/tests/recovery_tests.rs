@@ -13,8 +13,7 @@
 
 mod common;
 
-use std::io::{BufRead as _, BufReader, Write as _};
-use std::net::TcpListener;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use common::TestEngine;
 use hyperdb_api::{HyperProcess, Parameters, TransportMode};
+use hyperdb_mcp::daemon::control::{ControlListener, ControlStream, HealthEndpoint};
 use hyperdb_mcp::daemon::discovery::{self, DaemonInfo};
 use hyperdb_mcp::daemon::health;
 use hyperdb_mcp::error::{ErrorCode, is_connection_lost};
@@ -466,23 +466,19 @@ fn run_slow_health_mutex_child() {
         .expect("parent must provide a Hyper PID report path");
     let (hyper, endpoint) = start_reported_hyper_process(&state_dir, &hyper_pid_path);
 
-    let listener =
-        TcpListener::bind(("127.0.0.1", 0)).expect("bind controlled OS-assigned health listener");
-    let health_port = listener
-        .local_addr()
-        .expect("read controlled health listener address")
-        .port();
+    let health_endpoint = HealthEndpoint::for_new_daemon(&state_dir)
+        .expect("derive the controlled health endpoint inside the isolated state directory");
+    let listener = ControlListener::bind(&health_endpoint).expect("bind controlled health peer");
 
     let daemon_info = DaemonInfo {
         pid: std::process::id(),
         hyperd_endpoint: endpoint,
-        health_port,
+        health_endpoint: health_endpoint.as_str().to_owned(),
         started_at: "2026-08-14T00:00:00Z".to_string(),
         version: hyperdb_mcp::version::MCP_VERSION.to_string(),
     };
     // Discovery is the only routing input: the engine must route
-    // `REPORT_HYPERD_ERROR` to this effective health port. The child
-    // intentionally does not mutate the process-global daemon-port setting.
+    // `REPORT_HYPERD_ERROR` to this recorded health endpoint.
     discovery::write_discovery_file(&daemon_info).expect("write isolated daemon discovery");
 
     let engine_probe = Arc::new(OnceLock::<EngineHandle>::new());
@@ -497,7 +493,7 @@ fn run_slow_health_mutex_child() {
     let peer_worker_finished = Arc::clone(&worker_finished);
     let peer = thread::spawn(move || {
         run_controlled_health_peer(
-            &listener,
+            listener,
             &peer_info,
             &peer_engine_probe,
             &report_seen_tx,
@@ -509,7 +505,7 @@ fn run_slow_health_mutex_child() {
     // A real protocol round-trip proves the listener is accepting and its
     // STATUS response is usable; no timing sleep is needed for readiness.
     let status = health::send_command_with_timeout(
-        health_port,
+        &health_endpoint,
         "STATUS",
         Duration::from_secs(1),
         Duration::from_secs(1),
@@ -538,9 +534,9 @@ fn run_slow_health_mutex_child() {
             .expect("inspect warmed engine")
             .as_ref()
             .expect("warm-up must install an engine")
-            .daemon_health_port(),
-        Some(health_port),
-        "warmed engine must retain the discovered health port"
+            .daemon_health_endpoint(),
+        Some(health_endpoint.as_str()),
+        "warmed engine must retain the discovered health endpoint"
     );
 
     hyper
@@ -647,7 +643,7 @@ fn run_slow_health_mutex_child() {
     }
 
     let stop_result = health::send_command_with_timeout(
-        health_port,
+        &health_endpoint,
         "STOP",
         Duration::from_secs(1),
         Duration::from_secs(1),
@@ -714,8 +710,29 @@ fn receive_and_release_report(
     observation
 }
 
+/// Read one newline-terminated command a byte at a time.
+fn read_controlled_command(stream: &mut ControlStream) -> Result<String, String> {
+    let mut request = Vec::new();
+    let mut byte = [0_u8];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => {
+                if byte[0] == b'\n' {
+                    break;
+                }
+                request.push(byte[0]);
+            }
+            Err(error) => return Err(format!("read controlled health command: {error}")),
+        }
+    }
+    String::from_utf8(request)
+        .map(|command| command.trim().to_string())
+        .map_err(|error| format!("controlled health command not UTF-8: {error}"))
+}
+
 fn run_controlled_health_peer(
-    listener: &TcpListener,
+    mut listener: ControlListener,
     info: &DaemonInfo,
     engine_probe: &OnceLock<EngineHandle>,
     report_seen_tx: &mpsc::Sender<ReportObservation>,
@@ -724,23 +741,24 @@ fn run_controlled_health_peer(
 ) -> Result<Vec<String>, String> {
     let mut commands = Vec::new();
     let mut report_sequence = 0_usize;
+    // The peer lives for one scenario; never let a missed STOP hang the test.
+    let accept_deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let (stream, _) = listener
-            .accept()
-            .map_err(|error| format!("accept controlled health connection: {error}"))?;
+        let mut stream = match listener
+            .accept_timeout(Duration::from_millis(50))
+            .map_err(|error| format!("accept controlled health connection: {error}"))?
+        {
+            Some(stream) => stream,
+            None if Instant::now() >= accept_deadline => {
+                return Err("controlled health peer timed out waiting for a command".to_string());
+            }
+            None => continue,
+        };
         stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .map_err(|error| format!("bound controlled health read: {error}"))?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(2)))
-            .map_err(|error| format!("bound controlled health write: {error}"))?;
+            .set_io_timeout(Duration::from_secs(2))
+            .map_err(|error| format!("bound controlled health I/O: {error}"))?;
 
-        let mut reader = BufReader::new(&stream);
-        let mut command = String::new();
-        reader
-            .read_line(&mut command)
-            .map_err(|error| format!("read controlled health command: {error}"))?;
-        let command = command.trim().to_string();
+        let command = read_controlled_command(&mut stream)?;
         commands.push(command.clone());
 
         let (response, should_stop) = match command.as_str() {
@@ -808,9 +826,14 @@ fn run_controlled_health_peer(
             other => (format!("ERR unknown command {other}\n"), false),
         };
 
-        (&stream)
+        stream
             .write_all(response.as_bytes())
             .map_err(|error| format!("write controlled health response: {error}"))?;
+        // Keep the connection open until the client hangs up, as the real
+        // daemon does: closing first can make the client's next timeout
+        // update fail (EINVAL) on macOS.
+        let mut sink = [0_u8; 16];
+        while matches!(stream.read(&mut sink), Ok(count) if count > 0) {}
         if should_stop {
             return Ok(commands);
         }

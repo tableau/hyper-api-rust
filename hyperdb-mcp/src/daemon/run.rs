@@ -1,8 +1,16 @@
 // Copyright (c) 2026, Salesforce, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Daemon main loop: spawns `hyperd`, runs health listener, monitors hyperd liveness
-//! and optional idle timeout, restarts hyperd if it dies.
+//! Daemon main loop: takes the single-instance lock, spawns `hyperd`, runs the
+//! health listener, monitors hyperd liveness and optional idle timeout,
+//! restarts hyperd if it dies.
+//!
+//! Startup order: create and check the state directory, take the
+//! [`DaemonLock`], bind the control endpoint, start `hyperd`, write
+//! `daemon.json`. Shutdown runs it backwards: remove the record, stop the
+//! listener (which removes the socket), drop `hyperd`, and only then release
+//! the lock. The lock is what a client waits on, so it must outlive everything
+//! the next daemon could collide with.
 //!
 //! By default, the daemon never auto-shuts down due to inactivity (opt-in via
 //! `--idle-timeout` flag or `HYPERDB_DAEMON_IDLE_TIMEOUT` env var). When enabled,
@@ -18,13 +26,26 @@ use tracing::{error, info, warn};
 use hyperdb_api::{HyperProcess, Parameters, TransportMode};
 
 use super::ENV_IDLE_TIMEOUT;
+use super::control::HealthEndpoint;
 use super::discovery::{self, DaemonInfo};
 use super::health::{DaemonState, HealthListener};
+use super::lock::DaemonLock;
+
+/// How long startup keeps retrying for the daemon lock and for `hyperd`'s
+/// socket to come free. A predecessor that was just told to stop needs a moment
+/// to let go of both, and a fresh daemon should wait it out rather than fail.
+pub const STARTUP_WAIT: Duration = Duration::from_secs(10);
+
+/// Pause between startup retries.
+const STARTUP_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
+/// A live daemon must answer for this long before startup believes it is
+/// really running (and not merely finishing a shutdown) and gives up.
+const ALREADY_RUNNING_DEBOUNCE: Duration = Duration::from_secs(1);
 
 /// Configuration for the daemon process.
 #[derive(Debug)]
 pub struct DaemonConfig {
-    pub port: u16,
     /// Idle timeout duration. When `None`, the daemon never auto-shuts down due to
     /// inactivity (default behavior). When `Some`, the daemon shuts down after the
     /// specified duration without client activity.
@@ -38,7 +59,7 @@ impl DaemonConfig {
     /// 1. If `idle_timeout_secs` is `Some`, use that value.
     /// 2. Otherwise, if `HYPERDB_DAEMON_IDLE_TIMEOUT` env var is set and parseable, use it.
     /// 3. Otherwise, `None` (never auto-shutdown).
-    pub fn from_args(port: u16, idle_timeout_secs: Option<u64>) -> Self {
+    pub fn from_args(idle_timeout_secs: Option<u64>) -> Self {
         let idle_timeout = idle_timeout_secs
             .or_else(|| {
                 std::env::var(ENV_IDLE_TIMEOUT)
@@ -47,7 +68,7 @@ impl DaemonConfig {
             })
             .map(Duration::from_secs);
 
-        Self { port, idle_timeout }
+        Self { idle_timeout }
     }
 }
 
@@ -74,64 +95,127 @@ enum RestartError {
     SpawnFailed(String),
 }
 
+/// Take the daemon lock, retrying for up to `deadline`.
+///
+/// A held lock means another daemon is running, starting, or stopping. Only a
+/// daemon that keeps answering an identified `PING` for
+/// [`ALREADY_RUNNING_DEBOUNCE`] counts as running: one that is mid-shutdown
+/// stops answering within that time and the lock frees up behind it.
+async fn acquire_lock(state_dir: &Path, deadline: Instant) -> Result<DaemonLock, String> {
+    let mut seen_alive_since: Option<Instant> = None;
+    loop {
+        match DaemonLock::try_acquire(state_dir) {
+            Ok(Some(lock)) => return Ok(lock),
+            Ok(None) => {}
+            Err(error) => {
+                return Err(format!(
+                    "Failed to take the daemon lock in {}: {error}",
+                    state_dir.display()
+                ));
+            }
+        }
+
+        if discovery::discover_in(state_dir).is_some() {
+            let since = *seen_alive_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= ALREADY_RUNNING_DEBOUNCE {
+                return Err("Another hyperdb daemon is already running. \
+                     Use `hyperdb-mcp daemon status` to check or `hyperdb-mcp daemon stop` to stop it."
+                    .to_string());
+            }
+        } else {
+            seen_alive_since = None;
+        }
+
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "Timed out after {}s waiting for another hyperdb daemon in {} to release \
+                 the daemon lock",
+                STARTUP_WAIT.as_secs(),
+                state_dir.display()
+            ));
+        }
+        tokio::time::sleep(STARTUP_RETRY_INTERVAL).await;
+    }
+}
+
+/// [`build_params`], retrying while another `hyperd` still holds the socket.
+/// The previous daemon's `hyperd` can outlive its lock by a moment on some
+/// platforms; the pre-flight failing with `AddrInUse` is the signal to wait.
+async fn build_params_waiting(state_dir: &Path, deadline: Instant) -> std::io::Result<Parameters> {
+    loop {
+        match build_params(state_dir) {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AddrInUse && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(STARTUP_RETRY_INTERVAL).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Run the daemon. This function blocks until shutdown is triggered.
 ///
 /// # Errors
-/// Returns an error if the health port cannot be bound, `hyperd` fails to start,
-/// or the discovery file cannot be written.
+/// Returns an error if the state directory is not private to the current user,
+/// another daemon holds the lock, the control endpoint cannot be bound,
+/// `hyperd` fails to start, or the discovery file cannot be written.
 pub async fn run_daemon(config: DaemonConfig) -> Result<(), Box<dyn std::error::Error>> {
-    // Step 1: Bind health port (single-instance lock)
-    let listener = HealthListener::bind(config.port).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::AddrInUse {
-            format!(
-                "Another hyperdb daemon is already running on port {}. \
-                 Use `hyperdb-mcp daemon status` to check or `hyperdb-mcp daemon stop` to stop it.",
-                config.port
-            )
-        } else {
-            format!("Failed to bind health port {}: {e}", config.port)
-        }
-    })?;
-    let bound_port = listener.port;
-    info!(port = bound_port, "daemon health listener bound");
+    let deadline = Instant::now() + STARTUP_WAIT;
 
-    // Step 2: Spawn hyperd over a local IPC channel (Unix domain socket on
-    // Unix/macOS, named pipe on Windows).
+    // Step 1: Create the state directory, refuse one that others can write to,
+    // and take the single-instance lock.
     let state_dir = discovery::state_dir()?;
-    let hyper = HyperProcess::new(None, Some(&build_params(&state_dir)?))?;
+    super::state_perms::ensure_owner_only_dir(&state_dir)?;
+    super::state_perms::verify_state_dir_trusted(&state_dir)?;
+    let lock = acquire_lock(&state_dir, deadline).await?;
+
+    // Step 2: Bind the control endpoint. We hold the lock, so anything still
+    // sitting at the socket path is a dead daemon's leftover.
+    let endpoint = HealthEndpoint::for_new_daemon(&state_dir)?;
+    let listener = HealthListener::bind(&endpoint)
+        .map_err(|e| format!("Failed to bind the health endpoint {endpoint}: {e}"))?;
+    info!(endpoint = %endpoint, "daemon health listener bound");
+
+    // Step 3: Spawn hyperd over a local IPC channel (Unix domain socket on
+    // Unix/macOS, named pipe on Windows).
+    let hyper = HyperProcess::new(
+        None,
+        Some(&build_params_waiting(&state_dir, deadline).await?),
+    )?;
     // Publish the *connection* endpoint, not the raw callback descriptor. For a
     // Unix domain socket the raw `endpoint()` string reconstructs the path as
     // `<dir>/domain/hyper` (a `tab.domain://` scheme artifact), whereas hyperd
     // actually binds `<dir>/hyper`; `connection_endpoint_string()` carries the path a
     // client can connect to. For TCP and Windows named pipes the two agree.
-    let endpoint = hyper
+    let hyperd_endpoint = hyper
         .connection_endpoint_string()
         .ok_or("hyperd did not report a connection endpoint")?;
-    info!(endpoint = %endpoint, "hyperd started");
+    info!(endpoint = %hyperd_endpoint, "hyperd started");
 
-    // Step 3: Build DaemonInfo and write discovery file
+    // Step 4: Build DaemonInfo and write discovery file
     let info = DaemonInfo {
         pid: std::process::id(),
-        hyperd_endpoint: endpoint.clone(),
-        health_port: bound_port,
+        hyperd_endpoint,
+        health_endpoint: endpoint.as_str().to_string(),
         started_at: chrono::Utc::now().to_rfc3339(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     };
     discovery::write_enriched_discovery_file(&info)?;
     info!(path = %discovery::discovery_file_path()?.display(), "discovery file written");
 
-    // Step 4: Build the shared state.
+    // Step 5: Build the shared state.
     // - `info_arc` is shared with the health listener so STATUS reports the
     //   current endpoint even after a restart.
     // - `hyper_state` is owned by the monitor task; the listener never touches it.
-    let state = Arc::new(DaemonState::new());
+    let state = Arc::new(DaemonState::new(endpoint));
     let info_arc = Arc::new(Mutex::new(info));
     let hyper_state = Arc::new(Mutex::new(HyperState {
         hyper: Some(hyper),
         restart_history: Vec::new(),
     }));
 
-    // Step 5: Start health listener in a background thread
+    // Step 6: Start health listener in a background thread
     let health_state = Arc::clone(&state);
     let health_info = Arc::clone(&info_arc);
     let health_handle = std::thread::spawn(move || {
@@ -145,7 +229,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), Box<dyn std::error::
         info!("idle shutdown disabled (daemon will stay resident)");
     }
 
-    // Step 6: Run the three monitors concurrently. Whichever completes first
+    // Step 7: Run the three monitors concurrently. Whichever completes first
     // triggers shutdown. If `idle_timeout` is `None`, the idle monitor never fires.
     let idle_fut = async {
         match config.idle_timeout {
@@ -162,7 +246,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), Box<dyn std::error::
     }
     state.request_shutdown();
 
-    // Step 7: Graceful shutdown.
+    // Step 8: Graceful shutdown.
     // `tokio::select!` already cancelled the monitor and idle-monitor futures
     // when one branch completed, releasing their `hyper_state` Arc clones.
     // When this function returns, the last Arc drops, which drops the inner
@@ -172,7 +256,10 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), Box<dyn std::error::
     info!("shutting down daemon");
     discovery::remove_discovery_file();
     let _ = health_handle.join();
+    // The listener's drop removed the socket when `run` returned. Drop hyperd
+    // next, and release the lock last: it is what the next daemon waits on.
     drop(hyper_state); // explicit ordering: drop after health-listener join
+    drop(lock);
 
     Ok(())
 }
@@ -248,9 +335,9 @@ fn build_params(state_dir: &Path) -> std::io::Result<Parameters> {
         // this guard hyperd would die with "unable to listen on domain socket:
         // domain socket is in use" while `HyperProcess::new` masked it as a
         // 60-second "Timeout waiting for Hyper to connect to callback listener".
-        // Reachable today only when two daemons share one state dir (different
-        // ports). A refused/missing socket (stale file, dead owner) is fine —
-        // proceed and let hyperd's pid-liveness staleness check reclaim it. This
+        // Reachable only when a previous daemon's hyperd has outlived it
+        // (`build_params_waiting` retries on this). A refused/missing socket
+        // (stale file, dead owner) is fine: proceed and let hyperd's pid-liveness staleness check reclaim it. This
         // keeps the crash-restart path safe: `try_restart_hyperd` reaps the
         // SIGKILLed child (`guard.hyper = None`) before calling `build_params`,
         // so here the connect is refused and we proceed to rebind.
@@ -399,7 +486,7 @@ fn try_restart_hyperd(
     // Two independent channels advertise the endpoint: the `daemon.json`
     // discovery file that `discovery::discover()` reads — the path every
     // client's `Engine::new` takes — and the in-memory `DaemonInfo` that the
-    // health port's STATUS command serves. Updating STATUS first and the file
+    // health channel's STATUS command serves. Updating STATUS first and the file
     // afterwards left a window in which STATUS announced the freshly spawned
     // `hyperd` while the file still named the one we just dropped, so a client
     // discovering during that window connected to a dead port. Persisting

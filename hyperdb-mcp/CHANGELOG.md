@@ -25,6 +25,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   existing destination is refused with `PERMISSION_DENIED` unless the call
   passes `overwrite: true`. `export` used to replace an existing file or
   directory silently; `chart` defaulted `overwrite` to true.
+- **BREAKING: the daemon health channel is a per-user Unix domain socket
+  (`<state dir>/daemon.sock`, mode `0600`) or Windows named pipe, not a
+  loopback TCP port.** `daemon.json` replaces the `health_port` field with
+  `health_endpoint` (a string), `daemon status` prints `Health endpoint:`, the
+  engine status key `daemon_health_port` becomes `daemon_health_endpoint`, and
+  `doctor` reports `health_endpoint` and a new `lock` state in place of the
+  health port. A single-instance lock (`daemon.lock`) replaces the port bind as
+  the "is a daemon running" decision. An older client talking to a daemon of
+  this release cannot find it (the record no longer has `health_port`) and falls
+  back to local mode.
+- **The state directory must now be owned by the current user and not writable
+  by group or others.** A daemon refuses to start in one, and a client treats it
+  as untrusted and uses local mode rather than connecting to an endpoint it
+  names.
+
+### Removed
+
+- **`hyperdb-mcp daemon --port`, `daemon stop --port`, `daemon status --port`
+  and the `HYPERDB_DAEMON_PORT` environment variable.** There is no port to
+  choose. Use `HYPERDB_STATE_DIR` to run an isolated daemon. A
+  `HYPERDB_DAEMON_PORT` left in the environment is now ignored.
+- **The daemon port scan** (the 16 ports above 7485) and doctor's
+  scan-discovered daemon state. Discovery reads `daemon.json` from the state
+  directory only.
 
 ### Fixed
 

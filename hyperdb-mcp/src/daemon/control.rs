@@ -457,6 +457,11 @@ mod platform {
         Ok(format!("{PIPE_PREFIX}{}-{random:016x}", std::process::id()))
     }
 
+    /// Accepts any pipe name with this daemon family's prefix and character
+    /// set; `_state_dir` is deliberately not consulted. Unlike the Unix socket
+    /// path, a pipe name does not encode the state directory, so the check
+    /// cannot pin the exact endpoint. Protection on Windows is the pipe's DACL
+    /// (owner only), not this check.
     pub(super) fn is_valid_endpoint(record: &str, _state_dir: &Path) -> bool {
         record.strip_prefix(PIPE_PREFIX).is_some_and(|rest| {
             !rest.is_empty()

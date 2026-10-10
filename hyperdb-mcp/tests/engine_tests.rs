@@ -363,7 +363,7 @@ fn engine_status() {
 
     // Engine connection block. This is a `--no-daemon` engine (TestEngine uses
     // `Engine::new_no_daemon`), so mode is "local", there's a private hyperd
-    // endpoint, and no daemon health port.
+    // endpoint, and no daemon health endpoint.
     let engine_info = &status["engine"];
     assert_eq!(engine_info["mode"], "local");
     assert!(
@@ -372,8 +372,8 @@ fn engine_status() {
         engine_info["hyperd_endpoint"]
     );
     assert!(
-        engine_info["daemon_health_port"].is_null(),
-        "local engine has no daemon health port"
+        engine_info["daemon_health_endpoint"].is_null(),
+        "local engine has no daemon health endpoint"
     );
 
     // Decomposed connection forms (issue #124). The transport is whatever

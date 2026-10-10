@@ -127,22 +127,12 @@ enum Commands {
         json: bool,
     },
 
-    /// Run a foreground daemon managing shared hyperd. Auto-spawn scans before
-    /// launching; foreground startup binds its configured/base port exactly.
+    /// Run a foreground daemon managing shared hyperd. One daemon runs per
+    /// state directory (`~/.hyperdb`, or `HYPERDB_STATE_DIR`); it listens on a
+    /// per-user Unix socket or named pipe there, not on a TCP port.
     Daemon {
         #[command(subcommand)]
         action: Option<DaemonAction>,
-
-        /// Exact TCP health/lock port for foreground startup. Without `--port`,
-        /// the foreground daemon binds the configured/base port exactly
-        /// (`HYPERDB_DAEMON_PORT` when valid, otherwise 7485) and does not scan.
-        /// Auto-spawn performs bounded discovery from its configured base before
-        /// launching. For stop/status, omitting the port uses discovery plus
-        /// scanning. Must be 1-65535: port 0 asks the OS for an *ephemeral*
-        /// port, which contradicts the exact bind promised here and leaves a
-        /// daemon on a port no client's scan can ever find.
-        #[arg(long, global = true, value_parser = clap::value_parser!(u16).range(1..))]
-        port: Option<u16>,
 
         /// Idle timeout in seconds before the daemon shuts down
         #[arg(long)]
@@ -167,29 +157,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Doctor { json }) => run_doctor_mode(&cli, json),
         Some(Commands::Daemon {
             action: Some(DaemonAction::Stop),
-            port,
             ..
         }) => {
-            daemon_stop(port);
+            daemon_stop();
             Ok(())
         }
         Some(Commands::Daemon {
             action: Some(DaemonAction::Status),
-            port,
             ..
         }) => {
-            daemon_status(port);
+            daemon_status();
             Ok(())
         }
         Some(Commands::Daemon {
             action: None,
-            port,
             idle_timeout,
-        }) => {
-            // Resolve the effective port for daemon startup
-            let effective_port = port.unwrap_or_else(|| discovery::resolve_port_scan().base);
-            run_daemon_mode(effective_port, idle_timeout).await
-        }
+        }) => run_daemon_mode(idle_timeout).await,
         None => run_mcp_mode(cli).await,
     }
 }
@@ -214,10 +197,7 @@ fn run_doctor_mode(cli: &Cli, json: bool) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-async fn run_daemon_mode(
-    port: u16,
-    idle_timeout: Option<u64>,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_daemon_mode(idle_timeout: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
     // Daemon logs go to ~/.hyperdb/logs/. They record the hyperd endpoint, so
     // both the state directory and the log directory inside it are restricted
     // to the owning user, as `daemon.json` is.
@@ -238,7 +218,7 @@ async fn run_daemon_mode(
         .with(fmt::layer().with_writer(file_writer).with_ansi(false))
         .init();
 
-    let config = DaemonConfig::from_args(port, idle_timeout);
+    let config = DaemonConfig::from_args(idle_timeout);
     daemon::run::run_daemon(config).await
 }
 
@@ -303,57 +283,104 @@ async fn run_mcp_mode(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn daemon_stop(port: Option<u16>) {
-    let target_port = match port {
-        Some(p) => p,
-        None => {
-            // No explicit port — discover the running daemon
-            if let Some(info) = discovery::find_running_daemon() {
-                info.health_port
-            } else {
-                eprintln!("No daemon is currently running.");
-                std::process::exit(1);
-            }
-        }
-    };
+/// Find the running daemon and the endpoint to reach it on, or exit 1.
+///
+/// The record in `daemon.json` is the normal locator. A live daemon whose
+/// record is missing or unusable is still found through the daemon lock: when
+/// it is held, the daemon's well-known socket (Unix) is probed with an
+/// identified `PING`.
+fn running_daemon_endpoint() -> daemon::control::HealthEndpoint {
+    use daemon::control::HealthEndpoint;
 
-    match health::send_command(target_port, "STOP") {
+    let Ok(dir) = discovery::state_dir() else {
+        eprintln!("No daemon is currently running.");
+        std::process::exit(1);
+    };
+    if let Some(info) = discovery::discover_in(&dir)
+        && let Some(endpoint) = HealthEndpoint::from_record(&info.health_endpoint, &dir)
+    {
+        return endpoint;
+    }
+
+    match daemon::state_perms::verify_state_dir_trusted(&dir) {
+        Ok(()) => {}
+        // No state directory at all: nothing has ever run here.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("No daemon is currently running.");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("The daemon state directory cannot be trusted: {e}");
+            std::process::exit(1);
+        }
+    }
+    match daemon::lock::DaemonLock::try_acquire(&dir) {
+        Ok(Some(_free)) => {
+            eprintln!("No daemon is currently running.");
+            std::process::exit(1);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("Cannot check the daemon lock in {}: {e}", dir.display());
+            std::process::exit(1);
+        }
+    }
+    // The lock is held, so a daemon is running or starting. A Windows pipe
+    // name is random per daemon and only the record carries it, so only Unix
+    // can probe the fixed socket path.
+    #[cfg(unix)]
+    if let Ok(endpoint) = HealthEndpoint::for_new_daemon(&dir)
+        && health::ping_identified(
+            &endpoint,
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_millis(500),
+        )
+        .is_some()
+    {
+        return endpoint;
+    }
+    eprintln!(
+        "The daemon lock is held but no usable record was found, and nothing answered on the \
+         health channel in {}. A daemon may still be starting; try again shortly.",
+        dir.display()
+    );
+    std::process::exit(1);
+}
+
+fn daemon_stop() {
+    let endpoint = running_daemon_endpoint();
+    match health::send_command(&endpoint, "STOP") {
         Ok(response) => {
             println!("Daemon responded: {}", response.trim());
         }
         Err(e) => {
-            eprintln!("No daemon running on port {target_port} (or cannot connect): {e}");
+            eprintln!("No daemon running at {endpoint} (or cannot connect): {e}");
             std::process::exit(1);
         }
     }
 }
 
-fn daemon_status(port: Option<u16>) {
-    let info = if let Some(port) = port {
-        match health::send_command(port, "STATUS") {
-            Ok(response) => match serde_json::from_str::<discovery::DaemonInfo>(response.trim()) {
-                Ok(info) => info,
-                Err(e) => {
-                    eprintln!("Daemon on port {port} returned invalid status: {e}");
-                    std::process::exit(1);
-                }
-            },
+fn daemon_status() {
+    let endpoint = running_daemon_endpoint();
+    // Ask the daemon itself, so the report is its own view of its endpoints.
+    let info = match health::send_command(&endpoint, "STATUS") {
+        Ok(response) => match serde_json::from_str::<discovery::DaemonInfo>(response.trim()) {
+            Ok(info) => info,
             Err(e) => {
-                eprintln!("No daemon running on port {port} (or cannot connect): {e}");
+                eprintln!("Daemon at {endpoint} returned invalid status: {e}");
                 std::process::exit(1);
             }
+        },
+        Err(e) => {
+            eprintln!("No daemon running at {endpoint} (or cannot connect): {e}");
+            std::process::exit(1);
         }
-    } else if let Some(info) = discovery::find_running_daemon() {
-        info
-    } else {
-        eprintln!("No daemon is currently running.");
-        std::process::exit(1);
     };
 
     println!("Daemon is running:");
     println!("  PID:            {}", info.pid);
     println!("  Hyperd endpoint: {}", info.hyperd_endpoint);
-    println!("  Health port:    {}", info.health_port);
+    println!("  Health endpoint: {}", info.health_endpoint);
     println!("  Started:        {}", info.started_at);
     println!("  Version:        {}", info.version);
 }

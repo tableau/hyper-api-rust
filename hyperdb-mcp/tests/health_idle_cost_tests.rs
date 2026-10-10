@@ -44,6 +44,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use hyperdb_mcp::daemon::control::HealthEndpoint;
 use hyperdb_mcp::daemon::discovery::DaemonInfo;
 use hyperdb_mcp::daemon::health::{DaemonState, HealthListener};
 
@@ -114,29 +115,32 @@ fn timeval_to_duration(value: libc::timeval) -> Duration {
     Duration::from_secs(seconds) + Duration::from_micros(microseconds)
 }
 
-fn idle_daemon_info(health_port: u16) -> DaemonInfo {
+fn idle_daemon_info(endpoint: &HealthEndpoint) -> DaemonInfo {
     DaemonInfo {
         pid: std::process::id(),
         hyperd_endpoint: "127.0.0.1:0".to_string(),
-        health_port,
+        health_endpoint: endpoint.as_str().to_string(),
         started_at: "2026-09-06T00:00:00Z".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     }
 }
 
-/// Binds a real listener on an ephemeral port, leaves it completely alone for
-/// `IDLE_WINDOW`, and reports what the process paid for the privilege.
+/// Binds a real listener on a socket inside a private temporary directory,
+/// leaves it completely alone for `IDLE_WINDOW`, and reports what the process
+/// paid for the privilege.
 ///
-/// No client ever connects and no discovery record is written — the listener
-/// takes an ephemeral port and never touches the state directory — so this
+/// No client ever connects and no discovery record is written — the socket
+/// lives in a throwaway directory, never the real state directory — so this
 /// cannot disturb a daemon running on the same machine.
 #[test]
 #[ignore = "burns a fixed 5s wall-clock window and reads a process-wide counter; run deliberately"]
 fn idle_health_listener_costs_about_one_wakeup_per_second() {
-    let listener = HealthListener::bind(0).expect("bind idle-cost health listener");
-    let port = listener.port;
-    let state = Arc::new(DaemonState::new());
-    let info = Arc::new(Mutex::new(idle_daemon_info(port)));
+    let state_dir = tempfile::tempdir().expect("create idle-cost state dir");
+    let endpoint =
+        HealthEndpoint::for_new_daemon(state_dir.path()).expect("derive idle-cost health endpoint");
+    let listener = HealthListener::bind(&endpoint).expect("bind idle-cost health listener");
+    let state = Arc::new(DaemonState::new(endpoint.clone()));
+    let info = Arc::new(Mutex::new(idle_daemon_info(&endpoint)));
 
     let run_state = Arc::clone(&state);
     let server = std::thread::spawn(move || listener.run(run_state, info));

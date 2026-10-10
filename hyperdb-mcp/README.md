@@ -290,7 +290,7 @@ hyperdb-mcp daemon stop     # Gracefully shut down the daemon
 hyperdb-mcp daemon          # Run as a daemon explicitly (rarely needed)
 ```
 
-`status` and `stop` locate the running daemon automatically (reading `daemon.json`, then scanning the port range), so they work even if the daemon scanned onto a non-default port. Pass `--port <PORT>` to target a specific port explicitly.
+`status` and `stop` locate the running daemon automatically by reading `daemon.json` from the state directory and checking that the daemon answers on the health channel. There is no port to pass.
 
 State files live at `~/.hyperdb/` by default (override with `HYPERDB_STATE_DIR`).
 They record the `hyperd` endpoint, so the daemon restricts them to your own
@@ -317,15 +317,19 @@ details are bounded, optional launcher-reported provenance. A live daemon is
 attributed only after a fresh `STATUS` response is verified. Reports contain
 local paths; review them before sharing.
 
-**Port discovery.** MCP auto-spawn discovers a live daemon first, then scans
-upward from **7485** across 16 candidates before starting one at the selected
-exact port. Setting `HYPERDB_DAEMON_PORT` pins auto-spawn to one candidate.
-In contrast, a manually launched foreground `hyperdb-mcp daemon` never scans:
-`--port <PORT>` binds that exact port, while an omitted `--port` binds the
-configured/base port exactly. The health port doubles as a single-instance
-lock and identity check: clients send `PING` and require a
+**Health channel.** The daemon's health channel is a per-user Unix domain
+socket (`daemon.sock`, mode `0600`) in the state directory, or a named pipe on
+Windows, not a TCP port. Nothing listens on the network for it, and another
+account cannot reach it. A single-instance lock (`daemon.lock`, held for the
+daemon's lifetime and released by the OS if it dies) decides whether a daemon is
+running: a client that finds the lock held waits for the record rather than
+starting a second daemon. Clients send `PING` and require a
 `PONG hyperdb-mcp <version>` reply before trusting a daemon, so an unrelated
-process is not mistaken for HyperDB.
+process is not mistaken for HyperDB. The state directory must be owned by you
+and not writable by group or others; otherwise the client uses local mode (a
+private `hyperd`) instead of trusting it. To run a second, isolated daemon (for
+example in tests), point `HYPERDB_STATE_DIR` at a different directory; keep the
+path short, because Unix socket paths are limited to about 100 bytes.
 
 **Staying resident.** By default the daemon never idle-shuts-down — keeping `hyperd` warm means the next tool call connects immediately instead of triggering a "restarting, please retry" round-trip. To opt into auto-shutdown (e.g. on CI), pass `--idle-timeout <SECS>` or set `HYPERDB_DAEMON_IDLE_TIMEOUT`.
 
@@ -1061,11 +1065,10 @@ Deprecated:
                           stderr warning, and will be removed in a future release.
 
 Daemon subcommand:
-  hyperdb-mcp daemon                          Start foreground on the configured/base port exactly
+  hyperdb-mcp daemon                          Start in the foreground; the health channel is a
+                                              per-user socket or named pipe in the state directory
   hyperdb-mcp daemon stop                     Gracefully stop the running daemon
   hyperdb-mcp daemon status                   Show running daemon info
-  hyperdb-mcp daemon --port <PORT>            Bind this exact health/lock port; foreground
-                                              startup never performs the auto-spawn scan.
   hyperdb-mcp daemon --idle-timeout <SECS>    Opt into idle shutdown after SECS idle.
                                               When omitted, the daemon stays resident.
 
@@ -1073,11 +1076,10 @@ Environment:
   HYPERD_PATH                  Hyperd executable or containing directory; when absent or
                                non-UTF-8, walk upward for .hyperd/current/hyperd (no PATH lookup)
   HYPERDB_PERSISTENT_DB        Override the default persistent-db path
-  HYPERDB_STATE_DIR            Override daemon state directory (default ~/.hyperdb/); keep it
+  HYPERDB_STATE_DIR            Override daemon state directory (default ~/.hyperdb/); one
+                               daemon runs per state directory; keep it
                                under your user profile on Windows and on a filesystem with Unix
                                modes on Unix, or it cannot be restricted to your account
-  HYPERDB_DAEMON_PORT          Pin auto-spawn discovery to one health/lock candidate;
-                               foreground startup binds this configured/base port exactly
   HYPERDB_DAEMON_IDLE_TIMEOUT  Opt into idle shutdown (seconds); default: stay resident
 ```
 

@@ -1645,7 +1645,7 @@ impl HyperMcpServer {
     where
         F: FnOnce(&mut Engine) -> Result<R, McpError>,
     {
-        let (result, daemon_health_port, connection_lost) = {
+        let (result, daemon_health_endpoint, connection_lost) = {
             let mut guard = self.ensure_engine()?;
             // `&mut` because transactional paths need
             // `Engine::execute_in_transaction`, whose RAII guard borrows the
@@ -1653,7 +1653,7 @@ impl HyperMcpServer {
             // engine already lives behind this exclusive `Mutex`, so no
             // caller was ever sharing it concurrently.
             let engine = guard.as_mut().expect("ensure_engine guarantees Some");
-            let daemon_health_port = engine.daemon_health_port();
+            let daemon_health_endpoint = engine.daemon_health_endpoint_handle().cloned();
             // Bootstrap the catalog exactly once per engine. Intentionally
             // runs *inside* `with_engine` (not `ensure_engine`) so the
             // catalog SQL can see errors classified via the normal error
@@ -1684,31 +1684,34 @@ impl HyperMcpServer {
                 }
             }
             drop(guard);
-            (result, daemon_health_port, connection_lost)
+            (result, daemon_health_endpoint, connection_lost)
         };
 
-        // Health-plane TCP I/O must not hold the engine mutex. The captured
-        // port is authoritative for the daemon this engine actually uses;
+        // Health-plane I/O must not hold the engine mutex. The captured
+        // endpoint is authoritative for the daemon this engine actually uses;
         // `None` means local fallback and therefore no daemon report.
         if connection_lost {
-            if let Some(port) = daemon_health_port {
-                crate::daemon::health::report_hyperd_error_to_daemon(port);
+            if let Some(endpoint) = &daemon_health_endpoint {
+                crate::daemon::health::report_hyperd_error_to_daemon(endpoint);
             }
         } else {
-            self.maybe_send_heartbeat(daemon_health_port);
+            self.maybe_send_heartbeat(daemon_health_endpoint.as_ref());
         }
         result
     }
 
     /// Best-effort heartbeat to keep the daemon alive while this client is active.
     /// Debounced: only sends if more than 60 seconds have elapsed since the last heartbeat,
-    /// avoiding a new TCP connection on every tool call.
+    /// avoiding a new connection on every tool call.
     ///
-    /// Accepts the daemon health port captured while the engine was locked so
+    /// Accepts the daemon health endpoint captured while the engine was locked so
     /// this method never needs to re-lock `self.engine` after guard release.
-    fn maybe_send_heartbeat(&self, daemon_health_port: Option<u16>) {
+    fn maybe_send_heartbeat(
+        &self,
+        daemon_health_endpoint: Option<&crate::daemon::control::HealthEndpoint>,
+    ) {
         const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-        let Some(port) = daemon_health_port else {
+        let Some(endpoint) = daemon_health_endpoint else {
             return;
         };
 
@@ -1723,7 +1726,7 @@ impl HyperMcpServer {
             true
         });
         if should_send {
-            let _ = crate::daemon::health::send_command(port, "HEARTBEAT");
+            let _ = crate::daemon::health::send_command(endpoint, "HEARTBEAT");
         }
     }
 
@@ -1732,7 +1735,7 @@ impl HyperMcpServer {
     /// the mutex — so diagnostics never hang behind a stalled data-plane op.
     ///
     /// Includes everything answerable from `self` fields + a fast daemon-health
-    /// check (read `daemon.json` + one PING to the known health port, max
+    /// check (read `daemon.json` + one PING to the known health endpoint, max
     /// ~300ms). Omits `table_count`, `total_rows`, `disk_usage_bytes`,
     /// `ephemeral_path`, and `logs` (which require the engine / SQL against
     /// hyperd).
@@ -1740,10 +1743,9 @@ impl HyperMcpServer {
     /// Clients should check `engine_busy: true` and retry `status` later if
     /// they need the full stats, or wait for the in-progress operation to finish.
     fn status_degraded(&self) -> Result<Value, McpError> {
-        // Use discover() — NOT find_running_daemon(). discover() reads the
-        // daemon.json file + one PING to the known health port (~1ms if alive,
-        // 300ms timeout if dead). find_running_daemon() adds a 16-port scan on
-        // failure (up to 4.8s), which would defeat the "instant response" goal.
+        // discover() reads the daemon.json file + one PING to the recorded
+        // health endpoint (~1ms if alive, 300ms timeout if dead), which keeps
+        // the "instant response" goal.
         let (hyperd_running, engine_block) =
             if let Some(info) = crate::daemon::discovery::discover() {
                 (
@@ -1751,7 +1753,7 @@ impl HyperMcpServer {
                     json!({
                         "mode": "daemon",
                         "hyperd_endpoint": info.hyperd_endpoint,
-                        "daemon_health_port": info.health_port,
+                        "daemon_health_endpoint": info.health_endpoint,
                         "connection": crate::engine::describe_endpoint(&info.hyperd_endpoint),
                     }),
                 )
@@ -1762,7 +1764,7 @@ impl HyperMcpServer {
                     json!({
                         "mode": "local",
                         "hyperd_endpoint": null,
-                        "daemon_health_port": null,
+                        "daemon_health_endpoint": null,
                         "connection": null,
                     }),
                 )
@@ -1772,7 +1774,7 @@ impl HyperMcpServer {
                     json!({
                         "mode": "daemon",
                         "hyperd_endpoint": null,
-                        "daemon_health_port": null,
+                        "daemon_health_endpoint": null,
                         "connection": null,
                     }),
                 )
@@ -5858,36 +5860,42 @@ mod kv_value_path_size_tests {
 #[cfg(test)]
 mod heartbeat_debounce_tests {
     use std::io::{BufRead, BufReader, Write};
-    use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::{Arc, Barrier};
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
+    use crate::daemon::control::{ControlListener, ControlStream, HealthEndpoint};
+
     use super::HyperMcpServer;
 
+    /// A per-test state directory and the (not yet bound) endpoint inside it.
+    /// Kept short so the socket path stays under the platform's `sun_path`
+    /// limit.
+    fn test_endpoint() -> (tempfile::TempDir, HealthEndpoint) {
+        let dir = tempfile::tempdir().expect("create heartbeat test state dir");
+        let endpoint = HealthEndpoint::for_new_daemon(dir.path()).expect("heartbeat endpoint");
+        (dir, endpoint)
+    }
+
     struct HeldHeartbeatPeer {
-        port: u16,
+        _dir: tempfile::TempDir,
+        endpoint: HealthEndpoint,
         release: Option<Sender<()>>,
         handle: Option<JoinHandle<Result<Vec<String>, String>>>,
     }
 
     impl HeldHeartbeatPeer {
         fn spawn() -> Self {
+            let (dir, endpoint) = test_endpoint();
             let listener =
-                TcpListener::bind(("127.0.0.1", 0)).expect("bind controlled heartbeat listener");
-            listener
-                .set_nonblocking(true)
-                .expect("make controlled heartbeat listener nonblocking");
-            let port = listener
-                .local_addr()
-                .expect("controlled heartbeat listener address")
-                .port();
+                ControlListener::bind(&endpoint).expect("bind controlled heartbeat listener");
             let (release_tx, release_rx) = mpsc::channel();
             let handle =
-                std::thread::spawn(move || hold_heartbeat_responses(&listener, &release_rx));
+                std::thread::spawn(move || hold_heartbeat_responses(listener, &release_rx));
             Self {
-                port,
+                _dir: dir,
+                endpoint,
                 release: Some(release_tx),
                 handle: Some(handle),
             }
@@ -5917,19 +5925,17 @@ mod heartbeat_debounce_tests {
     }
 
     fn hold_heartbeat_responses(
-        listener: &TcpListener,
+        mut listener: ControlListener,
         release: &Receiver<()>,
     ) -> Result<Vec<String>, String> {
         let hard_deadline = Instant::now() + Duration::from_secs(5);
         let mut streams = Vec::new();
         loop {
-            loop {
-                match listener.accept() {
-                    Ok((stream, _)) => streams.push(stream),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(error) => {
-                        return Err(format!("controlled heartbeat accept failed: {error}"));
-                    }
+            match listener.accept_timeout(Duration::from_millis(2)) {
+                Ok(Some(stream)) => streams.push(stream),
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(format!("controlled heartbeat accept failed: {error}"));
                 }
             }
 
@@ -5940,25 +5946,22 @@ mod heartbeat_debounce_tests {
             if Instant::now() >= hard_deadline {
                 return Err("controlled heartbeat listener was never released".to_string());
             }
-            std::thread::sleep(Duration::from_millis(2));
         }
 
         // Accept any connections already queued when the release signal won
-        // the race with the nonblocking accept above.
+        // the race with the accept above.
         let drain_deadline = Instant::now() + Duration::from_millis(50);
         while Instant::now() < drain_deadline {
-            match listener.accept() {
-                Ok((stream, _)) => streams.push(stream),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+            match listener.accept_timeout(Duration::from_millis(5)) {
+                Ok(Some(stream)) => streams.push(stream),
+                Ok(None) => {}
                 Err(error) => return Err(format!("heartbeat queue drain failed: {error}")),
             }
         }
 
         let mut commands = Vec::with_capacity(streams.len());
         for mut stream in streams {
-            commands.push(read_heartbeat_command(&stream)?);
+            commands.push(read_heartbeat_command(&mut stream)?);
             stream
                 .write_all(b"OK\n")
                 .map_err(|error| format!("acknowledge held heartbeat: {error}"))?;
@@ -5966,43 +5969,32 @@ mod heartbeat_debounce_tests {
         Ok(commands)
     }
 
-    fn read_heartbeat_command(stream: &TcpStream) -> Result<String, String> {
+    fn read_heartbeat_command(stream: &mut ControlStream) -> Result<String, String> {
         stream
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .map_err(|error| format!("set heartbeat read timeout: {error}"))?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(1)))
-            .map_err(|error| format!("set heartbeat write timeout: {error}"))?;
-        let reader = stream
-            .try_clone()
-            .map_err(|error| format!("clone heartbeat stream: {error}"))?;
+            .set_io_timeout(Duration::from_secs(1))
+            .map_err(|error| format!("set heartbeat I/O timeout: {error}"))?;
         let mut command = String::new();
-        BufReader::new(reader)
+        BufReader::new(&mut *stream)
             .read_line(&mut command)
             .map_err(|error| format!("read heartbeat command: {error}"))?;
         Ok(command)
     }
 
     fn collect_immediate_heartbeats(
-        listener: &TcpListener,
+        mut listener: ControlListener,
         window: Duration,
     ) -> Result<Vec<String>, String> {
-        listener
-            .set_nonblocking(true)
-            .map_err(|error| format!("make follow-up listener nonblocking: {error}"))?;
         let deadline = Instant::now() + window;
         let mut commands = Vec::new();
         while Instant::now() < deadline {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    commands.push(read_heartbeat_command(&stream)?);
+            match listener.accept_timeout(Duration::from_millis(2)) {
+                Ok(Some(mut stream)) => {
+                    commands.push(read_heartbeat_command(&mut stream)?);
                     stream
                         .write_all(b"OK\n")
                         .map_err(|error| format!("acknowledge follow-up heartbeat: {error}"))?;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(2));
-                }
+                Ok(None) => {}
                 Err(error) => return Err(format!("follow-up heartbeat accept failed: {error}")),
             }
         }
@@ -6030,10 +6022,10 @@ mod heartbeat_debounce_tests {
             let server = Arc::clone(&server);
             let barrier = Arc::clone(&barrier);
             let completed = completed_tx.clone();
-            let port = peer.port;
+            let endpoint = peer.endpoint.clone();
             callers.push(std::thread::spawn(move || {
                 barrier.wait();
-                server.maybe_send_heartbeat(Some(port));
+                server.maybe_send_heartbeat(Some(&endpoint));
                 let _ = completed.send(());
             }));
         }
@@ -6064,27 +6056,22 @@ mod heartbeat_debounce_tests {
         // Preserve the existing best-effort rule: even a refused connection
         // consumes the debounce interval, so an immediate retry does not
         // create a heartbeat storm while the daemon is unavailable.
-        let reservation =
-            TcpListener::bind(("127.0.0.1", 0)).expect("reserve a closed heartbeat port");
-        let failed_port = reservation
-            .local_addr()
-            .expect("closed heartbeat port address")
-            .port();
-        drop(reservation);
+        // An endpoint nothing is bound to refuses the connection.
+        let (_failed_dir, failed_endpoint) = test_endpoint();
         *server
             .last_heartbeat
             .lock()
             .expect("heartbeat timestamp mutex") = Instant::now()
             .checked_sub(HEARTBEAT_INTERVAL)
             .expect("60-second heartbeat interval fits before current instant");
-        server.maybe_send_heartbeat(Some(failed_port));
+        server.maybe_send_heartbeat(Some(&failed_endpoint));
 
-        let follow_up_listener = TcpListener::bind(("127.0.0.1", failed_port))
-            .expect("bind follow-up listener on refused heartbeat port");
+        let follow_up_listener = ControlListener::bind(&failed_endpoint)
+            .expect("bind follow-up listener on refused heartbeat endpoint");
         let follow_up = std::thread::spawn(move || {
-            collect_immediate_heartbeats(&follow_up_listener, Duration::from_millis(300))
+            collect_immediate_heartbeats(follow_up_listener, Duration::from_millis(300))
         });
-        server.maybe_send_heartbeat(Some(failed_port));
+        server.maybe_send_heartbeat(Some(&failed_endpoint));
         let follow_up_commands = follow_up.join();
 
         let mut failures = Vec::new();

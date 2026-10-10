@@ -2,20 +2,31 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 //! Tests for the single-instance daemon: discovery file, health protocol,
-//! idle timeout, and full lifecycle integration with a real `hyperd`.
+//! idle timeout, the daemon lock, and full lifecycle integration with a real
+//! `hyperd`.
 //!
-//! Many tests mutate process-global environment variables (`HYPERDB_STATE_DIR`,
-//! `HYPERDB_DAEMON_PORT`) to isolate their state directories. Because env vars
+//! A daemon is identified by its state directory: the lock is `daemon.lock`,
+//! the health channel is the per-user socket `daemon.sock`, and `daemon.json`
+//! points at both. Every fake peer here therefore lives in its own short
+//! per-test state directory (a Unix socket path must fit in `sun_path`, 104
+//! bytes on macOS).
+//!
+//! Many tests mutate the process-global environment variable
+//! `HYPERDB_STATE_DIR` to isolate their state directories. Because env vars
 //! are process-global, these tests MUST run sequentially. We enforce this via a
 //! shared mutex — every test that touches env vars acquires `ENV_LOCK` first.
 
-use std::net::TcpListener;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use hyperdb_mcp::daemon::discovery::{self, DaemonInfo, PortScan};
+use hyperdb_mcp::daemon::control::{self, ControlListener, ControlStream, HealthEndpoint};
+use hyperdb_mcp::daemon::discovery::{self, DaemonInfo};
 use hyperdb_mcp::daemon::health::{self, DaemonState, HealthListener};
+use hyperdb_mcp::daemon::lock::DaemonLock;
 use tempfile::TempDir;
 
 /// Process-wide lock for tests that mutate environment variables.
@@ -23,7 +34,7 @@ use tempfile::TempDir;
 /// We recover from poison to prevent one test's panic from cascading.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 const ENGINE_REPORT_CHILD_ENV: &str = "HYPERDB_MCP_ENGINE_REPORT_CHILD";
-const ENGINE_REPORT_TEST_NAME: &str = "report_hyperd_error_targets_discovered_health_port";
+const ENGINE_REPORT_TEST_NAME: &str = "report_hyperd_error_targets_discovered_health_endpoint";
 
 /// Seconds a crash-recovery test waits for the daemon to bring a fresh `hyperd`
 /// back to a reachable state after the running engine is killed.
@@ -60,9 +71,16 @@ fn acquire_env_lock() -> std::sync::MutexGuard<'static, ()> {
 
 // ─── Unit tests: DaemonState (no env vars, safe to run in parallel) ───────────
 
+/// A `DaemonState` for a daemon whose endpoint lives in a fresh state
+/// directory. The directory must outlive the state.
+fn new_daemon_state() -> (TempDir, DaemonState) {
+    let (dir, endpoint) = test_endpoint();
+    (dir, DaemonState::new(endpoint))
+}
+
 #[test]
 fn daemon_state_touch_resets_idle_duration() {
-    let state = DaemonState::new();
+    let (_dir, state) = new_daemon_state();
     std::thread::sleep(Duration::from_millis(50));
     assert!(state.idle_duration() >= Duration::from_millis(50));
 
@@ -72,7 +90,7 @@ fn daemon_state_touch_resets_idle_duration() {
 
 #[test]
 fn daemon_state_shutdown_flag() {
-    let state = DaemonState::new();
+    let (_dir, state) = new_daemon_state();
     assert!(!state.should_shutdown());
 
     state.request_shutdown();
@@ -80,25 +98,14 @@ fn daemon_state_shutdown_flag() {
 }
 
 #[test]
-fn daemon_state_default_is_equivalent_to_new() {
-    let default_state = DaemonState::default();
-    assert!(!default_state.should_shutdown());
-    assert!(default_state.idle_duration() < Duration::from_millis(100));
-}
-
-#[test]
-fn daemon_state_default_initializes_restart_flag_false() {
-    // Guard against future regressions where Default and new() diverge —
-    // both must initialize restart_requested to false.
-    let default_state = DaemonState::default();
-    let new_state = DaemonState::new();
-    assert!(!default_state.consume_restart_request());
-    assert!(!new_state.consume_restart_request());
+fn daemon_state_new_initializes_restart_flag_false() {
+    let (_dir, state) = new_daemon_state();
+    assert!(!state.consume_restart_request());
 }
 
 #[test]
 fn daemon_state_restart_request_consume_round_trip() {
-    let state = DaemonState::new();
+    let (_dir, state) = new_daemon_state();
     assert!(!state.consume_restart_request(), "initially clear");
 
     state.request_restart();
@@ -196,7 +203,7 @@ fn daemon_config_from_args_none_when_unset() {
     let _lock = acquire_env_lock();
     let _guard = EnvGuard::remove("HYPERDB_DAEMON_IDLE_TIMEOUT");
 
-    let config = hyperdb_mcp::daemon::run::DaemonConfig::from_args(0, None);
+    let config = hyperdb_mcp::daemon::run::DaemonConfig::from_args(None);
     assert!(
         config.idle_timeout.is_none(),
         "idle_timeout should be None when neither flag nor env is set"
@@ -208,7 +215,7 @@ fn daemon_config_from_args_some_when_flag() {
     let _lock = acquire_env_lock();
     let _guard = EnvGuard::remove("HYPERDB_DAEMON_IDLE_TIMEOUT");
 
-    let config = hyperdb_mcp::daemon::run::DaemonConfig::from_args(0, Some(120));
+    let config = hyperdb_mcp::daemon::run::DaemonConfig::from_args(Some(120));
     assert_eq!(
         config.idle_timeout,
         Some(Duration::from_secs(120)),
@@ -221,7 +228,7 @@ fn daemon_config_from_args_some_when_env() {
     let _lock = acquire_env_lock();
     let _guard = EnvGuard::set("HYPERDB_DAEMON_IDLE_TIMEOUT", "90");
 
-    let config = hyperdb_mcp::daemon::run::DaemonConfig::from_args(0, None);
+    let config = hyperdb_mcp::daemon::run::DaemonConfig::from_args(None);
     assert_eq!(
         config.idle_timeout,
         Some(Duration::from_secs(90)),
@@ -234,7 +241,7 @@ fn daemon_config_from_args_flag_takes_precedence() {
     let _lock = acquire_env_lock();
     let _guard = EnvGuard::set("HYPERDB_DAEMON_IDLE_TIMEOUT", "90");
 
-    let config = hyperdb_mcp::daemon::run::DaemonConfig::from_args(0, Some(120));
+    let config = hyperdb_mcp::daemon::run::DaemonConfig::from_args(Some(120));
     assert_eq!(
         config.idle_timeout,
         Some(Duration::from_secs(120)),
@@ -245,57 +252,93 @@ fn daemon_config_from_args_flag_takes_precedence() {
 // ─── Unit tests: Health protocol (no env vars, safe to run in parallel) ───────
 
 #[test]
-fn health_listener_bind_succeeds_on_free_port() {
-    let listener = HealthListener::bind(0).unwrap();
-    assert_ne!(listener.port, 0);
+fn health_listener_bind_succeeds_on_a_free_endpoint() {
+    let (_dir, endpoint) = test_endpoint();
+    let listener = HealthListener::bind(&endpoint).unwrap();
+    assert_eq!(listener.endpoint(), &endpoint);
 }
 
 #[test]
-fn health_listener_second_bind_same_port_fails() {
-    let listener = HealthListener::bind(0).unwrap();
-    let port = listener.port;
+fn health_listener_second_bind_on_a_live_endpoint_fails() {
+    let (_dir, endpoint) = test_endpoint();
+    let _first = HealthListener::bind(&endpoint).unwrap();
 
-    let result = HealthListener::bind(port);
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::AddrInUse);
+    let second = HealthListener::bind(&endpoint);
+    assert!(
+        second.is_err(),
+        "a live listener must not be displaced by a second bind"
+    );
+}
+
+/// The lock, not the socket, is what keeps a state directory to one daemon:
+/// it is exclusive per state directory (also within one process, which the
+/// in-process test daemons rely on), independent across directories, and
+/// released on drop.
+#[test]
+fn daemon_lock_is_exclusive_per_state_dir_and_released_on_drop() {
+    let first_dir = TempDir::new().unwrap();
+    let second_dir = TempDir::new().unwrap();
+
+    let held = DaemonLock::try_acquire(first_dir.path())
+        .unwrap()
+        .expect("a free state directory yields the lock");
+    assert!(
+        DaemonLock::try_acquire(first_dir.path()).unwrap().is_none(),
+        "a second holder in the same state directory must be refused"
+    );
+    assert!(
+        DaemonLock::try_acquire(second_dir.path())
+            .unwrap()
+            .is_some(),
+        "another state directory has its own lock"
+    );
+
+    drop(held);
+    // A descriptor can linger briefly in a sibling test's freshly forked child
+    // (it is close-on-exec, so only until that child's exec), hence the short
+    // bounded wait rather than a single probe.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let released = loop {
+        if DaemonLock::try_acquire(first_dir.path()).unwrap().is_some() {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        released,
+        "dropping the lock must free it for the next holder"
+    );
 }
 
 #[test]
 fn health_listener_waits_for_command_after_accept() {
-    use std::io::{BufRead, BufReader, Write};
-    use std::net::{Shutdown, SocketAddr, TcpStream};
     use std::sync::mpsc;
 
     const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(1);
     const OVERALL_WATCHDOG: Duration = Duration::from_secs(3);
 
-    let listener = HealthListener::bind(0).expect("bind OS-assigned health-listener port");
-    let port = listener.port;
-    let info = DaemonInfo {
-        pid: 12345,
-        hyperd_endpoint: "127.0.0.1:54321".to_string(),
-        health_port: port,
-        started_at: "2026-05-20T10:30:00Z".to_string(),
-        version: "0.1.3".to_string(),
-    };
-    let mut listener = OwnedHealthListener::start(listener, info);
+    let (_dir, mut health) = start_health_listener();
+    let endpoint = health.endpoint.clone();
     let (outcome_tx, outcome_rx) = mpsc::sync_channel(1);
     let started = Instant::now();
 
     let client = std::thread::spawn(move || {
-        struct ShutdownOnDrop(TcpStream);
+        struct IdleClient(ControlStream);
 
-        impl ShutdownOnDrop {
-            fn connect(port: u16, timeout: Duration, label: &str) -> Result<Self, String> {
-                let address = SocketAddr::from(([127, 0, 0, 1], port));
-                let stream = TcpStream::connect_timeout(&address, timeout)
+        impl IdleClient {
+            fn connect(
+                endpoint: &HealthEndpoint,
+                timeout: Duration,
+                label: &str,
+            ) -> Result<Self, String> {
+                let mut stream = control::connect(endpoint, timeout)
                     .map_err(|error| format!("connect {label} raw health client: {error}"))?;
                 stream
-                    .set_read_timeout(Some(timeout))
-                    .map_err(|error| format!("set {label} client read timeout: {error}"))?;
-                stream
-                    .set_write_timeout(Some(timeout))
-                    .map_err(|error| format!("set {label} client write timeout: {error}"))?;
+                    .set_io_timeout(timeout)
+                    .map_err(|error| format!("set {label} client I/O timeout: {error}"))?;
                 Ok(Self(stream))
             }
 
@@ -304,12 +347,11 @@ fn health_listener_waits_for_command_after_accept() {
                     format!("{label} PING write failed ({:?}): {error}", error.kind())
                 })?;
 
-                let mut response = String::new();
-                match BufReader::new(&self.0).read_line(&mut response) {
-                    Ok(0) => Err(format!(
+                match read_line_from(&mut self.0) {
+                    Ok(response) if response.is_empty() => Err(format!(
                         "health listener returned early EOF for {label} PING"
                     )),
-                    Ok(_) => Ok(response),
+                    Ok(response) => Ok(response),
                     Err(error) => Err(format!(
                         "{label} PING read failed ({:?}): {error}",
                         error.kind()
@@ -318,21 +360,15 @@ fn health_listener_waits_for_command_after_accept() {
             }
         }
 
-        impl Drop for ShutdownOnDrop {
-            fn drop(&mut self) {
-                let _ = self.0.shutdown(Shutdown::Both);
-            }
-        }
-
         let outcome = (|| -> Result<String, String> {
-            let expected_pong = format!("PONG hyperdb-mcp {}\n", hyperdb_mcp::version::MCP_VERSION);
-            let mut idle_client = ShutdownOnDrop::connect(port, CLIENT_IO_TIMEOUT, "first idle")?;
+            let expected_pong = pong_line();
+            let mut idle_client = IdleClient::connect(&endpoint, CLIENT_IO_TIMEOUT, "first idle")?;
 
             // A PONG from a later connection proves the listener has accepted
             // and serviced connections while the first one remains byte-empty.
             {
                 let mut progress_probe =
-                    ShutdownOnDrop::connect(port, CLIENT_IO_TIMEOUT, "progress probe")?;
+                    IdleClient::connect(&endpoint, CLIENT_IO_TIMEOUT, "progress probe")?;
                 let probe_response = progress_probe.ping("progress-probe")?;
                 if probe_response != expected_pong {
                     return Err(format!(
@@ -341,9 +377,9 @@ fn health_listener_waits_for_command_after_accept() {
                 }
             }
 
-            // An accepted socket must not inherit the listener's
+            // An accepted connection must not inherit the listener's
             // non-blocking mode: a non-blocking read would fail with
-            // WouldBlock at once. Keep the first socket idle for 350 ms,
+            // WouldBlock at once. Keep the first connection idle for 350 ms,
             // well inside the handler's 5 s read timeout, before sending
             // its first command.
             std::thread::sleep(Duration::from_millis(350));
@@ -353,7 +389,7 @@ fn health_listener_waits_for_command_after_accept() {
     });
 
     let outcome = outcome_rx.recv_timeout(OVERALL_WATCHDOG);
-    listener.stop_and_join();
+    health.stop_and_join();
     let client_join = client.join();
 
     assert!(
@@ -365,10 +401,7 @@ fn health_listener_waits_for_command_after_accept() {
     });
     assert_eq!(
         response,
-        Ok(format!(
-            "PONG hyperdb-mcp {}\n",
-            hyperdb_mcp::version::MCP_VERSION
-        )),
+        Ok(pong_line()),
         "HealthListener must keep an accepted connection open until its first command; elapsed={:?}",
         started.elapsed()
     );
@@ -376,45 +409,45 @@ fn health_listener_waits_for_command_after_accept() {
 
 #[test]
 fn health_protocol_ping_pong() {
-    let (port, _handle, _state) = start_health_listener();
+    let (_dir, health) = start_health_listener();
 
-    let response = health::send_command(port, "PING").unwrap();
+    let response = health::send_command(&health.endpoint, "PING").unwrap();
     assert!(response.trim().starts_with("PONG hyperdb-mcp "));
 }
 
 #[test]
 fn health_protocol_heartbeat_resets_idle() {
-    let (port, _handle, state) = start_health_listener();
+    let (_dir, health) = start_health_listener();
 
     std::thread::sleep(Duration::from_millis(50));
-    assert!(state.idle_duration() >= Duration::from_millis(50));
+    assert!(health.state.idle_duration() >= Duration::from_millis(50));
 
-    let response = health::send_command(port, "HEARTBEAT").unwrap();
+    let response = health::send_command(&health.endpoint, "HEARTBEAT").unwrap();
     assert_eq!(response.trim(), "OK");
 
-    assert!(state.idle_duration() < Duration::from_millis(30));
+    assert!(health.state.idle_duration() < Duration::from_millis(30));
 }
 
 #[test]
 fn health_protocol_stop_triggers_shutdown() {
-    let (port, handle, state) = start_health_listener();
+    let (_dir, mut health) = start_health_listener();
 
-    assert!(!state.should_shutdown());
+    assert!(!health.state.should_shutdown());
 
-    let response = health::send_command(port, "STOP").unwrap();
+    let response = health::send_command(&health.endpoint, "STOP").unwrap();
     assert_eq!(response.trim(), "STOPPING");
 
-    assert!(state.should_shutdown());
+    assert!(health.state.should_shutdown());
 
     // Health listener should exit its loop
-    handle.join().unwrap();
+    health.join();
 }
 
 #[test]
 fn health_protocol_status_returns_json() {
-    let (port, _handle, _state) = start_health_listener();
+    let (_dir, health) = start_health_listener();
 
-    let response = health::send_command(port, "STATUS").unwrap();
+    let response = health::send_command(&health.endpoint, "STATUS").unwrap();
     let parsed: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
     assert_eq!(parsed["pid"], 12345);
     assert_eq!(parsed["hyperd_endpoint"], "127.0.0.1:54321");
@@ -422,370 +455,151 @@ fn health_protocol_status_returns_json() {
 
 #[test]
 fn health_protocol_unknown_command_returns_error() {
-    let (port, _handle, _state) = start_health_listener();
+    let (_dir, health) = start_health_listener();
 
-    let response = health::send_command(port, "INVALID").unwrap();
+    let response = health::send_command(&health.endpoint, "INVALID").unwrap();
     assert!(response.contains("ERR"));
 }
 
 #[test]
 fn health_protocol_report_hyperd_error_sets_flag() {
-    let (port, _handle, state) = start_health_listener();
+    let (_dir, health) = start_health_listener();
 
-    assert!(!state.consume_restart_request(), "flag starts clear");
+    assert!(!health.state.consume_restart_request(), "flag starts clear");
 
-    let response = health::send_command(port, "REPORT_HYPERD_ERROR").unwrap();
+    let response = health::send_command(&health.endpoint, "REPORT_HYPERD_ERROR").unwrap();
     assert_eq!(response.trim(), "OK");
 
     // The handler ran on a different thread. The flag is set before the OK
     // reply is written, so it is observable as soon as send_command returns.
     assert!(
-        state.consume_restart_request(),
+        health.state.consume_restart_request(),
         "REPORT_HYPERD_ERROR must set the restart-requested flag"
     );
 }
 
 #[test]
 fn health_protocol_multi_command_session() {
-    let (port, _handle, _state) = start_health_listener();
+    let (_dir, health) = start_health_listener();
 
-    let response1 = health::send_command(port, "PING").unwrap();
+    let response1 = health::send_command(&health.endpoint, "PING").unwrap();
     assert!(response1.trim().starts_with("PONG hyperdb-mcp "));
 
-    let response2 = health::send_command(port, "STATUS").unwrap();
+    let response2 = health::send_command(&health.endpoint, "STATUS").unwrap();
     let parsed: serde_json::Value = serde_json::from_str(response2.trim()).unwrap();
-    assert_eq!(parsed["health_port"], port);
+    assert_eq!(parsed["health_endpoint"], health.endpoint.as_str());
 
-    let response3 = health::send_command(port, "HEARTBEAT").unwrap();
+    let response3 = health::send_command(&health.endpoint, "HEARTBEAT").unwrap();
     assert_eq!(response3.trim(), "OK");
 }
 
 #[test]
 fn health_protocol_ping_identity_accept() {
-    let (port, _handle, _state) = start_health_listener();
+    let (_dir, health) = start_health_listener();
 
-    let version =
-        health::ping_identified(port, Duration::from_millis(300), Duration::from_millis(300))
-            .expect("should return Some for a valid hyperdb-mcp daemon");
+    let version = health::ping_identified(
+        &health.endpoint,
+        Duration::from_millis(300),
+        Duration::from_millis(300),
+    )
+    .expect("should return Some for a valid hyperdb-mcp daemon");
     assert_eq!(version, hyperdb_mcp::version::MCP_VERSION);
 }
 
 #[test]
 fn health_protocol_ping_identity_reject_foreign() {
-    use std::io::Write;
+    // A peer that returns a bare "PONG\n" without the identifying token.
+    let dir = TempDir::new().unwrap();
+    let mut peer = FakeHealthPeer::start_in(dir.path(), |_| b"PONG\n".to_vec());
 
-    // Bind a raw listener that returns a bare "PONG\n" without the identifying token
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-
-    std::thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            let _ = stream.write_all(b"PONG\n");
-        }
-    });
-
-    // Give the thread a moment to start accepting
-    std::thread::sleep(Duration::from_millis(50));
-
-    let result =
-        health::ping_identified(port, Duration::from_millis(300), Duration::from_millis(300));
+    let result = health::ping_identified(
+        &peer.endpoint,
+        Duration::from_millis(300),
+        Duration::from_millis(300),
+    );
     assert_eq!(result, None, "should reject foreign PONG without token");
+    assert_eq!(
+        peer.stop_and_join(),
+        ["PING"],
+        "the peer must actually have been asked, or the rejection proves nothing"
+    );
 }
 
 #[test]
 fn health_protocol_ping_identity_reject_token_lookalike() {
-    use std::io::Write;
-
     // A foreign service whose token *starts with* "hyperdb-mcp" must NOT pass.
     // Guards against a naive `starts_with("PONG hyperdb-mcp")` prefix check.
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let dir = TempDir::new().unwrap();
+    let mut peer =
+        FakeHealthPeer::start_in(dir.path(), |_| b"PONG hyperdb-mcpEVIL 9.9.9\n".to_vec());
 
-    std::thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            let _ = stream.write_all(b"PONG hyperdb-mcpEVIL 9.9.9\n");
-        }
-    });
-
-    std::thread::sleep(Duration::from_millis(50));
-
-    let result =
-        health::ping_identified(port, Duration::from_millis(300), Duration::from_millis(300));
+    let result = health::ping_identified(
+        &peer.endpoint,
+        Duration::from_millis(300),
+        Duration::from_millis(300),
+    );
     assert_eq!(
         result, None,
         "must reject a token that only shares a prefix"
     );
+    assert_eq!(peer.stop_and_join(), ["PING"]);
 }
 
 #[test]
 fn health_protocol_ping_identity_reject_refused() {
-    // Bind a listener to get a port, then drop it so the port is closed
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
+    // Bind a listener, then drop it so nothing serves the endpoint any more.
+    let (_dir, endpoint) = test_endpoint();
+    let listener = ControlListener::bind(&endpoint).unwrap();
     drop(listener);
 
-    // Brief sleep to reduce the race (the OS may not have fully released the port)
-    std::thread::sleep(Duration::from_millis(10));
-
-    let result =
-        health::ping_identified(port, Duration::from_millis(300), Duration::from_millis(300));
-    assert_eq!(result, None, "should return None for connection refused");
-}
-
-#[test]
-fn resolve_port_scan_pins_when_env_set() {
-    let _lock = acquire_env_lock();
-    let _guard = EnvGuard::set("HYPERDB_DAEMON_PORT", "9001");
-    assert_eq!(
-        discovery::resolve_port_scan(),
-        PortScan {
-            base: 9001,
-            span: 1
-        }
+    let result = health::ping_identified(
+        &endpoint,
+        Duration::from_millis(300),
+        Duration::from_millis(300),
     );
+    assert_eq!(result, None, "should return None when nothing serves it");
 }
 
-#[test]
-fn resolve_port_scan_scans_when_env_unset() {
-    let _lock = acquire_env_lock();
-    let _guard = EnvGuard::remove("HYPERDB_DAEMON_PORT");
-    let scan = discovery::resolve_port_scan();
-    assert_eq!(scan.base, hyperdb_mcp::daemon::DEFAULT_DAEMON_BASE_PORT);
-    assert_eq!(scan.span, hyperdb_mcp::daemon::DAEMON_PORT_SCAN_SPAN);
-}
-
-/// `"0".parse::<u16>()` succeeds, so port 0 slipped through the env chain's
-/// validity filter and pinned `PortScan { base: 0, span: 1 }` — a
-/// configuration nothing can satisfy. `bind` would take an OS-assigned
-/// ephemeral port instead of port 0, while every client's scan kept probing
-/// port 0 and read `ProbeResult::Refused` as "free", so each client that
-/// missed the discovery fast path spawned another daemon-and-`hyperd` pair on
-/// another unfindable port. It must fall back to the scanning default, exactly
-/// as unparseable input already does.
-#[test]
-fn resolve_port_scan_rejects_zero_and_falls_back_to_the_default_scan() {
-    let _lock = acquire_env_lock();
-    let _guard = EnvGuard::set("HYPERDB_DAEMON_PORT", "0");
-    let scan = discovery::resolve_port_scan();
-    assert_eq!(
-        scan,
-        PortScan {
-            base: hyperdb_mcp::daemon::DEFAULT_DAEMON_BASE_PORT,
-            span: hyperdb_mcp::daemon::DAEMON_PORT_SCAN_SPAN,
-        },
-        "HYPERDB_DAEMON_PORT=0 must fall back to the default scan, not pin an \
-         unsatisfiable base: 0 / span: 1"
-    );
-}
-
-/// The same rejection at the other entry point. Driven through the real
-/// binary because `Cli` lives in `main.rs` and is not reachable from a test
-/// crate; that also verifies the clap `value_parser` produces a usage error
-/// (exit 2) rather than something the daemon has to defend against later.
+/// The removed `--port` flag. Driven through the real binary because `Cli`
+/// lives in `main.rs` and is not reachable from a test crate. clap must reject
+/// it as a usage error (exit 2) rather than a daemon quietly accepting it.
 ///
-/// Two safety properties this test needs, both learned the hard way by
-/// running it against the unfixed binary:
-///
-/// - **It must not hang.** Without the `value_parser`, `daemon --port 0` is
-///   *accepted* and runs a foreground daemon forever, so a plain
-///   `Command::output()` never returns. Each child is therefore waited on
-///   against a deadline and killed if it outlives it — a reverted fix fails
-///   with a message instead of wedging the suite.
-/// - **It must not touch the real state directory.** That same accepted
-///   daemon writes `daemon.json`, which overwrote the developer's live
-///   discovery record. `HOME`/`USERPROFILE`/`HYPERDB_STATE_DIR` are pinned
-///   into a temp dir so the blast radius of a regression stays inside the
-///   test.
+/// Each child is waited on against a deadline and killed if it outlives it:
+/// had `--port` still been accepted, `daemon --port 1234` would run a
+/// foreground daemon forever and a plain `Command::output()` would never
+/// return.
 #[test]
-fn daemon_cli_rejects_port_zero() {
-    /// Long enough that a loaded machine cannot mistake startup for a hang,
-    /// short enough that a regression reports promptly. A rejected port exits
-    /// in milliseconds; an accepted one never exits at all.
-    const CHILD_DEADLINE: Duration = Duration::from_secs(20);
-
-    let sandbox = TempDir::new().expect("temp state dir for port-0 CLI test");
-    let mut failures = Vec::new();
-
-    let run_bounded = |args: &[&str]| -> Result<(Option<i32>, String), String> {
-        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hyperdb-mcp"));
-        command.env_clear();
-        preserve_child_runtime_environment(&mut command);
-        command
-            .args(args)
-            .current_dir(sandbox.path())
-            .env("HOME", sandbox.path())
-            .env("USERPROFILE", sandbox.path())
-            .env("HYPERDB_STATE_DIR", sandbox.path())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if let Some(hyperd) = std::env::var_os("HYPERD_PATH") {
-            command.env("HYPERD_PATH", hyperd);
-        }
-
-        let mut child = command.spawn().map_err(|error| error.to_string())?;
-        let deadline = Instant::now() + CHILD_DEADLINE;
-        loop {
-            match child.try_wait().map_err(|error| error.to_string())? {
-                Some(status) => {
-                    let output = child
-                        .wait_with_output()
-                        .map_err(|error| error.to_string())?;
-                    return Ok((
-                        status.code(),
-                        String::from_utf8_lossy(&output.stderr).into(),
-                    ));
-                }
-                None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!(
-                        "`hyperdb-mcp {}` was still running after {CHILD_DEADLINE:?}; \
-                         port 0 was accepted and started a foreground daemon instead of \
-                         being rejected",
-                        args.join(" ")
-                    ));
-                }
-                None => std::thread::sleep(Duration::from_millis(50)),
-            }
-        }
-    };
+fn daemon_cli_rejects_the_removed_port_flag() {
+    let sandbox = TempDir::new().expect("temp state dir for the port-flag CLI test");
 
     for args in [
+        ["daemon", "--port", "1234"].as_slice(),
         ["daemon", "--port", "0"].as_slice(),
-        ["daemon", "stop", "--port", "0"].as_slice(),
-        ["daemon", "status", "--port", "0"].as_slice(),
+        ["daemon", "stop", "--port", "1234"].as_slice(),
+        ["daemon", "status", "--port", "1234"].as_slice(),
     ] {
-        match run_bounded(args) {
-            Ok((code, stderr)) => {
-                if code != Some(2) {
-                    failures.push(format!(
-                        "{args:?}: expected clap's usage-error exit 2, got {code:?} (stderr {stderr:?})"
-                    ));
-                }
-                if !stderr.contains("not in") {
-                    failures.push(format!(
-                        "{args:?}: stderr should name the rejected range, got {stderr:?}"
-                    ));
-                }
-            }
-            Err(message) => failures.push(format!("{args:?}: {message}")),
-        }
-    }
-
-    // A valid port must still parse. `--help` short-circuits before any bind,
-    // so this stays hermetic: no daemon is started and no port is taken.
-    match run_bounded(&["daemon", "--port", "7485", "--help"]) {
-        Ok((Some(0), _)) => {}
-        Ok((code, stderr)) => failures.push(format!(
-            "a valid --port must still be accepted; exit {code:?}, stderr {stderr:?}"
-        )),
-        Err(message) => failures.push(format!("valid --port: {message}")),
+        let output = run_cli_bounded(args, sandbox.path(), Duration::from_secs(20));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?}: expected clap's usage-error exit 2\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("unexpected argument"),
+            "{args:?}: stderr should say the argument is unexpected, got {stderr:?}"
+        );
     }
 
     assert!(
         !sandbox.path().join("daemon.json").exists(),
         "no invocation in this test may publish a discovery record; \
-         port 0 was accepted and a daemon actually started"
-    );
-    assert!(
-        failures.is_empty(),
-        "port-0 rejection failures:\n{}",
-        failures.join("\n")
+         a rejected flag must not have started a daemon"
     );
 }
 
 #[test]
-fn daemon_status_post_action_port_targets_explicit_listener() {
-    let _lock = acquire_env_lock();
-    let temp_dir = TempDir::new().expect("create isolated daemon-status state root");
-    let state_dir = temp_dir.path().join("state");
-    std::fs::create_dir_all(&state_dir).expect("create isolated daemon-status state directory");
-    let discovery_path = state_dir.join("daemon.json");
-    let stale_discovery = br#"{
-  "pid": 424242,
-  "hyperd_endpoint": "127.0.0.1:1",
-  "health_port": 0,
-  "started_at": "stale-discovery-sentinel",
-  "version": "0.0.0-stale"
-}"#;
-    std::fs::write(&discovery_path, stale_discovery)
-        .expect("write stale discovery sentinel for explicit-port bypass proof");
-
-    let mut explicit_listener = CliStatusListener::start();
-    let reserved_base = TcpListener::bind(("127.0.0.1", 0))
-        .expect("reserve an isolated discovery base port different from the explicit listener");
-    let base_port = reserved_base
-        .local_addr()
-        .expect("read reserved discovery base address")
-        .port();
-    assert_ne!(
-        base_port, explicit_listener.port,
-        "isolated discovery base must differ from the explicit target"
-    );
-
-    let spellings = [
-        vec![
-            "daemon".to_string(),
-            "status".to_string(),
-            "--port".to_string(),
-            explicit_listener.port.to_string(),
-        ],
-        vec![
-            "daemon".to_string(),
-            "--port".to_string(),
-            explicit_listener.port.to_string(),
-            "status".to_string(),
-        ],
-    ];
-    let mut failures = Vec::new();
-
-    for args in &spellings {
-        let output = run_cli_child_with_watchdog(args, &state_dir, base_port);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !output.status.success() {
-            failures.push(format!(
-                "`hyperdb-mcp {}` exited {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
-                args.join(" "),
-                output.status
-            ));
-        }
-        let expected_port_line = format!("Health port:    {}", explicit_listener.port);
-        if !stdout.contains(&expected_port_line) {
-            failures.push(format!(
-                "`hyperdb-mcp {}` did not report the explicit listener {expected_port_line:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
-                args.join(" ")
-            ));
-        }
-    }
-
-    let received_commands = explicit_listener.stop_and_join();
-    if received_commands != ["STATUS", "STATUS"] {
-        failures.push(format!(
-            "explicit listener received {received_commands:?}, expected one STATUS from each literal spelling"
-        ));
-    }
-    match std::fs::read(&discovery_path) {
-        Ok(contents) if contents == stale_discovery => {}
-        Ok(contents) => failures.push(format!(
-            "explicit status mutated stale discovery sentinel: {:?}",
-            String::from_utf8_lossy(&contents)
-        )),
-        Err(error) => failures.push(format!(
-            "explicit status removed or made stale discovery unreadable: {error}"
-        )),
-    }
-
-    assert!(
-        failures.is_empty(),
-        "explicit daemon status contract failures:\n{}",
-        failures.join("\n\n")
-    );
-}
-
-#[test]
-fn report_hyperd_error_targets_discovered_health_port() {
+fn report_hyperd_error_targets_discovered_health_endpoint() {
     let _lock = acquire_env_lock();
     if std::env::var_os(ENGINE_REPORT_CHILD_ENV).is_some() {
         run_engine_report_child();
@@ -800,12 +614,6 @@ fn run_bounded_engine_report_child() {
     let process_temp_dir = temp_dir.path().join("tmp");
     std::fs::create_dir_all(&state_dir).expect("create isolated engine-construction state");
     std::fs::create_dir_all(&process_temp_dir).expect("create isolated process temp directory");
-    let configured_base =
-        TcpListener::bind(("127.0.0.1", 0)).expect("reserve configured daemon base port");
-    let configured_base_port = configured_base
-        .local_addr()
-        .expect("read configured daemon base port")
-        .port();
 
     let mut command = std::process::Command::new(
         std::env::current_exe().expect("locate daemon integration-test binary"),
@@ -819,7 +627,6 @@ fn run_bounded_engine_report_child() {
         .env("HOME", &state_dir)
         .env("USERPROFILE", &state_dir)
         .env("HYPERDB_STATE_DIR", &state_dir)
-        .env("HYPERDB_DAEMON_PORT", configured_base_port.to_string())
         .env("TMPDIR", &process_temp_dir)
         .env("TEMP", &process_temp_dir)
         .env("TMP", &process_temp_dir)
@@ -877,40 +684,33 @@ fn run_bounded_engine_report_child() {
 }
 
 fn run_engine_report_child() {
-    let configured_base_port = std::env::var("HYPERDB_DAEMON_PORT")
-        .expect("parent must configure a distinct daemon base port")
-        .parse::<u16>()
-        .expect("configured daemon base port must be a u16");
-
-    let health_listener = HealthListener::bind(0).expect("bind discovered health listener");
-    let health_port = health_listener.port;
-    assert_ne!(
-        health_port, configured_base_port,
-        "discovered health port must differ from the configured base"
-    );
-    let daemon_info = DaemonInfo {
+    let state_dir = discovery::state_dir().expect("child state directory");
+    let mut health = RunningHealth::start_with_info(&state_dir, |endpoint| DaemonInfo {
         pid: 616_161,
         // Port zero is never a reachable TCP server endpoint. It makes the
         // public Engine constructor enter the daemon connection-error branch
         // without racing another process for a recently released port.
         hyperd_endpoint: "127.0.0.1:0".to_string(),
-        health_port,
+        health_endpoint: endpoint.as_str().to_string(),
         started_at: "2026-08-14T12:34:56Z".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-    };
-    let mut health_listener = OwnedHealthListener::start(health_listener, daemon_info.clone());
-    discovery::write_discovery_file(&daemon_info)
-        .expect("write isolated non-base daemon discovery record");
+    });
+    let daemon_info = health
+        .info
+        .lock()
+        .expect("daemon info mutex must not be poisoned")
+        .clone();
+    discovery::write_discovery_file(&daemon_info).expect("write isolated daemon discovery record");
     assert!(
-        !health_listener.state.consume_restart_request(),
+        !health.state.consume_restart_request(),
         "restart flag must begin clear"
     );
 
     let error = hyperdb_mcp::engine::Engine::new(None)
         .expect_err("unreachable discovered Hyper endpoint must fail Engine construction");
 
-    let restart_requested = health_listener.state.consume_restart_request();
-    health_listener.stop_and_join();
+    let restart_requested = health.state.consume_restart_request();
+    health.stop_and_join();
     assert!(
         error
             .message
@@ -920,7 +720,7 @@ fn run_engine_report_child() {
     );
     assert!(
         restart_requested,
-        "Engine::try_daemon_mode must report through the non-base health port from discovery"
+        "Engine::try_daemon_mode must report through the health endpoint from discovery"
     );
 }
 
@@ -941,8 +741,8 @@ fn daemon_idle_timeout_shuts_down_daemon() {
     // long this thread took to get from `new()` to `Instant::now()` rather
     // than on the timeout under test.
     let start = Instant::now();
-    let state = Arc::new(DaemonState::new());
-
+    let (_dir, state) = new_daemon_state();
+    let state = Arc::new(state);
     let monitor_state = Arc::clone(&state);
     let monitor = std::thread::spawn(move || {
         loop {
@@ -984,8 +784,8 @@ fn daemon_idle_timeout_shuts_down_daemon() {
 /// readiness floor is removed: `run` then never returns and the join hangs
 /// forever, which is what the daemon would do in production.
 ///
-/// Needs no state-directory isolation: the listener takes an ephemeral port
-/// rather than the daemon port, and nothing here writes a discovery record or
+/// Needs no state-directory isolation beyond its own tempdir: the listener
+/// binds a socket there, and nothing here writes a discovery record or
 /// otherwise touches `$HOME`.
 #[test]
 fn idle_timeout_stops_a_real_health_listener() {
@@ -995,16 +795,10 @@ fn idle_timeout_stops_a_real_health_listener() {
     // the unbounded wait a broken accept loop would produce.
     const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(15);
 
-    let listener = HealthListener::bind(0).expect("bind real health listener");
-    let port = listener.port;
-    let state = Arc::new(DaemonState::new());
-    let info = Arc::new(Mutex::new(DaemonInfo {
-        pid: std::process::id(),
-        hyperd_endpoint: "127.0.0.1:0".to_string(),
-        health_port: port,
-        started_at: "2026-09-06T00:00:00Z".to_string(),
-        version: "0.0.0-test".to_string(),
-    }));
+    let (_dir, endpoint) = test_endpoint();
+    let listener = HealthListener::bind(&endpoint).expect("bind real health listener");
+    let state = Arc::new(DaemonState::new(endpoint.clone()));
+    let info = Arc::new(Mutex::new(test_daemon_info(&endpoint)));
 
     let run_state = Arc::clone(&state);
     let (finished_tx, finished_rx) = std::sync::mpsc::channel();
@@ -1016,9 +810,9 @@ fn idle_timeout_stops_a_real_health_listener() {
     // PING rather than HEARTBEAT: it proves the listener is really serving
     // before the clock matters, without resetting the idle timer the test is
     // about.
-    let pong = health::send_command(port, "PING").expect("real health listener must answer PING");
+    let pong =
+        health::send_command(&endpoint, "PING").expect("real health listener must answer PING");
     assert!(pong.starts_with("PONG"), "unexpected PING reply: {pong:?}");
-
     // The same decision `run.rs`'s `idle_monitor` makes, at a tick that suits a
     // test: no activity for `IDLE_TIMEOUT` ⇒ request shutdown.
     let monitor_state = Arc::clone(&state);
@@ -1060,7 +854,8 @@ fn idle_timeout_stops_a_real_health_listener() {
 
 #[test]
 fn daemon_heartbeat_prevents_idle_shutdown() {
-    let state = Arc::new(DaemonState::new());
+    let (_dir, state) = new_daemon_state();
+    let state = Arc::new(state);
     let idle_timeout = Duration::from_secs(1);
 
     let monitor_state = Arc::clone(&state);
@@ -1109,11 +904,11 @@ fn daemon_heartbeat_prevents_idle_shutdown() {
 // ─── Unit tests: Discovery file (require ENV_LOCK) ────────────────────────────
 
 #[test]
-fn legacy_daemon_info_literal_is_source_compatible() {
+fn daemon_info_literal_serializes_the_health_endpoint_field() {
     let info = DaemonInfo {
         pid: 12345,
         hyperd_endpoint: "127.0.0.1:54321".to_string(),
-        health_port: 7484,
+        health_endpoint: "/tmp/state/daemon.sock".to_string(),
         started_at: "2026-05-20T10:30:00Z".to_string(),
         version: "0.1.3".to_string(),
     };
@@ -1123,7 +918,7 @@ fn legacy_daemon_info_literal_is_source_compatible() {
         serde_json::json!({
             "pid": 12345,
             "hyperd_endpoint": "127.0.0.1:54321",
-            "health_port": 7484,
+            "health_endpoint": "/tmp/state/daemon.sock",
             "started_at": "2026-05-20T10:30:00Z",
             "version": "0.1.3"
         })
@@ -1139,7 +934,7 @@ fn discovery_file_write_and_read() {
     let info = DaemonInfo {
         pid: 12345,
         hyperd_endpoint: "127.0.0.1:54321".to_string(),
-        health_port: 7484,
+        health_endpoint: "/tmp/state/daemon.sock".to_string(),
         started_at: "2026-05-20T10:30:00Z".to_string(),
         version: "0.1.3".to_string(),
     };
@@ -1153,7 +948,7 @@ fn discovery_file_write_and_read() {
     let read_back: DaemonInfo = serde_json::from_str(&contents).unwrap();
     assert_eq!(read_back.pid, 12345);
     assert_eq!(read_back.hyperd_endpoint, "127.0.0.1:54321");
-    assert_eq!(read_back.health_port, 7484);
+    assert_eq!(read_back.health_endpoint, "/tmp/state/daemon.sock");
     assert_eq!(read_back.version, "0.1.3");
 }
 
@@ -1166,7 +961,7 @@ fn discovery_file_overwrite_replaces_content() {
     let info1 = DaemonInfo {
         pid: 100,
         hyperd_endpoint: "127.0.0.1:1111".to_string(),
-        health_port: 7484,
+        health_endpoint: "/tmp/state/daemon.sock".to_string(),
         started_at: "2026-01-01T00:00:00Z".to_string(),
         version: "0.1.0".to_string(),
     };
@@ -1175,7 +970,7 @@ fn discovery_file_overwrite_replaces_content() {
     let info2 = DaemonInfo {
         pid: 200,
         hyperd_endpoint: "127.0.0.1:2222".to_string(),
-        health_port: 7485,
+        health_endpoint: "/tmp/other/daemon.sock".to_string(),
         started_at: "2026-02-02T00:00:00Z".to_string(),
         version: "0.2.0".to_string(),
     };
@@ -1186,6 +981,7 @@ fn discovery_file_overwrite_replaces_content() {
     let read_back: DaemonInfo = serde_json::from_str(&contents).unwrap();
     assert_eq!(read_back.pid, 200);
     assert_eq!(read_back.hyperd_endpoint, "127.0.0.1:2222");
+    assert_eq!(read_back.health_endpoint, "/tmp/other/daemon.sock");
 }
 
 #[test]
@@ -1197,7 +993,7 @@ fn remove_discovery_file_deletes_it() {
     let info = DaemonInfo {
         pid: 1,
         hyperd_endpoint: "127.0.0.1:1".to_string(),
-        health_port: 7484,
+        health_endpoint: "/tmp/state/daemon.sock".to_string(),
         started_at: "2026-01-01T00:00:00Z".to_string(),
         version: "0.0.1".to_string(),
     };
@@ -1218,170 +1014,23 @@ fn discover_returns_none_when_no_file_exists() {
     assert!(discovery::discover().is_none());
 }
 
+/// A record whose endpoint nobody serves is not a daemon. Unlike the previous
+/// `discover`, it is also *not deleted* here: removing a stale record is the
+/// job of whoever holds the daemon lock, because only a held lock proves no
+/// daemon is starting.
 #[test]
-fn discover_returns_none_for_stale_file() {
-    let _lock = acquire_env_lock();
+fn discover_returns_none_for_stale_record_and_leaves_it() {
     let tmp = TempDir::new().unwrap();
-    let _guard = EnvGuard::set("HYPERDB_STATE_DIR", tmp.path().to_str().unwrap());
+    let endpoint = HealthEndpoint::for_new_daemon(tmp.path()).unwrap();
+    let record = write_record(tmp.path(), &test_daemon_info(&endpoint));
 
-    let info = DaemonInfo {
-        pid: 99999,
-        hyperd_endpoint: "127.0.0.1:1".to_string(),
-        health_port: 1,
-        started_at: "2026-01-01T00:00:00Z".to_string(),
-        version: "0.0.1".to_string(),
-    };
-    discovery::write_discovery_file(&info).unwrap();
+    assert!(discovery::discover_in(tmp.path()).is_none());
 
-    assert!(discovery::discover().is_none());
-
-    let path = tmp.path().join("daemon.json");
-    assert!(!path.exists());
-}
-
-#[test]
-fn resolve_port_uses_env_var() {
-    let _lock = acquire_env_lock();
-    let _guard = EnvGuard::set("HYPERDB_DAEMON_PORT", "9999");
-    assert_eq!(discovery::resolve_port(), 9999);
-}
-
-#[test]
-fn resolve_port_uses_default_when_env_unset() {
-    let _lock = acquire_env_lock();
-    let _guard = EnvGuard::remove("HYPERDB_DAEMON_PORT");
     assert_eq!(
-        discovery::resolve_port(),
-        hyperdb_mcp::daemon::DEFAULT_DAEMON_BASE_PORT
+        std::fs::read(tmp.path().join("daemon.json")).unwrap(),
+        record,
+        "discovery must be side-effect free"
     );
-}
-
-// ─── Unit tests: Port scanning (require ENV_LOCK + sandbox OFF) ──────────────
-
-#[test]
-fn scan_finds_our_daemon_via_status() {
-    let _lock = acquire_env_lock();
-    let (port, _handle, _state) = start_health_listener();
-
-    let scan = PortScan {
-        base: port,
-        span: 1,
-    };
-    match discovery::scan_for_daemon(scan) {
-        discovery::ScanOutcome::Found(info) => {
-            assert_eq!(info.hyperd_endpoint, "127.0.0.1:54321");
-        }
-        other => panic!("expected Found, got {other:?}"),
-    }
-}
-
-#[test]
-fn scan_skips_camped_returns_free() {
-    let _lock = acquire_env_lock();
-
-    // Find a camped port `base` whose immediate successor `base + 1` is free,
-    // so the scan range is exactly the two adjacent ports {base, base+1}.
-    //
-    // TOCTOU mitigation: other tests' `start_health_listener` helpers leak
-    // identity-answering listeners on random high ports for the test-process
-    // lifetime. If one steals `base+1` between our probe-drop and the scan,
-    // the scan returns `Found` instead of `FreePort`. We retry with a fresh
-    // port pair up to 5 times to tolerate this race on busy CI runners.
-    for _attempt in 0..5 {
-        let (camped_listener, base) = loop {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let port = listener.local_addr().unwrap().port();
-            if port < u16::MAX
-                && let Ok(probe) = TcpListener::bind(("127.0.0.1", port + 1))
-            {
-                drop(probe);
-                break (listener, port);
-            }
-            drop(listener);
-        };
-        let expected_free = base + 1;
-
-        // Spawn a thread that keeps the camped listener alive and accepts
-        // connections, answering with non-protocol garbage so the identity
-        // check classifies it as `Camped`, not `OurDaemon`.
-        std::thread::spawn(move || {
-            loop {
-                if let Ok((mut stream, _)) = camped_listener.accept() {
-                    use std::io::Write;
-                    let _ = stream.write_all(b"NOPE\n");
-                }
-            }
-        });
-
-        // Give the thread a moment to start accepting.
-        std::thread::sleep(Duration::from_millis(50));
-
-        // Scan exactly {base (camped), base+1 (free)}.
-        let scan = PortScan { base, span: 2 };
-
-        match discovery::scan_for_daemon(scan) {
-            discovery::ScanOutcome::FreePort(port) => {
-                assert_eq!(
-                    port, expected_free,
-                    "scan should skip the camped base port and return base+1"
-                );
-                return; // Success
-            }
-            discovery::ScanOutcome::Found(_) => {
-                // Another test's leaked health listener stole base+1 — retry.
-            }
-            other => panic!("expected FreePort, got {other:?}"),
-        }
-    }
-    panic!("scan_skips_camped_returns_free: failed after 5 attempts (port stolen each time)");
-}
-
-#[test]
-fn scan_all_refused_returns_freeport_base() {
-    // Pick a high port that's almost certainly free.
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let base = listener.local_addr().unwrap().port();
-    drop(listener); // Release the port so it's free again.
-
-    std::thread::sleep(Duration::from_millis(10));
-
-    // Span of 1: probe only the single known-free `base` port. A wider span
-    // would risk colliding with a leaked health listener from another parallel
-    // test (they bind random high ports and leak for the test-process lifetime),
-    // which would be reported as `Found` rather than `FreePort`.
-    let scan = PortScan { base, span: 1 };
-    match discovery::scan_for_daemon(scan) {
-        discovery::ScanOutcome::FreePort(port) => {
-            assert_eq!(port, base, "should return the first free port (base)");
-        }
-        other => panic!("expected FreePort(base), got {other:?}"),
-    }
-}
-
-#[test]
-fn probe_refused_when_closed() {
-    // Bind a listener to get a port, then drop it so the port is closed.
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-
-    std::thread::sleep(Duration::from_millis(10));
-
-    // Access the private probe_port via the public scan_for_daemon wrapper.
-    // We know that if the scan returns FreePort, then probe_port returned Refused.
-    let scan = PortScan {
-        base: port,
-        span: 1,
-    };
-    match discovery::scan_for_daemon(scan) {
-        discovery::ScanOutcome::FreePort(p) => {
-            assert_eq!(
-                p, port,
-                "probe_port should have returned Refused for closed port"
-            );
-        }
-        other => panic!("expected FreePort (Refused), got {other:?}"),
-    }
 }
 
 #[test]
@@ -1390,54 +1039,125 @@ fn discover_finds_live_daemon() {
     let tmp = TempDir::new().unwrap();
     let _guard = EnvGuard::set("HYPERDB_STATE_DIR", tmp.path().to_str().unwrap());
 
-    let (port, _handle, _state) = start_health_listener();
+    let health = start_health_listener_in(tmp.path());
 
-    let info = DaemonInfo {
-        pid: 12345,
-        hyperd_endpoint: "127.0.0.1:54321".to_string(),
-        health_port: port,
-        started_at: "2026-05-20T10:30:00Z".to_string(),
-        version: "0.1.3".to_string(),
-    };
+    let info = test_daemon_info(&health.endpoint);
     discovery::write_discovery_file(&info).unwrap();
 
     let discovered = discovery::discover().expect("should discover live daemon");
     assert_eq!(discovered.pid, 12345);
-    assert_eq!(discovered.health_port, port);
+    assert_eq!(discovered.health_endpoint, health.endpoint.as_str());
 }
 
-// ─── Unit tests: concurrent-spawn dedup (no env vars, safe parallel) ────────────
-
+/// A record naming a live socket that is not this state directory's own
+/// `daemon.sock` must never be connected to: the record is attacker-writable
+/// input as far as the client is concerned. Unix only, where the endpoint is a
+/// path derived from the state directory (a Windows pipe name is random).
+#[cfg(unix)]
 #[test]
-fn scan_for_daemon_prefers_lower_port_daemon() {
-    // Simulates the concurrent-spawn race: two daemons ended up on adjacent ports
-    // (base and base+1). The client that landed on base+1 should prefer the
-    // base-port daemon when it re-scans the lower range.
-    //
-    // We model this by starting two real health listeners (which answer PING with
-    // the identifying token), then asserting that scan_for_daemon with a 2-port
-    // range returns the LOWER port's daemon as Found.
-    let (lower_port, _lower_handle, _lower_state) = start_health_listener();
-    let (higher_port, _higher_handle, _higher_state) = start_health_listener();
+fn discover_never_connects_to_an_endpoint_outside_the_state_dir() {
+    let state = TempDir::new().unwrap();
+    let elsewhere = TempDir::new().unwrap();
+    let mut foreign = FakeHealthPeer::start_in(elsewhere.path(), |command| match command {
+        "PING" => pong_line().into_bytes(),
+        _ => b"ERR\n".to_vec(),
+    });
+    write_record(state.path(), &test_daemon_info(&foreign.endpoint));
 
-    // Make sure lower_port < higher_port for a predictable result.
-    let (base, _top) = if lower_port < higher_port {
-        (lower_port, higher_port)
-    } else {
-        (higher_port, lower_port)
-    };
+    assert!(
+        discovery::discover_in(state.path()).is_none(),
+        "a record pointing at a live foreign socket must not be believed"
+    );
+    assert!(
+        foreign.stop_and_join().is_empty(),
+        "the client must not even connect to a socket outside its state directory"
+    );
+}
 
-    let scan = PortScan { base, span: 2 };
+/// A state directory another user could write to may hold a record steering
+/// the client anywhere, so discovery refuses it outright, live daemon or not.
+/// Group-writable is testable without root; "owned by someone else" takes
+/// the same branch of `verify_state_dir_trusted` but needs a second user.
+#[cfg(unix)]
+#[test]
+fn discover_refuses_a_group_writable_state_dir_even_with_a_live_daemon() {
+    let tmp = TempDir::new().unwrap();
+    let mut peer = FakeHealthPeer::start_in(tmp.path(), |_| pong_line().into_bytes());
+    write_record(tmp.path(), &test_daemon_info(&peer.endpoint));
+    assert!(
+        discovery::discover_in(tmp.path()).is_some(),
+        "control: the same directory is discoverable while private"
+    );
+    peer.stop_and_join();
 
-    match discovery::scan_for_daemon(scan) {
-        discovery::ScanOutcome::Found(info) => {
-            assert_eq!(
-                info.health_port, base,
-                "scan should return the LOWEST-port daemon (the first one bound)"
-            );
-        }
-        other => panic!("expected Found, got {other:?}"),
-    }
+    let mut peer = FakeHealthPeer::start_in(tmp.path(), |_| pong_line().into_bytes());
+    make_group_writable(tmp.path());
+
+    assert!(discovery::discover_in(tmp.path()).is_none());
+    assert!(
+        peer.stop_and_join().is_empty(),
+        "an untrusted state directory must be rejected before any connection"
+    );
+}
+
+/// `ensure_daemon` on an untrusted state directory fails and spawns nothing
+/// (and `Engine` then falls back to a private `hyperd`). Observable without a
+/// spawner seam: a spawn would create `daemon.json` / `daemon.lock` /
+/// `daemon.sock` here, or at least leave a process behind.
+#[cfg(unix)]
+#[test]
+fn ensure_daemon_refuses_an_untrusted_state_dir_without_spawning() {
+    let _lock = acquire_env_lock();
+    let tmp = TempDir::new().unwrap();
+    let mut peer = FakeHealthPeer::start_in(tmp.path(), |_| pong_line().into_bytes());
+    write_record(tmp.path(), &test_daemon_info(&peer.endpoint));
+    make_group_writable(tmp.path());
+    let _guard = EnvGuard::set("HYPERDB_STATE_DIR", tmp.path().to_str().unwrap());
+
+    let started = Instant::now();
+    let error = hyperdb_mcp::daemon::spawn::ensure_daemon()
+        .expect_err("an untrusted state directory must not yield a daemon");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "refusal must be immediate, not a spawn wait"
+    );
+    assert!(
+        !tmp.path().join(control_lock_name()).exists(),
+        "no daemon lock was ever taken, so nothing was spawned"
+    );
+    assert!(
+        peer.stop_and_join().is_empty(),
+        "the untrusted directory's socket must not be contacted"
+    );
+}
+
+/// The user-visible end of the same rule: with an untrusted state directory
+/// the engine does not use the (apparently live) daemon but runs its own
+/// private `hyperd`.
+#[cfg(unix)]
+#[test]
+fn engine_falls_back_to_local_mode_in_an_untrusted_state_dir() {
+    let _lock = acquire_env_lock();
+    let tmp = TempDir::new().unwrap();
+    let mut peer = FakeHealthPeer::start_in(tmp.path(), |_| pong_line().into_bytes());
+    write_record(tmp.path(), &test_daemon_info(&peer.endpoint));
+    make_group_writable(tmp.path());
+    let _guard = EnvGuard::set("HYPERDB_STATE_DIR", tmp.path().to_str().unwrap());
+
+    let engine = hyperdb_mcp::engine::Engine::new(None)
+        .expect("an untrusted state directory must fall back to a private hyperd");
+
+    assert!(
+        engine.daemon_health_endpoint().is_none(),
+        "the engine must be in local mode, not attached to the daemon"
+    );
+    drop(engine);
+    assert!(
+        peer.stop_and_join().is_empty(),
+        "the untrusted directory's socket must not be contacted"
+    );
 }
 
 // ─── Unit tests: Version takeover decision (no env vars, safe parallel) ─────────
@@ -1490,6 +1210,303 @@ fn takeover_decision_both_unparseable_reuses() {
     );
 }
 
+// ─── CLI tests: `daemon status` / `daemon stop` / `daemon` against fakes ──────
+
+/// With no daemon at all, `status` and `stop` say so and exit 1.
+#[test]
+fn daemon_cli_status_and_stop_without_a_daemon_exit_1() {
+    let state = TempDir::new().unwrap();
+
+    for action in ["status", "stop"] {
+        let output = run_cli_bounded(&["daemon", action], state.path(), Duration::from_secs(5));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "daemon {action}: {stderr}");
+        assert!(
+            stderr.contains("No daemon is currently running."),
+            "daemon {action} stderr was {stderr:?}"
+        );
+    }
+}
+
+/// A record left behind by a dead daemon (right shape, nobody serving the
+/// socket) is not a daemon: the CLI reports none, and does not clean up —
+/// cleanup belongs to whoever holds the daemon lock.
+#[test]
+fn daemon_cli_status_ignores_a_stale_record_and_leaves_it() {
+    let state = TempDir::new().unwrap();
+    let endpoint = HealthEndpoint::for_new_daemon(state.path()).unwrap();
+    let record = write_record(state.path(), &test_daemon_info(&endpoint));
+
+    let output = run_cli_bounded(&["daemon", "status"], state.path(), Duration::from_secs(5));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("No daemon is currently running."),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(state.path().join("daemon.json")).unwrap(),
+        record,
+        "`daemon status` must not delete or rewrite the record"
+    );
+}
+
+/// `daemon status` talks to the endpoint recorded in the state directory
+/// (selected by `HYPERDB_STATE_DIR`) and prints that daemon's own STATUS.
+#[test]
+fn daemon_status_cli_queries_the_recorded_endpoint() {
+    let state = TempDir::new().unwrap();
+    let endpoint = HealthEndpoint::for_new_daemon(state.path()).unwrap();
+    let info = DaemonInfo {
+        pid: 515_151,
+        ..test_daemon_info(&endpoint)
+    };
+    write_record(state.path(), &info);
+    let mut peer = FakeHealthPeer::start_at(&endpoint, scripted_daemon(&info));
+
+    let output = run_cli_bounded(&["daemon", "status"], state.path(), Duration::from_secs(10));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "`daemon status` failed: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+    assert!(
+        stdout.contains(&format!("Health endpoint: {}", endpoint.as_str())),
+        "status must report the endpoint it asked\nstdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("515151"),
+        "status must report the pid\n{stdout}"
+    );
+
+    let commands = peer.stop_and_join();
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| *command == "STATUS")
+            .count(),
+        1,
+        "exactly one STATUS expected, got {commands:?}"
+    );
+}
+
+/// `daemon stop` sends STOP to the recorded endpoint and relays the answer.
+#[test]
+fn daemon_stop_cli_sends_stop_to_the_recorded_endpoint() {
+    let state = TempDir::new().unwrap();
+    let endpoint = HealthEndpoint::for_new_daemon(state.path()).unwrap();
+    let info = test_daemon_info(&endpoint);
+    write_record(state.path(), &info);
+    let mut peer = FakeHealthPeer::start_at(&endpoint, scripted_daemon(&info));
+
+    let output = run_cli_bounded(&["daemon", "stop"], state.path(), Duration::from_secs(10));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "`daemon stop` failed: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+    assert!(
+        stdout.contains("Daemon responded: STOPPING"),
+        "stdout was {stdout:?}"
+    );
+    assert!(
+        peer.stop_and_join().iter().any(|command| command == "STOP"),
+        "the peer never received STOP"
+    );
+}
+
+/// A live daemon whose `daemon.json` is gone is still reachable by `daemon
+/// stop` and `daemon status`: the held lock plus an identified `PING` on the
+/// well-known socket find it. Unix only (a Windows pipe name lives in the record).
+#[cfg(unix)]
+#[test]
+fn daemon_cli_reaches_a_live_daemon_whose_record_is_missing() {
+    let state = TempDir::new().unwrap();
+    let endpoint = HealthEndpoint::for_new_daemon(state.path()).unwrap();
+    let info = test_daemon_info(&endpoint);
+    // No record is written. The held lock stands in for the live daemon.
+    let _lock = DaemonLock::try_acquire(state.path())
+        .unwrap()
+        .expect("fresh state directory has a free lock");
+    let mut peer = FakeHealthPeer::start_at(&endpoint, scripted_daemon(&info));
+
+    let status = run_cli_bounded(&["daemon", "status"], state.path(), Duration::from_secs(10));
+    assert!(
+        status.status.success(),
+        "`daemon status` failed: {}\nstderr:\n{}",
+        status.status,
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let stop = run_cli_bounded(&["daemon", "stop"], state.path(), Duration::from_secs(10));
+    assert!(
+        stop.status.success(),
+        "`daemon stop` failed: {}\nstderr:\n{}",
+        stop.status,
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert!(
+        peer.stop_and_join().iter().any(|command| command == "STOP"),
+        "the peer never received STOP"
+    );
+}
+
+/// A held lock with no record and nothing answering gets a clear message, not
+/// "No daemon is currently running."
+#[test]
+fn daemon_cli_explains_a_held_lock_with_no_usable_record() {
+    let state = TempDir::new().unwrap();
+    let _lock = DaemonLock::try_acquire(state.path())
+        .unwrap()
+        .expect("fresh state directory has a free lock");
+
+    for args in [["daemon", "status"], ["daemon", "stop"]] {
+        let output = run_cli_bounded(&args, state.path(), Duration::from_secs(10));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("daemon lock is held but no usable record was found"),
+            "{args:?} stderr was {stderr:?}"
+        );
+        assert!(
+            !stderr.contains("No daemon is currently running"),
+            "{stderr}"
+        );
+    }
+}
+
+/// A record naming a live socket outside the state directory is rejected by the
+/// CLI without connecting to it. Unix only (see
+/// `discover_never_connects_to_an_endpoint_outside_the_state_dir`).
+#[cfg(unix)]
+#[test]
+fn daemon_cli_does_not_follow_a_record_to_a_foreign_socket() {
+    let state = TempDir::new().unwrap();
+    let elsewhere = TempDir::new().unwrap();
+    let foreign_info = test_daemon_info(&HealthEndpoint::for_new_daemon(elsewhere.path()).unwrap());
+    let mut foreign = FakeHealthPeer::start_in(elsewhere.path(), scripted_daemon(&foreign_info));
+    write_record(state.path(), &foreign_info);
+
+    let output = run_cli_bounded(&["daemon", "status"], state.path(), Duration::from_secs(5));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("No daemon is currently running."),
+        "{stderr}"
+    );
+    assert!(
+        foreign.stop_and_join().is_empty(),
+        "the CLI connected to a socket that is not its state directory's"
+    );
+}
+
+/// A group-writable state directory is untrusted: the CLI reports no daemon and
+/// never contacts the socket in it, even though a live daemon is answering.
+#[cfg(unix)]
+#[test]
+fn daemon_cli_does_not_trust_a_group_writable_state_dir() {
+    let state = TempDir::new().unwrap();
+    let endpoint = HealthEndpoint::for_new_daemon(state.path()).unwrap();
+    let info = test_daemon_info(&endpoint);
+    write_record(state.path(), &info);
+    let mut peer = FakeHealthPeer::start_at(&endpoint, scripted_daemon(&info));
+    make_group_writable(state.path());
+
+    let output = run_cli_bounded(&["daemon", "status"], state.path(), Duration::from_secs(5));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("cannot be trusted"), "{stderr}");
+    assert!(
+        peer.stop_and_join().is_empty(),
+        "an untrusted state directory's socket must not be contacted"
+    );
+}
+
+// ─── Single-instance tests: the daemon lock, not a port, decides ──────────────
+
+/// While a daemon holds the lock and answers PING, a second `hyperdb-mcp
+/// daemon` in the same state directory is refused promptly with the
+/// "already running" message.
+///
+/// Replaces `health_listener_second_bind_same_port_fails`. What this proves:
+/// the second start sees a held lock and a live, PING-answering daemon for the
+/// debounce interval, and bails *before* binding anything or spawning a
+/// `hyperd` — the pre-existing record and the live socket are untouched (a
+/// second daemon would have rewritten the record), and the live peer only ever
+/// saw PINGs. It does not start a real `hyperd`; the real-process variant is
+/// `second_daemon_in_the_same_state_dir_is_refused_while_the_first_runs`.
+#[test]
+fn second_daemon_is_refused_while_the_lock_is_held_by_a_live_daemon() {
+    let state = TempDir::new().unwrap();
+    let endpoint = HealthEndpoint::for_new_daemon(state.path()).unwrap();
+    let info = test_daemon_info(&endpoint);
+    let held = DaemonLock::try_acquire(state.path())
+        .unwrap()
+        .expect("fresh state directory is lockable");
+    let record = write_record(state.path(), &info);
+    let mut peer = FakeHealthPeer::start_at(&endpoint, scripted_daemon(&info));
+
+    let started = Instant::now();
+    let output = run_cli_bounded(&["daemon"], state.path(), Duration::from_secs(20));
+    let elapsed = started.elapsed();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "a second daemon must not start; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("already running"),
+        "stderr must say a daemon is already running, got:\n{stderr}"
+    );
+    assert!(
+        elapsed < hyperdb_mcp::daemon::run::STARTUP_WAIT,
+        "the refusal took {elapsed:?}; a live daemon must be detected after \
+         about a second, not after the {:?} startup wait",
+        hyperdb_mcp::daemon::run::STARTUP_WAIT
+    );
+    assert_eq!(
+        std::fs::read(state.path().join("daemon.json")).unwrap(),
+        record,
+        "the refused daemon must not touch the running daemon's record"
+    );
+    let commands = peer.stop_and_join();
+    assert!(
+        !commands.is_empty() && commands.iter().all(|command| command == "PING"),
+        "the live daemon should only have been PINGed, got {commands:?}"
+    );
+    drop(held);
+}
+
+/// A held lock with nothing answering means a daemon that is starting or
+/// stopping: a new daemon waits the full startup budget for the lock and then
+/// gives up with a lock-specific message instead of racing it.
+#[test]
+fn second_daemon_waits_out_a_lock_held_without_a_daemon_then_times_out() {
+    let state = TempDir::new().unwrap();
+    let _held = DaemonLock::try_acquire(state.path())
+        .unwrap()
+        .expect("fresh state directory is lockable");
+
+    let started = Instant::now();
+    let output = run_cli_bounded(&["daemon"], state.path(), Duration::from_secs(30));
+    let elapsed = started.elapsed();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("daemon lock"),
+        "stderr must name the lock, got:\n{stderr}"
+    );
+    assert!(
+        elapsed + Duration::from_secs(1) >= hyperdb_mcp::daemon::run::STARTUP_WAIT,
+        "gave up after {elapsed:?}; a starting/stopping daemon deserves the full wait"
+    );
+}
+
 // ─── Integration tests: full daemon lifecycle with real hyperd ─────────────────
 
 #[test]
@@ -1535,7 +1552,7 @@ fn daemon_mode_two_engines_share_same_hyperd() {
         hyperdb_mcp::engine::Engine::new(Some(path2.to_str().unwrap().to_string())).unwrap();
 
     // Both engines should be in daemon mode (connected to the same daemon).
-    // We verify via the health port rather than the hyperd endpoint, because
+    // We verify via the health endpoint rather than the hyperd endpoint, because
     // the daemon's liveness monitor can restart hyperd (changing the endpoint)
     // between the two Engine::new calls.
     let ep1 = engine1.hyperd_endpoint().unwrap();
@@ -1544,8 +1561,8 @@ fn daemon_mode_two_engines_share_same_hyperd() {
         !ep1.is_empty() && !ep2.is_empty(),
         "both engines must report a daemon endpoint"
     );
-    // Verify the daemon is the one we started (health port reachable)
-    let status = health::send_command(daemon.info.health_port, "PING").unwrap();
+    // Verify the daemon is the one we started (health endpoint reachable)
+    let status = health::send_command(&daemon.endpoint, "PING").unwrap();
     assert!(status.trim().starts_with("PONG hyperdb-mcp "));
 
     engine1.execute_command("CREATE TABLE foo (x INT)").unwrap();
@@ -1615,7 +1632,7 @@ fn daemon_mode_persistent_engine_data_is_queryable() {
     assert_eq!(rows[0]["name"], "alpha");
     assert_eq!(rows[1]["name"], "beta");
 
-    let resp = health::send_command(daemon.info.health_port, "PING").unwrap();
+    let resp = health::send_command(&daemon.endpoint, "PING").unwrap();
     assert!(resp.trim().starts_with("PONG hyperdb-mcp "));
 }
 
@@ -1640,7 +1657,7 @@ fn hyperd_monitor_detects_killed_hyperd_and_restarts() {
     // (5s monitor tick + cold spawn + slack) so a loaded CI runner doesn't trip
     // a false timeout; see RESTART_READINESS_BUDGET_SECS.
     let new_endpoint = wait_for_live_hyperd_after_kill(
-        daemon.info.health_port,
+        &daemon.endpoint,
         &daemon.info.hyperd_endpoint,
         RESTART_READINESS_BUDGET_SECS,
     )
@@ -1674,11 +1691,11 @@ fn client_report_triggers_restart_after_kill() {
     // Even so, the monitor only reacts on its 5s tick, so the worst-case
     // recovery time is unchanged. This test just verifies the report path
     // triggers the same restart as detection-via-polling.
-    let response = health::send_command(daemon.info.health_port, "REPORT_HYPERD_ERROR").unwrap();
+    let response = health::send_command(&daemon.endpoint, "REPORT_HYPERD_ERROR").unwrap();
     assert_eq!(response.trim(), "OK");
 
     let new_endpoint = wait_for_live_hyperd_after_kill(
-        daemon.info.health_port,
+        &daemon.endpoint,
         &daemon.info.hyperd_endpoint,
         RESTART_READINESS_BUDGET_SECS,
     )
@@ -1737,7 +1754,7 @@ fn engine_recovers_after_hyperd_killed() {
     // it flips what STATUS serves, so a live endpoint from STATUS means the
     // discovery file `Engine::new` reads below is already committed.
     wait_for_live_hyperd_after_kill(
-        daemon.info.health_port,
+        &daemon.endpoint,
         &daemon.info.hyperd_endpoint,
         RESTART_READINESS_BUDGET_SECS,
     )
@@ -1782,117 +1799,201 @@ fn daemon_mode_ephemeral_database_cleaned_up_on_drop() {
     );
 }
 
+/// The real-process variant of the single-instance guarantee: with a genuine
+/// daemon (and its `hyperd`) running, a second `hyperdb-mcp daemon` process in
+/// the same state directory is refused with "already running", and the first
+/// daemon is left undisturbed — same record, same pid, still answering.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "flaky on macOS CI — daemon startup exceeds 150s timeout"
+)]
+fn second_daemon_in_the_same_state_dir_is_refused_while_the_first_runs() {
+    let _lock = acquire_env_lock();
+    let daemon = TestDaemon::start();
+    let record = std::fs::read(daemon.state_dir.join("daemon.json")).unwrap();
+
+    let started = Instant::now();
+    let output = run_cli_bounded(&["daemon"], &daemon.state_dir, Duration::from_secs(30));
+    let elapsed = started.elapsed();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "a second daemon must not start; stderr:\n{stderr}"
+    );
+    assert!(stderr.contains("already running"), "stderr:\n{stderr}");
+    assert!(
+        elapsed < hyperdb_mcp::daemon::run::STARTUP_WAIT,
+        "refusal took {elapsed:?}"
+    );
+
+    assert_eq!(
+        std::fs::read(daemon.state_dir.join("daemon.json")).unwrap(),
+        record,
+        "the refused daemon must not have rewritten the record"
+    );
+    let status = health::send_command(&daemon.endpoint, "STATUS").unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(status.trim()).unwrap();
+    assert_eq!(
+        parsed["pid"],
+        std::process::id(),
+        "the original (in-process) daemon must still be the one answering"
+    );
+    assert_eq!(parsed["hyperd_endpoint"], daemon.info.hyperd_endpoint);
+}
+
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
-struct OwnedHealthListener {
-    state: Arc<DaemonState>,
-    handle: Option<std::thread::JoinHandle<()>>,
+/// A per-test state directory and the health endpoint inside it. The directory
+/// is short (a system temp dir plus a random name) so that
+/// `<dir>/daemon.sock` stays under the platform's `sun_path` limit.
+fn test_endpoint() -> (TempDir, HealthEndpoint) {
+    let dir = TempDir::new().expect("create short per-test state dir");
+    let endpoint = HealthEndpoint::for_new_daemon(dir.path()).expect("derive health endpoint");
+    (dir, endpoint)
 }
 
-impl OwnedHealthListener {
-    fn start(listener: HealthListener, info: DaemonInfo) -> Self {
-        let state = Arc::new(DaemonState::new());
-        let run_state = Arc::clone(&state);
-        let info = Arc::new(Mutex::new(info));
-        let handle = std::thread::spawn(move || listener.run(run_state, info));
-        Self {
-            state,
-            handle: Some(handle),
+/// The reply a genuine daemon gives to `PING`.
+fn pong_line() -> String {
+    format!("PONG hyperdb-mcp {}\n", hyperdb_mcp::version::MCP_VERSION)
+}
+
+/// A `DaemonInfo` for a daemon serving `endpoint`, with a fixed identity.
+fn test_daemon_info(endpoint: &HealthEndpoint) -> DaemonInfo {
+    DaemonInfo {
+        pid: 12345,
+        hyperd_endpoint: "127.0.0.1:54321".to_string(),
+        health_endpoint: endpoint.as_str().to_string(),
+        started_at: "2026-05-20T10:30:00Z".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
+
+/// Write `info` as `daemon.json` in `state_dir` and return the exact bytes, so
+/// a test can later prove the record was left alone.
+fn write_record(state_dir: &Path, info: &DaemonInfo) -> Vec<u8> {
+    let bytes = serde_json::to_vec_pretty(info).expect("serialize test daemon record");
+    std::fs::write(state_dir.join("daemon.json"), &bytes).expect("write test daemon record");
+    bytes
+}
+
+/// A reply script for [`FakeHealthPeer`] that behaves like a daemon: an
+/// identified `PONG`, the given record as `STATUS`, and `STOPPING`.
+fn scripted_daemon(info: &DaemonInfo) -> impl Fn(&str) -> Vec<u8> + Send + 'static {
+    let status = format!(
+        "{}\n",
+        serde_json::to_string(info).expect("serialize test status")
+    );
+    move |command| match command {
+        "PING" => pong_line().into_bytes(),
+        "STATUS" => status.clone().into_bytes(),
+        "STOP" => b"STOPPING\n".to_vec(),
+        _ => b"ERR unknown command\n".to_vec(),
+    }
+}
+
+/// Name of the file whose presence proves a daemon lock was taken.
+#[cfg(unix)]
+fn control_lock_name() -> &'static str {
+    hyperdb_mcp::daemon::lock::LOCK_FILE_NAME
+}
+
+/// Remove the "private to this user" property from a state directory.
+#[cfg(unix)]
+fn make_group_writable(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o770))
+        .expect("make test state dir group-writable");
+}
+
+/// Read one line (including its newline) a byte at a time, so no buffered
+/// reader swallows bytes meant for a later read. An empty string means EOF
+/// before any byte.
+fn read_line_from(stream: &mut ControlStream) -> std::io::Result<String> {
+    let mut line = Vec::new();
+    let mut byte = [0_u8];
+    loop {
+        if stream.read(&mut byte)? == 0 {
+            break;
+        }
+        line.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
         }
     }
-
-    fn stop_and_join(&mut self) {
-        self.state.request_shutdown();
-        if let Some(handle) = self.handle.take() {
-            handle
-                .join()
-                .expect("owned health listener must shut down cleanly");
-        }
-    }
+    String::from_utf8(line)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
-impl Drop for OwnedHealthListener {
-    fn drop(&mut self) {
-        self.stop_and_join();
-    }
-}
-
-struct CliStatusListener {
-    port: u16,
+/// A scripted stand-in for a daemon: serves a control endpoint, records every
+/// command it is sent, and answers each with whatever the script returns.
+/// Drives the code under test without a real daemon or `hyperd`.
+struct FakeHealthPeer {
+    endpoint: HealthEndpoint,
+    stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<Vec<String>>>,
 }
 
-impl CliStatusListener {
-    fn start() -> Self {
-        use std::io::{BufRead, BufReader, Write};
+impl FakeHealthPeer {
+    /// Serve `<state_dir>/daemon.sock`.
+    fn start_in(state_dir: &Path, reply: impl Fn(&str) -> Vec<u8> + Send + 'static) -> Self {
+        let endpoint = HealthEndpoint::for_new_daemon(state_dir).expect("derive peer endpoint");
+        Self::start_at(&endpoint, reply)
+    }
 
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .expect("bind OS-assigned explicit daemon-status listener");
-        let port = listener
-            .local_addr()
-            .expect("read explicit daemon-status listener address")
-            .port();
+    /// Serve an already derived endpoint.
+    fn start_at(
+        endpoint: &HealthEndpoint,
+        reply: impl Fn(&str) -> Vec<u8> + Send + 'static,
+    ) -> Self {
+        let mut listener = ControlListener::bind(endpoint).expect("bind fake health peer");
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
         let handle = std::thread::spawn(move || {
             let mut commands = Vec::new();
-            loop {
-                let (mut stream, _) = listener
-                    .accept()
-                    .expect("explicit daemon-status listener accept");
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .expect("bound explicit daemon-status request read");
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(2)))
-                    .expect("bound explicit daemon-status response write");
-                let mut line = String::new();
-                BufReader::new(&stream)
-                    .read_line(&mut line)
-                    .expect("read explicit daemon-status command");
-                let command = line.trim();
-                if command == "TEST_SHUTDOWN" {
-                    break;
+            while !thread_stop.load(Ordering::SeqCst) {
+                let mut stream = match listener.accept_timeout(Duration::from_millis(50)) {
+                    Ok(Some(stream)) => stream,
+                    Ok(None) => continue,
+                    Err(error) => panic!("fake health peer accept failed: {error}"),
+                };
+                if stream.set_io_timeout(Duration::from_secs(2)).is_err() {
+                    continue;
                 }
+                let Ok(line) = read_line_from(&mut stream) else {
+                    continue;
+                };
+                let command = line.trim();
+                // A bare connect-and-hang-up is a wake-up, not a command.
+                if command.is_empty() {
+                    continue;
+                }
+                let response = reply(command);
                 commands.push(command.to_string());
-                let response = serde_json::json!({
-                    "pid": 515151,
-                    "hyperd_endpoint": "127.0.0.1:54321",
-                    "health_port": port,
-                    "started_at": "2026-08-14T12:34:56Z",
-                    "version": env!("CARGO_PKG_VERSION")
-                });
-                writeln!(stream, "{response}").expect("write explicit daemon-status response");
+                let _ = stream.write_all(&response);
+                let _ = stream.finish();
             }
             commands
         });
         Self {
-            port,
+            endpoint: endpoint.clone(),
+            stop,
             handle: Some(handle),
         }
     }
 
+    /// Stop serving and return every command received, in order.
     fn stop_and_join(&mut self) -> Vec<String> {
-        use std::io::Write;
-
-        if self.handle.is_none() {
-            return Vec::new();
-        }
-        let mut stream = std::net::TcpStream::connect(("127.0.0.1", self.port))
-            .expect("connect explicit daemon-status listener shutdown");
-        stream
-            .set_write_timeout(Some(Duration::from_secs(2)))
-            .expect("bound explicit daemon-status shutdown write");
-        stream
-            .write_all(b"TEST_SHUTDOWN\n")
-            .expect("signal explicit daemon-status listener shutdown");
-        self.handle
-            .take()
-            .expect("explicit daemon-status listener handle exists")
-            .join()
-            .expect("explicit daemon-status listener must join")
+        self.stop.store(true, Ordering::SeqCst);
+        self.handle.take().map_or_else(Vec::new, |handle| {
+            handle.join().expect("fake health peer must join cleanly")
+        })
     }
 }
 
-impl Drop for CliStatusListener {
+impl Drop for FakeHealthPeer {
     fn drop(&mut self) {
         if self.handle.is_some() {
             let _ = self.stop_and_join();
@@ -1900,47 +2001,110 @@ impl Drop for CliStatusListener {
     }
 }
 
-fn run_cli_child_with_watchdog(
-    args: &[String],
-    state_dir: &std::path::Path,
-    base_port: u16,
-) -> Output {
+/// A real [`HealthListener`] running on its own thread against a real
+/// [`DaemonState`], bound inside a caller-owned state directory.
+struct RunningHealth {
+    endpoint: HealthEndpoint,
+    state: Arc<DaemonState>,
+    info: Arc<Mutex<DaemonInfo>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RunningHealth {
+    fn start_with_info(
+        state_dir: &Path,
+        make_info: impl FnOnce(&HealthEndpoint) -> DaemonInfo,
+    ) -> Self {
+        let endpoint = HealthEndpoint::for_new_daemon(state_dir).expect("derive health endpoint");
+        let listener = HealthListener::bind(&endpoint).expect("bind running health listener");
+        let state = Arc::new(DaemonState::new(endpoint.clone()));
+        let info = Arc::new(Mutex::new(make_info(&endpoint)));
+        let run_state = Arc::clone(&state);
+        let run_info = Arc::clone(&info);
+        let handle = std::thread::spawn(move || listener.run(run_state, run_info));
+        Self {
+            endpoint,
+            state,
+            info,
+            handle: Some(handle),
+        }
+    }
+
+    /// Wait for the listener thread to return (after a `STOP`, say).
+    fn join(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle
+                .join()
+                .expect("running health listener must shut down cleanly");
+        }
+    }
+
+    fn stop_and_join(&mut self) {
+        self.state.request_shutdown();
+        self.join();
+    }
+}
+
+impl Drop for RunningHealth {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
+/// Starts a health listener in `state_dir`. Does NOT touch env vars — safe for
+/// parallel use. The caller owns (and must outlive) the directory.
+fn start_health_listener_in(state_dir: &Path) -> RunningHealth {
+    RunningHealth::start_with_info(state_dir, test_daemon_info)
+}
+
+/// [`start_health_listener_in`] in a fresh short state directory.
+fn start_health_listener() -> (TempDir, RunningHealth) {
+    let dir = TempDir::new().expect("create short per-test state dir");
+    let health = start_health_listener_in(dir.path());
+    (dir, health)
+}
+
+/// Run `hyperdb-mcp <args>` against `state_dir` with a scrubbed environment and
+/// a deadline. The child never sees the developer's real `HOME` or state
+/// directory: both are pinned to `state_dir`, so a regression's blast radius
+/// stays inside the test. A child that outlives `deadline` is killed and the
+/// test fails with its output.
+fn run_cli_bounded(args: &[&str], state_dir: &Path, deadline: Duration) -> Output {
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hyperdb-mcp"));
     command.env_clear();
     preserve_child_runtime_environment(&mut command);
     command
-        .current_dir(
-            state_dir
-                .parent()
-                .expect("isolated daemon-status state has a parent"),
-        )
+        .current_dir(state_dir)
         .env("HOME", state_dir)
         .env("USERPROFILE", state_dir)
         .env("HYPERDB_STATE_DIR", state_dir)
-        .env("HYPERDB_DAEMON_PORT", base_port.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .args(args);
-    let mut child = command.spawn().expect("spawn isolated daemon-status child");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    if let Some(hyperd) = std::env::var_os("HYPERD_PATH") {
+        command.env("HYPERD_PATH", hyperd);
+    }
+    let mut child = command.spawn().expect("spawn hyperdb-mcp CLI child");
+    let give_up_at = Instant::now() + deadline;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => {
                 return child
                     .wait_with_output()
-                    .expect("collect completed daemon-status child output");
+                    .expect("collect completed CLI child output");
             }
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
+            Ok(None) if Instant::now() < give_up_at => {
+                std::thread::sleep(Duration::from_millis(20));
             }
             Ok(None) => {
                 let kill_error = child.kill().err();
                 let output = child
                     .wait_with_output()
-                    .expect("wait for timed-out daemon-status child after kill");
+                    .expect("wait for timed-out CLI child after kill");
                 panic!(
-                    "daemon-status child exceeded 5s and was killed ({kill_error:?})\nstdout:\n{}\nstderr:\n{}",
+                    "`hyperdb-mcp {}` exceeded {deadline:?} and was killed ({kill_error:?})\nstdout:\n{}\nstderr:\n{}",
+                    args.join(" "),
                     String::from_utf8_lossy(&output.stdout),
                     String::from_utf8_lossy(&output.stderr)
                 );
@@ -1949,9 +2113,9 @@ fn run_cli_child_with_watchdog(
                 let kill_error = child.kill().err();
                 let output = child
                     .wait_with_output()
-                    .expect("wait for daemon-status child after status error");
+                    .expect("wait for CLI child after status error");
                 panic!(
-                    "daemon-status child status failed: {error}; kill result: {kill_error:?}\nstdout:\n{}\nstderr:\n{}",
+                    "CLI child status failed: {error}; kill result: {kill_error:?}\nstdout:\n{}\nstderr:\n{}",
                     String::from_utf8_lossy(&output.stdout),
                     String::from_utf8_lossy(&output.stderr)
                 );
@@ -1976,67 +2140,34 @@ fn preserve_child_runtime_environment(command: &mut std::process::Command) {
     }
 }
 
-/// Starts a health listener on a random port and returns the port, join handle,
-/// and shared state. Does NOT touch env vars — safe for parallel use.
-fn start_health_listener() -> (u16, std::thread::JoinHandle<()>, Arc<DaemonState>) {
-    let listener = HealthListener::bind(0).unwrap();
-    let port = listener.port;
-    let state = Arc::new(DaemonState::new());
-    let run_state = Arc::clone(&state);
-
-    let info = Arc::new(Mutex::new(DaemonInfo {
-        pid: 12345,
-        hyperd_endpoint: "127.0.0.1:54321".to_string(),
-        health_port: port,
-        started_at: "2026-05-20T10:30:00Z".to_string(),
-        version: "0.1.3".to_string(),
-    }));
-
-    let handle = std::thread::spawn(move || {
-        listener.run(run_state, info);
-    });
-
-    // Give the listener a moment to start accepting
-    std::thread::sleep(Duration::from_millis(50));
-
-    (port, handle, state)
-}
-
 /// A real daemon running in a background thread for integration tests.
-/// Sets `HYPERDB_STATE_DIR` and `HYPERDB_DAEMON_PORT` to isolated values.
+/// Sets `HYPERDB_STATE_DIR` to an isolated, short directory.
 /// Caller MUST hold `ENV_LOCK` before calling `start()`.
 struct TestDaemon {
     info: DaemonInfo,
+    endpoint: HealthEndpoint,
+    state_dir: PathBuf,
     _state_dir_guard: EnvGuard,
-    _port_guard: EnvGuard,
+    /// Declared last so the directory outlives every other field's drop.
+    _tmp: TempDir,
 }
 
 impl TestDaemon {
     fn start() -> Self {
         let tmp = TempDir::new().unwrap();
-        // Leak the TempDir so it persists for the lifetime of the test.
-        let tmp = Box::leak(Box::new(tmp));
+        let state_dir = tmp.path().to_path_buf();
 
-        let state_dir_guard = EnvGuard::set("HYPERDB_STATE_DIR", tmp.path().to_str().unwrap());
-
-        // Pass port 0 so the daemon's HealthListener binds an OS-assigned
-        // free port and reports it back via the discovery file. We avoid
-        // the find_free_port → set env → daemon binds later TOCTOU race
-        // where another process could grab the port between pick and bind
-        // (a real source of flakes on busy CI runners). The
-        // `HYPERDB_DAEMON_PORT` env var only matters for the
-        // spawn-daemon-if-missing path; once we've written the discovery
-        // file, clients read `health_port` directly from it.
-        let port_guard = EnvGuard::set("HYPERDB_DAEMON_PORT", "0");
+        let state_dir_guard = EnvGuard::set("HYPERDB_STATE_DIR", state_dir.to_str().unwrap());
 
         // Start the daemon in a background tokio runtime. Capture errors
         // via a JoinHandle so a bind/spawn failure fails the test fast
-        // with a real message instead of a 30s timeout.
+        // with a real message instead of a 30s timeout. The daemon takes the
+        // state directory from `HYPERDB_STATE_DIR` and serves
+        // `<state_dir>/daemon.sock`; there is no port to choose or race for.
         let daemon_handle = std::thread::spawn(move || -> Result<(), String> {
             let rt = tokio::runtime::Runtime::new().map_err(|e| format!("rt: {e}"))?;
             rt.block_on(async {
                 let config = hyperdb_mcp::daemon::run::DaemonConfig {
-                    port: 0,
                     idle_timeout: Some(Duration::from_secs(300)),
                 };
                 hyperdb_mcp::daemon::run::run_daemon(config)
@@ -2060,10 +2191,14 @@ impl TestDaemon {
         let start = Instant::now();
         loop {
             if let Some(info) = discovery::discover() {
+                let endpoint = HealthEndpoint::from_record(&info.health_endpoint, &state_dir)
+                    .expect("a discovered record names this state directory's endpoint");
                 return Self {
                     info,
+                    endpoint,
+                    state_dir,
                     _state_dir_guard: state_dir_guard,
-                    _port_guard: port_guard,
+                    _tmp: tmp,
                 };
             }
             // Fail fast if the daemon thread has already exited (bind error,
@@ -2087,15 +2222,33 @@ impl TestDaemon {
 
 impl Drop for TestDaemon {
     fn drop(&mut self) {
-        let _ = health::send_command(self.info.health_port, "STOP");
-        // Wait until the daemon's health port is unreachable, indicating full
-        // shutdown (HyperProcess Drop can take up to ~5s). 200ms was not
-        // enough — under load, the next test could find the port still bound.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], self.info.health_port));
-            if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err() {
-                return;
+        let _ = health::send_command(&self.endpoint, "STOP");
+        // The daemon holds the state directory's lock until after its `hyperd`
+        // has exited, so the lock being free is the one reliable sign of full
+        // shutdown (`HyperProcess` drop can take ~5s). Waiting on the control
+        // endpoint instead would return before `hyperd` is gone, and the next
+        // test could find the previous one's engine still winding down.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            match DaemonLock::try_acquire(&self.state_dir) {
+                Ok(Some(lock)) => {
+                    drop(lock);
+                    return;
+                }
+                // Cannot be checked at all (directory gone): nothing to wait on.
+                Err(_) => return,
+                Ok(None) => {}
+            }
+            if Instant::now() >= deadline {
+                let message = format!(
+                    "TestDaemon: the daemon lock in {} was still held 15s after STOP",
+                    self.state_dir.display()
+                );
+                if std::thread::panicking() {
+                    eprintln!("{message}");
+                    return;
+                }
+                panic!("{message}");
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -2196,7 +2349,7 @@ fn kill_pid(pid: u32) {
 /// its whole timeout on a perfectly healthy restart.
 #[cfg(unix)]
 fn wait_for_live_hyperd_after_kill(
-    health_port: u16,
+    health_endpoint: &HealthEndpoint,
     killed_endpoint: &str,
     timeout_secs: u64,
 ) -> Option<String> {
@@ -2220,7 +2373,7 @@ fn wait_for_live_hyperd_after_kill(
     // Phase 2: whatever STATUS advertises now must be reachable. With the old
     // socket proven down, a successful connect means a live replacement.
     while Instant::now() < deadline {
-        if let Ok(response) = health::send_command(health_port, "STATUS")
+        if let Ok(response) = health::send_command(health_endpoint, "STATUS")
             && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(response.trim())
             && let Some(endpoint) = parsed["hyperd_endpoint"].as_str()
             && endpoint_accepts_connection(endpoint)
