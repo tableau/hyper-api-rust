@@ -15,7 +15,9 @@
 //! and locks that one. Releasing the lock only closes the handle.
 //!
 //! The lock conflicts within one process too, because each acquire opens the
-//! file separately; the in-process test daemons rely on that.
+//! file separately (`flock` on Unix, a `LockFileEx` byte-range lock on
+//! Windows, both owned by the open handle); the in-process test daemons rely
+//! on that.
 //!
 //! This module depends only on `std`, `libc` and `windows-sys`, so it can be
 //! compiled for Windows on its own.
@@ -45,8 +47,23 @@ impl DaemonLock {
     /// any reason other than being held, such as `state_dir` missing, or the
     /// lock file being a symlink on Unix.
     pub fn try_acquire(state_dir: &Path) -> io::Result<Option<Self>> {
-        platform::try_lock(&state_dir.join(LOCK_FILE_NAME))
+        platform::try_lock(&state_dir.join(LOCK_FILE_NAME), true)
             .map(|held| held.map(|file| Self { _file: file }))
+    }
+
+    /// Whether another holder has the lock, without ever creating the lock
+    /// file: a missing file (or state directory) means nobody holds it. The
+    /// probe takes the lock for an instant and lets go again.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::try_acquire`], except that a missing file is not an error.
+    pub fn is_held(state_dir: &Path) -> io::Result<bool> {
+        match platform::try_lock(&state_dir.join(LOCK_FILE_NAME), false) {
+            Ok(held) => Ok(held.is_none()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -58,11 +75,11 @@ mod platform {
     use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
 
-    pub(super) fn try_lock(path: &Path) -> io::Result<Option<File>> {
+    pub(super) fn try_lock(path: &Path, create: bool) -> io::Result<Option<File>> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
+            .create(create)
             .truncate(false)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -86,25 +103,55 @@ mod platform {
     use std::fs::{File, OpenOptions};
     use std::io;
     use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
     use std::path::Path;
 
-    /// `ERROR_SHARING_VIOLATION`: another handle has the file open.
-    const ERROR_SHARING_VIOLATION: i32 = 32;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_READ, FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+        LockFileEx,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
 
-    /// Opening with no sharing is the lock: a second open fails while the
-    /// first handle lives.
-    pub(super) fn try_lock(path: &Path) -> io::Result<Option<File>> {
-        match OpenOptions::new()
+    /// `ERROR_LOCK_VIOLATION`: another handle holds a conflicting byte-range
+    /// lock.
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+
+    /// An exclusive `LockFileEx` lock on the first byte is the lock. Byte
+    /// range locks belong to the handle, so a second open in this process
+    /// conflicts like one in another process, and the OS drops the lock when
+    /// the handle closes however the process exits. The file is opened
+    /// without `FILE_SHARE_DELETE` so it cannot be unlinked while held.
+    pub(super) fn try_lock(path: &Path, create: bool) -> io::Result<Option<File>> {
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
+            .create(create)
             .truncate(false)
-            .share_mode(0)
-            .open(path)
-        {
-            Ok(file) => Ok(Some(file)),
-            Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => Ok(None),
-            Err(error) => Err(error),
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(path)?;
+        // SAFETY: an all-zero `OVERLAPPED` is the documented initial state
+        // (offset 0, no event) for a synchronous `LockFileEx`.
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        // SAFETY: `file` owns a valid handle for the whole call and
+        // `overlapped` outlives it.
+        let locked = unsafe {
+            LockFileEx(
+                file.as_raw_handle(),
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                1,
+                0,
+                &raw mut overlapped,
+            )
+        };
+        if locked != 0 {
+            return Ok(Some(file));
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION) {
+            Ok(None)
+        } else {
+            Err(error)
         }
     }
 }
@@ -145,6 +192,24 @@ mod tests {
                 .is_some(),
             "a released lock can be taken again"
         );
+    }
+
+    #[test]
+    fn is_held_never_creates_the_lock_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(!DaemonLock::is_held(dir.path()).expect("probe"));
+        assert!(
+            !dir.path().join(LOCK_FILE_NAME).exists(),
+            "a probe must not create daemon.lock"
+        );
+        assert!(!DaemonLock::is_held(&dir.path().join("missing")).expect("missing dir is free"));
+
+        let lock = DaemonLock::try_acquire(dir.path())
+            .expect("acquire")
+            .expect("free lock");
+        assert!(DaemonLock::is_held(dir.path()).expect("probe"));
+        drop(lock);
+        assert!(!DaemonLock::is_held(dir.path()).expect("probe"));
     }
 
     #[test]

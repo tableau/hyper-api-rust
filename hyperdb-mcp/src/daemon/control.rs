@@ -21,6 +21,10 @@
 //! same bounded-wait accept ([`ControlListener::accept_timeout`]), so the
 //! accept loop in the health module keeps its shape.
 //!
+//! Clients also authenticate the server: on Unix the socket peer's uid must be
+//! the current user's, on Windows the pipe server's process must run as the
+//! current user; otherwise [`connect`] fails with `PermissionDenied`.
+//!
 //! A known limitation on Windows: a daemon started from an elevated prompt
 //! may create a pipe that clients running without elevation cannot open.
 //!
@@ -53,9 +57,16 @@ impl HealthEndpoint {
     }
 
     /// Parse the endpoint string of a discovery record found in `state_dir`.
-    /// `None` when it is not exactly an endpoint a daemon of this state
-    /// directory could have produced, so a tampered or foreign record (say, a
-    /// path to some other program's socket) is never connected to.
+    /// `None` when it is not an endpoint a daemon of this state directory
+    /// could have produced, so a tampered or foreign record (say, a path to
+    /// some other program's socket) is never connected to.
+    ///
+    /// On Unix the record must equal the exact socket path of `state_dir`. On
+    /// Windows a pipe name does not encode the state directory, so only the
+    /// `\\.\pipe\hyperdb-mcp-` prefix and character set are checked; the
+    /// protection there is the random pipe name, the owner-only DACL and the
+    /// client's server-owner check in [`connect`]. The ancestors of
+    /// `state_dir` are not examined on either platform.
     #[must_use]
     pub fn from_record(record: &str, state_dir: &Path) -> Option<Self> {
         platform::is_valid_endpoint(record, state_dir).then(|| Self(record.to_owned()))
@@ -364,7 +375,69 @@ mod platform {
     }
 
     pub(super) fn connect(endpoint: &str, _connect_timeout: Duration) -> io::Result<Stream> {
-        UnixStream::connect(endpoint).map(|inner| Stream { inner })
+        let inner = UnixStream::connect(endpoint)?;
+        // The socket path sits in a directory only we may write to, but a
+        // stale record could still point at a socket some other user's
+        // process owns; never speak to one.
+        let peer = peer_uid(&inner)?;
+        // SAFETY: `geteuid` takes no arguments and cannot fail.
+        let ours = unsafe { libc::geteuid() };
+        if peer != ours {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("the daemon control socket is served by uid {peer}, not by this user"),
+            ));
+        }
+        Ok(Stream { inner })
+    }
+
+    /// The effective uid of the process on the other end of `stream`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn peer_uid(stream: &UnixStream) -> io::Result<libc::uid_t> {
+        let mut credentials = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut length = libc::socklen_t::try_from(std::mem::size_of::<libc::ucred>())
+            .expect("ucred size fits socklen_t");
+        // SAFETY: the descriptor is valid for the call; `credentials` is a
+        // writable `ucred` and `length` holds its size.
+        let status = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&raw mut credentials).cast(),
+                &raw mut length,
+            )
+        };
+        if status == 0 {
+            Ok(credentials.uid)
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    /// The effective uid of the process on the other end of `stream`.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn peer_uid(stream: &UnixStream) -> io::Result<libc::uid_t> {
+        let mut uid: libc::uid_t = 0;
+        let mut gid: libc::gid_t = 0;
+        // SAFETY: the descriptor is valid for the call; both out-pointers are
+        // writable.
+        let status = unsafe { libc::getpeereid(stream.as_raw_fd(), &raw mut uid, &raw mut gid) };
+        if status == 0 {
+            Ok(uid)
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn own_peer_uid_matches(stream: &UnixStream) -> bool {
+        // SAFETY: `geteuid` takes no arguments and cannot fail.
+        peer_uid(stream).is_ok_and(|uid| uid == unsafe { libc::geteuid() })
     }
 
     #[derive(Debug)]
@@ -431,11 +504,12 @@ mod platform {
     };
     use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
     use windows_sys::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
-        PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+        ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeServerProcessId, PIPE_READMODE_BYTE,
+        PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
     use windows_sys::Win32::System::Threading::{
-        CreateEventW, GetCurrentProcess, OpenProcessToken, WaitForSingleObject,
+        CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken,
+        PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
     };
 
     /// Prefix every endpoint of ours carries; anything else in a record is
@@ -549,10 +623,16 @@ mod platform {
 
     /// The current user's SID in string form (`S-1-5-21-...`).
     fn current_user_sid() -> io::Result<String> {
+        // SAFETY: the pseudo-handle of the current process needs no closing.
+        token_user_sid(unsafe { GetCurrentProcess() })
+    }
+
+    /// The user SID, in string form, of the process behind `process`.
+    fn token_user_sid(process: windows_sys::Win32::Foundation::HANDLE) -> io::Result<String> {
         let mut token = ptr::null_mut();
-        // SAFETY: the pseudo-handle of the current process needs no closing;
+        // SAFETY: `process` is a valid process handle with query access;
         // `token` is a valid out-pointer.
-        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
+        if unsafe { OpenProcessToken(process, TOKEN_QUERY, &raw mut token) } == 0 {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: `token` is a valid handle returned just above, owned here.
@@ -775,6 +855,32 @@ mod platform {
         }
     }
 
+    /// Refuse a pipe whose server process does not run as the current user.
+    /// The pipe name is random and its DACL owner-only, but a stale record
+    /// could name a pipe another user's process created; never speak to one.
+    fn verify_server_is_us(pipe: &OwnedHandle) -> io::Result<()> {
+        let mut server_pid = 0_u32;
+        // SAFETY: `pipe` is a valid pipe handle; `server_pid` is writable.
+        if unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle(), &raw mut server_pid) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: plain call; a null handle on failure is checked below.
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, server_pid) };
+        if process.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `process` is a valid handle returned just above, owned here.
+        let process = unsafe { OwnedHandle::from_raw_handle(process) };
+        if token_user_sid(process.as_raw_handle())? == current_user_sid()? {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the daemon control pipe is served by a process of another user",
+            ))
+        }
+    }
+
     pub(super) fn connect(endpoint: &str, connect_timeout: Duration) -> io::Result<Stream> {
         let deadline = Instant::now() + connect_timeout;
         loop {
@@ -786,7 +892,11 @@ mod platform {
                 .security_qos_flags(SECURITY_IDENTIFICATION)
                 .open(endpoint);
             match opened {
-                Ok(file) => return Stream::new(OwnedHandle::from(file)),
+                Ok(file) => {
+                    let pipe = OwnedHandle::from(file);
+                    verify_server_is_us(&pipe)?;
+                    return Stream::new(pipe);
+                }
                 Err(error)
                     if error
                         .raw_os_error()
@@ -1137,6 +1247,17 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_records_accept_our_pipe_prefix_and_refuse_others() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(HealthEndpoint::from_record(r"\\.\pipe\hyperdb-mcp-12-00ab", dir.path()).is_some());
+        assert!(HealthEndpoint::from_record(r"\\.\pipe\docker_engine", dir.path()).is_none());
+        assert!(HealthEndpoint::from_record(r"\\.\pipe\hyperdb-mcp-", dir.path()).is_none());
+        assert!(HealthEndpoint::from_record(r"\\.\pipe\hyperdb-mcp-a\b", dir.path()).is_none());
+        assert!(HealthEndpoint::from_record(r"\\server\pipe\hyperdb-mcp-1", dir.path()).is_none());
+    }
+
     #[cfg(unix)]
     mod unix {
         use std::os::unix::fs::PermissionsExt;
@@ -1155,6 +1276,22 @@ mod tests {
                 .permissions()
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
+        }
+
+        /// The peer-uid check passes for a server running as this user (the
+        /// only kind this test can create without a second account).
+        #[test]
+        fn the_peer_uid_of_a_same_user_server_is_accepted() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let endpoint = endpoint_in(&dir);
+            let _listener = ControlListener::bind(&endpoint).expect("bind");
+            let stream =
+                std::os::unix::net::UnixStream::connect(endpoint.as_str()).expect("connect");
+            assert!(crate::daemon::control::platform::own_peer_uid_matches(
+                &stream
+            ));
+            crate::daemon::control::connect(&endpoint, std::time::Duration::from_secs(5))
+                .expect("a same-user server passes the peer check");
         }
 
         #[test]

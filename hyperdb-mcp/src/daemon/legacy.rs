@@ -138,8 +138,11 @@ pub(super) fn retire_under_lock(dir: &Path, stop_wait: Duration) -> io::Result<(
                 io::ErrorKind::TimedOut,
                 format!(
                     "the pre-1.0 daemon record names port {}, which is open but did not \
-                     identify the recorded daemon (pid {}); nothing was sent to it",
-                    record.health_port, record.pid
+                     identify the recorded daemon (pid {}); nothing was sent to it. If \
+                     something else holds that port, delete {} and try again",
+                    record.health_port,
+                    record.pid,
+                    dir.join("daemon.json").display()
                 ),
             ));
         }

@@ -1251,6 +1251,41 @@ fn daemon_cli_status_ignores_a_stale_record_and_leaves_it() {
     );
 }
 
+/// A pre-1.0 daemon holds no lock and speaks TCP, so the 1.0 CLI cannot stop
+/// it; `daemon stop` and `daemon status` say that it is recorded, with its pid
+/// and port, instead of a bare "no daemon".
+#[test]
+fn daemon_cli_names_a_recorded_pre_1_0_daemon() {
+    let state = TempDir::new().unwrap();
+    std::fs::write(
+        state.path().join("daemon.json"),
+        serde_json::json!({
+            "pid": 424_242,
+            "hyperd_endpoint": "127.0.0.1:54321",
+            "health_port": 7485,
+            "started_at": "2026-08-13T12:34:56Z",
+            "version": "0.7.0",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    for action in ["stop", "status"] {
+        let output = run_cli_bounded(&["daemon", action], state.path(), Duration::from_secs(5));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{action}: {stderr}");
+        assert!(
+            stderr.contains("pre-1.0 daemon")
+                && stderr.contains("424242")
+                && stderr.contains("7485"),
+            "{action}: {stderr}"
+        );
+    }
+    assert!(
+        !state.path().join("daemon.lock").exists(),
+        "the CLI must not create daemon.lock"
+    );
+}
+
 /// `daemon status` talks to the endpoint recorded in the state directory
 /// (selected by `HYPERDB_STATE_DIR`) and prints that daemon's own STATUS.
 #[test]

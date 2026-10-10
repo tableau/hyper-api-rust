@@ -201,8 +201,8 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), Box<dyn std::error::
         started_at: chrono::Utc::now().to_rfc3339(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     };
-    discovery::write_enriched_discovery_file(&info)?;
-    info!(path = %discovery::discovery_file_path()?.display(), "discovery file written");
+    discovery::write_enriched_discovery_file_in(&state_dir, &info)?;
+    info!(path = %state_dir.join("daemon.json").display(), "discovery file written");
 
     // Step 5: Build the shared state.
     // - `info_arc` is shared with the health listener so STATUS reports the
@@ -239,7 +239,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), Box<dyn std::error::
     };
     tokio::select! {
         () = idle_fut => {}
-        () = hyperd_monitor(Arc::clone(&state), Arc::clone(&hyper_state), Arc::clone(&info_arc)) => {}
+        () = hyperd_monitor(Arc::clone(&state), Arc::clone(&hyper_state), Arc::clone(&info_arc), &state_dir) => {}
         () = shutdown_signal() => {
             info!("received shutdown signal");
         }
@@ -259,7 +259,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), Box<dyn std::error::
     // connection and lets hyperd exit cleanly. We don't lock-and-clear here
     // because that would gain nothing — the same drop happens via Arc refcount.
     info!("shutting down daemon");
-    discovery::remove_discovery_file();
+    discovery::remove_discovery_file_in(&state_dir);
     let _ = health_handle.join();
     // The listener's drop removed the socket when `run` returned. Drop hyperd
     // next, and release the lock last: it is what the next daemon waits on.
@@ -388,6 +388,7 @@ async fn hyperd_monitor(
     state: Arc<DaemonState>,
     hyper_state: Arc<Mutex<HyperState>>,
     info_arc: Arc<Mutex<DaemonInfo>>,
+    state_dir: &Path,
 ) {
     loop {
         tokio::time::sleep(HYPERD_POLL_INTERVAL).await;
@@ -417,7 +418,7 @@ async fn hyperd_monitor(
             continue;
         }
 
-        match try_restart_hyperd(&hyper_state, &info_arc) {
+        match try_restart_hyperd(&hyper_state, &info_arc, state_dir) {
             Ok(new_endpoint) => {
                 info!(endpoint = %new_endpoint, "hyperd restarted");
                 // Drain any reports that landed *during* the restart — those
@@ -452,6 +453,7 @@ async fn hyperd_monitor(
 fn try_restart_hyperd(
     hyper_state: &Mutex<HyperState>,
     info_arc: &Mutex<DaemonInfo>,
+    state_dir: &Path,
 ) -> Result<String, RestartError> {
     let mut guard = hyper_state.lock().expect("HyperState mutex poisoned");
 
@@ -475,8 +477,7 @@ fn try_restart_hyperd(
     guard.hyper = None;
 
     // Spawn the replacement.
-    let state_dir = discovery::state_dir().map_err(|e| RestartError::SpawnFailed(e.to_string()))?;
-    let params = build_params(&state_dir).map_err(|e| RestartError::SpawnFailed(e.to_string()))?;
+    let params = build_params(state_dir).map_err(|e| RestartError::SpawnFailed(e.to_string()))?;
     let new_hyper = HyperProcess::new(None, Some(&params))
         .map_err(|e| RestartError::SpawnFailed(e.to_string()))?;
     // See `run_daemon`: publish the connectable `connection_endpoint_string()`, not
@@ -503,7 +504,7 @@ fn try_restart_hyperd(
     // endpoint the file has not committed yet. The critical section is one
     // small serialize-and-rename, and the only contender is `status_json`,
     // whose own critical section is a single clone.
-    // `write_enriched_discovery_file` never touches `info_arc`, so holding it
+    // `write_enriched_discovery_file_in` never touches `info_arc`, so holding it
     // here cannot deadlock.
     //
     // Failing the write before mutating `DaemonInfo` also matters: the `?`
@@ -513,7 +514,7 @@ fn try_restart_hyperd(
         let mut info_guard = info_arc.lock().expect("DaemonInfo mutex poisoned");
         let mut snapshot = info_guard.clone();
         snapshot.hyperd_endpoint.clone_from(&new_endpoint);
-        discovery::write_enriched_discovery_file(&snapshot)
+        discovery::write_enriched_discovery_file_in(state_dir, &snapshot)
             .map_err(|e| RestartError::SpawnFailed(format!("discovery write: {e}")))?;
         info_guard.hyperd_endpoint.clone_from(&new_endpoint);
     }

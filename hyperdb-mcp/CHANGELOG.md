@@ -34,7 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   health port. A single-instance lock (`daemon.lock`) replaces the port bind as
   the "is a daemon running" decision. An older client talking to a daemon of
   this release cannot find it (the record no longer has `health_port`) and falls
-  back to local mode.
+  back to local mode. A client also checks who serves the endpoint (Unix:
+  peer uid via `SO_PEERCRED` / `getpeereid`; Windows: the pipe server process's
+  user) and refuses one that is not the current user.
 - **The state directory must now be owned by the current user and not writable
   by group or others.** A daemon refuses to start in one, and a client treats it
   as untrusted and uses local mode rather than connecting to an endpoint it
@@ -50,7 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (a daemon that ignores `STOP` costs up to 15 s and another `STOP` on every
   client start until it exits). An old client meeting a new
   daemon cannot parse its record, so it waits out its spawn timeout and runs in
-  local mode; nothing is destroyed.
+  local mode; nothing is destroyed. Running pre-rc.4 clients and new ones
+  against one state directory at the same time is not supported: an old client
+  may overwrite `daemon.json` (not verified against the old code), in which
+  case a new client no longer finds the daemon through the record.
 
 ### Removed
 

@@ -251,14 +251,25 @@ Falls back to local mode (per-session `hyperd` via `HyperProcess::new`) when the
 `ControlListener`, `ControlStream`, `connect`). `daemon.json` carries it as
 `health_endpoint`; a client accepts the recorded value only if
 `HealthEndpoint::from_record` finds it equals the endpoint its own state
-directory implies, so a tampered record can never redirect it. Liveness is an
+directory implies. On Unix that pins the exact socket path, so a tampered
+record cannot redirect a client; the client also checks the peer uid of the
+socket (`SO_PEERCRED` / `getpeereid`) equals its own. On Windows a pipe name
+does not encode the state directory, so the check only pins the
+`\\.\pipe\hyperdb-mcp-` prefix and character set; the trust model there is a
+random per-daemon pipe name, an owner-only DACL, `FILE_FLAG_FIRST_PIPE_INSTANCE`
+at creation, and a client-side check that the pipe's server process runs as the
+current user (a squatter's pipe is refused with `PermissionDenied`). Neither
+platform verifies the *ancestors* of the state directory: only the directory
+itself is checked for ownership and write bits, so a user who can rename an
+ancestor can swap the whole directory. Liveness is an
 identity handshake: `health::ping_identified` sends `PING` and requires the
 reply's first two tokens to be exactly `PONG` and `hyperdb-mcp` (the third is
 the daemon version). `discover()` is a pure read (record + identified `PING`);
 stale-record removal lives in `ensure_daemon`, under the lock.
 
-**Single instance.** `daemon::lock::DaemonLock` is an `flock` (Windows: a locked
-file region) on `<state dir>/daemon.lock`, never unlinked. `run_daemon` creates
+**Single instance.** `daemon::lock::DaemonLock` is an `flock` (Windows: an
+exclusive `LockFileEx` lock on the first byte, opened without
+`FILE_SHARE_DELETE`; `ERROR_LOCK_VIOLATION` means held) on `<state dir>/daemon.lock`, never unlinked. `run_daemon` creates
 and checks the state directory (`state_perms::verify_state_dir_trusted`: owned
 by the effective user, no group/other write), takes the lock (retrying up to
 `STARTUP_WAIT`; a daemon that answers an identified `PING` continuously for

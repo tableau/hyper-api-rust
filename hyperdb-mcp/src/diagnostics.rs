@@ -1066,9 +1066,11 @@ fn probe_daemon_lock(state_dir: &Path) -> DoctorLockState {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return DoctorLockState::Absent,
         Err(_) => return DoctorLockState::Unknown,
     }
-    match crate::daemon::lock::DaemonLock::try_acquire(state_dir) {
-        Ok(Some(_lock)) => DoctorLockState::Free,
-        Ok(None) => DoctorLockState::Held,
+    // `is_held` opens without creating, so a lock file that vanished since
+    // the check above is not recreated by a read-only probe.
+    match crate::daemon::lock::DaemonLock::is_held(state_dir) {
+        Ok(false) => DoctorLockState::Free,
+        Ok(true) => DoctorLockState::Held,
         Err(_) => DoctorLockState::Unknown,
     }
 }

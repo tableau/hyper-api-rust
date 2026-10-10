@@ -203,6 +203,10 @@ async fn run_daemon_mode(idle_timeout: Option<u64>) -> Result<(), Box<dyn std::e
     // to the owning user, as `daemon.json` is.
     let state_dir = discovery::state_dir()?;
     daemon::state_perms::ensure_owner_only_dir(&state_dir)?;
+    // Before anything is written into it: an untrusted directory (someone
+    // else's, or writable by others) gets no log file and no logs directory.
+    // Logging is not up yet, so the error reaches the caller's stderr.
+    daemon::state_perms::verify_state_dir_trusted(&state_dir)?;
     let log_dir = state_dir.join("logs");
     daemon::state_perms::ensure_owner_only_dir(&log_dir)?;
 
@@ -302,6 +306,15 @@ fn running_daemon_endpoint() -> daemon::control::HealthEndpoint {
         eprintln!("No daemon is currently running.");
         std::process::exit(1);
     };
+    // The lock-based daemon is not running; a pre-1.0 one holds no lock, so
+    // say so when its record is there.
+    let no_daemon = || -> ! {
+        match discovery::legacy_daemon_hint(&dir) {
+            Some(hint) => eprintln!("No daemon is currently running. {hint}"),
+            None => eprintln!("No daemon is currently running."),
+        }
+        std::process::exit(1);
+    };
     if let Some(info) = discovery::discover_in(&dir)
         && let Some(endpoint) = HealthEndpoint::from_record(&info.health_endpoint, &dir)
     {
@@ -311,21 +324,15 @@ fn running_daemon_endpoint() -> daemon::control::HealthEndpoint {
     match daemon::state_perms::verify_state_dir_trusted(&dir) {
         Ok(()) => {}
         // No state directory at all: nothing has ever run here.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("No daemon is currently running.");
-            std::process::exit(1);
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => no_daemon(),
         Err(e) => {
             eprintln!("The daemon state directory cannot be trusted: {e}");
             std::process::exit(1);
         }
     }
-    match daemon::lock::DaemonLock::try_acquire(&dir) {
-        Ok(Some(_free)) => {
-            eprintln!("No daemon is currently running.");
-            std::process::exit(1);
-        }
-        Ok(None) => {}
+    match daemon::lock::DaemonLock::is_held(&dir) {
+        Ok(false) => no_daemon(),
+        Ok(true) => {}
         Err(e) => {
             eprintln!("Cannot check the daemon lock in {}: {e}", dir.display());
             std::process::exit(1);

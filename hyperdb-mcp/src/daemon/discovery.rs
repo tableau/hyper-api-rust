@@ -292,17 +292,27 @@ pub fn discovery_file_path() -> io::Result<PathBuf> {
 /// # Errors
 /// Returns an error if the state directory cannot be created or the file cannot be written.
 pub fn write_discovery_file(info: &DaemonInfo) -> io::Result<()> {
-    write_discovery_record(info)
+    write_discovery_record(&state_dir()?, info)
 }
 
-pub(super) fn write_enriched_discovery_file(info: &DaemonInfo) -> io::Result<()> {
+/// [`write_discovery_file`] for an explicit state directory.
+///
+/// # Errors
+/// As [`write_discovery_file`].
+pub fn write_discovery_file_in(dir: &Path, info: &DaemonInfo) -> io::Result<()> {
+    write_discovery_record(dir, info)
+}
+
+/// Write the record with this process's identity, into `dir`. The daemon
+/// passes the state directory it already holds rather than re-reading the
+/// environment.
+pub(super) fn write_enriched_discovery_file_in(dir: &Path, info: &DaemonInfo) -> io::Result<()> {
     let record = DaemonRecord::with_current_identity(info)?;
-    write_discovery_record(&record)
+    write_discovery_record(dir, &record)
 }
 
-fn write_discovery_record(record: &(impl Serialize + ?Sized)) -> io::Result<()> {
-    let dir = state_dir()?;
-    super::state_perms::ensure_owner_only_dir(&dir)?;
+fn write_discovery_record(dir: &Path, record: &(impl Serialize + ?Sized)) -> io::Result<()> {
+    super::state_perms::ensure_owner_only_dir(dir)?;
 
     let path = dir.join("daemon.json");
     let tmp_path = dir.join("daemon.json.tmp");
@@ -425,6 +435,23 @@ pub(super) fn read_legacy_record(dir: &Path) -> Option<super::legacy::LegacyReco
     }
 }
 
+/// A sentence for the CLI when `dir` holds a pre-1.0 daemon's record: that
+/// daemon holds no daemon lock and speaks TCP, so `daemon stop` and `status`
+/// cannot reach it. `None` when there is no legacy record.
+#[must_use]
+pub fn legacy_daemon_hint(dir: &Path) -> Option<String> {
+    let record = read_legacy_record(dir)?;
+    Some(format!(
+        "{} records a pre-1.0 daemon (pid {}, port {}), which this version cannot \
+         stop or inspect. Starting a hyperdb-mcp session retires it automatically; \
+         or stop it yourself (kill {}) and delete that file.",
+        dir.join("daemon.json").display(),
+        record.pid,
+        record.health_port,
+        record.pid
+    ))
+}
+
 /// Remove the legacy record `expected`, if `dir` still holds exactly it.
 ///
 /// The caller must hold the [`DaemonLock`](super::lock::DaemonLock) for `dir`.
@@ -437,9 +464,14 @@ pub(super) fn remove_legacy_record(dir: &Path, expected: super::legacy::LegacyRe
 
 /// Remove the discovery file (called during graceful shutdown).
 pub fn remove_discovery_file() {
-    if let Ok(path) = discovery_file_path() {
-        let _ = std::fs::remove_file(&path);
+    if let Ok(dir) = state_dir() {
+        remove_discovery_file_in(&dir);
     }
+}
+
+/// [`remove_discovery_file`] for an explicit state directory.
+pub fn remove_discovery_file_in(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join("daemon.json"));
 }
 
 /// Check if the daemon is alive by sending PING and verifying the identifying
@@ -885,7 +917,9 @@ mod tests {
     }
 
     /// A record pointing at an endpoint this state directory does not imply is
-    /// never connected to, even if something answers there.
+    /// never connected to, even if something answers there. Unix pins the
+    /// exact socket path; the Windows twin is below.
+    #[cfg(unix)]
     #[test]
     fn discover_in_rejects_a_foreign_endpoint() {
         let live_dir = short_state_dir();
@@ -897,6 +931,32 @@ mod tests {
         write_record_for_test(other_dir.path(), &live_info);
         assert!(discover_in(other_dir.path()).is_none());
         // And the live daemon is found through its own directory.
+        write_record_for_test(live_dir.path(), &live_info);
+        assert_eq!(discover_in(live_dir.path()), Some(live_info));
+    }
+
+    /// Windows: a pipe name does not encode the state directory, so only the
+    /// prefix and character set are checked. A record naming another
+    /// program's pipe is never connected to, even if it answers.
+    #[cfg(windows)]
+    #[test]
+    fn discover_in_rejects_a_foreign_endpoint() {
+        let live_dir = short_state_dir();
+        let other_dir = short_state_dir();
+        let live_info = info_for(live_dir.path(), 9_200);
+        let _daemon = LiveDaemon::start(live_dir.path(), &live_info);
+
+        for foreign in [
+            r"\\.\pipe\docker_engine",
+            r"\\.\pipe\hyperdb-mcp-",
+            "127.0.0.1:7485",
+        ] {
+            let mut info = live_info.clone();
+            info.health_endpoint = foreign.to_string();
+            write_record_for_test(other_dir.path(), &info);
+            assert!(discover_in(other_dir.path()).is_none(), "{foreign}");
+        }
+        // The daemon is found through a record that names its own pipe.
         write_record_for_test(live_dir.path(), &live_info);
         assert_eq!(discover_in(live_dir.path()), Some(live_info));
     }
@@ -1469,6 +1529,16 @@ mod tests {
 
         remove_legacy_record(tmp.path(), judged);
         assert!(path.exists(), "a changed record must survive");
+    }
+
+    #[test]
+    fn legacy_daemon_hint_names_pid_and_port_only_for_a_legacy_record() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(legacy_daemon_hint(tmp.path()), None);
+        write_legacy_file(tmp.path(), 4_242);
+        let hint = legacy_daemon_hint(tmp.path()).expect("legacy record gives a hint");
+        assert!(hint.contains("pre-1.0 daemon"), "{hint}");
+        assert!(hint.contains("4242"), "{hint}");
     }
 
     #[test]
