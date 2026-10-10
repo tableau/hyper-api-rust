@@ -42,6 +42,7 @@ fn export_csv_from_table() {
         path: path_str.into(),
         format: "csv".into(),
         overwrite: true,
+        protected_paths: Vec::new(),
         format_options: None,
         source_db: None,
     };
@@ -68,6 +69,7 @@ fn export_csv_from_query() {
         path: path_str.into(),
         format: "csv".into(),
         overwrite: true,
+        protected_paths: Vec::new(),
         format_options: None,
         source_db: None,
     };
@@ -90,6 +92,7 @@ fn export_parquet_from_table() {
         path: path_str.into(),
         format: "parquet".into(),
         overwrite: true,
+        protected_paths: Vec::new(),
         format_options: None,
         source_db: None,
     };
@@ -113,6 +116,7 @@ fn export_hyper_copies_workspace() {
         path: path_str.into(),
         format: "hyper".into(),
         overwrite: true,
+        protected_paths: Vec::new(),
         format_options: None,
         source_db: None,
     };
@@ -154,6 +158,7 @@ fn export_hyper_with_source_db_snapshots_persistent() {
         path: path_str.into(),
         format: "hyper".into(),
         overwrite: true,
+        protected_paths: Vec::new(),
         format_options: None,
         source_db: Some("persistent".into()),
     };
@@ -205,6 +210,7 @@ fn export_hyper_requires_no_sql_or_table() {
         path: path_str.into(),
         format: "hyper".into(),
         overwrite: true,
+        protected_paths: Vec::new(),
         format_options: None,
         source_db: None,
     };
@@ -236,6 +242,7 @@ fn export_csv_without_sql_or_table_errors() {
         path: path_str.into(),
         format: "csv".into(),
         overwrite: true,
+        protected_paths: Vec::new(),
         format_options: None,
         source_db: None,
     };
@@ -272,6 +279,7 @@ fn export_overwrite_false_rejects_existing_file() {
             path: csv_path.to_str().unwrap().into(),
             format: "csv".into(),
             overwrite: false,
+            protected_paths: Vec::new(),
             format_options: None,
             source_db: None,
         },
@@ -303,6 +311,7 @@ fn export_overwrite_false_rejects_existing_file() {
             path: hyper_path.to_str().unwrap().into(),
             format: "hyper".into(),
             overwrite: false,
+            protected_paths: Vec::new(),
             format_options: None,
             source_db: None,
         },
@@ -331,6 +340,7 @@ fn export_overwrite_false_allows_new_path() {
         path: path.to_str().unwrap().into(),
         format: "csv".into(),
         overwrite: false,
+        protected_paths: Vec::new(),
         format_options: None,
         source_db: None,
     };
@@ -340,8 +350,7 @@ fn export_overwrite_false_allows_new_path() {
     assert!(std::fs::metadata(&path).unwrap().len() > 0);
 }
 
-/// `overwrite = true` replaces an existing file — this is both the default
-/// and the long-standing behavior from before the flag existed.
+/// `overwrite = true` lets hyperd's `COPY ... TO` replace an existing file.
 #[test]
 fn export_overwrite_true_replaces_existing_file() {
     let te = TestEngine::new_ephemeral();
@@ -356,6 +365,7 @@ fn export_overwrite_true_replaces_existing_file() {
         path: path.to_str().unwrap().into(),
         format: "csv".into(),
         overwrite: true,
+        protected_paths: Vec::new(),
         format_options: None,
         source_db: None,
     };
@@ -370,23 +380,11 @@ fn export_overwrite_true_replaces_existing_file() {
     assert!(contents.contains("Alice") && contents.contains("Bob"));
 }
 
-/// Regression test for #277: exporting `format: "hyper"` routes its
-/// `CREATE DATABASE` / `ATTACH DATABASE` pair through
-/// `Engine::execute_attach_command`, so a lock conflict on the target
-/// surfaces as `RESOURCE_BUSY` rather than a generic `SqlError`.
-///
-/// `export_hyper` deletes any pre-existing target before `CREATE DATABASE`,
-/// so no external lock can be forced through the public API on Unix. The
-/// deterministic case is a target already attached under another alias in
-/// the same session, and the result differs per platform:
-///
-/// - **Unix:** the pre-delete unlinks the open file, and `CREATE DATABASE`
-///   fails with SQLSTATE `42P04` ("database already exists"). That does not
-///   match `is_resource_busy`, so it stays `SqlError`.
-/// - **Windows:** `hyperd` holds the file open, the pre-delete fails with
-///   `ERROR_SHARING_VIOLATION`, and the error classifies as `RESOURCE_BUSY`.
+/// A `hyper` export never replaces a database the session has attached,
+/// even with `overwrite`. The file is compared by identity, so another path
+/// to it is refused too, and nothing is left beside it.
 #[test]
-fn export_hyper_over_same_session_attached_target_is_classified_per_platform() {
+fn export_hyper_over_an_attached_target_is_refused() {
     let te = TestEngine::new_ephemeral();
     setup_test_table(&te);
 
@@ -394,9 +392,8 @@ fn export_hyper_over_same_session_attached_target_is_classified_per_platform() {
     let path = dir.path().join("already_attached.hyper");
     let path_str = path.to_str().unwrap();
 
-    // Attach the (fresh) target path under an unrelated alias first,
-    // exactly like a user calling `attach_database` on a file they
-    // then separately ask to export a hyper snapshot over.
+    // Attach the target under an unrelated alias first, like a user calling
+    // `attach_database` on a file they then ask to export a snapshot over.
     te.engine
         .execute_command(&format!(
             "CREATE DATABASE {}",
@@ -409,53 +406,31 @@ fn export_hyper_over_same_session_attached_target_is_classified_per_platform() {
             hyperdb_api::escape_sql_path(path_str)
         ))
         .unwrap();
-
-    let opts = ExportOptions {
-        sql: None,
-        table: Some("test_export".into()),
-        path: path_str.into(),
-        format: "hyper".into(),
-        overwrite: true,
-        format_options: None,
-        source_db: None,
+    // Metadata, not contents: on Windows hyperd holds the attached file
+    // exclusively, so it cannot be read.
+    let stamp = |p: &std::path::Path| {
+        let meta = std::fs::metadata(p).unwrap();
+        (meta.len(), meta.modified().unwrap())
     };
-    let err = export_to_file(&te.engine, &opts)
-        .expect_err("exporting over a path already attached in this session must fail");
+    let before = stamp(&path);
 
-    if cfg!(windows) {
-        // The pre-delete loses to hyperd's own handle on the attached
-        // file. That is a holder conflict, not a permissions problem, so
-        // it must carry the "close the other process / copy the file"
-        // guidance rather than "check file permissions".
-        assert_eq!(
-            err.code,
-            ErrorCode::ResourceBusy,
-            "a target held open by another process must classify as \
-             RESOURCE_BUSY, not PERMISSION_DENIED: {err:?}"
-        );
-        let guidance = err
-            .suggestion
-            .as_deref()
-            .expect("RESOURCE_BUSY must carry recovery guidance");
-        assert!(
-            guidance.to_lowercase().contains("another process"),
-            "guidance must point at the holder, not at file permissions: {guidance}"
-        );
-    } else {
-        // Unix unlinks the open file, so the export reaches its own
-        // `CREATE DATABASE` and collides with the same-session alias.
-        assert_eq!(
-            err.code,
-            ErrorCode::SqlError,
-            "a same-session 'database already exists' conflict (42P04) is not a \
-             lock conflict and must not be reclassified as RESOURCE_BUSY: {err:?}"
-        );
-        assert!(
-            err.message.contains("42P04") || err.message.to_lowercase().contains("already exists"),
-            "expected a duplicate-database error, got: {}",
-            err.message
-        );
+    for target in [
+        path.clone(),
+        dir.path().join(".").join("already_attached.hyper"),
+    ] {
+        let opts = ExportOptions {
+            format: "hyper".into(),
+            path: target.to_str().unwrap().into(),
+            overwrite: true,
+            protected_paths: vec![path.clone()],
+            ..ExportOptions::default()
+        };
+        let err = export_to_file(&te.engine, &opts)
+            .expect_err("exporting over an attached database must fail");
+        assert_eq!(err.code, ErrorCode::InvalidArgument, "{err:?}");
     }
+    assert_eq!(stamp(&path), before);
+    assert_eq!(dir_entries(dir.path()), ["already_attached.hyper"]);
 }
 
 /// Iceberg round-trip: export a table to an Iceberg directory, then read
@@ -481,6 +456,7 @@ fn iceberg_export_round_trips_through_load_iceberg() {
         path: iceberg_str.into(),
         format: "iceberg".into(),
         overwrite: true,
+        protected_paths: Vec::new(),
         format_options: None,
         source_db: None,
     };
@@ -576,6 +552,7 @@ fn iceberg_export_overwrite_replaces_directory() {
         path: iceberg_str.into(),
         format: "iceberg".into(),
         overwrite: true,
+        protected_paths: Vec::new(),
         format_options: None,
         source_db: None,
     };
@@ -589,6 +566,7 @@ fn iceberg_export_overwrite_replaces_directory() {
         path: iceberg_str.into(),
         format: "iceberg".into(),
         overwrite: true,
+        protected_paths: Vec::new(),
         format_options: None,
         source_db: None,
     };
@@ -631,6 +609,7 @@ fn iceberg_export_refuses_overwrite_when_disabled() {
         path: iceberg_str.into(),
         format: "iceberg".into(),
         overwrite: true,
+        protected_paths: Vec::new(),
         format_options: None,
         source_db: None,
     };
@@ -643,6 +622,7 @@ fn iceberg_export_refuses_overwrite_when_disabled() {
         path: iceberg_str.into(),
         format: "iceberg".into(),
         overwrite: false,
+        protected_paths: Vec::new(),
         format_options: None,
         source_db: None,
     };
@@ -697,6 +677,7 @@ fn parquet_export_round_trips_through_load_file() {
             path: path_str.into(),
             format: "parquet".into(),
             overwrite: true,
+            protected_paths: Vec::new(),
             format_options: None,
             source_db: None,
         },
@@ -792,6 +773,7 @@ fn arrow_ipc_export_round_trips_through_load_file() {
             path: path_str.into(),
             format: "arrow_ipc".into(),
             overwrite: true,
+            protected_paths: Vec::new(),
             format_options: None,
             source_db: None,
         },
@@ -871,6 +853,7 @@ fn parquet_export_honors_compression_override() {
                 path: path.to_str().unwrap().into(),
                 format: "parquet".into(),
                 overwrite: true,
+                protected_paths: Vec::new(),
                 format_options: Some(opts),
                 source_db: None,
             },
@@ -926,6 +909,7 @@ fn csv_export_honors_delimiter_override() {
             path: path_str.into(),
             format: "csv".into(),
             overwrite: true,
+            protected_paths: Vec::new(),
             format_options: Some(opts),
             source_db: None,
         },
@@ -971,6 +955,7 @@ fn format_options_invalid_shapes_reject_cleanly() {
             path: path_str.clone(),
             format: "parquet".into(),
             overwrite: true,
+            protected_paths: Vec::new(),
             format_options: Some(null_val),
             source_db: None,
         },
@@ -993,6 +978,7 @@ fn format_options_invalid_shapes_reject_cleanly() {
             path: path_str.clone(),
             format: "parquet".into(),
             overwrite: true,
+            protected_paths: Vec::new(),
             format_options: Some(bad_key),
             source_db: None,
         },
@@ -1042,6 +1028,7 @@ fn export_hyper_preserves_constraints() {
             path: path_str.into(),
             format: "hyper".into(),
             overwrite: true,
+            protected_paths: Vec::new(),
             format_options: None,
             source_db: None,
         },
@@ -1133,6 +1120,7 @@ fn sql_export(sql: &str, path: &std::path::Path, format: &str) -> ExportOptions 
         path: path.to_str().unwrap().into(),
         format: format.into(),
         overwrite: true,
+        protected_paths: Vec::new(),
         format_options: None,
         source_db: None,
     }
@@ -1206,4 +1194,258 @@ fn export_query_ending_in_a_line_comment() {
         .unwrap_or_else(|err| panic!("{format}: {err:?}"));
         assert_eq!(result.rows, 2, "{format}");
     }
+}
+
+/// The sorted names in `dir`.
+fn dir_entries(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Every file under `dir` with its contents, sorted, for byte-identity
+/// checks across a failed export.
+fn tree_snapshot(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        for entry in std::fs::read_dir(&p).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                stack.push(entry.path());
+            } else {
+                let rel = entry
+                    .path()
+                    .strip_prefix(dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((rel, std::fs::read(entry.path()).unwrap()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// `overwrite=true` replaces only an Iceberg table: a directory holding
+/// anything else, a `.hyper` file among it, or a regular file, is refused
+/// and left as it was.
+#[test]
+fn iceberg_export_refuses_to_replace_what_is_not_an_iceberg_table() {
+    let te = TestEngine::new_ephemeral();
+    setup_test_table(&te);
+    let dir = tempfile::tempdir().unwrap();
+
+    let sentinel = dir.path().join("documents");
+    std::fs::create_dir(&sentinel).unwrap();
+    std::fs::write(sentinel.join("notes.txt"), b"keep me").unwrap();
+    let with_hyper = dir.path().join("databases");
+    std::fs::create_dir_all(with_hyper.join("metadata")).unwrap();
+    std::fs::write(with_hyper.join("metadata/v1.metadata.json"), b"{}").unwrap();
+    std::fs::write(with_hyper.join("work.hyper"), b"Hyper\x08\0\0").unwrap();
+    let file = dir.path().join("plain-file");
+    std::fs::write(&file, b"keep me").unwrap();
+
+    for target in [&sentinel, &with_hyper] {
+        let before = tree_snapshot(target);
+        let err = export_to_file(
+            &te.engine,
+            &sql_export("SELECT * FROM test_export", target, "iceberg"),
+        )
+        .expect_err("a non-Iceberg directory must not be replaced");
+        assert_eq!(err.code, ErrorCode::InvalidArgument, "{err:?}");
+        assert!(
+            err.message.contains("not an Iceberg table"),
+            "{}",
+            err.message
+        );
+        assert_eq!(tree_snapshot(target), before);
+    }
+    let err = export_to_file(
+        &te.engine,
+        &sql_export("SELECT * FROM test_export", &file, "iceberg"),
+    )
+    .expect_err("a regular file must not be replaced by an Iceberg export");
+    assert_eq!(err.code, ErrorCode::InvalidArgument, "{err:?}");
+    assert_eq!(std::fs::read(&file).unwrap(), b"keep me");
+    assert_eq!(
+        dir_entries(dir.path()),
+        ["databases", "documents", "plain-file"]
+    );
+}
+
+/// An Iceberg replace that fails puts the previous table back byte for
+/// byte and leaves no backup beside it. The cast fails while `COPY` runs,
+/// after the query passed its parse check.
+#[test]
+fn failed_iceberg_replace_restores_the_previous_table() {
+    let te = TestEngine::new_ephemeral();
+    setup_test_table(&te);
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("table");
+    export_to_file(
+        &te.engine,
+        &sql_export("SELECT * FROM test_export", &target, "iceberg"),
+    )
+    .unwrap();
+    let before = tree_snapshot(&target);
+
+    let err = export_to_file(
+        &te.engine,
+        &sql_export(
+            "SELECT CAST(name AS INT) AS n FROM test_export",
+            &target,
+            "iceberg",
+        ),
+    )
+    .expect_err("the cast must fail at execution");
+    // 22P02 (invalid integer text), hyperd's error rather than a refusal.
+    assert_eq!(err.code, ErrorCode::SchemaMismatch, "{err:?}");
+    assert_eq!(tree_snapshot(&target), before);
+    assert_eq!(dir_entries(dir.path()), ["table"]);
+}
+
+/// `overwrite=true` replaces only a Hyper database file: anything else is
+/// refused and untouched, while a real `.hyper` file is replaced.
+#[test]
+fn hyper_export_replaces_only_a_hyper_file() {
+    let te = TestEngine::new_ephemeral();
+    setup_test_table(&te);
+    let dir = tempfile::tempdir().unwrap();
+    let not_hyper = dir.path().join("report.hyper");
+    std::fs::write(&not_hyper, b"Hype? not a database").unwrap();
+    let a_dir = dir.path().join("dir.hyper");
+    std::fs::create_dir(&a_dir).unwrap();
+
+    let hyper_export = |path: &std::path::Path| ExportOptions {
+        path: path.to_str().unwrap().into(),
+        format: "hyper".into(),
+        overwrite: true,
+        ..ExportOptions::default()
+    };
+    for target in [&not_hyper, &a_dir] {
+        let err = export_to_file(&te.engine, &hyper_export(target))
+            .expect_err("only a Hyper file may be replaced");
+        assert_eq!(err.code, ErrorCode::InvalidArgument, "{err:?}");
+        assert!(
+            err.message.contains("not a Hyper database"),
+            "{}",
+            err.message
+        );
+    }
+    assert_eq!(std::fs::read(&not_hyper).unwrap(), b"Hype? not a database");
+
+    let real = dir.path().join("real.hyper");
+    export_to_file(&te.engine, &hyper_export(&real)).unwrap();
+    let first = std::fs::read(&real).unwrap();
+    te.engine
+        .execute_command("INSERT INTO test_export VALUES (3, 'Carol', 1.0)")
+        .unwrap();
+    let result = export_to_file(&te.engine, &hyper_export(&real)).unwrap();
+    assert_eq!(result.rows, 3);
+    assert_ne!(std::fs::read(&real).unwrap(), first);
+    assert_eq!(
+        dir_entries(dir.path()),
+        ["dir.hyper", "real.hyper", "report.hyper"]
+    );
+}
+
+/// A `hyper` export that fails after creating its database (an unknown
+/// `source_db` fails once the target is attached) leaves the previous
+/// file byte-identical and no temporary file beside it.
+#[test]
+fn failed_hyper_replace_leaves_the_previous_file() {
+    let te = TestEngine::new_ephemeral();
+    setup_test_table(&te);
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("backup.hyper");
+    let opts = |source_db: Option<&str>| ExportOptions {
+        path: target.to_str().unwrap().into(),
+        format: "hyper".into(),
+        overwrite: true,
+        source_db: source_db.map(Into::into),
+        ..ExportOptions::default()
+    };
+    export_to_file(&te.engine, &opts(None)).unwrap();
+    let before = std::fs::read(&target).unwrap();
+
+    export_to_file(&te.engine, &opts(Some("no_such_db")))
+        .expect_err("an unknown source database must fail");
+    assert_eq!(std::fs::read(&target).unwrap(), before);
+    assert_eq!(dir_entries(dir.path()), ["backup.hyper"]);
+}
+
+/// Every format refuses a protected file, even with `overwrite`, whichever
+/// path reaches it: the file itself, a path through `.`, or a symlink.
+#[test]
+fn export_refuses_a_protected_file_by_identity() {
+    let te = TestEngine::new_ephemeral();
+    setup_test_table(&te);
+    let dir = tempfile::tempdir().unwrap();
+    let protected = dir.path().join("session.hyper");
+    std::fs::write(&protected, b"Hyper\x08\0\0 session").unwrap();
+    let mut targets = vec![
+        protected.clone(),
+        dir.path().join(".").join("session.hyper"),
+    ];
+    #[cfg(unix)]
+    {
+        let link = dir.path().join("link.hyper");
+        std::os::unix::fs::symlink(&protected, &link).unwrap();
+        targets.push(link);
+    }
+
+    for target in &targets {
+        for format in ["csv", "parquet", "arrow_ipc", "iceberg", "hyper"] {
+            for overwrite in [true, false] {
+                let opts = ExportOptions {
+                    table: Some("test_export".into()),
+                    path: target.to_str().unwrap().into(),
+                    format: format.into(),
+                    overwrite,
+                    protected_paths: vec![protected.clone()],
+                    ..ExportOptions::default()
+                };
+                let err = export_to_file(&te.engine, &opts)
+                    .expect_err("a protected file must never be written");
+                assert_eq!(
+                    err.code,
+                    ErrorCode::InvalidArgument,
+                    "{format} overwrite={overwrite} {}: {err:?}",
+                    target.display()
+                );
+            }
+        }
+    }
+    assert_eq!(std::fs::read(&protected).unwrap(), b"Hyper\x08\0\0 session");
+}
+
+/// A directory holding a protected file is refused too: replacing an
+/// Iceberg-shaped directory would delete the file inside it.
+#[test]
+fn export_refuses_a_directory_holding_a_protected_file() {
+    let te = TestEngine::new_ephemeral();
+    setup_test_table(&te);
+    let dir = tempfile::tempdir().unwrap();
+    let table = dir.path().join("table");
+    std::fs::create_dir_all(table.join("metadata")).unwrap();
+    std::fs::create_dir_all(table.join("data")).unwrap();
+    std::fs::write(table.join("metadata").join("v1.metadata.json"), b"{}").unwrap();
+    let protected = table.join("data").join("session.hyper");
+    std::fs::write(&protected, b"Hyper\x08\0\0 session").unwrap();
+    let before = tree_snapshot(&table);
+
+    let opts = ExportOptions {
+        protected_paths: vec![protected],
+        ..sql_export("SELECT * FROM test_export", &table, "iceberg")
+    };
+    let err = export_to_file(&te.engine, &opts)
+        .expect_err("a directory holding a protected file must not be replaced");
+    assert_eq!(err.code, ErrorCode::InvalidArgument, "{err:?}");
+    assert_eq!(tree_snapshot(&table), before);
+    assert_eq!(dir_entries(dir.path()), ["table"]);
 }

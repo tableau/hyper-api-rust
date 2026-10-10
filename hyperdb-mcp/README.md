@@ -700,12 +700,32 @@ export(sql: 'SELECT ...', path: '~/Desktop/analysis.hyper', format: 'hyper')
 |-----------|------|----------|-------------|
 | `sql` | string | no | Read-only query to export (if omitted, exports whole table) |
 | `table` | string | no | Table name (used if `sql` omitted) |
-| `path` | string | yes | Output file path |
+| `path` | string | yes | Output file path (a directory for `iceberg`) |
 | `format` | string | yes | `"csv"`, `"parquet"`, `"iceberg"`, `"arrow_ipc"`, or `"hyper"` |
+| `database` | string | no | Source database: `local` (default), `persistent`, or an attached alias |
+| `format_options` | object | no | Options passed to hyperd's `COPY ... TO ... WITH (...)`; ignored for `hyper` |
+| `overwrite` | bool | no | Replace an existing destination (default `false`) |
 
 The `"hyper"` format produces a `.hyper` file that opens directly in **Tableau
 Desktop**. It does not mutate the source database; it creates or replaces the
 destination and materializes every user table from the selected source into it.
+
+An existing destination is refused with `PERMISSION_DENIED` unless `overwrite`
+is `true`. Even then, `iceberg` replaces only an empty directory or one shaped
+like an Iceberg table, and `hyper` only a Hyper database file; anything else is
+refused with `INVALID_ARGUMENT`. A failed export leaves the previous contents in
+place: the old Iceberg table is set aside while the export runs and put back on
+failure, and a Hyper export is built beside the old file and renamed over it
+only once complete. If an old Iceberg table cannot be put back, the error names
+the sibling `<name>.hyperdb-mcp-old-*` directory that holds it. A server that
+stops mid-export leaves that directory, or a Hyper export's
+`<name>.hyperdb-mcp-tmp-*` file, behind; neither is deleted automatically.
+
+`export` and `chart` never write to a database the session has open (the
+persistent database, the local database, or an attached file) or to a directory
+containing one, whatever path reaches it; that is refused with
+`INVALID_ARGUMENT`. "The session" is this MCP connection: a file another client
+attached through the same daemon is not covered.
 
 ### Visualization
 
@@ -735,7 +755,7 @@ chart(sql: 'SELECT product, SUM(revenue) as total FROM sales GROUP BY product', 
 | `bins` | int | no | Histogram bins (default 20, clamped 1..500) |
 | `output_path` | string | no | Destination file; parent directories are created |
 | `inline` | bool | no | Return image bytes inline (default `true`) |
-| `overwrite` | bool | no | Permit replacing `output_path` (default `true`) |
+| `overwrite` | bool | no | Permit replacing `output_path` (default `false`) |
 | `bar_orientation` | string | no | `vertical` (default) or `horizontal`; bars only |
 | `label_values` | bool | no | Draw each original y scalar beside its bar |
 | `show_legend` | bool | no | Show series legend (default `true`) |
@@ -1080,7 +1100,7 @@ Errors include a machine-readable code and a suggestion:
 | `CONNECTION_LOST` | `hyperd` crashed or wire protocol desynchronized | Retry — the server tears down the engine and reconnects on the next call |
 | `INVALID_ARGUMENT` | Bad parameter (relative path, duplicate saved-query name, invalid alias) | Fix the argument per the message |
 | `EMPTY_DATA` | Input has zero rows or columns | Check the source data |
-| `PERMISSION_DENIED` | Filesystem permission denied, or `export` with `overwrite: false` hit an existing file | Choose another path or fix permissions |
+| `PERMISSION_DENIED` | Filesystem permission denied, or `export` / `chart` hit an existing file without `overwrite: true` | Choose another path, pass `overwrite: true`, or fix permissions |
 | `INTERNAL_ERROR` | Unexpected server failure | Retry; report with `hyperdb-mcp doctor` output |
 
 Server-returned errors include a machine-readable `code`, a `message`, and a

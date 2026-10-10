@@ -91,8 +91,8 @@ Log bars start at the positive lower bound, not zero.
 `output_path`, its PNG (default) or SVG is returned `inline` and no file
 is written. Supplying `output_path` writes the file and still returns it
 inline; set `inline=false` for disk-only output (an omitted path then gets
-an auto-generated temp file). Set `overwrite=false` to refuse an existing
-destination. The path extension and explicit `format`, when both supplied,
+an auto-generated temp file). An existing file needs `overwrite=true`.
+The path extension and explicit `format`, when both supplied,
 must agree. Use `database` to route the SQL to local, persistent, or an
 attached database.
 
@@ -194,12 +194,12 @@ interop; `.hyper` export snapshots every table for Tableau.
 
 ### Export
 - `export` — write a table or query result to a file (Parquet, Iceberg,
-  Arrow IPC, CSV, .hyper). A `.hyper` export leaves the source unchanged
-  but creates/replaces the destination file and materializes every user
-  table into it — a faithful backup: NOT NULL, DEFAULT, COLLATE, ASSUMED
-  PRIMARY KEY, and ASSUMED UNIQUE all survive (Hyper never accepts
-  enforced PRIMARY KEY / UNIQUE / FOREIGN KEY / CHECK at CREATE TABLE, so
-  no source table carries those). The response carries a `schema_fidelity`
+  Arrow IPC, CSV, .hyper). Replaces a file only with `overwrite: true`,
+  never an open database. A `.hyper` export leaves the source unchanged
+  and writes every user table to the destination — a faithful backup:
+  NOT NULL, DEFAULT, COLLATE, ASSUMED PRIMARY KEY, and ASSUMED UNIQUE all
+  survive (Hyper never accepts enforced PRIMARY KEY / UNIQUE / FOREIGN
+  KEY / CHECK at CREATE TABLE, so no source table carries those). The response carries a `schema_fidelity`
   object (`fully_preserved` plus per-class counts and an `unpreserved`
   list naming each `table` + `column`) — check it before trusting an
   export as a backup.

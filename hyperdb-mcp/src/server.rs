@@ -55,6 +55,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlformat::{FormatOptions, Indent, QueryParams as SqlQueryParams};
 use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// Number of rows returned by the `hyper://tables/{name}/sample` JSON
@@ -571,9 +572,10 @@ pub struct ChartParams {
     /// image is returned inline. Defaults to true so MCP clients can
     /// display the chart without a separate file-read round-trip.
     pub inline: Option<bool>,
-    /// When false, refuse to overwrite an existing file at `output_path`
-    /// and return `PERMISSION_DENIED` without touching it. Defaults to
-    /// true (overwrite silently), matching the `export` tool.
+    /// Whether to replace an existing file at `output_path`. Defaults to
+    /// false: an existing file is refused with `PERMISSION_DENIED`; pass
+    /// true to replace it. A database this session has open is never
+    /// replaced.
     pub overwrite: Option<bool>,
     /// Target database alias for unqualified name resolution in the
     /// chart's SQL. Omit to query the local database. Pass
@@ -651,9 +653,11 @@ pub struct ExportParams {
     /// root with a `metadata/` and `data/` subdir); for all other
     /// formats it is a single file.
     pub format: String,
-    /// If false, refuse to overwrite an existing file at `path` and return
-    /// a `PERMISSION_DENIED` error instead. Defaults to true (overwrite
-    /// silently) to match pre-flag behavior.
+    /// Whether to replace an existing destination. Defaults to false: an
+    /// existing destination is refused with `PERMISSION_DENIED`; pass true
+    /// to replace it. `iceberg` replaces only an Iceberg table directory,
+    /// `hyper` only a `.hyper` file, and a database this session has open
+    /// is never replaced.
     pub overwrite: Option<bool>,
     /// Optional per-format options passed through into hyperd's `COPY
     /// (query) TO '…' WITH (…)` clause. Keys must match hyperd's own
@@ -1224,6 +1228,18 @@ impl HyperMcpServer {
     #[must_use]
     pub fn attachments_handle(&self) -> Arc<AttachRegistry> {
         Arc::clone(&self.attachments)
+    }
+
+    /// The files `export` and `chart` must never write to: the ephemeral
+    /// and persistent databases and every attached file.
+    fn protected_paths(&self, engine: &Engine) -> Vec<PathBuf> {
+        let mut paths = vec![engine.ephemeral_path().to_path_buf()];
+        paths.extend(engine.persistent_path().map(Path::to_path_buf));
+        paths.extend(self.attachments.list().into_iter().map(|entry| {
+            let AttachSource::LocalFile { path } = entry.source;
+            path
+        }));
+        paths
     }
 
     /// Whether the server is running in read-only mode.
@@ -2948,11 +2964,21 @@ impl HyperMcpServer {
                 ));
             }
 
-            // If the caller passed an explicit output path, validate it.
-            // Auto-generated paths land in a temp dir and don't need this gate.
-            if let Some(out) = params.output_path.as_deref() {
-                crate::attach::validate_output_path(out, "chart output")?;
-            }
+            // If the caller passed an explicit output path, validate it and
+            // write to the validated path. Auto-generated paths land in a
+            // temp dir and don't need this gate.
+            let output_path = match params.output_path.as_deref() {
+                Some(out) => {
+                    let path = crate::attach::validate_output_path(out, "chart output")?;
+                    crate::attach::refuse_protected_destination(
+                        &path,
+                        &self.protected_paths(engine),
+                        "chart",
+                    )?;
+                    Some(path)
+                }
+                None => None,
+            };
             // Resolve format up front — the path extension may imply it,
             // and we need the format before we can auto-generate a path.
             let format = crate::chart::resolve_chart_format(
@@ -3040,10 +3066,10 @@ impl HyperMcpServer {
             // tool error instead of a half-delivered response.
             let disposition = crate::chart::resolve_chart_disposition(
                 params.inline.unwrap_or(true),
-                params.output_path.as_deref(),
+                output_path.as_deref(),
                 opts.format,
             );
-            let overwrite = params.overwrite.unwrap_or(true);
+            let overwrite = params.overwrite.unwrap_or(false);
             if let Some(path) = disposition.path() {
                 crate::chart::write_chart_to_disk(path, &chart.bytes, overwrite)?;
             }
@@ -3059,7 +3085,12 @@ impl HyperMcpServer {
                     ChartFormat::Svg => "svg",
                 };
                 let wants_inline = disposition.wants_inline();
-                let output_path_str = disposition.path().map(|p| p.to_string_lossy().into_owned());
+                // Report the path as the caller gave it; the write went to
+                // its validated form, the same file.
+                let output_path_str = params
+                    .output_path
+                    .clone()
+                    .or_else(|| disposition.path().map(|p| p.to_string_lossy().into_owned()));
 
                 let mut stats = serde_json::Map::new();
                 stats.insert("operation".into(), json!("chart"));
@@ -3261,9 +3292,6 @@ impl HyperMcpServer {
         Parameters(params): Parameters<ExportParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self.with_engine(|engine| {
-            // Validate output path: must be absolute, no `..` components.
-            // (Iceberg "exports" to a directory; the same rules apply.)
-            crate::attach::validate_output_path(&params.path, "export")?;
             // `format_options` must be a JSON object if supplied. Anything
             // else (array, string, number, null) is a caller error — reject
             // with a clear message rather than silently dropping it.
@@ -3312,7 +3340,8 @@ impl HyperMcpServer {
                 table: effective_table,
                 path: params.path,
                 format: params.format,
-                overwrite: params.overwrite.unwrap_or(true),
+                overwrite: params.overwrite.unwrap_or(false),
+                protected_paths: self.protected_paths(engine),
                 format_options,
                 source_db: target_db.clone(),
             };

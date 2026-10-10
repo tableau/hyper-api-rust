@@ -78,6 +78,7 @@ pub mod engine;
 pub mod error;
 #[doc(hidden)]
 pub mod export;
+mod file_identity;
 #[doc(hidden)]
 pub mod ingest;
 #[doc(hidden)]

@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Trimmed the always-in-context tool descriptions (~26% smaller)** — moved
   the format-selection and edge-case detail into `get_readme` while keeping the
   actionable rules inline, cutting the tokens the tool catalog costs per load.
+- **BREAKING: `export` and `chart` no longer overwrite by default.** An
+  existing destination is refused with `PERMISSION_DENIED` unless the call
+  passes `overwrite: true`. `export` used to replace an existing file or
+  directory silently; `chart` defaulted `overwrite` to true.
 
 ### Fixed
 
@@ -42,6 +46,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   wrapper.** SQL that closed the parenthesis itself could name its own
   target path and options; it is now refused, and a query that ends in a
   `--` comment exports instead of failing with a syntax error.
+- **`export` and `chart` no longer destroy the databases the session has
+  open.** Pointing either at the persistent database, the local database, an
+  attached `.hyper` file (by any path, including a symlink) or a directory
+  holding one is refused with `INVALID_ARGUMENT`. `export` with `format: "hyper"` used to delete and
+  recreate an attached file.
+- **`export` with `overwrite: true` replaces only what it could have written.**
+  `iceberg` used to `remove_dir_all` whatever directory `path` named; it now
+  replaces only an empty directory or an Iceberg table, and `hyper` only a
+  Hyper database file. Both build the new export before discarding the old one, so a
+  failed export leaves the previous table or file in place.
 - **`query_data` / `query_file` no longer interpolate `table_name` unescaped
   into the scratch-table `DROP`.** A `table_name` containing a double quote
   could end the quoted identifier and append further SQL to the cleanup

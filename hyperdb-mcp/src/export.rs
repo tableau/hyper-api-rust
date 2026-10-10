@@ -30,6 +30,8 @@ use crate::error::{ErrorCode, McpError};
 use crate::stats::{ExportStats, StatsTimer};
 use hyperdb_api::{CopyTableReport, escape_sql_path, escape_string_literal};
 use serde_json::{Map, Value};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Specifies what to export and where.
 ///
@@ -45,15 +47,20 @@ pub struct ExportOptions {
     /// Table name — converted to `SELECT * FROM "<table>"` when `sql` is
     /// None. Ignored when `format = "hyper"`.
     pub table: Option<String>,
-    /// Destination file path.
+    /// Destination file path. Must be absolute.
     pub path: String,
     /// One of `"csv"`, `"parquet"`, `"arrow_ipc"`, `"iceberg"`, or
     /// `"hyper"`.
     pub format: String,
-    /// Whether to overwrite an existing file at `path`. When `false` and
+    /// Whether to replace an existing destination. When `false` and
     /// `path` already exists, [`export_to_file`] returns a
-    /// [`ErrorCode::PermissionDenied`] error without touching the file.
+    /// [`ErrorCode::PermissionDenied`] error without touching it. When
+    /// `true`, `iceberg` replaces only an Iceberg table directory and
+    /// `hyper` only a Hyper database file.
     pub overwrite: bool,
+    /// Files the export must never write to, compared by identity: the
+    /// session's own databases and its attached files.
+    pub protected_paths: Vec<PathBuf>,
     /// Extra options passed through verbatim into the `WITH (...)`
     /// clause of hyperd's `COPY TO`. Keys must match hyperd's own
     /// option names (e.g. `codec`, `rows_per_row_group`,
@@ -79,11 +86,25 @@ pub struct ExportResult {
     pub schema_fidelity: Option<CopyTableReport>,
 }
 
+impl ExportResult {
+    /// Report the destination as the caller named it: the export wrote to
+    /// its validated form, which is the same file.
+    fn reported_at(mut self, path: &str) -> Self {
+        path.clone_into(&mut self.stats.output_path);
+        self
+    }
+}
+
 /// Top-level export dispatcher. Resolves the source SQL, then delegates to
 /// the format-specific exporter.
 ///
 /// # Errors
 ///
+/// - Returns [`ErrorCode::InvalidArgument`] if `opts.path` is relative,
+///   has `..` components or is not UTF-8, if it is one of
+///   `opts.protected_paths`, or if `opts.overwrite` would replace
+///   something other than an Iceberg table (`iceberg`) or a Hyper database
+///   file (`hyper`).
 /// - Returns [`ErrorCode::PermissionDenied`] if `opts.path` already
 ///   exists and `opts.overwrite` is `false`.
 /// - Returns [`ErrorCode::SqlError`] when neither `opts.sql` nor
@@ -112,16 +133,31 @@ pub fn export_to_file(engine: &Engine, opts: &ExportOptions) -> Result<ExportRes
         ));
     }
 
+    // Everything below checks and writes the validated path, which has
+    // symlinks in its existing part resolved. hyperd gets it in the form
+    // it can open (no `\\?\` prefix on Windows), and so does the file
+    // system, so both name the same file.
+    let dest = crate::attach::validate_output_path(&opts.path, "export")?;
+    crate::attach::refuse_protected_destination(&dest, &opts.protected_paths, "export")?;
+    let dest = crate::ingest::path_for_hyperd(dest);
+    let path = dest.to_str().ok_or_else(|| {
+        McpError::new(
+            ErrorCode::InvalidArgument,
+            format!("Export path '{}' is not valid UTF-8", dest.display()),
+        )
+    })?;
+
     // Refuse to clobber an existing destination when caller opted out of
     // overwrite. Done up-front (before SQL resolution or format dispatch)
     // so every format — including the file-copy hyper path and the
-    // directory-based iceberg path — gets the same guarantee.
-    if !opts.overwrite && std::path::Path::new(&opts.path).exists() {
+    // directory-based iceberg path — gets the same guarantee. A dangling
+    // symlink counts as existing.
+    let exists = std::fs::symlink_metadata(&dest).is_ok();
+    if !opts.overwrite && exists {
         return Err(McpError::new(
             ErrorCode::PermissionDenied,
             format!(
-                "Refusing to overwrite existing destination: {} (pass overwrite=true to replace it)",
-                opts.path
+                "Refusing to overwrite existing destination: {path} (pass overwrite=true to replace it)"
             ),
         ));
     }
@@ -130,7 +166,8 @@ pub fn export_to_file(engine: &Engine, opts: &ExportOptions) -> Result<ExportRes
     // `table` is meaningful for it, so branch before the SQL-resolution
     // check that the row-oriented formats require.
     if opts.format == "hyper" {
-        return export_hyper(engine, &opts.path, opts.source_db.as_deref(), &timer);
+        return export_hyper(engine, path, opts.source_db.as_deref(), &timer)
+            .map(|result| result.reported_at(&opts.path));
     }
 
     let select_sql = match (&opts.sql, &opts.table) {
@@ -155,23 +192,17 @@ pub fn export_to_file(engine: &Engine, opts: &ExportOptions) -> Result<ExportRes
     engine.check_embeddable_query(&select_sql)?;
 
     let extra = opts.format_options.as_ref();
-    match opts.format.as_str() {
-        "csv" => export_csv(engine, &select_sql, &opts.path, extra, &timer),
-        "parquet" => export_parquet(engine, &select_sql, &opts.path, extra, &timer),
-        "arrow_ipc" => export_arrow_ipc(engine, &select_sql, &opts.path, extra, &timer),
-        "iceberg" => export_iceberg(
-            engine,
-            &select_sql,
-            &opts.path,
-            opts.overwrite,
-            extra,
-            &timer,
-        ),
+    let result = match opts.format.as_str() {
+        "csv" => export_csv(engine, &select_sql, path, extra, &timer),
+        "parquet" => export_parquet(engine, &select_sql, path, extra, &timer),
+        "arrow_ipc" => export_arrow_ipc(engine, &select_sql, path, extra, &timer),
+        "iceberg" => export_iceberg(engine, &select_sql, path, extra, &timer),
         other => Err(McpError::new(
             ErrorCode::UnsupportedFormat,
             format!("Unsupported export format: {other}"),
         )),
-    }
+    };
+    result.map(|result| result.reported_at(&opts.path))
 }
 
 /// Validate that an option key like `codec` is a safe identifier.
@@ -367,46 +398,41 @@ fn export_arrow_ipc(
 /// The produced layout round-trips cleanly back through `load_iceberg`.
 ///
 /// Caller semantics:
-/// - `path` is a *directory* path (not a single file). If a directory
-///   or file already exists there and `overwrite` is true, we remove
-///   it first — hyperd's `COPY TO` refuses to write into an existing
-///   non-empty Iceberg location.
+/// - `path` is a *directory* path (not a single file). hyperd's `COPY TO`
+///   refuses to write into an existing non-empty Iceberg location, so an
+///   existing `path` (which `export_to_file` lets through only with
+///   `overwrite`) must be an Iceberg table or empty, and is moved aside
+///   while the export runs: a failed export puts it back.
 fn export_iceberg(
     engine: &Engine,
     sql: &str,
     path: &str,
-    overwrite: bool,
     format_options: Option<&Map<String, Value>>,
     timer: &StatsTimer,
 ) -> Result<ExportResult, McpError> {
-    // Clear the destination if it exists. The outer overwrite guard in
-    // `export_to_file` has already rejected the call if `overwrite` is
-    // false and the path exists, so by the time we get here either the
-    // path is empty or we've been told to replace it.
-    let dest = std::path::Path::new(path);
-    if dest.exists() && overwrite {
-        if dest.is_dir() {
-            std::fs::remove_dir_all(dest).map_err(|e| {
-                McpError::new(
-                    ErrorCode::PermissionDenied,
-                    format!("Cannot remove existing Iceberg directory '{path}': {e}"),
-                )
-            })?;
-        } else {
-            std::fs::remove_file(dest).map_err(|e| {
-                McpError::new(
-                    ErrorCode::PermissionDenied,
-                    format!("Cannot remove existing file at '{path}': {e}"),
-                )
-            })?;
-        }
-    }
-
+    let dest = Path::new(path);
     let with_clause = render_copy_with_clause("format => 'iceberg'", format_options)?;
     let quoted_path = escape_string_literal(path);
     let copy_sql = copy_to_sql(sql, &quoted_path, &with_clause);
 
-    let row_count = engine.execute_command(&copy_sql)?;
+    let previous = if std::fs::symlink_metadata(dest).is_ok() {
+        require_iceberg_table_dir(dest)?;
+        Some(ReplaceGuard::move_aside(dest)?)
+    } else {
+        None
+    };
+    let row_count = match engine.execute_command(&copy_sql) {
+        Ok(rows) => rows,
+        Err(e) => {
+            return Err(match previous {
+                Some(previous) => previous.restore(e),
+                None => e,
+            });
+        }
+    };
+    if let Some(previous) = previous {
+        previous.commit();
+    }
 
     // Directory size = sum of all file sizes under `path`. Not strictly
     // required by callers, but useful for telemetry.
@@ -444,6 +470,161 @@ fn walk_dir_size(dir: &std::path::Path) -> std::io::Result<u64> {
         }
     }
     Ok(total)
+}
+
+/// Refuse to replace `dest` unless it is an empty directory or one shaped
+/// like hyperd's Iceberg export: top-level entries only `data/` and
+/// `metadata/`, with a `*.metadata.json` in `metadata/` (measured against
+/// hyperd 0.0.26359, with and without rows).
+fn require_iceberg_table_dir(dest: &Path) -> Result<(), McpError> {
+    if is_iceberg_table_dir(dest).unwrap_or(false) {
+        return Ok(());
+    }
+    Err(McpError::new(
+        ErrorCode::InvalidArgument,
+        format!(
+            "Refusing to replace '{}': it is not an Iceberg table directory",
+            dest.display()
+        ),
+    )
+    .with_suggestion("Export to a new directory, or to an existing Iceberg table to replace it."))
+}
+
+fn is_iceberg_table_dir(dest: &Path) -> std::io::Result<bool> {
+    if !std::fs::symlink_metadata(dest)?.is_dir() {
+        return Ok(false);
+    }
+    let mut has_metadata = false;
+    for entry in std::fs::read_dir(dest)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            return Ok(false);
+        }
+        match entry.file_name().to_str() {
+            Some("data") => {}
+            Some("metadata") => {
+                for file in std::fs::read_dir(entry.path())? {
+                    let file = file?;
+                    if file.file_type()?.is_file()
+                        && file
+                            .file_name()
+                            .to_str()
+                            .is_some_and(|name| name.ends_with(".metadata.json"))
+                    {
+                        has_metadata = true;
+                    }
+                }
+                if !has_metadata {
+                    return Ok(false);
+                }
+            }
+            _ => return Ok(false),
+        }
+    }
+    // An empty directory has neither entry, and holds nothing to lose.
+    Ok(has_metadata || std::fs::read_dir(dest)?.next().is_none())
+}
+
+/// A sibling of `dest` named `<name>.hyperdb-mcp-<tag>-<pid>-<n>`, unique
+/// within this process.
+fn sibling_path(dest: &Path, tag: &str) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let mut name = dest.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".hyperdb-mcp-{tag}-{}-{n}", std::process::id()));
+    dest.with_file_name(name)
+}
+
+/// The previous contents of an export destination, moved to a sibling
+/// backup while the export writes a new one.
+///
+/// [`Self::commit`] deletes the backup. [`Self::restore`], or dropping the
+/// guard without either, removes whatever the export wrote and moves the
+/// backup back. A backup that cannot be restored is left in place and
+/// named, never deleted.
+struct ReplaceGuard {
+    dest: PathBuf,
+    backup: Option<PathBuf>,
+}
+
+impl ReplaceGuard {
+    fn move_aside(dest: &Path) -> Result<Self, McpError> {
+        let backup = sibling_path(dest, "old");
+        std::fs::rename(dest, &backup).map_err(|e| {
+            McpError::new(
+                if is_file_in_use(&e) {
+                    ErrorCode::ResourceBusy
+                } else {
+                    ErrorCode::PermissionDenied
+                },
+                format!("Cannot move existing '{}' aside: {e}", dest.display()),
+            )
+        })?;
+        Ok(Self {
+            dest: dest.to_path_buf(),
+            backup: Some(backup),
+        })
+    }
+
+    /// The export succeeded: delete the previous contents.
+    fn commit(mut self) {
+        if let Some(backup) = self.backup.take()
+            && let Err(e) = std::fs::remove_dir_all(&backup)
+        {
+            tracing::warn!(
+                backup = %backup.display(),
+                err = %e,
+                "failed to delete the replaced export destination",
+            );
+        }
+    }
+
+    /// The export failed with `err`: put the previous contents back and
+    /// return `err`, naming the backup if it could not be restored.
+    fn restore(mut self, err: McpError) -> McpError {
+        let Some(backup) = self.backup.take() else {
+            return err;
+        };
+        match restore_backup(&self.dest, &backup) {
+            Ok(()) => err,
+            Err(e) => McpError {
+                message: format!(
+                    "{} (the previous contents could not be restored and are at '{}': {e})",
+                    err.message,
+                    backup.display()
+                ),
+                ..err
+            },
+        }
+    }
+}
+
+impl Drop for ReplaceGuard {
+    fn drop(&mut self) {
+        if let Some(backup) = self.backup.take()
+            && let Err(e) = restore_backup(&self.dest, &backup)
+        {
+            tracing::warn!(
+                backup = %backup.display(),
+                err = %e,
+                "failed to restore the previous export destination",
+            );
+        }
+    }
+}
+
+/// Remove what is at `dest` now (written by the failed export, since the
+/// original was moved away) and move `backup` back. Something another
+/// process created at `dest` while the export ran would be removed too;
+/// that race is accepted.
+fn restore_backup(dest: &Path, backup: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(dest) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(dest)?,
+        Ok(_) => std::fs::remove_file(dest)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    std::fs::rename(backup, dest)
 }
 
 /// True when a filesystem error means "another process is holding this file
@@ -491,21 +672,35 @@ fn export_hyper(
     source_db: Option<&str>,
     timer: &StatsTimer,
 ) -> Result<ExportResult, McpError> {
-    // The target path is a separate file from the primary workspace,
-    // so OS-level copy/delete on it is fine — the lock conflict only
-    // affects the workspace hyperd has open. Pre-delete on overwrite
-    // because `CREATE DATABASE IF NOT EXISTS` would otherwise silently
-    // attach to the stale contents.
-    if std::path::Path::new(path).exists() {
-        std::fs::remove_file(path).map_err(|e| {
+    // `export_to_file` lets an existing `path` through only with
+    // `overwrite`; it must then be a Hyper database, and it is not touched
+    // until the new one is complete. The new database is built at a
+    // sibling temp path (`CREATE DATABASE` refuses an existing file) and
+    // renamed over `path`, so a failed export leaves `path` as it was.
+    let dest = Path::new(path);
+    if std::fs::symlink_metadata(dest).is_ok() {
+        require_hyper_file(dest)?;
+    }
+    let temp = sibling_path(dest, "tmp");
+    let temp_str = temp
+        .to_str()
+        .expect("a sibling of a UTF-8 path with an ASCII suffix is UTF-8");
+
+    let result = build_hyper_export(engine, temp_str, source_db, timer).and_then(|report| {
+        std::fs::rename(&temp, dest).map_err(|e| {
             // A file another process is holding open is not a permissions
             // problem, and "Check file permissions on the source or target
             // path" — `PermissionDenied`'s guidance — sends the caller
             // somewhere there is nothing to find. `ResourceBusy` carries
             // the guidance that actually resolves it (close the holder, or
-            // copy the file), and this is the *only* place a contended
-            // export target can surface: on Windows the unlink below is
-            // what fails, and on Unix it succeeds regardless of holders.
+            // copy the file). On Unix the rename succeeds regardless of
+            // holders. On Windows, replacing a file held without
+            // `FILE_SHARE_DELETE` may instead fail with
+            // `ERROR_ACCESS_DENIED`, which cannot be told apart from a real
+            // permission error and so stays `PermissionDenied`.
+            //
+            // The rename also replaces a file created at `dest` after
+            // `export_to_file` found nothing there; that race is accepted.
             if is_file_in_use(&e) {
                 McpError::new(
                     ErrorCode::ResourceBusy,
@@ -516,12 +711,75 @@ fn export_hyper(
             } else {
                 McpError::new(
                     ErrorCode::PermissionDenied,
-                    format!("Cannot remove existing target '{path}': {e}"),
+                    format!("Cannot move the export into place at '{path}': {e}"),
                 )
             }
         })?;
-    }
+        Ok(report)
+    });
+    let report = match result {
+        Ok(report) => report,
+        Err(e) => {
+            if let Err(remove_err) = std::fs::remove_file(&temp)
+                && remove_err.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(
+                    temp = %temp.display(),
+                    err = %remove_err,
+                    "failed to remove the temporary hyper export",
+                );
+            }
+            return Err(e);
+        }
+    };
+    let rows = report.rows_copied;
 
+    let file_size = std::fs::metadata(path).map_or(0, |m| m.len());
+
+    Ok(ExportResult {
+        rows,
+        stats: ExportStats {
+            operation: "export".into(),
+            rows,
+            elapsed_ms: timer.elapsed_ms(),
+            file_size_bytes: file_size,
+            format: "hyper".into(),
+            output_path: path.into(),
+        },
+        schema_fidelity: Some(report),
+    })
+}
+
+/// Refuse to replace `dest` unless it is a regular file (not a symlink or
+/// a directory) that starts with Hyper's file magic.
+fn require_hyper_file(dest: &Path) -> Result<(), McpError> {
+    let is_hyper = std::fs::symlink_metadata(dest).is_ok_and(|m| m.is_file()) && {
+        let mut magic = [0_u8; 5];
+        std::fs::File::open(dest)
+            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic))
+            .is_ok_and(|()| &magic == b"Hyper")
+    };
+    if is_hyper {
+        return Ok(());
+    }
+    Err(McpError::new(
+        ErrorCode::InvalidArgument,
+        format!(
+            "Refusing to replace '{}': it is not a Hyper database file",
+            dest.display()
+        ),
+    )
+    .with_suggestion("Export to a new path, or to an existing .hyper file to replace it."))
+}
+
+/// Create a database at `path`, fill it with the user tables of
+/// `source_db`, and detach it.
+fn build_hyper_export(
+    engine: &Engine,
+    path: &str,
+    source_db: Option<&str>,
+    timer: &StatsTimer,
+) -> Result<CopyTableReport, McpError> {
     // Unique alias so we don't collide with a user-issued attach. The
     // `__export_target_` prefix + PID + nanos makes accidental overlap
     // exceedingly unlikely and stays within the 63-char identifier cap.
@@ -566,23 +824,7 @@ fn export_hyper(
         );
     }
 
-    let report = result?;
-    let rows = report.rows_copied;
-
-    let file_size = std::fs::metadata(path).map_or(0, |m| m.len());
-
-    Ok(ExportResult {
-        rows,
-        stats: ExportStats {
-            operation: "export".into(),
-            rows,
-            elapsed_ms: timer.elapsed_ms(),
-            file_size_bytes: file_size,
-            format: "hyper".into(),
-            output_path: path.into(),
-        },
-        schema_fidelity: Some(report),
-    })
+    result
 }
 
 /// Copy every user table from `source_db` (None → primary) into the

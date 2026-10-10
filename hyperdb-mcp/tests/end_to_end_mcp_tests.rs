@@ -4123,3 +4123,146 @@ async fn sql_read_tools_refuse_writes_in_both_modes() -> TestResult {
     );
     Ok(())
 }
+
+/// `export` and `chart` never write over a database the session has open,
+/// even with `overwrite=true` and through a symlink: the persistent
+/// database and an attached file are refused with `INVALID_ARGUMENT`, and
+/// both keep their rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn export_and_chart_never_replace_session_databases() -> TestResult {
+    let dir = TempDir::new()?;
+    let workspace = seed_guarded_workspace(&dir).await?;
+    let h = TestHarness::start_at_persistent(workspace.clone(), false).await?;
+    let attached = dir.path().join("attached.hyper");
+    let r = call_tool(
+        &h.client,
+        "attach_database",
+        serde_json::json!({
+            "alias": "user_db",
+            "kind": "local_file",
+            "path": attached.to_string_lossy(),
+            "writable": true,
+            "on_missing": "create",
+        }),
+    )
+    .await?;
+    assert!(!is_error(&r), "attach failed: {:?}", first_text(&r));
+    for sql in [
+        "CREATE TABLE \"user_db\".\"public\".\"kept\" (id INT)",
+        "INSERT INTO \"user_db\".\"public\".\"kept\" VALUES (1), (2)",
+    ] {
+        let r = call_tool(&h.client, "execute", serde_json::json!({ "sql": [sql] })).await?;
+        assert!(!is_error(&r), "seed attached failed: {:?}", first_text(&r));
+    }
+
+    let mut targets = vec![workspace.clone(), attached.clone()];
+    #[cfg(unix)]
+    {
+        let link = dir.path().join("link.hyper");
+        std::os::unix::fs::symlink(&workspace, &link)?;
+        targets.push(link);
+    }
+
+    let mut failures = Vec::new();
+    for target in &targets {
+        let path = target.to_string_lossy();
+        for (tool, args) in [
+            (
+                "export",
+                serde_json::json!({ "table": "guarded", "database": "persistent",
+                    "path": path, "format": "csv", "overwrite": true }),
+            ),
+            (
+                "export",
+                serde_json::json!({ "path": path, "format": "hyper", "overwrite": true }),
+            ),
+            (
+                "export",
+                serde_json::json!({ "path": path, "format": "hyper" }),
+            ),
+            (
+                "chart",
+                serde_json::json!({ "sql": "SELECT 'a' AS x, 1 AS y", "chart_type": "bar",
+                    "x": "x", "y": "y", "output_path": path, "overwrite": true }),
+            ),
+        ] {
+            let case = format!("{tool} {args}");
+            let r = call_tool(&h.client, tool, args).await?;
+            record_error_contract(&mut failures, &case, &r, "INVALID_ARGUMENT");
+            if !all_text(&r).contains("has open") {
+                failures.push(format!(
+                    "{case}: must name the open database; got {}",
+                    all_text(&r)
+                ));
+            }
+        }
+    }
+
+    for (sql, table) in [
+        (
+            format!("SELECT COUNT(*) AS n FROM {GUARDED_TABLE}"),
+            "persistent",
+        ),
+        (
+            "SELECT COUNT(*) AS n FROM \"user_db\".\"public\".\"kept\"".to_owned(),
+            "attached",
+        ),
+    ] {
+        let rows =
+            all_text(&call_tool(&h.client, "query", serde_json::json!({ "sql": sql })).await?);
+        if !rows.contains("\"n\":2") && !rows.contains("\"n\": 2") {
+            failures.push(format!(
+                "the {table} table must keep its two rows; got {rows}"
+            ));
+        }
+    }
+    h.shutdown().await?;
+    assert!(
+        failures.is_empty(),
+        "a session database was not protected:\n- {}",
+        failures.join("\n- ")
+    );
+    Ok(())
+}
+
+/// `overwrite` defaults to false for `export` and `chart`: an existing file
+/// is refused with `PERMISSION_DENIED` and left as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn export_and_chart_refuse_an_existing_file_by_default() -> TestResult {
+    let h = TestHarness::start(false, false).await?;
+    let dir = TempDir::new()?;
+    let csv = dir.path().join("existing.csv");
+    let png = dir.path().join("existing.png");
+    std::fs::write(&csv, b"keep")?;
+    std::fs::write(&png, b"keep")?;
+
+    let mut failures = Vec::new();
+    for (tool, args) in [
+        (
+            "export",
+            serde_json::json!({ "sql": "SELECT 1 AS a", "path": csv.to_string_lossy(),
+                "format": "csv" }),
+        ),
+        (
+            "chart",
+            serde_json::json!({ "sql": "SELECT 'a' AS x, 1 AS y", "chart_type": "bar",
+                "x": "x", "y": "y", "output_path": png.to_string_lossy() }),
+        ),
+    ] {
+        let case = format!("{tool} {args}");
+        let r = call_tool(&h.client, tool, args).await?;
+        record_error_contract(&mut failures, &case, &r, "PERMISSION_DENIED");
+    }
+    for path in [&csv, &png] {
+        if std::fs::read(path)? != b"keep" {
+            failures.push(format!("{} was modified", path.display()));
+        }
+    }
+    h.shutdown().await?;
+    assert!(
+        failures.is_empty(),
+        "an existing file was not refused:\n- {}",
+        failures.join("\n- ")
+    );
+    Ok(())
+}

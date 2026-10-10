@@ -168,7 +168,11 @@ export handler then discards its result and passes the raw `params.path` on
    overwrite=true to replace it" message. Auto-generated chart paths are
    unique, so only an explicit `output_path` is affected.
 2. **Use the validated path.** The path `validate_output_path` returns is the
-   one that is checked and the one handed to hyperd or the filesystem.
+   one that is checked and the one handed to hyperd or the filesystem; on
+   Windows the export gives both the `\\?\`-free, forward-slash form
+   ingest already uses, since hyperd cannot open an extended-length path.
+   The response still reports the caller's `path` / `output_path`, not the
+   canonical form.
 3. **Never write over a file the session uses**, for every export format and
    for chart, even with `overwrite=true`. The server builds the protected set
    once per call: the persistent database, the ephemeral scratch database,
@@ -177,14 +181,20 @@ export handler then discards its result and passes the raw `params.path` on
    *same file* as a protected one, compared by identity: `(dev, ino)` on Unix,
    (volume serial number, file index) on Windows. Identity sees through
    symlinks, hard links and case folding, which a path comparison does not. A
-   destination that does not exist cannot be one of them. The helper lives in
-   a self-contained `src/file_identity.rs` (std and `windows-sys` only).
+   destination that does not exist cannot be one of them. A directory
+   destination that contains a protected file is refused the same way, and
+   a protected file whose identity cannot be read (other than `NotFound`)
+   fails the call with `INTERNAL_ERROR` rather than being skipped. The
+   helper lives in a self-contained `src/file_identity.rs` (std and
+   `windows-sys` only). The set is per MCP session: a file another client
+   attached through the same daemon is not in it (accepted; documented).
 4. **Iceberg replaces only an Iceberg table.** With `overwrite=true` and an
    existing `dest`:
-   - it must be a directory that is empty, or whose top-level entries are a
-     subset of the layout Hyper's Iceberg export writes (at least
-     `metadata/`, holding a `*.metadata.json`; iteration 2 measures the full
-     set from a real export and pins it). Anything else, including a regular
+   - it must be a directory that is empty, or whose top-level entries are
+     only directories named `data/` and `metadata/`, with a
+     `*.metadata.json` in `metadata/` (measured against hyperd 0.0.26359: an
+     export writes exactly those two, with and without rows). Anything else,
+     including a regular
      file or a directory holding a `.hyper` database, is refused with
      `INVALID_ARGUMENT`: "Refusing to replace '`<path>`': it is not an Iceberg
      table directory".
@@ -199,11 +209,15 @@ export handler then discards its result and passes the raw `params.path` on
    is complete.** With `overwrite=true` and an existing `path`, refuse unless
    it is a regular file (not a symlink, not a directory) whose first five
    bytes are `Hyper` (the file magic; verified against real files:
-   `48 79 70 65 72 08 00 00 ...`). The export then creates its database at a
-   sibling temp path `<name>.hyperdb-mcp-tmp-<pid>-<n>`, fills and detaches
-   it, and renames it over `path`. On failure the temp file is removed and
-   `path` was never touched. The existing `is_file_in_use` →
-   `RESOURCE_BUSY` mapping applies to the final rename.
+   `48 79 70 65 72 08 00 00 ...`). Every Hyper export, replacing or not,
+   creates its database at a sibling temp path
+   `<name>.hyperdb-mcp-tmp-<pid>-<n>` (hyperd accepts a database path without
+   a `.hyper` extension), fills and detaches it, and renames it over `path`.
+   On failure the temp file is removed and `path` was never touched. The
+   existing `is_file_in_use` → `RESOURCE_BUSY` mapping applies to the final
+   rename; on Windows a held file may instead fail it with
+   `ERROR_ACCESS_DENIED`, which stays `PERMISSION_DENIED` (unverified
+   locally; Windows CI decides).
 6. CSV, Parquet and Arrow IPC keep letting hyperd's `COPY ... TO` replace a
    file when `overwrite=true`; points 1 to 3 cover them.
 
