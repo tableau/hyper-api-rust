@@ -3,8 +3,10 @@
 
 //! Single-instance daemon for sharing a `hyperd` process across MCP clients.
 
+pub mod control;
 pub mod discovery;
 pub mod health;
+pub mod lock;
 pub mod run;
 pub mod spawn;
 pub mod state_perms;
