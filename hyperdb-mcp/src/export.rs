@@ -25,7 +25,7 @@
 //!   directly in Tableau Desktop. (Cannot use plain `std::fs::copy` because
 //!   on Windows `hyperd` holds an exclusive lock on the workspace file.)
 
-use crate::engine::Engine;
+use crate::engine::{Engine, require_read_only_sql};
 use crate::error::{ErrorCode, McpError};
 use crate::stats::{ExportStats, StatsTimer};
 use hyperdb_api::{CopyTableReport, escape_sql_path, escape_string_literal};
@@ -87,7 +87,9 @@ pub struct ExportResult {
 /// - Returns [`ErrorCode::PermissionDenied`] if `opts.path` already
 ///   exists and `opts.overwrite` is `false`.
 /// - Returns [`ErrorCode::SqlError`] when neither `opts.sql` nor
-///   `opts.table` is provided (for row-oriented formats).
+///   `opts.table` is provided (for row-oriented formats), when `opts.sql`
+///   is not a single read-only statement, or when Hyper cannot parse it on
+///   its own.
 /// - Returns [`ErrorCode::UnsupportedFormat`] when `opts.format` is
 ///   not one of `hyper`, `csv`, `parquet`, `arrow_ipc`, or `iceberg`.
 /// - Propagates any format-specific error from the delegated exporter
@@ -145,6 +147,12 @@ pub fn export_to_file(engine: &Engine, opts: &ExportOptions) -> Result<ExportRes
             ));
         }
     };
+
+    // Every row format splices `select_sql` into `COPY (...) TO <path>`.
+    // It must be read-only, and Hyper must parse it on its own first, so
+    // it cannot close the parenthesis and name a `TO` target of its own.
+    require_read_only_sql("export", &select_sql)?;
+    engine.check_embeddable_query(&select_sql)?;
 
     let extra = opts.format_options.as_ref();
     match opts.format.as_str() {
@@ -234,6 +242,13 @@ fn render_copy_with_clause(
     Ok(clause)
 }
 
+/// `COPY (<sql>) TO <path> WITH (<options>)`, with `sql` on lines of its
+/// own so a trailing `--` comment in it ends before the `)`. `sql` must
+/// have passed [`Engine::check_embeddable_query`].
+fn copy_to_sql(sql: &str, quoted_path: &str, with_clause: &str) -> String {
+    format!("COPY (\n{sql}\n) TO {quoted_path} WITH ({with_clause})")
+}
+
 /// Shared helper: issue a single `COPY (query) TO 'path' WITH (...)` to
 /// hyperd and return the reported row count + on-disk file size. All
 /// row-oriented exports funnel through this — the format-specific logic
@@ -254,7 +269,7 @@ fn run_copy_to(
 ) -> Result<ExportResult, McpError> {
     let with_clause = render_copy_with_clause(base_with, extra_options)?;
     let quoted_path = escape_string_literal(path);
-    let copy_sql = format!("COPY ({sql}) TO {quoted_path} WITH ({with_clause})");
+    let copy_sql = copy_to_sql(sql, &quoted_path, &with_clause);
     let row_count = engine.execute_command(&copy_sql)?;
 
     let file_size = std::fs::metadata(path).map_or(0, |m| m.len());
@@ -389,7 +404,7 @@ fn export_iceberg(
 
     let with_clause = render_copy_with_clause("format => 'iceberg'", format_options)?;
     let quoted_path = escape_string_literal(path);
-    let copy_sql = format!("COPY ({sql}) TO {quoted_path} WITH ({with_clause})");
+    let copy_sql = copy_to_sql(sql, &quoted_path, &with_clause);
 
     let row_count = engine.execute_command(&copy_sql)?;
 

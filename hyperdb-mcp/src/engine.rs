@@ -52,6 +52,8 @@
 use crate::daemon;
 use crate::error::{ErrorCode, McpError};
 use crate::schema::ColumnSchema;
+pub(crate) use crate::sql_classify::strip_leading_sql_comments;
+pub use crate::sql_classify::{StatementKind, classify_statement, is_read_only_sql};
 use hyperdb_api::{
     Catalog, Connection, CopyTableReport, CreateMode, HyperProcess, Parameters, SqlType,
     Transaction, escape_sql_path,
@@ -996,6 +998,25 @@ impl Engine {
     /// dropped.
     pub fn execute_command(&self, sql: &str) -> Result<u64, McpError> {
         self.connection.execute_command(sql).map_err(McpError::from)
+    }
+
+    /// Have Hyper parse `sql` on its own (Parse/Describe through
+    /// [`Connection::prepare`]), without running it, before a caller splices
+    /// it into a larger statement such as `COPY (...) TO`.
+    ///
+    /// Hyper refuses unbalanced parentheses, an unterminated literal or
+    /// comment, and more than one statement here, so SQL that passes cannot
+    /// close the surrounding parentheses itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns the converted [`hyperdb_api::Error`] when Hyper rejects the
+    /// statement (typically [`ErrorCode::SqlError`]).
+    pub fn check_embeddable_query(&self, sql: &str) -> Result<(), McpError> {
+        self.connection
+            .prepare(sql)
+            .map(drop)
+            .map_err(McpError::from)
     }
 
     /// Execute an `ATTACH DATABASE` statement for a user-supplied `.hyper`
@@ -2192,123 +2213,23 @@ fn translate_table_missing(err: McpError, table_name: &str) -> McpError {
     }
 }
 
-/// Returns `true` if a SQL statement is read-only: `SELECT`, `WITH`, `EXPLAIN`,
-/// `SHOW`, or `VALUES`. Anything else (`CREATE`, `INSERT`, `UPDATE`, `DELETE`,
-/// `DROP`, `ALTER`, `COPY`, ...) is considered mutating.
+/// Refuse `sql` unless [`is_read_only_sql`] accepts it, naming `tool` in
+/// the error.
 ///
-/// Checks whether the first SQL keyword indicates a read-only statement.
+/// # Errors
 ///
-/// Strips leading whitespace and SQL comments (line `--` and block `/* */`)
-/// before inspecting the first alphabetic token. This prevents comment-based
-/// bypass of the read-only guard (e.g. `/* harmless */ DROP TABLE ...`).
-///
-/// Note: data-modifying CTEs (`WITH x AS (DELETE ...) SELECT ...`) still slip
-/// past this check. Hyper itself rejects such CTEs, so this is defense-in-depth
-/// rather than the sole security boundary.
-#[must_use]
-pub fn is_read_only_sql(sql: &str) -> bool {
-    matches!(classify_statement(sql), StatementKind::ReadOnly)
-}
-
-/// Coarse classification of a single SQL statement, comment-aware.
-///
-/// Used by the atomic-batch `execute` tool to enforce the rule "a batch
-/// must be either all-DDL singletons or all-DML; mixing the two aborts
-/// the transaction with SQLSTATE 0A000". The first-keyword heuristic
-/// matches what `is_read_only_sql` already trusts elsewhere in the
-/// codebase.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StatementKind {
-    /// `SELECT` / `WITH` / `EXPLAIN` / `SHOW` / `VALUES`.
-    ReadOnly,
-    /// `CREATE` / `DROP` / `ALTER` / `TRUNCATE` / `RENAME` — Hyper auto-commits.
-    Ddl,
-    /// `INSERT` / `UPDATE` / `DELETE` / `COPY` / `MERGE` — transactional.
-    Dml,
-    /// `BEGIN` / `START` / `COMMIT` / `END` / `ROLLBACK` / `ABORT` /
-    /// `SAVEPOINT` / `RELEASE`. Rejected inside a batch because the
-    /// `execute` tool already manages the transaction; an explicit
-    /// COMMIT mid-batch would defeat atomicity.
-    TransactionControl,
-    /// Empty/comment-only input or an unrecognized first keyword. Treated
-    /// as opaque by the batch validator (passed through to Hyper).
-    Other,
-}
-
-/// Coarse-classify the first SQL statement in `sql` after stripping
-/// leading whitespace and line/block comments.
-///
-/// First-keyword only: a `WITH x AS (DELETE …) SELECT …` CTE is
-/// classified as `ReadOnly` even though it mutates. Hyper itself
-/// rejects data-modifying CTEs, so this is a defense-in-depth heuristic
-/// rather than the only barrier.
-#[must_use]
-pub fn classify_statement(sql: &str) -> StatementKind {
-    let stripped = strip_leading_sql_comments(sql);
-    let first_token: String = stripped
-        .chars()
-        .take_while(|c| c.is_alphabetic())
-        .flat_map(char::to_uppercase)
-        .collect();
-    match first_token.as_str() {
-        "SELECT" | "WITH" | "EXPLAIN" | "SHOW" | "VALUES" => StatementKind::ReadOnly,
-        "CREATE" | "DROP" | "ALTER" | "TRUNCATE" | "RENAME" => StatementKind::Ddl,
-        "INSERT" | "UPDATE" | "DELETE" | "COPY" | "MERGE" => StatementKind::Dml,
-        "BEGIN" | "START" | "COMMIT" | "END" | "ROLLBACK" | "ABORT" | "SAVEPOINT" | "RELEASE" => {
-            StatementKind::TransactionControl
-        }
-        _ => StatementKind::Other,
+/// Returns [`ErrorCode::SqlError`] for SQL that is not a single read-only
+/// statement.
+pub(crate) fn require_read_only_sql(tool: &str, sql: &str) -> Result<(), McpError> {
+    if is_read_only_sql(sql) {
+        return Ok(());
     }
-}
-
-/// Strips leading whitespace, line comments (`--`), and block comments (`/* */`)
-/// from SQL text. Handles nested block comments.
-pub(crate) fn strip_leading_sql_comments(sql: &str) -> &str {
-    let mut s = sql;
-    loop {
-        s = s.trim_start();
-        if s.starts_with("--") {
-            // Line comment — skip to end of line (handles LF, CRLF, and CR)
-            match s.find(&['\n', '\r'][..]) {
-                Some(pos) => {
-                    let mut next = pos + 1;
-                    // Handle CRLF: skip both characters
-                    if s.as_bytes().get(pos) == Some(&b'\r')
-                        && s.as_bytes().get(pos + 1) == Some(&b'\n')
-                    {
-                        next = pos + 2;
-                    }
-                    s = &s[next..];
-                }
-                None => return "",
-            }
-        } else if s.starts_with("/*") {
-            // Block comment — find matching close, handling nesting
-            let mut depth = 0u32;
-            let mut chars = s.char_indices().peekable();
-            let mut end = None;
-            while let Some((i, c)) = chars.next() {
-                if c == '/' && chars.peek().map(|(_, c2)| *c2) == Some('*') {
-                    chars.next();
-                    depth += 1;
-                } else if c == '*' && chars.peek().map(|(_, c2)| *c2) == Some('/') {
-                    chars.next();
-                    depth -= 1;
-                    if depth == 0 {
-                        end = Some(i + 2);
-                        break;
-                    }
-                }
-            }
-            match end {
-                Some(pos) => s = &s[pos..],
-                None => return "", // Unclosed comment — no valid SQL
-            }
-        } else {
-            break;
-        }
-    }
-    s
+    Err(McpError::new(
+        ErrorCode::SqlError,
+        format!(
+            "The {tool} tool only accepts read-only SQL (SELECT, WITH, EXPLAIN, SHOW, VALUES). Use the execute tool for DDL/DML."
+        ),
+    ))
 }
 
 impl Drop for Engine {
@@ -2569,67 +2490,6 @@ fn bootstrap_public_schema(connection: &Connection) -> Result<(), McpError> {
                 format!("Failed to bootstrap public schema: {e}"),
             )
         })
-}
-
-#[cfg(test)]
-mod statement_helper_tests {
-    use super::*;
-
-    #[test]
-    fn classify_statement_recognizes_each_kind() {
-        assert_eq!(classify_statement("SELECT 1"), StatementKind::ReadOnly);
-        assert_eq!(
-            classify_statement("with x as (..) select * from x"),
-            StatementKind::ReadOnly
-        );
-        assert_eq!(
-            classify_statement("CREATE TABLE t (i INT)"),
-            StatementKind::Ddl
-        );
-        assert_eq!(classify_statement("drop table t"), StatementKind::Ddl);
-        assert_eq!(
-            classify_statement("INSERT INTO t VALUES (1)"),
-            StatementKind::Dml
-        );
-        assert_eq!(classify_statement("update t set i = 2"), StatementKind::Dml);
-        assert_eq!(classify_statement("delete from t"), StatementKind::Dml);
-        assert_eq!(classify_statement(""), StatementKind::Other);
-    }
-
-    #[test]
-    fn classify_statement_recognizes_transaction_control() {
-        for kw in [
-            "BEGIN",
-            "Begin transaction",
-            "START TRANSACTION",
-            "COMMIT",
-            "Commit work",
-            "END",
-            "ROLLBACK",
-            "Rollback to savepoint sp1",
-            "ABORT",
-            "SAVEPOINT sp1",
-            "RELEASE SAVEPOINT sp1",
-        ] {
-            assert_eq!(
-                classify_statement(kw),
-                StatementKind::TransactionControl,
-                "expected TransactionControl for `{kw}`"
-            );
-        }
-    }
-
-    #[test]
-    fn classify_statement_strips_comments() {
-        assert_eq!(
-            classify_statement("/* harmless */ DROP TABLE t"),
-            StatementKind::Ddl
-        );
-        assert_eq!(
-            classify_statement("-- pretend to be readonly\nINSERT INTO t VALUES (1)"),
-            StatementKind::Dml
-        );
-    }
 }
 
 #[cfg(test)]

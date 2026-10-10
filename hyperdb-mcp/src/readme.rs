@@ -290,8 +290,10 @@ scale 0 and truncates decimal places. Example: `41.54178215::numeric`
 - **File paths must be absolute.** Relative paths are rejected.
 - **Identifiers fold to lowercase** unless double-quoted. `SELECT * FROM
   Sales` reads `sales`. Use `\"Sales\"` to preserve case.
-- **`query` is read-only.** SELECT / WITH / EXPLAIN / SHOW / VALUES
-  only. For DDL / DML use `execute`.
+- **Query SQL is read-only** in every tool that takes it (`query`,
+  `query_data`, `query_file`, `export`, `chart`, ...): one SELECT / WITH /
+  EXPLAIN / SHOW / VALUES, even without `--read-only`. A write behind
+  `WITH` or `EXPLAIN (ANALYZE)` is refused. For DDL / DML use `execute`.
 - **Read-only mode** (`--read-only` flag on the server) guards exactly:
   `execute`, `load_data`, `load_file`, `load_files`, `load_iceberg`,
   `watch_directory`, `save_query`, `delete_query`, `set_table_metadata`,

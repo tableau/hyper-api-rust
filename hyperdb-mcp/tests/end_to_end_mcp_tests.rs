@@ -139,15 +139,17 @@ impl TestHarness {
     }
 
     /// Same in-memory MCP harness, but attaches a caller-owned persistent
-    /// workspace. The parent of the self-child fixture owns that path's RAII
-    /// directory, so it remains valid for the complete contention scenario.
+    /// workspace, so a test can seed it with one server and reopen it with
+    /// another (or, in the self-child fixture, keep it valid for the
+    /// complete contention scenario).
     async fn start_at_persistent(
         persistent_path: PathBuf,
+        read_only: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let temp_dir = Arc::new(TempDir::new()?);
         let (server_io, client_io) = tokio::io::duplex(64 * 1024);
         let workspace = Some(persistent_path.to_string_lossy().to_string());
-        let server = HyperMcpServer::with_no_daemon(workspace, false, true);
+        let server = HyperMcpServer::with_no_daemon(workspace, read_only, true);
         let engine_handle = server.engine_handle();
 
         let server_handle = tokio::spawn(async move {
@@ -1393,7 +1395,7 @@ async fn run_persistent_lock_mcp_child(workspace: PathBuf) -> TestResult {
         .canonicalize()
         .unwrap_or_else(|_| workspace.clone());
     let owner = Engine::new_no_daemon(Some(workspace.to_string_lossy().into_owned()))?;
-    let h = TestHarness::start_at_persistent(workspace).await?;
+    let h = TestHarness::start_at_persistent(workspace, false).await?;
 
     let status = tokio::time::timeout(
         Duration::from_secs(2),
@@ -4002,6 +4004,121 @@ async fn copy_query_preserves_target_and_resolved_database() -> TestResult {
     assert!(
         failures.is_empty(),
         "copy_query resolved-database compatibility regressions:\n- {}",
+        failures.join("\n- ")
+    );
+    Ok(())
+}
+
+const GUARDED_TABLE: &str = "\"persistent\".\"public\".\"guarded\"";
+
+/// Create `persistent.public.guarded` holding two rows in a new workspace
+/// under `dir`, using a writable server that is shut down again.
+async fn seed_guarded_workspace(
+    dir: &TempDir,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let workspace = dir.path().join("workspace.hyper");
+    let h = TestHarness::start_at_persistent(workspace.clone(), false).await?;
+    for sql in [
+        format!("CREATE TABLE {GUARDED_TABLE} (id INT)"),
+        format!("INSERT INTO {GUARDED_TABLE} VALUES (1), (2)"),
+    ] {
+        let r = call_tool(&h.client, "execute", serde_json::json!({ "sql": [sql] })).await?;
+        assert!(!is_error(&r), "seed failed: {:?}", first_text(&r));
+    }
+    h.shutdown().await?;
+    Ok(workspace)
+}
+
+/// Every SQL-taking read tool refuses a write, with and without
+/// `--read-only`: `query_data`, `query_file` and `export` used to run any
+/// statement, and `query` let a write through behind `WITH` or
+/// `EXPLAIN (ANALYZE)`. Hyper enforces nothing here, so the table must
+/// still hold its rows afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sql_read_tools_refuse_writes_in_both_modes() -> TestResult {
+    let dir = TempDir::new()?;
+    let workspace = seed_guarded_workspace(&dir).await?;
+    let input = dir.path().join("input.csv");
+    std::fs::write(&input, b"a\n1\n")?;
+    let input = input.to_string_lossy().into_owned();
+    let count = format!("SELECT COUNT(*) AS n FROM {GUARDED_TABLE}");
+
+    let mut failures = Vec::new();
+    let mut export_index = 0;
+    for read_only in [false, true] {
+        let h = TestHarness::start_at_persistent(workspace.clone(), read_only).await?;
+        let mut cases = Vec::new();
+        for sql in [
+            format!("DELETE FROM {GUARDED_TABLE}"),
+            format!("DROP TABLE {GUARDED_TABLE}"),
+        ] {
+            export_index += 1;
+            let out = dir.path().join(format!("refused-{export_index}.csv"));
+            cases.push((
+                "query_data",
+                serde_json::json!({ "data": "a\n1\n", "format": "csv", "sql": sql }),
+            ));
+            cases.push((
+                "query_file",
+                serde_json::json!({ "path": input, "sql": sql }),
+            ));
+            cases.push((
+                "export",
+                serde_json::json!({ "sql": sql, "path": out.to_string_lossy(), "format": "csv" }),
+            ));
+        }
+        for sql in [
+            format!("WITH x AS (SELECT 1) DELETE FROM {GUARDED_TABLE}"),
+            format!("EXPLAIN (ANALYZE) DELETE FROM {GUARDED_TABLE}"),
+        ] {
+            cases.push(("query", serde_json::json!({ "sql": sql })));
+        }
+        for (tool, args) in cases {
+            let case = format!("read_only={read_only} {tool} {}", args["sql"]);
+            let r = call_tool(&h.client, tool, args).await?;
+            record_error_contract(&mut failures, &case, &r, "SQL_ERROR");
+        }
+
+        // Plain reads keep working, and a plain EXPLAIN only plans.
+        export_index += 1;
+        let out = dir.path().join(format!("allowed-{export_index}.csv"));
+        for (tool, args) in [
+            (
+                "query_data",
+                serde_json::json!({ "data": "a\n1\n", "format": "csv", "sql": count }),
+            ),
+            (
+                "query_file",
+                serde_json::json!({ "path": input, "sql": count }),
+            ),
+            (
+                "export",
+                serde_json::json!({ "sql": count, "path": out.to_string_lossy(), "format": "csv" }),
+            ),
+            (
+                "query",
+                serde_json::json!({ "sql": format!("EXPLAIN DELETE FROM {GUARDED_TABLE}") }),
+            ),
+        ] {
+            let case = format!("read_only={read_only} {tool} {}", args["sql"]);
+            let r = call_tool(&h.client, tool, args).await?;
+            if is_error(&r) {
+                failures.push(format!("{case}: must succeed; got {}", all_text(&r)));
+            }
+        }
+
+        let rows =
+            all_text(&call_tool(&h.client, "query", serde_json::json!({ "sql": count })).await?);
+        if !rows.contains("\"n\":2") && !rows.contains("\"n\": 2") {
+            failures.push(format!(
+                "read_only={read_only}: the table must keep its two rows; got {rows}"
+            ));
+        }
+        h.shutdown().await?;
+    }
+    assert!(
+        failures.is_empty(),
+        "read tools let a write through:\n- {}",
         failures.join("\n- ")
     );
     Ok(())

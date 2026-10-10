@@ -24,6 +24,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`query_data`, `query_file` and `export` now accept only read-only SQL**,
+  with or without `--read-only`. They used to run any statement, so
+  `query_data(sql: "DROP TABLE persistent.public.t")` dropped a persistent
+  table even on a read-only server. Writes are refused with `SQL_ERROR`, as
+  `query` already did.
+- **The read-only SQL check now sees statements the way Hyper does.**
+  `WITH x AS (...) DELETE ...` and `EXPLAIN (ANALYZE) DELETE ...`, both of
+  which Hyper runs, passed as read-only through `query`, `chart`,
+  `save_query` and `copy_query`. Block comments are no longer treated as
+  nesting (Hyper's do not), string literals, quoted identifiers and dollar
+  quotes are skipped the way Hyper's lexer skips them, `SELECT ... INTO`
+  counts as a write, and input that is not exactly one statement (or nests
+  parentheses more than 256 deep) is refused. The `execute` batch validator uses the
+  same classifier, so it now counts those wrapped writes as DML.
+- **`export` with `sql` can no longer break out of its `COPY (...) TO`
+  wrapper.** SQL that closed the parenthesis itself could name its own
+  target path and options; it is now refused, and a query that ends in a
+  `--` comment exports instead of failing with a syntax error.
 - **`query_data` / `query_file` no longer interpolate `table_name` unescaped
   into the scratch-table `DROP`.** A `table_name` containing a double quote
   could end the quoted identifier and append further SQL to the cleanup

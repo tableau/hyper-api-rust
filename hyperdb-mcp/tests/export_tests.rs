@@ -1124,3 +1124,86 @@ fn export_hyper_preserves_constraints() {
         .execute_command("DETACH DATABASE \"verify\"")
         .unwrap();
 }
+
+/// Export options for `sql` written to `path` as `format`.
+fn sql_export(sql: &str, path: &std::path::Path, format: &str) -> ExportOptions {
+    ExportOptions {
+        sql: Some(sql.into()),
+        table: None,
+        path: path.to_str().unwrap().into(),
+        format: format.into(),
+        overwrite: true,
+        format_options: None,
+        source_db: None,
+    }
+}
+
+/// Query mode splices the SQL into `COPY (...) TO <path>`, so SQL that
+/// closes the parenthesis itself could name its own target and options.
+/// It is refused, and neither target is written.
+#[test]
+fn export_refuses_sql_that_escapes_the_copy_wrapper() {
+    let te = TestEngine::new_ephemeral();
+    setup_test_table(&te);
+    let dir = tempfile::tempdir().unwrap();
+    for format in ["csv", "iceberg"] {
+        let path = dir.path().join(format!("export-{format}"));
+        let escaped = dir.path().join(format!("escaped-{format}.csv"));
+        let sql = format!(
+            "SELECT * FROM test_export) TO '{}' WITH (format => 'csv') --",
+            escaped.display()
+        );
+        let err = export_to_file(&te.engine, &sql_export(&sql, &path, format))
+            .err()
+            .unwrap_or_else(|| panic!("{format}: the escaping export must be refused"));
+        assert_eq!(err.code, ErrorCode::SqlError, "{format}: {err:?}");
+        assert!(
+            !escaped.exists(),
+            "{format}: the SQL's own target was written"
+        );
+        assert!(!path.exists(), "{format}: the export target was written");
+    }
+}
+
+/// Query mode refuses a write, which Hyper would otherwise run (or reject
+/// only by accident of the wrapper).
+#[test]
+fn export_refuses_write_sql() {
+    let te = TestEngine::new_ephemeral();
+    setup_test_table(&te);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("refused.csv");
+    for sql in [
+        "DELETE FROM test_export",
+        "WITH x AS (SELECT 1) DELETE FROM test_export",
+    ] {
+        let err = export_to_file(&te.engine, &sql_export(sql, &path, "csv"))
+            .err()
+            .unwrap_or_else(|| panic!("`{sql}` must be refused"));
+        assert_eq!(err.code, ErrorCode::SqlError, "{sql}: {err:?}");
+    }
+    let rows = te
+        .engine
+        .execute_query_to_json("SELECT COUNT(*) AS n FROM test_export")
+        .unwrap();
+    assert_eq!(rows[0]["n"], 2, "the table must keep its rows");
+    assert!(!path.exists());
+}
+
+/// A query that ends in a `--` comment still exports: the wrapper puts the
+/// closing parenthesis on its own line.
+#[test]
+fn export_query_ending_in_a_line_comment() {
+    let te = TestEngine::new_ephemeral();
+    setup_test_table(&te);
+    let dir = tempfile::tempdir().unwrap();
+    for format in ["csv", "iceberg"] {
+        let path = dir.path().join(format!("commented-{format}"));
+        let result = export_to_file(
+            &te.engine,
+            &sql_export("SELECT * FROM test_export -- both rows", &path, format),
+        )
+        .unwrap_or_else(|err| panic!("{format}: {err:?}"));
+        assert_eq!(result.rows, 2, "{format}");
+    }
+}

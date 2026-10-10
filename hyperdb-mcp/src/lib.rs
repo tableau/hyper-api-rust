@@ -96,6 +96,7 @@ pub mod saved_queries;
 pub mod schema;
 #[doc(hidden)]
 pub mod server;
+mod sql_classify;
 #[doc(hidden)]
 pub mod stats;
 #[doc(hidden)]

@@ -18,6 +18,7 @@ use crate::chart::{
 };
 use crate::engine::{
     Engine, StatementKind, classify_statement, is_read_only_sql, lock_engine_recovering_poison,
+    require_read_only_sql,
 };
 use crate::error::{ErrorCode, McpError};
 use crate::export::{ExportOptions, export_to_file};
@@ -152,7 +153,7 @@ present in multiple stores (row multiplication).
 pub struct QueryDataParams {
     /// JSON array of objects or CSV text.
     pub data: String,
-    /// SQL query to run against the data. Reference the table by
+    /// Read-only SQL query to run against the data. Reference the table by
     /// `table_name` (default `data`).
     pub sql: String,
     /// Data format: `"json"` or `"csv"`. Auto-detected from the first byte
@@ -172,7 +173,7 @@ pub struct QueryDataParams {
 pub struct QueryFileParams {
     /// Absolute path to a CSV / JSON / JSONL / Parquet / Arrow IPC file.
     pub path: String,
-    /// SQL query to run. Reference the file's rows by `table_name`
+    /// Read-only SQL query to run. Reference the file's rows by `table_name`
     /// (default `data`), e.g. `SELECT * FROM data`.
     pub sql: String,
     /// Table name the SQL references the file's rows as. Default `data`.
@@ -639,7 +640,7 @@ pub struct InspectFileParams {
 /// Parameters for the `export` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ExportParams {
-    /// SQL query to export (if omitted, exports whole table)
+    /// Read-only SQL query to export (if omitted, exports whole table)
     pub sql: Option<String>,
     /// Table name (used if sql omitted)
     pub table: Option<String>,
@@ -1917,6 +1918,7 @@ impl HyperMcpServer {
         Parameters(params): Parameters<QueryDataParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self.with_engine(|engine| {
+            require_read_only_sql("query_data", &params.sql)?;
             let tname = params.table_name.unwrap_or_else(|| "data".into());
             let temp_table = format!("_tmp_{}_{}", tname, rand_suffix());
             let fmt = params.format.unwrap_or_else(|| detect_format(&params.data));
@@ -1937,8 +1939,11 @@ impl HyperMcpServer {
             let query_sql = replace_identifier(&params.sql, &tname, &temp_table);
             // Drop the scratch table whether the query succeeds or fails —
             // propagating the query error with `?` before the drop would
-            // orphan the temp table (it then surfaces in `describe`).
-            let query_result = engine.execute_query_to_json(&query_sql);
+            // orphan the temp table (it then surfaces in `describe`). The
+            // rewritten SQL is checked again: `table_name` is the caller's,
+            // and substituting it can change how the statement tokenizes.
+            let query_result = require_read_only_sql("query_data", &query_sql)
+                .and_then(|()| engine.execute_query_to_json(&query_sql));
             let _ = engine.execute_command(&drop_scratch_table_sql(&temp_table));
             let rows = query_result?;
 
@@ -1965,6 +1970,7 @@ impl HyperMcpServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self.with_engine(|engine| {
             crate::attach::validate_input_path(&params.path, "data file")?;
+            require_read_only_sql("query_file", &params.sql)?;
             let tname = params.table_name.unwrap_or_else(|| "data".into());
             let temp_table = format!("_tmp_{}_{}", tname, rand_suffix());
             let schema_override = crate::schema::normalize_schema_param(params.schema.as_ref())?;
@@ -2000,8 +2006,11 @@ impl HyperMcpServer {
             let query_sql = replace_identifier(&params.sql, &tname, &temp_table);
             // Drop the scratch table whether the query succeeds or fails —
             // propagating the query error with `?` before the drop would
-            // orphan the temp table (it then surfaces in `describe`).
-            let query_result = engine.execute_query_to_json(&query_sql);
+            // orphan the temp table (it then surfaces in `describe`). The
+            // rewritten SQL is checked again: `table_name` is the caller's,
+            // and substituting it can change how the statement tokenizes.
+            let query_result = require_read_only_sql("query_file", &query_sql)
+                .and_then(|()| engine.execute_query_to_json(&query_sql));
             let _ = engine.execute_command(&drop_scratch_table_sql(&temp_table));
             let rows = query_result?;
 
@@ -2690,12 +2699,7 @@ impl HyperMcpServer {
         Parameters(params): Parameters<QueryParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self.with_engine(|engine| {
-            if !is_read_only_sql(&params.sql) {
-                return Err(McpError::new(
-                    ErrorCode::SqlError,
-                    "The query tool only accepts read-only SQL (SELECT, WITH, EXPLAIN, SHOW, VALUES). Use the execute tool for DDL/DML.",
-                ));
-            }
+            require_read_only_sql("query", &params.sql)?;
             // Optional database routing — temporarily redirect search_path
             // for the duration of this call. Restored on guard drop.
             let target_db = self.resolve_db(engine, params.database.as_deref(), None, false)?;
@@ -5273,13 +5277,10 @@ fn validate_execute_batch(stmts: &[String]) -> Result<(), McpError> {
             )
             .with_suggestion("Remove the empty element or replace it with a real statement."));
         }
-        // Classification is comment-aware and only inspects the leading
-        // keyword, so it returns a meaningful answer even for input
-        // that happens to be multi-statement. We don't try to detect
-        // multi-statement input client-side — Hyper's own
-        // "Multi-part queries" / SQLSTATE 0A000 error is mapped at
-        // [error.rs:130-134] to a clear "split into separate array
-        // elements" suggestion, so the LLM gets the same actionable
+        // Multi-statement input classifies as `Other` and passes through:
+        // Hyper's own "Multi-part queries" / SQLSTATE 0A000 error is
+        // mapped at [error.rs:130-134] to a clear "split into separate
+        // array elements" suggestion, so the LLM gets the same actionable
         // hint after one round-trip.
         match classify_statement(stmt) {
             StatementKind::ReadOnly => {

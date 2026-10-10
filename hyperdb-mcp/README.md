@@ -362,7 +362,7 @@ query_data(data: '[{"region":"West","revenue":1200},...]', sql: 'SELECT region, 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `data` | string | yes | JSON array of objects, or CSV text |
-| `sql` | string | yes | SQL query to run against the data |
+| `sql` | string | yes | Read-only SQL query to run against the data |
 | `format` | string | no | `"json"` or `"csv"` — auto-detected if omitted |
 | `table_name` | string | no | Table name for use in SQL — defaults to `"data"` |
 | `schema` | object | no | Partial column-name → type map (see [Schema Overrides](#schema-overrides)) |
@@ -378,7 +378,7 @@ query_file(path: '/tmp/sales.parquet', sql: 'SELECT TOP 10 * FROM data ORDER BY 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `path` | string | yes | Path to CSV / JSON / JSONL / Parquet / Arrow IPC file |
-| `sql` | string | yes | SQL query to run |
+| `sql` | string | yes | Read-only SQL query to run |
 | `table_name` | string | no | Table name for use in SQL — defaults to `"data"` |
 | `schema` | object | no | Partial column-name → type map (see [Schema Overrides](#schema-overrides)) |
 | `json_extract_path` | string | no | Dot-separated path to a nested array in a JSON wrapper file (numeric segments index arrays) |
@@ -698,7 +698,7 @@ export(sql: 'SELECT ...', path: '~/Desktop/analysis.hyper', format: 'hyper')
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `sql` | string | no | Query to export (if omitted, exports whole table) |
+| `sql` | string | no | Read-only query to export (if omitted, exports whole table) |
 | `table` | string | no | Table name (used if `sql` omitted) |
 | `path` | string | yes | Output file path |
 | `format` | string | yes | `"csv"`, `"parquet"`, `"iceberg"`, `"arrow_ipc"`, or `"hyper"` |
@@ -893,7 +893,7 @@ hyperdb-mcp --persistent-db ~/analytics.hyper --read-only
 - **Blocked:** `execute`, `load_data`, `load_file`, `load_files`, `load_iceberg`, `watch_directory`, `save_query`, `delete_query`, `set_table_metadata`, `copy_query`, `kv_set`, `kv_set_many`, `kv_delete`, `kv_pop`, and `kv_clear` — return `READ_ONLY_VIOLATION`. `attach_database` is also guarded when `writable: true` or `on_missing: "create"`; ordinary read-only attachment remains available.
 - **Resources, prompts, and resource subscriptions** work normally — read-only clients can still subscribe to `hyper://...` URIs and receive notifications when other (non-read-only) connections mutate state
 
-The `query` tool also enforces read-only at the SQL level — only `SELECT`/`WITH`/`EXPLAIN`/`SHOW`/`VALUES` are accepted.
+Independently of `--read-only`, every tool that takes a query (`query`, `query_data`, `query_file`, `export`, `chart`, `save_query`, `copy_query`) accepts only a single read-only statement — `SELECT`/`WITH`/`EXPLAIN`/`SHOW`/`VALUES` — and refuses anything else with `SQL_ERROR`. That includes a write behind `WITH` (`WITH x AS (...) DELETE ...`) or `EXPLAIN (ANALYZE)`, both of which Hyper runs. Hyper does not enforce read-only transactions, so this check is the only guard.
 
 ---
 
