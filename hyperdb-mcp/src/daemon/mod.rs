@@ -11,6 +11,7 @@
 pub mod control;
 pub mod discovery;
 pub mod health;
+mod legacy;
 pub mod lock;
 pub mod run;
 pub mod spawn;

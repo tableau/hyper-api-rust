@@ -39,6 +39,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   by group or others.** A daemon refuses to start in one, and a client treats it
   as untrusted and uses local mode rather than connecting to an endpoint it
   names.
+- **A running pre-1.0 (rc.5 and earlier) TCP daemon is stopped and replaced
+  on first contact.** Before spawning, a new client checks `daemon.json` for the
+  old `health_port` shape. It sends `STOP` only to a daemon that answers an
+  identified `PING` and reports the pid the record names, then waits up to 15 s
+  for the port to go quiet. A record whose port is dead or answered by anything
+  else is removed with nothing further sent. Only a refused connection counts
+  as a dead port: if the port is open but unresponsive, or the daemon will not
+  stop, the record is kept and the client runs in local mode without spawning
+  (a daemon that ignores `STOP` costs up to 15 s and another `STOP` on every
+  client start until it exits). An old client meeting a new
+  daemon cannot parse its record, so it waits out its spawn timeout and runs in
+  local mode; nothing is destroyed.
 
 ### Removed
 

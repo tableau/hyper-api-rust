@@ -17,6 +17,7 @@ use std::path::Path;
 
 use super::control::HealthEndpoint;
 use super::discovery::{self, DaemonInfo};
+use super::legacy;
 use super::lock::DaemonLock;
 
 /// Maximum time to wait for the daemon to write its discovery file after spawning.
@@ -39,7 +40,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// period.
 pub fn ensure_daemon() -> io::Result<DaemonInfo> {
     let dir = discovery::state_dir()?;
-    ensure_daemon_in(&dir, spawn_detached, SPAWN_TIMEOUT)
+    ensure_daemon_in(&dir, spawn_detached, SPAWN_TIMEOUT, legacy::STOP_WAIT)
 }
 
 /// [`ensure_daemon`] for an explicit state directory, spawner and wait budget.
@@ -47,6 +48,7 @@ fn ensure_daemon_in(
     dir: &Path,
     spawn: impl FnOnce() -> io::Result<()>,
     timeout: Duration,
+    legacy_stop_wait: Duration,
 ) -> io::Result<DaemonInfo> {
     match super::state_perms::verify_state_dir_trusted(dir) {
         Ok(()) => {}
@@ -68,9 +70,15 @@ fn ensure_daemon_in(
             Err(error) => return Err(error),
         };
         if let Some(lock) = lock {
-            // Nothing holds the lock, so no daemon is running and any record
-            // left behind is stale. Clean it up while we hold the lock so a
-            // daemon cannot start between the check and the removal.
+            // Nothing holds the lock, so no daemon of this release is running
+            // and any record left behind is stale. Clean it up while we hold
+            // the lock so a daemon cannot start between the check and the
+            // removal.
+            //
+            // A pre-1.0 daemon holds no lock, so it is retired first; if it
+            // will not stop, return without spawning (the caller runs in
+            // local mode).
+            legacy::retire_under_lock(dir, legacy_stop_wait)?;
             discovery::remove_stale_record(dir);
             drop(lock);
             info!("no running daemon detected, spawning one");
@@ -304,6 +312,7 @@ mod tests {
             dir.path(),
             counting_spawner(&calls),
             Duration::from_millis(300),
+            NO_LEGACY_WAIT,
         )
         .expect_err("a held lock with no daemon must not succeed");
 
@@ -326,6 +335,7 @@ mod tests {
             dir.path(),
             counting_spawner(&calls),
             Duration::from_millis(200),
+            NO_LEGACY_WAIT,
         )
         .expect_err("the fake spawner publishes no daemon");
 
@@ -341,10 +351,324 @@ mod tests {
         let dir = parent.path().join("never-created");
         let calls = Cell::new(0);
 
-        let error = ensure_daemon_in(&dir, counting_spawner(&calls), Duration::from_millis(200))
-            .expect_err("the fake spawner publishes no daemon");
+        let error = ensure_daemon_in(
+            &dir,
+            counting_spawner(&calls),
+            Duration::from_millis(200),
+            NO_LEGACY_WAIT,
+        )
+        .expect_err("the fake spawner publishes no daemon");
 
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert_eq!(calls.get(), 1, "the spawner must run once");
+    }
+
+    /// Legacy wait for tests that have no legacy daemon.
+    const NO_LEGACY_WAIT: Duration = Duration::from_millis(100);
+
+    // ─── Retiring a pre-1.0 TCP daemon ──────────────────────────────────
+
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread::JoinHandle;
+
+    /// What the fake legacy daemon does on `STOP`.
+    #[derive(Clone, Copy)]
+    enum OnStop {
+        /// Release the port, as an rc.5 daemon does when it shuts down.
+        ClosePort,
+        /// Keep answering forever.
+        KeepAnswering,
+        /// Keep the port open but stop replying (accept, then stay silent).
+        GoSilent,
+    }
+
+    /// How the fake behaves from the first connection.
+    #[derive(Clone, Copy)]
+    enum Mode {
+        /// An rc.5 daemon reporting this pid.
+        Daemon(u32, OnStop),
+        /// Accepts, reads the command, never replies.
+        Silent,
+        /// A foreign service: answers every command with something else.
+        Foreign,
+    }
+
+    /// An rc.5 look-alike on `127.0.0.1:0`: answers `PING`, `STATUS` and
+    /// `STOP`, and records every command it receives.
+    struct FakeLegacyDaemon {
+        port: u16,
+        received: Arc<Mutex<Vec<String>>>,
+        quit: Arc<AtomicBool>,
+        handle: Option<JoinHandle<()>>,
+    }
+
+    impl FakeLegacyDaemon {
+        fn start(mode: Mode) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake legacy daemon");
+            let port = listener.local_addr().expect("local addr").port();
+            listener.set_nonblocking(true).expect("nonblocking");
+            let received = Arc::new(Mutex::new(Vec::new()));
+            let quit = Arc::new(AtomicBool::new(false));
+            let handle = {
+                let received = Arc::clone(&received);
+                let quit = Arc::clone(&quit);
+                std::thread::spawn(move || {
+                    let mut silent = matches!(mode, Mode::Silent);
+                    while !quit.load(Ordering::SeqCst) {
+                        let Ok((stream, _)) = listener.accept() else {
+                            std::thread::sleep(Duration::from_millis(5));
+                            continue;
+                        };
+                        stream.set_nonblocking(false).expect("blocking stream");
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .expect("read timeout");
+                        let mut line = String::new();
+                        let mut reader = BufReader::new(stream);
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                            continue;
+                        }
+                        let command = line.trim().to_string();
+                        received.lock().expect("received").push(command.clone());
+                        let (reported_pid, on_stop) = match mode {
+                            Mode::Daemon(pid, on_stop) => (pid, Some(on_stop)),
+                            Mode::Silent | Mode::Foreign => (0, None),
+                        };
+                        if silent {
+                            // Hold the connection open without replying.
+                            for _ in 0..70 {
+                                if quit.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                            continue;
+                        }
+                        let reply = match (mode, command.as_str()) {
+                            (Mode::Foreign, _) => "SSH-2.0-OpenSSH_9.0\n".to_string(),
+                            (_, "PING") => "PONG hyperdb-mcp 0.7.0\n".to_string(),
+                            (_, "STATUS") => format!("{{\"pid\":{reported_pid}}}\n"),
+                            (_, "STOP") => "STOPPING\n".to_string(),
+                            _ => "ERR unknown command\n".to_string(),
+                        };
+                        let _ = reader.get_mut().write_all(reply.as_bytes());
+                        if command == "STOP" {
+                            match on_stop {
+                                Some(OnStop::ClosePort) => break,
+                                Some(OnStop::GoSilent) => silent = true,
+                                _ => {}
+                            }
+                        }
+                    }
+                    // Dropping the listener releases the port.
+                })
+            };
+            Self {
+                port,
+                received,
+                quit,
+                handle: Some(handle),
+            }
+        }
+
+        fn received(&self) -> Vec<String> {
+            self.received.lock().expect("received").clone()
+        }
+    }
+
+    impl Drop for FakeLegacyDaemon {
+        fn drop(&mut self) {
+            self.quit.store(true, Ordering::SeqCst);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn write_legacy_record(dir: &Path, pid: u32, port: u16) -> std::path::PathBuf {
+        let path = dir.join("daemon.json");
+        let record = serde_json::json!({
+            "pid": pid,
+            "hyperd_endpoint": "127.0.0.1:54321",
+            "health_port": port,
+            "started_at": "2026-08-13T12:34:56Z",
+            "version": "0.7.0",
+        });
+        std::fs::write(&path, serde_json::to_vec(&record).expect("serialize")).expect("write");
+        path
+    }
+
+    fn stops(received: &[String]) -> usize {
+        received.iter().filter(|command| *command == "STOP").count()
+    }
+
+    /// The recorded daemon proves its pid, is stopped, its port goes quiet,
+    /// the legacy record is removed, and the new daemon is spawned.
+    #[test]
+    fn a_legacy_daemon_is_retired_and_the_record_removed() {
+        let dir = tempfile::tempdir().expect("state dir");
+        let peer = FakeLegacyDaemon::start(Mode::Daemon(4_242, OnStop::ClosePort));
+        let record = write_legacy_record(dir.path(), 4_242, peer.port);
+        let calls = Cell::new(0);
+
+        let error = ensure_daemon_in(
+            dir.path(),
+            counting_spawner(&calls),
+            Duration::from_millis(200),
+            Duration::from_secs(5),
+        )
+        .expect_err("the fake spawner publishes no daemon");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(calls.get(), 1, "a retired legacy daemon is replaced");
+        assert!(!record.exists(), "the legacy record must be gone");
+        let received = peer.received();
+        assert_eq!(&received[..3], ["PING", "STATUS", "STOP"], "{received:?}");
+        assert_eq!(stops(&received), 1);
+    }
+
+    /// A pid that does not match the record means the port belongs to
+    /// someone else: no `STOP` is sent, the stale record is removed.
+    #[test]
+    fn a_legacy_record_with_a_different_pid_gets_no_stop() {
+        let dir = tempfile::tempdir().expect("state dir");
+        let peer = FakeLegacyDaemon::start(Mode::Daemon(9_999, OnStop::ClosePort));
+        let record = write_legacy_record(dir.path(), 4_242, peer.port);
+        let calls = Cell::new(0);
+
+        let error = ensure_daemon_in(
+            dir.path(),
+            counting_spawner(&calls),
+            Duration::from_millis(200),
+            Duration::from_secs(5),
+        )
+        .expect_err("the fake spawner publishes no daemon");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(calls.get(), 1);
+        assert!(!record.exists(), "the stale legacy record must be removed");
+        let received = peer.received();
+        assert_eq!(received, ["PING", "STATUS"], "nothing beyond STATUS");
+    }
+
+    /// A legacy record whose port nobody serves is stale: removed, then spawn.
+    #[test]
+    fn a_legacy_record_with_a_dead_port_is_removed_and_spawns() {
+        let dir = tempfile::tempdir().expect("state dir");
+        let port = {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().expect("addr").port()
+        };
+        let record = write_legacy_record(dir.path(), 4_242, port);
+        let calls = Cell::new(0);
+
+        let _ = ensure_daemon_in(
+            dir.path(),
+            counting_spawner(&calls),
+            Duration::from_millis(200),
+            Duration::from_secs(5),
+        );
+
+        assert_eq!(calls.get(), 1);
+        assert!(!record.exists());
+    }
+
+    /// A legacy daemon that keeps answering after `STOP`: wait the injected
+    /// time, never spawn, leave its record, and report local mode's cause.
+    #[test]
+    fn a_legacy_daemon_that_never_stops_means_no_spawn() {
+        let dir = tempfile::tempdir().expect("state dir");
+        let peer = FakeLegacyDaemon::start(Mode::Daemon(4_242, OnStop::KeepAnswering));
+        let record = write_legacy_record(dir.path(), 4_242, peer.port);
+        let calls = Cell::new(0);
+
+        let started = Instant::now();
+        let error = ensure_daemon_in(
+            dir.path(),
+            counting_spawner(&calls),
+            Duration::from_millis(200),
+            Duration::from_millis(400),
+        )
+        .expect_err("a legacy daemon that will not stop must not succeed");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("pre-1.0"), "{error}");
+        assert_eq!(calls.get(), 0, "the spawner must never run");
+        assert!(record.exists(), "the running daemon's record is kept");
+        assert!(started.elapsed() >= Duration::from_millis(400));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(stops(&peer.received()), 1, "STOP is sent once");
+    }
+
+    /// An open port that never answers is not proof of a dead daemon: keep
+    /// the record, send nothing, do not spawn.
+    #[test]
+    fn a_legacy_port_that_never_replies_keeps_the_record_and_never_spawns() {
+        let dir = tempfile::tempdir().expect("state dir");
+        let peer = FakeLegacyDaemon::start(Mode::Silent);
+        let record = write_legacy_record(dir.path(), 4_242, peer.port);
+        let calls = Cell::new(0);
+
+        let error = ensure_daemon_in(
+            dir.path(),
+            counting_spawner(&calls),
+            Duration::from_millis(200),
+            Duration::from_millis(400),
+        )
+        .expect_err("an unresponsive legacy port must not succeed");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("pre-1.0"), "{error}");
+        assert_eq!(calls.get(), 0, "the spawner must never run");
+        assert!(record.exists(), "the record must be kept");
+        let received = peer.received();
+        assert_eq!(received, ["PING"], "nothing beyond the PING");
+    }
+
+    /// A foreign service answering something else holds the port: the record
+    /// is stale, removed, and only the PING was sent.
+    #[test]
+    fn a_foreign_service_on_the_legacy_port_gets_only_a_ping() {
+        let dir = tempfile::tempdir().expect("state dir");
+        let peer = FakeLegacyDaemon::start(Mode::Foreign);
+        let record = write_legacy_record(dir.path(), 4_242, peer.port);
+        let calls = Cell::new(0);
+
+        let _ = ensure_daemon_in(
+            dir.path(),
+            counting_spawner(&calls),
+            Duration::from_millis(200),
+            Duration::from_secs(5),
+        );
+
+        assert_eq!(calls.get(), 1);
+        assert!(!record.exists(), "the stale record must be removed");
+        assert_eq!(peer.received(), ["PING"]);
+    }
+
+    /// After `STOP`, a port that hangs (open, silent) still counts as alive.
+    #[test]
+    fn a_legacy_port_that_hangs_after_stop_counts_as_alive() {
+        let dir = tempfile::tempdir().expect("state dir");
+        let peer = FakeLegacyDaemon::start(Mode::Daemon(4_242, OnStop::GoSilent));
+        let record = write_legacy_record(dir.path(), 4_242, peer.port);
+        let calls = Cell::new(0);
+
+        let error = ensure_daemon_in(
+            dir.path(),
+            counting_spawner(&calls),
+            Duration::from_millis(200),
+            Duration::from_millis(400),
+        )
+        .expect_err("a hung legacy daemon must not succeed");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("still running"), "{error}");
+        assert_eq!(calls.get(), 0, "the spawner must never run");
+        assert!(record.exists());
+        assert_eq!(stops(&peer.received()), 1);
     }
 }

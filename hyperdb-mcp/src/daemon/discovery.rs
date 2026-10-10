@@ -413,6 +413,28 @@ pub(super) fn remove_stale_record(dir: &Path) {
     }
 }
 
+/// The record in `dir`, if it is a pre-1.0 (legacy-shaped) one that names a
+/// TCP health port. Reads like doctor does: bounded, and without following a
+/// symlink. A current-shape record yields `None`.
+pub(super) fn read_legacy_record(dir: &Path) -> Option<super::legacy::LegacyRecord> {
+    match read_discovery_file_raw(&dir.join("daemon.json")) {
+        RawDiscoveryRead::Malformed { contents, .. } => {
+            super::legacy::LegacyRecord::parse(contents.as_slice())
+        }
+        _ => None,
+    }
+}
+
+/// Remove the legacy record `expected`, if `dir` still holds exactly it.
+///
+/// The caller must hold the [`DaemonLock`](super::lock::DaemonLock) for `dir`.
+/// The re-read keeps a record that changed since it was judged.
+pub(super) fn remove_legacy_record(dir: &Path, expected: super::legacy::LegacyRecord) {
+    if read_legacy_record(dir) == Some(expected) {
+        let _ = std::fs::remove_file(dir.join("daemon.json"));
+    }
+}
+
 /// Remove the discovery file (called during graceful shutdown).
 pub fn remove_discovery_file() {
     if let Ok(path) = discovery_file_path() {
@@ -1410,5 +1432,70 @@ mod tests {
             return;
         }
         run_discovery_compatibility_child(TEST_NAME, CHILD_SENTINEL_ENV);
+    }
+
+    // ─── Legacy record hook ──────────────────────────────────────────────
+
+    fn write_legacy_file(dir: &Path, pid: u32) -> PathBuf {
+        let path = dir.join("daemon.json");
+        let record = json!({
+            "pid": pid,
+            "hyperd_endpoint": "127.0.0.1:54321",
+            "health_port": 7485,
+            "started_at": "2026-08-13T12:34:56Z",
+            "version": "0.7.0",
+        });
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn remove_legacy_record_removes_exactly_the_judged_record() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_legacy_file(tmp.path(), 4_242);
+        let judged = read_legacy_record(tmp.path()).expect("legacy record");
+        assert_eq!(judged.pid, 4_242);
+
+        remove_legacy_record(tmp.path(), judged);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn remove_legacy_record_keeps_a_record_that_changed_since_it_was_read() {
+        let tmp = TempDir::new().unwrap();
+        write_legacy_file(tmp.path(), 4_242);
+        let judged = read_legacy_record(tmp.path()).expect("legacy record");
+        let path = write_legacy_file(tmp.path(), 9_999);
+
+        remove_legacy_record(tmp.path(), judged);
+        assert!(path.exists(), "a changed record must survive");
+    }
+
+    #[test]
+    fn read_legacy_record_ignores_a_current_shape_record() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("daemon.json");
+        std::fs::write(
+            &path,
+            json!({"pid": 1, "hyperd_endpoint": "x", "health_endpoint": "y",
+                   "started_at": "t", "version": "1.0.0"})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(read_legacy_record(tmp.path()), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_hooks_do_not_follow_a_symlinked_daemon_json() {
+        let tmp = TempDir::new().unwrap();
+        let target_dir = TempDir::new().unwrap();
+        let target = write_legacy_file(target_dir.path(), 4_242);
+        std::os::unix::fs::symlink(&target, tmp.path().join("daemon.json")).unwrap();
+
+        assert_eq!(read_legacy_record(tmp.path()), None);
+        let judged = read_legacy_record(target_dir.path()).unwrap();
+        remove_legacy_record(tmp.path(), judged);
+        assert!(target.exists(), "the symlink target must be left alone");
     }
 }

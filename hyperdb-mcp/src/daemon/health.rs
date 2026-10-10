@@ -929,16 +929,22 @@ mod tests {
     /// reply must still be readable.
     #[test]
     fn rearming_the_timeout_after_the_peer_closed_keeps_the_reply_readable() {
-        let peer = spawn_test_peer(|mut stream, _stop| {
+        let (closed_tx, closed_rx) = mpsc::channel::<()>();
+        let peer = spawn_test_peer(move |mut stream, _stop| {
             read_test_command(&mut stream)?;
             stream
                 .write_all(b"OK\n")
                 .map_err(|error| format!("write reply: {error}"))?;
             drop(stream);
+            let _ = closed_tx.send(());
             Ok(())
         });
         let mut client = control::connect(&peer.endpoint, Duration::from_secs(1)).unwrap();
         client.write_all(b"X\n").unwrap();
+        // Finishing the peer earlier can stop it before it accepts.
+        closed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("peer must reply and close");
         peer.finish().expect("peer must finish");
         std::thread::sleep(Duration::from_millis(100));
 
