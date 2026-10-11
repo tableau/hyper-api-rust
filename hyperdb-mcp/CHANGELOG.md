@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **`get_readme` is now written in a compact schema notation.** Tool
+  signatures read `tool(required, optional?=default) → result`, with a legend
+  at the top. The document is about 10% smaller yet carries more: per-tool
+  parameter defaults and limits, `chart` size clamps, export `format_options`,
+  `attach_database` `on_missing`, `copy_query` `temp_attach`, the
+  `watch_directory` `.ready` sentinel protocol, and `kv_get` / `kv_pop`
+  response shapes.
 - **Upgraded the `rmcp` SDK dependency from 1.x to 3.4.** Resolves the
   outstanding `rmcp` security advisories. Purely an internal dependency bump —
   the MCP wire protocol and tool surface exposed by this server are unchanged.
