@@ -1714,7 +1714,9 @@ mod tests {
     use std::io::{self, Read as _, Write as _};
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    #[cfg(unix)]
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};

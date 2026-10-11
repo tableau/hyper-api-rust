@@ -1989,6 +1989,7 @@ fn scripted_daemon(info: &DaemonInfo) -> impl Fn(&str) -> Vec<u8> + Send + 'stat
 
 /// [`scripted_daemon`] that also raises `stop_seen` the moment it is sent `STOP`,
 /// so a test can release the daemon lock only after the CLI really asked.
+#[cfg(unix)]
 fn scripted_daemon_noting_stop(
     info: &DaemonInfo,
     stop_seen: Arc<AtomicBool>,
@@ -2003,6 +2004,7 @@ fn scripted_daemon_noting_stop(
 }
 
 /// Block until `flag` is raised, failing the test after `budget`.
+#[cfg(unix)]
 fn wait_for_flag(flag: &AtomicBool, budget: Duration) {
     let started = Instant::now();
     while !flag.load(Ordering::SeqCst) {

@@ -4155,13 +4155,13 @@ async fn export_and_chart_never_replace_session_databases() -> TestResult {
         assert!(!is_error(&r), "seed attached failed: {:?}", first_text(&r));
     }
 
-    let mut targets = vec![workspace.clone(), attached.clone()];
+    let targets = vec![workspace.clone(), attached.clone()];
     #[cfg(unix)]
-    {
+    let targets = {
         let link = dir.path().join("link.hyper");
         std::os::unix::fs::symlink(&workspace, &link)?;
-        targets.push(link);
-    }
+        targets.into_iter().chain([link]).collect::<Vec<_>>()
+    };
 
     let mut failures = Vec::new();
     for target in &targets {

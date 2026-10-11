@@ -1388,16 +1388,16 @@ fn export_refuses_a_protected_file_by_identity() {
     let dir = tempfile::tempdir().unwrap();
     let protected = dir.path().join("session.hyper");
     std::fs::write(&protected, b"Hyper\x08\0\0 session").unwrap();
-    let mut targets = vec![
+    let targets = vec![
         protected.clone(),
         dir.path().join(".").join("session.hyper"),
     ];
     #[cfg(unix)]
-    {
+    let targets = {
         let link = dir.path().join("link.hyper");
         std::os::unix::fs::symlink(&protected, &link).unwrap();
-        targets.push(link);
-    }
+        targets.into_iter().chain([link]).collect::<Vec<_>>()
+    };
 
     for target in &targets {
         for format in ["csv", "parquet", "arrow_ipc", "iceberg", "hyper"] {

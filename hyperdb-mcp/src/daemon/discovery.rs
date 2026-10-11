@@ -551,6 +551,7 @@ mod tests {
         entries
     }
 
+    #[cfg(unix)]
     fn run_discovery_compatibility_child(test_name: &str, child_sentinel_env: &str) {
         use std::process::{Command, Stdio};
         use std::time::Instant;
