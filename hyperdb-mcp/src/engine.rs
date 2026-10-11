@@ -19,7 +19,7 @@
 //! detects the [`crate::error::ErrorCode::ConnectionLost`] error, drops the
 //! engine, and transparently re-creates it on the next call. This auto-reconnect
 //! path covers both transport-level failures and the `"desynchronized"` state
-//! surfaced by the `hyper-client` layer's bounded drain.
+//! surfaced by the bounded drain in `hyperdb_api_core::client`.
 //!
 //! # Workspace Model
 //!
@@ -52,6 +52,8 @@
 use crate::daemon;
 use crate::error::{ErrorCode, McpError};
 use crate::schema::ColumnSchema;
+pub(crate) use crate::sql_classify::strip_leading_sql_comments;
+pub use crate::sql_classify::{StatementKind, classify_statement, is_read_only_sql};
 use hyperdb_api::{
     Catalog, Connection, CopyTableReport, CreateMode, HyperProcess, Parameters, SqlType,
     Transaction, escape_sql_path,
@@ -329,8 +331,7 @@ fn create_table_statements(
 /// Closures receive this rather than `&Engine` for a reason: the guard
 /// holds `&mut Connection`, so the borrow checker will not let the same
 /// connection be driven around the transaction. That statically rules out
-/// the "statement escaped the transaction" bug class that the previous
-/// `&self` + `*_unguarded` shape could only address by convention.
+/// the "statement escaped the transaction" bug class.
 #[derive(Debug)]
 pub struct EngineTransaction<'conn> {
     txn: Transaction<'conn>,
@@ -418,10 +419,10 @@ pub struct Engine {
     hyper: Option<HyperProcess>,
     /// Stored endpoint for daemon mode (the daemon advertises this).
     daemon_endpoint: Option<String>,
-    /// The daemon's health port, if connected via daemon mode. `None` in local mode.
-    /// Used by the server's heartbeat logic to target the correct port (not a re-resolve,
-    /// which would break when scanning is enabled).
-    daemon_health_port: Option<u16>,
+    /// The daemon's health endpoint (Unix socket path or named pipe), if
+    /// connected via daemon mode. `None` in local mode. Used by the server's
+    /// heartbeat logic to reach the daemon this engine actually connected to.
+    daemon_health_endpoint: Option<daemon::control::HealthEndpoint>,
     connection: Connection,
     /// The primary database for this session. Lives in a temp dir and is
     /// deleted on `Drop`.
@@ -429,10 +430,8 @@ pub struct Engine {
     /// User-data persistent database. Attached under alias `"persistent"`
     /// during [`Engine::new`]. `None` in `--ephemeral-only` mode.
     persistent_path: Option<PathBuf>,
-    /// `true` when the persistent `.hyper` file was just created during
-    /// engine construction (so the catalog-seed step should fire). Reset
-    /// to `false` after the server consumes it via
-    /// [`Self::take_persistent_was_created`].
+    /// `true` when engine construction created the persistent `.hyper`
+    /// file. Read via [`Self::persistent_was_just_created`]; never reset.
     persistent_was_created: bool,
     /// Cached "_table_catalog exists in `<alias>`" probes, keyed by
     /// canonical alias (lowercase). Populated on first call to
@@ -575,7 +574,7 @@ impl Engine {
         Ok(Self {
             hyper: Some(hyper),
             daemon_endpoint: None,
-            daemon_health_port: None,
+            daemon_health_endpoint: None,
             connection,
             ephemeral_path,
             persistent_path,
@@ -608,12 +607,21 @@ impl Engine {
         persistent_path: Option<PathBuf>,
         log_dir: &Path,
     ) -> Result<Option<Self>, McpError> {
-        let info = match daemon::spawn::ensure_daemon(daemon::discovery::resolve_port_scan()) {
+        let info = match daemon::spawn::ensure_daemon() {
             Ok(info) => info,
             Err(e) => {
-                tracing::debug!(error = %e, "daemon unavailable, falling back to local mode");
+                tracing::warn!(error = %e, "daemon unavailable, falling back to local mode");
                 return Ok(None);
             }
+        };
+        // Discovery only returns a record whose endpoint it validated against
+        // this state directory, so a failure here means the directory moved
+        // underneath us; local mode is the safe answer.
+        let Some(health_endpoint) = daemon::discovery::state_dir().ok().and_then(|dir| {
+            daemon::control::HealthEndpoint::from_record(&info.health_endpoint, &dir)
+        }) else {
+            tracing::debug!("daemon health endpoint is not valid here, falling back to local mode");
+            return Ok(None);
         };
 
         let endpoint = &info.hyperd_endpoint;
@@ -628,7 +636,7 @@ impl Engine {
             // The daemon's discovery file points at this endpoint but we can't
             // reach it — hyperd is likely dead. Tell the daemon so it can
             // restart it on its next monitor tick.
-            daemon::health::report_hyperd_error_to_daemon(info.health_port);
+            daemon::health::report_hyperd_error_to_daemon(&health_endpoint);
             McpError::new(
                 ErrorCode::InternalError,
                 format!("Failed to connect to daemon hyperd at {endpoint}: {e}"),
@@ -638,7 +646,7 @@ impl Engine {
         bootstrap_public_schema(&connection)?;
 
         // Send heartbeat so daemon knows we're active
-        let _ = daemon::health::send_command(info.health_port, "HEARTBEAT");
+        let _ = daemon::health::send_command(&health_endpoint, "HEARTBEAT");
 
         let primary_db_name = path_stem(ephemeral_path);
         let persistent_was_created = Self::attach_persistent_if_present(
@@ -650,7 +658,7 @@ impl Engine {
         Ok(Some(Self {
             hyper: None,
             daemon_endpoint: Some(info.hyperd_endpoint),
-            daemon_health_port: Some(info.health_port),
+            daemon_health_endpoint: Some(health_endpoint),
             connection,
             ephemeral_path: ephemeral_path.to_path_buf(),
             persistent_path,
@@ -667,15 +675,15 @@ impl Engine {
     /// whichever transport it names (a Unix domain socket, a named pipe, or
     /// TCP) — the same endpoint queries run against. This reflects *current*
     /// liveness of the resource the engine actually depends on, and is robust
-    /// to two failure modes the health-port PING is not:
-    ///   - the health port being unreachable (stale `daemon.json`,
-    ///     port-scan-adopted daemon, firewall) while the libpq endpoint serves;
+    /// to two failure modes the health-endpoint PING is not:
+    ///   - the health endpoint being unreachable (stale `daemon.json`) while
+    ///     the libpq endpoint serves;
     ///   - the daemon restarting `hyperd` at a new endpoint, leaving the cached
     ///     one stale (the probe then correctly reports `false`); the Unix socket
     ///     path is stable across restarts, so there the same probe instead
     ///     observes the live replacement.
     ///
-    /// Falls back to discovery (`daemon.json` + health-port PING) only when no
+    /// Falls back to discovery (`daemon.json` + health-endpoint PING) only when no
     /// endpoint has been cached yet (before the first connection attempt).
     pub fn is_running(&self) -> bool {
         if let Some(ref hyper) = self.hyper {
@@ -707,10 +715,18 @@ impl Engine {
             .map_err(|e| McpError::new(ErrorCode::InternalError, e.to_string()))
     }
 
-    /// The daemon's health port, if this engine is connected via daemon mode.
-    /// Returns `None` in local mode (when this engine owns a private `HyperProcess`).
-    pub fn daemon_health_port(&self) -> Option<u16> {
-        self.daemon_health_port
+    /// The daemon's health endpoint (a Unix socket path or a named-pipe name),
+    /// if this engine is connected via daemon mode. Returns `None` in local mode
+    /// (when this engine owns a private `HyperProcess`).
+    pub fn daemon_health_endpoint(&self) -> Option<&str> {
+        self.daemon_health_endpoint
+            .as_ref()
+            .map(daemon::control::HealthEndpoint::as_str)
+    }
+
+    /// The typed form of [`Self::daemon_health_endpoint`], for sending commands.
+    pub(crate) fn daemon_health_endpoint_handle(&self) -> Option<&daemon::control::HealthEndpoint> {
+        self.daemon_health_endpoint.as_ref()
     }
 
     /// Absolute path to the ephemeral primary `.hyper` file on disk.
@@ -857,9 +873,9 @@ impl Engine {
         let set_sql = format!("SET schema_search_path = '{}'", alias.replace('\'', "''"));
         self.execute_command(&set_sql)?;
 
-        // `AssertUnwindSafe` is sound for the same reason it is in
-        // `ScopedSearchPath`'s `Drop`: the only state that outlives the
-        // unwind is a session variable we are about to overwrite anyway.
+        // `AssertUnwindSafe` is sound here: after a panic in `f`, the only
+        // work done on `self` is the `SET` that restores the search path,
+        // and the panic is then re-raised unchanged.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
 
         let restore_sql = format!(
@@ -922,10 +938,9 @@ impl Engine {
     }
 
     /// `true` when this engine just created the persistent `.hyper` file
-    /// during construction. The server consumes this signal once to
-    /// decide whether to seed `_table_catalog`; subsequent reads stay
-    /// `true` (the flag isn't reset — it's a fact about the engine's
-    /// startup, not a one-shot signal).
+    /// during construction.
+    ///
+    /// The flag is a fact about the engine's startup and is never reset.
     pub fn persistent_was_just_created(&self) -> bool {
         self.persistent_was_created
     }
@@ -1002,6 +1017,25 @@ impl Engine {
         self.connection.execute_command(sql).map_err(McpError::from)
     }
 
+    /// Have Hyper parse `sql` on its own (Parse/Describe through
+    /// [`Connection::prepare`]), without running it, before a caller splices
+    /// it into a larger statement such as `COPY (...) TO`.
+    ///
+    /// Hyper refuses unbalanced parentheses, an unterminated literal or
+    /// comment, and more than one statement here, so SQL that passes cannot
+    /// close the surrounding parentheses itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns the converted [`hyperdb_api::Error`] when Hyper rejects the
+    /// statement (typically [`ErrorCode::SqlError`]).
+    pub fn check_embeddable_query(&self, sql: &str) -> Result<(), McpError> {
+        self.connection
+            .prepare(sql)
+            .map(drop)
+            .map_err(McpError::from)
+    }
+
     /// Execute an `ATTACH DATABASE` statement for a user-supplied `.hyper`
     /// file, mapping a lock conflict (SQLSTATE `55006`, or a legacy
     /// "already attached"/"file is locked" phrase from older hyperd) to
@@ -1033,7 +1067,7 @@ impl Engine {
     /// functionally equivalent to a successful rollback).
     ///
     /// This is the correctness primitive for ingest operations: it lets
-    /// per-row `INSERT` loops (Parquet, Arrow, JSON) leave zero partial data
+    /// the per-row `INSERT` loop of JSON ingest leave zero partial data
     /// on failure. The CSV `COPY FROM` path is already atomic at the
     /// statement level, but wrapping it in a transaction costs nothing and
     /// makes per-row INSERT loops atomic across the whole batch.
@@ -1560,10 +1594,9 @@ impl Engine {
     ///
     /// Avoids the `Catalog::has_table` probe entirely — we just run the sample
     /// SELECT first and translate a Hyper "table does not exist" error into
-    /// our own [`ErrorCode::TableNotFound`]. This sidesteps the old pattern
-    /// where a racy `has_table` silently returning `Err` would be rewritten
-    /// to `false` and surface as a spurious `TableNotFound` for tables that
-    /// actually exist.
+    /// our own [`ErrorCode::TableNotFound`]. A racy `has_table` that silently
+    /// returned `Err` would otherwise be rewritten to `false` and surface as a
+    /// spurious `TableNotFound` for tables that actually exist.
     ///
     /// # Errors
     ///
@@ -1790,18 +1823,18 @@ impl Engine {
         });
 
         // Connection details for the backing `hyperd`. In daemon mode the
-        // endpoint and health port come from the shared daemon's discovery
+        // endpoint and health endpoint come from the shared daemon's discovery
         // file; in local mode (`--no-daemon`) this engine owns a private
-        // `hyperd` and there is no health port. `hyperd_endpoint()` only errors
+        // `hyperd` and there is no health endpoint. `hyperd_endpoint()` only errors
         // if no endpoint is available at all, which `is_running` already
         // reflects — surface it as null rather than failing the whole status.
         let in_daemon_mode = self.daemon_endpoint.is_some();
         let endpoint = self.hyperd_endpoint().ok();
         let connection_value = endpoint.as_deref().map_or(Value::Null, describe_endpoint);
         let endpoint_value = endpoint.map_or(Value::Null, Value::String);
-        let health_port_value = self
-            .daemon_health_port
-            .map_or(Value::Null, |p| Value::Number(p.into()));
+        let health_endpoint_value = self
+            .daemon_health_endpoint()
+            .map_or(Value::Null, |endpoint| Value::String(endpoint.to_string()));
 
         Ok(json!({
             "hyperd_running": self.is_running(),
@@ -1812,15 +1845,15 @@ impl Engine {
             "total_rows": total_rows,
             "disk_usage_bytes": disk_bytes,
             // Where this engine is talking to hyperd. `hyperd_endpoint` is the
-            // libpq endpoint queries run against; `daemon_health_port` is the
-            // shared daemon's control/lock port (null in local mode);
+            // libpq endpoint queries run against; `daemon_health_endpoint` is the
+            // shared daemon's control socket or pipe (null in local mode);
             // `connection` decomposes the endpoint into transport, host/port
             // (TCP only), socket path (IPC only), and the scheme-qualified
             // descriptor another Hyper client can connect with.
             "engine": {
                 "mode": if in_daemon_mode { "daemon" } else { "local" },
                 "hyperd_endpoint": endpoint_value,
-                "daemon_health_port": health_port_value,
+                "daemon_health_endpoint": health_endpoint_value,
                 "connection": connection_value,
             },
             // The MCP server and the `hyperdb-api` crate it's built on live in
@@ -1892,9 +1925,8 @@ fn row_value_to_json(row: &hyperdb_api::Row, idx: usize, sql_type: &SqlType) -> 
             .unwrap_or(Value::Null);
     }
     if oid_val == oids::NUMERIC.0 {
-        // `Row` is schema-aware as of the upstream NUMERIC fix — it
-        // carries an `Arc<ResultSchema>` and `row.get::<Numeric>()`
-        // reads the scale from the column's
+        // `Row` is schema-aware: it carries an `Arc<ResultSchema>` and
+        // `row.get::<Numeric>()` reads the scale from the column's
         // `SqlType::Numeric { precision, scale }` descriptor before
         // dispatching on the buffer length. That covers all three
         // NUMERIC wire shapes the server can send on a query result:
@@ -1903,12 +1935,8 @@ fn row_value_to_json(row: &hyperdb_api::Row, idx: usize, sql_type: &SqlType) -> 
         //   * 16-byte `BigNumeric`  (precision > 18)
         //   * Arrow `Decimal128`/`Decimal256` (gRPC transport)
         //
-        // Prior to the upstream fix, `type_modifier` was being dropped
-        // during `RowDescription` parsing so the scale presented here
-        // was always `0`, the 8-byte form wasn't decodable at all, and
-        // `AVG` results fell through to `Null`. All of that is now
-        // handled inside `hyperdb-api`; this function only needs to pick
-        // the JSON shape.
+        // Scale and width decoding are handled inside `hyperdb-api`; this
+        // function only needs to pick the JSON shape.
         //
         // `Numeric::to_string()` uses the decoded scale and is exact.
         // Ordinary query results retain their established compact JSON
@@ -2121,11 +2149,6 @@ pub fn resolve_log_dir(persistent_db_path: Option<&str>) -> PathBuf {
     }
 }
 
-/// Build the `{name, columns, row_count}` JSON for a single table, shared
-/// between [`Engine::describe_tables`] (bulk) and [`Engine::describe_table`]
-/// (single) so both paths emit byte-identical shapes. A missing table
-/// surfaces as the underlying Hyper "relation does not exist" error; single-
-/// table callers should run it through `translate_table_missing`.
 /// Describe columns of `table_name` in attached database `db_alias` by
 /// querying that database's `pg_catalog.pg_attribute` directly. Used when
 /// the connection-bound `Catalog` API can't see the target database.
@@ -2163,6 +2186,10 @@ fn describe_columns_via_pg_catalog(
         .collect())
 }
 
+/// Build the `{name, columns, row_count}` JSON for a single table, shared
+/// between [`Engine::describe_tables`] (bulk) and [`Engine::describe_table`]
+/// (single) so both paths emit byte-identical shapes. Callers check existence
+/// first; a missing table surfaces as the underlying catalog error.
 fn describe_table_with_catalog(catalog: &Catalog<'_>, name: &str) -> Result<Value, McpError> {
     let def = catalog.get_table_definition(name).map_err(McpError::from)?;
     let row_count = catalog.get_row_count(name).unwrap_or(0);
@@ -2203,124 +2230,23 @@ fn translate_table_missing(err: McpError, table_name: &str) -> McpError {
     }
 }
 
-/// Returns `true` if a SQL statement is read-only: `SELECT`, `WITH`, `EXPLAIN`,
-/// `SHOW`, or `VALUES`. Anything else (`CREATE`, `INSERT`, `UPDATE`, `DELETE`,
-/// `DROP`, `ALTER`, `COPY`, ...) is considered mutating.
+/// Refuse `sql` unless [`is_read_only_sql`] accepts it, naming `tool` in
+/// the error.
 ///
-/// The check is a simple prefix match after trimming and upper-casing the first
-/// Checks whether the first SQL keyword indicates a read-only statement.
+/// # Errors
 ///
-/// Strips leading whitespace and SQL comments (line `--` and block `/* */`)
-/// before inspecting the first alphabetic token. This prevents comment-based
-/// bypass of the read-only guard (e.g. `/* harmless */ DROP TABLE ...`).
-///
-/// Note: data-modifying CTEs (`WITH x AS (DELETE ...) SELECT ...`) still slip
-/// past this check. Hyper itself rejects such CTEs, so this is defense-in-depth
-/// rather than the sole security boundary.
-#[must_use]
-pub fn is_read_only_sql(sql: &str) -> bool {
-    matches!(classify_statement(sql), StatementKind::ReadOnly)
-}
-
-/// Coarse classification of a single SQL statement, comment-aware.
-///
-/// Used by the atomic-batch `execute` tool to enforce the rule "a batch
-/// must be either all-DDL singletons or all-DML; mixing the two aborts
-/// the transaction with SQLSTATE 0A000". The first-keyword heuristic
-/// matches what `is_read_only_sql` already trusts elsewhere in the
-/// codebase.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StatementKind {
-    /// `SELECT` / `WITH` / `EXPLAIN` / `SHOW` / `VALUES`.
-    ReadOnly,
-    /// `CREATE` / `DROP` / `ALTER` / `TRUNCATE` / `RENAME` — Hyper auto-commits.
-    Ddl,
-    /// `INSERT` / `UPDATE` / `DELETE` / `COPY` / `MERGE` — transactional.
-    Dml,
-    /// `BEGIN` / `START` / `COMMIT` / `END` / `ROLLBACK` / `ABORT` /
-    /// `SAVEPOINT` / `RELEASE`. Rejected inside a batch because the
-    /// `execute` tool already manages the transaction; an explicit
-    /// COMMIT mid-batch would defeat atomicity.
-    TransactionControl,
-    /// Empty/comment-only input or an unrecognized first keyword. Treated
-    /// as opaque by the batch validator (passed through to Hyper).
-    Other,
-}
-
-/// Coarse-classify the first SQL statement in `sql` after stripping
-/// leading whitespace and line/block comments.
-///
-/// First-keyword only: a `WITH x AS (DELETE …) SELECT …` CTE is
-/// classified as `ReadOnly` even though it mutates. Hyper itself
-/// rejects data-modifying CTEs, so this is a defense-in-depth heuristic
-/// rather than the only barrier.
-#[must_use]
-pub fn classify_statement(sql: &str) -> StatementKind {
-    let stripped = strip_leading_sql_comments(sql);
-    let first_token: String = stripped
-        .chars()
-        .take_while(|c| c.is_alphabetic())
-        .flat_map(char::to_uppercase)
-        .collect();
-    match first_token.as_str() {
-        "SELECT" | "WITH" | "EXPLAIN" | "SHOW" | "VALUES" => StatementKind::ReadOnly,
-        "CREATE" | "DROP" | "ALTER" | "TRUNCATE" | "RENAME" => StatementKind::Ddl,
-        "INSERT" | "UPDATE" | "DELETE" | "COPY" | "MERGE" => StatementKind::Dml,
-        "BEGIN" | "START" | "COMMIT" | "END" | "ROLLBACK" | "ABORT" | "SAVEPOINT" | "RELEASE" => {
-            StatementKind::TransactionControl
-        }
-        _ => StatementKind::Other,
+/// Returns [`ErrorCode::SqlError`] for SQL that is not a single read-only
+/// statement.
+pub(crate) fn require_read_only_sql(tool: &str, sql: &str) -> Result<(), McpError> {
+    if is_read_only_sql(sql) {
+        return Ok(());
     }
-}
-
-/// Strips leading whitespace, line comments (`--`), and block comments (`/* */`)
-/// from SQL text. Handles nested block comments.
-pub(crate) fn strip_leading_sql_comments(sql: &str) -> &str {
-    let mut s = sql;
-    loop {
-        s = s.trim_start();
-        if s.starts_with("--") {
-            // Line comment — skip to end of line (handles LF, CRLF, and CR)
-            match s.find(&['\n', '\r'][..]) {
-                Some(pos) => {
-                    let mut next = pos + 1;
-                    // Handle CRLF: skip both characters
-                    if s.as_bytes().get(pos) == Some(&b'\r')
-                        && s.as_bytes().get(pos + 1) == Some(&b'\n')
-                    {
-                        next = pos + 2;
-                    }
-                    s = &s[next..];
-                }
-                None => return "",
-            }
-        } else if s.starts_with("/*") {
-            // Block comment — find matching close, handling nesting
-            let mut depth = 0u32;
-            let mut chars = s.char_indices().peekable();
-            let mut end = None;
-            while let Some((i, c)) = chars.next() {
-                if c == '/' && chars.peek().map(|(_, c2)| *c2) == Some('*') {
-                    chars.next();
-                    depth += 1;
-                } else if c == '*' && chars.peek().map(|(_, c2)| *c2) == Some('/') {
-                    chars.next();
-                    depth -= 1;
-                    if depth == 0 {
-                        end = Some(i + 2);
-                        break;
-                    }
-                }
-            }
-            match end {
-                Some(pos) => s = &s[pos..],
-                None => return "", // Unclosed comment — no valid SQL
-            }
-        } else {
-            break;
-        }
-    }
-    s
+    Err(McpError::new(
+        ErrorCode::SqlError,
+        format!(
+            "The {tool} tool only accepts read-only SQL (SELECT, WITH, EXPLAIN, SHOW, VALUES). Use the execute tool for DDL/DML."
+        ),
+    ))
 }
 
 impl Drop for Engine {
@@ -2584,75 +2510,13 @@ fn bootstrap_public_schema(connection: &Connection) -> Result<(), McpError> {
 }
 
 #[cfg(test)]
-mod statement_helper_tests {
-    use super::*;
-
-    #[test]
-    fn classify_statement_recognizes_each_kind() {
-        assert_eq!(classify_statement("SELECT 1"), StatementKind::ReadOnly);
-        assert_eq!(
-            classify_statement("with x as (..) select * from x"),
-            StatementKind::ReadOnly
-        );
-        assert_eq!(
-            classify_statement("CREATE TABLE t (i INT)"),
-            StatementKind::Ddl
-        );
-        assert_eq!(classify_statement("drop table t"), StatementKind::Ddl);
-        assert_eq!(
-            classify_statement("INSERT INTO t VALUES (1)"),
-            StatementKind::Dml
-        );
-        assert_eq!(classify_statement("update t set i = 2"), StatementKind::Dml);
-        assert_eq!(classify_statement("delete from t"), StatementKind::Dml);
-        assert_eq!(classify_statement(""), StatementKind::Other);
-    }
-
-    #[test]
-    fn classify_statement_recognizes_transaction_control() {
-        for kw in [
-            "BEGIN",
-            "Begin transaction",
-            "START TRANSACTION",
-            "COMMIT",
-            "Commit work",
-            "END",
-            "ROLLBACK",
-            "Rollback to savepoint sp1",
-            "ABORT",
-            "SAVEPOINT sp1",
-            "RELEASE SAVEPOINT sp1",
-        ] {
-            assert_eq!(
-                classify_statement(kw),
-                StatementKind::TransactionControl,
-                "expected TransactionControl for `{kw}`"
-            );
-        }
-    }
-
-    #[test]
-    fn classify_statement_strips_comments() {
-        assert_eq!(
-            classify_statement("/* harmless */ DROP TABLE t"),
-            StatementKind::Ddl
-        );
-        assert_eq!(
-            classify_statement("-- pretend to be readonly\nINSERT INTO t VALUES (1)"),
-            StatementKind::Dml
-        );
-    }
-}
-
-#[cfg(test)]
 mod endpoint_description_tests {
     use super::*;
 
-    /// The TCP shape every `hyperdb-mcp` session uses today: both the daemon
-    /// (`daemon::run` sets `TransportMode::Tcp` explicitly) and the local
-    /// fallback (`HyperProcess` defaults to TCP on every platform) hand the
-    /// engine a `host:port` string. The descriptor must round-trip back to
-    /// the `tab.tcp://` form `hyperd` sent over its callback connection.
+    /// The TCP shape a private `hyperd` uses (`--no-daemon` or the daemon
+    /// fallback; `HyperProcess` defaults to TCP on every platform): the
+    /// engine receives a `host:port` string. The descriptor must round-trip
+    /// back to the `tab.tcp://` form `hyperd` sent over its callback connection.
     #[test]
     fn tcp_endpoint_decomposes_into_host_port_and_descriptor() {
         let described = describe_endpoint("127.0.0.1:64687");

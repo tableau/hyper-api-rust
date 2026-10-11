@@ -1,10 +1,9 @@
 // Copyright (c) 2026, Salesforce, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Build script for hyper-client.
+//! Build script for hyperdb-api-core.
 //!
 //! This generates Rust code from the `HyperService` protobuf definitions.
-//! gRPC support is always available.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Path to proto files (relative to this crate's root)
@@ -12,14 +11,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Compile the HyperService and ErrorInfo protos.
     //
-    // `.bytes(["."])` tells prost to generate `bytes::Bytes` for every `bytes`
+    // `.bytes(".")` tells prost to generate `bytes::Bytes` for every `bytes`
     // field in the protos (instead of the default `Vec<u8>`). This lets prost
     // decode directly from the HTTP/2 frame buffer with a refcount bump
     // instead of an allocation + copy, which is critical on the gRPC result
     // path where payloads are full Arrow IPC streams.
-    // In tonic 0.14 the proto-compile entry point moved from `tonic-build`
-    // to the new `tonic-prost-build` crate; `tonic-build` itself now only
-    // handles TokenStream-level service codegen.
+    // Proto compilation uses `tonic-prost-build`.
     let mut config = tonic_prost_build::configure()
         .build_server(false) // We only need the client
         .build_client(true)

@@ -15,7 +15,7 @@ The recommended way to drive transactions is the **RAII guard** (`Transaction<'c
 ### RAII Transaction Guard (Sync)
 
 ```rust
-use hyperdb_api::Transaction;
+use hyperdb_api::{Connection, CreateMode, Transaction};
 
 let mut conn = Connection::connect("localhost:7483", "db.hyper", CreateMode::DoNotCreate)?;
 let txn: Transaction<'_> = conn.transaction()?; // exclusively borrows conn
@@ -93,7 +93,7 @@ txn.commit()?;
 ### RAII Transaction Guard (Async)
 
 ```rust
-use hyperdb_api::AsyncTransaction;
+use hyperdb_api::{AsyncConnection, AsyncTransaction, CreateMode};
 
 let mut conn = AsyncConnection::connect("localhost:7483", "db.hyper", CreateMode::DoNotCreate).await?;
 let txn: AsyncTransaction<'_> = conn.transaction().await?; // exclusively borrows conn

@@ -157,26 +157,26 @@ Use rustdoc's intra-doc links: `[`Connection`]` or `[`crate::Connection`]`.
 Use these conventional heading sections in doc comments where applicable:
 
 ```rust
-/// Opens a connection to the database.
+/// Connects to a database on a running `hyperd` instance.
 ///
 /// # Examples
 ///
 /// ```no_run
-/// use hyperdb_api::{Connection, HyperProcess};
+/// use hyperdb_api::{Connection, CreateMode, HyperProcess};
 ///
 /// let hyper = HyperProcess::new(None, None)?;
-/// let conn = Connection::open(&hyper, "example.hyper")?;
+/// let conn = Connection::new(&hyper, "example.hyper", CreateMode::CreateIfNotExists)?;
 /// # Ok::<(), hyperdb_api::Error>(())
 /// ```
 ///
 /// # Errors
 ///
-/// Returns [`Error::ConnectionFailed`] if the server is unreachable.
-///
-/// # Panics
-///
-/// Panics if `path` contains a null byte.
-pub fn open(process: &HyperProcess, path: &str) -> Result<Self, Error> {
+/// Returns [`Error::Connection`] if the server is unreachable.
+pub fn new(
+    instance: &HyperProcess,
+    database_path: impl AsRef<Path>,
+    create_mode: CreateMode,
+) -> Result<Self> {
 ```
 
 * **`# Examples`** — Provide for all non-trivial public APIs. Doc examples are compiled and run by `cargo test`, so they also serve as integration tests. Use `no_run` for examples that need a running `hyperd` server. Use `#` prefix to hide boilerplate lines.

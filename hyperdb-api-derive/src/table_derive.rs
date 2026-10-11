@@ -58,7 +58,7 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
 
     let create_sql = format!(
         "CREATE TABLE IF NOT EXISTS {} ({})",
-        table_name,
+        quote_ident(&table_name),
         col_defs.join(", ")
     );
 
@@ -108,7 +108,10 @@ struct StructOpts {
     table_name: Option<String>,
     /// Whether `#[hyperdb(register)]` was present.
     /// Only used when `compile-time` feature is enabled.
-    #[allow(dead_code, reason = "only used when compile-time feature is enabled")]
+    #[cfg_attr(
+        not(feature = "compile-time"),
+        expect(dead_code, reason = "read only with the compile-time feature")
+    )]
     register: bool,
 }
 
@@ -162,9 +165,11 @@ struct FieldOpts {
     /// Positional access (from `#[hyperdb(index = N)]`). Named columns are
     /// excluded from the column-subset validation check.
     index: Option<usize>,
-    /// Whether the field is the primary key.
-    /// Parsed but not yet used — reserved for v2 (schema enforcement).
-    #[allow(dead_code, reason = "reserved for v2 schema enforcement")]
+    /// Whether the field carries `#[hyperdb(primary_key)]`.
+    #[expect(
+        dead_code,
+        reason = "attribute accepted for documentation; no DDL emitted"
+    )]
     primary_key: bool,
 }
 
@@ -240,7 +245,18 @@ fn column_def(field: &Field, _table_name: &str) -> syn::Result<String> {
         " NOT NULL"
     };
 
-    Ok(format!("{col_name} {sql_type}{nullability}"))
+    Ok(format!(
+        "{} {sql_type}{nullability}",
+        quote_ident(&col_name)
+    ))
+}
+
+/// Double-quote an identifier for the generated `CREATE TABLE`.
+///
+/// Always quoting keeps reserved words (`order`, `user`, ...) legal; for a
+/// plain lowercase name the quoted and bare forms are the same identifier.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 /// Map a Rust type to a SQL type string.

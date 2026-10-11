@@ -7,12 +7,12 @@
 //!
 //! Two [`SavedQueryStore`] implementations:
 //!
-//! * [`SessionStore`] — in-memory `HashMap` behind a `Mutex`. Used for
-//!   ephemeral servers (no `--workspace`) where persistence across restarts
-//!   is meaningless because the whole `.hyper` file is thrown away.
+//! * [`SessionStore`] — in-memory `HashMap` behind a `Mutex`. Used when no
+//!   persistent database is configured (`--ephemeral-only`, or no platform
+//!   data directory), where persistence across restarts is meaningless.
 //! * [`WorkspaceStore`] — backs onto a dedicated meta-table
-//!   `_hyperdb_saved_queries` inside the Hyper workspace. Chosen when a
-//!   `--workspace` path is configured so saved queries survive restarts
+//!   `_hyperdb_saved_queries` inside the Hyper workspace. Chosen whenever a
+//!   persistent database is configured so saved queries survive restarts
 //!   alongside the data they query.
 //!
 //! The server picks a store variant in `HyperMcpServer::new` and hands it
@@ -77,18 +77,16 @@ impl SavedQuery {
 /// Hyper; stores that don't need it (e.g. [`SessionStore`]) simply ignore
 /// the argument.
 pub trait SavedQueryStore: Send + Sync {
-    /// Persist a new query. Returns an `AlreadyExists`-class error
-    /// (currently `SchemaMismatch`, with a clear message) if `name` is
-    /// already in use — callers should `delete` first if overwriting is
-    /// intended.
+    /// Persist a new query. Fails if `name` is already in use; callers
+    /// should `delete` first if overwriting is intended.
     ///
     /// # Errors
     ///
     /// - Returns [`ErrorCode::InvalidArgument`] if a query with the same
     ///   name already exists.
     /// - Returns [`ErrorCode::InternalError`] for store-specific failures
-    ///   (poisoned mutex in [`SessionStore`], Hyper catalog errors in
-    ///   `CatalogStore`).
+    ///   (poisoned mutex in [`SessionStore`]). [`WorkspaceStore`] propagates
+    ///   engine errors with their own codes.
     fn save(&self, engine: Option<&Engine>, query: SavedQuery) -> Result<(), McpError>;
 
     /// Retrieve a single saved query by name, or `Ok(None)` if not found.
@@ -191,9 +189,9 @@ impl SavedQueryStore for SessionStore {
 // --- WorkspaceStore ---------------------------------------------------------
 
 /// Persistent [`SavedQueryStore`] backed by the `_hyperdb_saved_queries`
-/// meta-table inside the `.hyper` workspace. Rows round-trip through SQL
-/// parameter binding so saved queries containing quotes or backslashes are
-/// handled safely.
+/// meta-table inside the `.hyper` workspace. Values are embedded as escaped
+/// literals via `sql_literal`, so saved queries containing quotes or
+/// backslashes are handled safely.
 ///
 /// Lazy init: the meta-table is created on the first `save`/`list`/`get`/
 /// `delete` call, guarded by a `Mutex<bool>` so concurrent first-touches
@@ -297,8 +295,8 @@ fn row_to_saved_query(row: &Value) -> Result<SavedQuery, McpError> {
         .map(String::from);
     let created_at_str = row.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
     // Accept both RFC 3339 and the space-separated `YYYY-MM-DD HH:MM:SS[.fff]`
-    // shape Hyper emits for TIMESTAMP columns; fall back to "now" on parse
-    // failure rather than losing the whole row.
+    // shape Hyper emits for TIMESTAMP columns; a parse failure is an
+    // `InternalError`.
     let created_at = DateTime::parse_from_rfc3339(created_at_str)
         .map(|d| d.with_timezone(&Utc))
         .or_else(|_| {
@@ -334,8 +332,7 @@ impl SavedQueryStore for WorkspaceStore {
         self.ensure_table(engine)?;
         let table = Self::qualified_table();
 
-        // Up-front existence check — clearer error than Hyper's raw PK
-        // violation message, and matches SessionStore's behaviour.
+        // Up-front existence check — matches SessionStore's behaviour.
         let existing_sql = format!(
             "SELECT name FROM {table} WHERE name = {}",
             sql_literal(&query.name)
@@ -431,7 +428,8 @@ impl SavedQueryStore for WorkspaceStore {
 /// Build the right store for a given workspace mode.
 ///
 /// `Some(path)` → [`WorkspaceStore`] (persisted in the `.hyper` file).
-/// `None`       → [`SessionStore`] (in-memory, dies with the process).
+/// `None`       → [`SessionStore`] (in-memory, dies with the process); used
+///                when no persistent database is configured.
 #[must_use]
 pub fn build_store(workspace_path: Option<&str>) -> Arc<dyn SavedQueryStore> {
     if workspace_path.is_some() {

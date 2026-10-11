@@ -21,6 +21,18 @@ Hyper database files (`.hyper`) without any C library dependencies.
 hyperdb-api = "1.0"
 ```
 
+### Semver and re-exported crates
+
+`arrow`, `chrono` and `geo_types` types appear in this crate's public API
+(`ArrowInserter`, `ArrowRowset`, `Timestamp` conversions, `Geography`), so
+`hyperdb-api` re-exports all three crates from its root. Use
+`hyperdb_api::arrow` (and friends), or depend on exactly the same major
+yourself: two majors in one binary give two incompatible `RecordBatch` types.
+
+A **major** version bump of any re-exported crate is a **major** version bump
+of `hyperdb-api`. This release builds against `arrow` 60, `chrono` 0.4 and
+`geo-types` 0.7.
+
 ## Runtime Requirements
 
 The `hyperd` executable (Hyper database server) must be available. Set its path via:
@@ -107,14 +119,14 @@ async fn main() -> Result<()> {
     let hyper = HyperProcess::new(None, None)?;
     let endpoint = hyper.require_endpoint()?;
 
-    let config = PoolConfig::new(&endpoint, "pooled.hyper")
+    let config = PoolConfig::new(endpoint, "pooled.hyper")
         .create_mode(CreateMode::CreateIfNotExists)
         .max_size(10);
 
     let pool = create_pool(config)?;
 
     // Get connections from the pool — returned automatically when dropped
-    let conn = pool.get().await.map_err(|e| hyperdb_api::Error::internal(e.to_string()))?;
+    let conn = pool.get().await?;
     conn.execute_command("SELECT 1").await?;
 
     Ok(())
@@ -215,6 +227,30 @@ let users: Vec<User> = conn.fetch_all_as_params(
     &[&42i32],
 )?;
 ```
+
+#### Known limitation: `OR` / `IN` lists over parameters
+
+A `hyperd` defect rejects a filter on a single column that combines a bound
+parameter with other values through `OR`, `IN`, `NOT IN` or `= ANY(ARRAY[...])`,
+for example `WHERE id = $1 OR id = $2` or `WHERE id IN ($1, $2)`. The statement
+fails when it is prepared, with SQLSTATE `XX000` ("A parameter was accessed in an
+execution target with too few registered parameters"). This affects every API
+that binds parameters, including `command_params` for `UPDATE` and `DELETE`.
+Filters that combine parameters with `AND`, and `OR` across two different
+columns, are not affected.
+
+Rewrite the list as a subquery over an array built from the parameters. The
+values stay bound, so the query is still injection-safe:
+
+```rust
+// Fails: "SELECT * FROM users WHERE id IN ($1, $2)"
+let mut result = conn.query_params(
+    "SELECT * FROM users WHERE id IN (SELECT unnest(ARRAY[$1, $2]))",
+    &[&1i64, &2i64],
+)?;
+```
+
+See the `Connection::query_params` API docs for details.
 
 #### Compile-time SQL validation (opt-in)
 
@@ -364,7 +400,7 @@ if catalog.has_table("public.users")? {
 Type-safe SQL identifier handling with automatic escaping:
 
 ```rust
-use hyperdb_api::{Name, TableName};
+use hyperdb_api::{table_name, Name, TableName};
 
 // Simple construction
 let name = Name::try_new("users")?;
@@ -439,12 +475,34 @@ ASCII `A-Z a-z 0-9 _ . -`; anything else returns `Error::InvalidName`.
 
 ## Connection Features
 
+### TLS
+
+TCP connections use TLS through the builders' `tls()`, with libpq `sslmode`
+names: `Disable` (the default), `Prefer`, `Require`, `VerifyCa` and
+`VerifyFull`. `PoolConfig` and `SyncPoolConfig` take the same setting; the
+`Connection::new` / `connect*` shortcuts stay plaintext.
+
+```rust
+use hyperdb_api::{ConnectionBuilder, TlsConfig, TlsMode};
+
+let conn = ConnectionBuilder::new("hyper.example.com:7483")
+    .database("data.hyper")
+    .tls(TlsConfig::new(TlsMode::VerifyFull).root_cert("ca.pem"))
+    .build()?;
+assert!(conn.is_tls());
+```
+
+A `hyperd` serves TLS when started with the `ssl_key` and `ssl_certificate`
+settings (`Parameters::set`) over the TCP transport. gRPC picks TLS from its
+`https://` scheme instead. See `TlsMode` for how each mode treats a server
+without TLS and which certificate checks it runs.
+
 ### Query Cancellation
 
 Thread-safe cancellation from another thread:
 
 ```rust
-let conn = Arc::new(Connection::create_or_open(&hyper, "test.hyper")?);
+let conn = Arc::new(Connection::new(&hyper, "test.hyper", CreateMode::CreateIfNotExists)?);
 // ... in another thread:
 conn.cancel()?;  // Cancels running query (SQLSTATE 57014)
 ```
@@ -453,7 +511,7 @@ conn.cancel()?;  // Cancels running query (SQLSTATE 57014)
 
 ```rust
 conn.set_notice_receiver(Some(Box::new(|notice| {
-    println!("Notice: {} ({})", notice.message, notice.severity.as_deref().unwrap_or(""));
+    println!("Notice: {} ({})", notice.message(), notice.severity().unwrap_or(""));
 })));
 ```
 
@@ -462,7 +520,7 @@ conn.set_notice_receiver(Some(Box::new(|notice| {
 Per-query performance metrics from Hyper's internal log:
 
 ```rust
-use hyperdb_api::query_stats::LogFileStatsProvider;
+use hyperdb_api::LogFileStatsProvider;
 
 conn.enable_query_stats(LogFileStatsProvider::from_process(&hyper));
 conn.execute_command("SELECT * FROM users")?;
@@ -517,13 +575,20 @@ window functions, CTEs, complex JOINs, and type-safe query composition.
 
 ```toml
 [dependencies]
-sea-query = "0.32"
+sea-query = "1.0"
 sea-query-hyperdb = "1.0"
 ```
 
 ```rust
-use sea_query::{Query, Expr, Iden};
+use sea_query::{Expr, ExprTrait, Iden, Query};
 use sea_query_hyperdb::HyperQueryBuilder;
+
+#[derive(Iden)]
+enum Users {
+    Table,
+    Name,
+    Age,
+}
 
 let sql = Query::select()
     .column(Users::Name)
@@ -559,4 +624,4 @@ crates.io-friendly.)
 
 ## License
 
-Apache-2.0
+Licensed under either of [Apache License, Version 2.0](https://github.com/tableau/hyper-api-rust/blob/main/LICENSE-APACHE.txt) or [MIT license](https://github.com/tableau/hyper-api-rust/blob/main/LICENSE-MIT.txt), at your option.

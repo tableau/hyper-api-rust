@@ -73,7 +73,7 @@
 
 use crate::error::Result;
 
-// Re-export types from hyperdb_api_core::client::grpc for convenience
+// Internal imports from hyperdb_api_core::client::grpc; the public re-exports live in `crate::grpc`.
 pub(crate) use hyperdb_api_core::client::grpc::{
     GrpcClient, GrpcClientSync, GrpcConfig, GrpcQueryResult,
 };
@@ -95,12 +95,9 @@ pub(crate) use hyperdb_api_core::client::grpc::{
 ///
 /// # Async vs Sync
 ///
-/// This struct provides both async and sync APIs:
-///
-/// - `connect()` / `execute_query()` - blocking (uses internal tokio runtime)
-/// - `connect_async()` / `execute_query_async()` - async (requires tokio runtime)
-///
-/// For applications already using tokio, the async methods are preferred.
+/// This struct is blocking: `connect()` and `execute_query()` use an internal
+/// tokio runtime. Applications already using tokio should use the async
+/// counterpart, [`GrpcConnectionAsync`].
 #[derive(Debug)]
 pub struct GrpcConnection {
     /// The underlying gRPC client (sync wrapper)
@@ -195,7 +192,7 @@ impl GrpcConnection {
     /// # Errors
     ///
     /// Returns [`crate::Error::Server`] if the gRPC server rejects the query
-    /// or if the HTTP/2 channel fails mid-stream.
+    /// or [`crate::Error::Connection`] if the HTTP/2 channel fails mid-stream.
     pub fn execute_query_to_arrow(&mut self, sql: &str) -> Result<bytes::Bytes> {
         Ok(self.client.execute_query_to_arrow(sql)?)
     }
@@ -221,7 +218,7 @@ impl GrpcConnection {
     /// # Errors
     ///
     /// Returns [`crate::Error::Server`] if the gRPC server rejects the query
-    /// or the HTTP/2 channel fails.
+    /// or [`crate::Error::Connection`] if the HTTP/2 channel fails.
     pub fn execute_query(&mut self, sql: &str) -> Result<GrpcQueryResult> {
         Ok(self.client.execute_query(sql)?)
     }
@@ -248,21 +245,12 @@ impl GrpcConnection {
     /// (channel closed, network error, auth expired) — useful for
     /// metrics, retry logic, or "cancel failed" UX.
     ///
-    /// # Fallible by design
+    /// # Why it takes a `query_id`
     ///
-    /// The `Result<()>` return is the **explicit user-facing cancel
-    /// API** and is distinct from the
-    /// [`Cancellable`](hyperdb_api_core::client::Cancellable) trait, which requires
-    /// an infallible `cancel(&self)` method with no arguments. A
-    /// `GrpcConnection` cannot implement `Cancellable` directly: the
-    /// trait's signature has nowhere to pass a `query_id`, and gRPC
-    /// connections can carry many concurrent queries (so there is no
-    /// unambiguous "the" query to cancel the way there is on a PG wire
-    /// connection). If you need `Cancellable`-style fire-and-forget
-    /// cancel for a future gRPC streaming result type, it will live
-    /// on a per-query handle that wraps this method and swallows
-    /// errors — mirroring
-    /// [`impl Cancellable for hyperdb_api_core::client::Client`](hyperdb_api_core::client::Cancellable).
+    /// A gRPC channel can carry many concurrent queries, so there is no
+    /// single query to cancel implicitly; the caller names the query to
+    /// cancel, and the call returns `Result<()>` so transport failures are
+    /// visible.
     ///
     /// # Example
     ///
@@ -375,8 +363,8 @@ impl GrpcConnectionAsync {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::Server`] if the server rejects the query or the
-    /// HTTP/2 channel fails mid-stream.
+    /// Returns [`crate::Error::Server`] if the server rejects the query or
+    /// [`crate::Error::Connection`] if the HTTP/2 channel fails mid-stream.
     pub async fn execute_query_to_arrow(&mut self, sql: &str) -> Result<bytes::Bytes> {
         Ok(self.client.execute_query_to_arrow(sql).await?)
     }
@@ -385,18 +373,15 @@ impl GrpcConnectionAsync {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::Server`] if the server rejects the query or the
-    /// HTTP/2 channel fails.
+    /// Returns [`crate::Error::Server`] if the server rejects the query or
+    /// [`crate::Error::Connection`] if the HTTP/2 channel fails.
     pub async fn execute_query(&mut self, sql: &str) -> Result<GrpcQueryResult> {
         Ok(self.client.execute_query(sql).await?)
     }
 
     /// Cancels an in-flight gRPC query by its `query_id` (async).
     ///
-    /// See [`GrpcConnection::cancel_query`] for full semantics, including
-    /// the "Fallible by design" discussion of why this returns
-    /// `Result<()>` and why it is *not* an implementation of the
-    /// [`Cancellable`](hyperdb_api_core::client::Cancellable) trait. The async
+    /// See [`GrpcConnection::cancel_query`] for full semantics. The async
     /// variant avoids blocking the current thread; both variants route
     /// the cancel over the same channel used for queries, carrying this
     /// connection's database routing and custom headers.

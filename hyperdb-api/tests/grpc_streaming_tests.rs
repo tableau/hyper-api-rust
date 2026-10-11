@@ -3,20 +3,20 @@
 
 //! Integration tests for the gRPC streaming chunk API.
 //!
-//! These tests verify that [`GrpcClient::execute_query_stream`] and the
+//! These tests verify that `GrpcClientSync::execute_query_stream` and the
 //! streaming [`ArrowRowset::from_stream`] path wire up correctly against a
 //! live `hyperd`:
 //!
-//! - the raw client's streaming API yields one or more `Bytes` chunks that
-//!   together reproduce the query result, and
-//! - the high-level `Connection::execute_query` on a gRPC transport uses
-//!   the streaming path without regressing row counts or schema.
+//! - the raw `GrpcClientSync` streaming API yields one or more `Bytes`
+//!   chunks, and the streaming `ArrowRowset::from_stream` path decodes them
+//!   to the full row count.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hyperdb_api::{HyperProcess, ListenMode, Parameters, Result};
 
-/// Spins up `hyperd` in gRPC-only mode and returns (process, grpc url, db path).
-/// The table `streaming_probe` is populated over gRPC-less server-side
-/// `generate_series`, so no TCP INSERT is required for these tests.
+/// Spins up `hyperd` in gRPC-only mode and returns the process and its gRPC URL.
 fn grpc_hyperd() -> Result<(HyperProcess, String)> {
     let mut params = Parameters::new();
     params.set("log_dir", "test_results");
@@ -37,19 +37,19 @@ fn test_grpc_stream_chunks_decode_correctly() -> Result<()> {
     let config = hyperdb_api_core::client::grpc::GrpcConfig::new(&url);
     let mut client = hyperdb_api_core::client::grpc::GrpcClientSync::connect(config)?;
 
-    // A generate_series result is cheap and predictable — 50k i64 rows.
+    // A generate_series result is cheap and predictable — 50k rows.
     let stream = client.execute_query_stream("SELECT i FROM generate_series(1, 50000) AS s(i)")?;
 
     // Count how many raw Bytes chunks the server produced.
     struct Counter {
         inner: hyperdb_api_core::client::grpc::GrpcChunkStreamSync,
-        seen: usize,
+        seen: Arc<AtomicUsize>,
     }
     impl hyperdb_api::ChunkSource for Counter {
         fn next_chunk(&mut self) -> hyperdb_api::Result<Option<bytes::Bytes>> {
             match self.inner.next_chunk()? {
                 Some(b) => {
-                    self.seen += 1;
+                    self.seen.fetch_add(1, Ordering::Relaxed);
                     Ok(Some(b))
                 }
                 None => Ok(None),
@@ -57,9 +57,10 @@ fn test_grpc_stream_chunks_decode_correctly() -> Result<()> {
         }
     }
 
+    let chunks = Arc::new(AtomicUsize::new(0));
     let source = Box::new(Counter {
         inner: stream,
-        seen: 0,
+        seen: Arc::clone(&chunks),
     });
     let mut rowset = hyperdb_api::ArrowRowset::from_stream(source)?;
 
@@ -68,6 +69,10 @@ fn test_grpc_stream_chunks_decode_correctly() -> Result<()> {
         total_rows += chunk.len();
     }
     assert_eq!(total_rows, 50_000, "streamed row count must match query");
+    assert!(
+        chunks.load(Ordering::Relaxed) >= 1,
+        "server produced no chunks"
+    );
     Ok(())
 }
 

@@ -905,9 +905,9 @@ impl<'conn> Catalog<'conn> {
     // Metadata Helpers
     // ============================================================
 
-    /// Returns the approximate row count for a table.
+    /// Returns the row count of a table.
     ///
-    /// This executes `SELECT COUNT(*) FROM table_name`.
+    /// This executes `SELECT COUNT(*) FROM table_name`, so the count is exact.
     ///
     /// # Example
     ///

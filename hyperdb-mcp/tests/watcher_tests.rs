@@ -348,8 +348,8 @@ async fn watcher_ingests_many_files_concurrently() {
     assert_eq!(total, (FILES * ROWS_PER_FILE) as i64);
 }
 
-/// Iter 3: a watcher with `target_db = Some("persistent")` opens the
-/// persistent file as its pool workspace and ingests rows there
+/// A watcher with `target_db = Some("persistent")` opens the
+/// persistent file in its connection pool and ingests rows there
 /// instead of into primary. Verifies the pool resolution path picks
 /// the right .hyper file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -358,8 +358,7 @@ async fn watcher_ingests_into_persistent_target() {
 
     // Pre-create the target table in persistent so the watcher's
     // append mode has somewhere to land. The current watcher contract
-    // is "append into an existing table" — auto-create is not part of
-    // this iteration's scope.
+    // is "append into an existing table"; the watcher does not auto-create.
     {
         let guard = engine.lock().unwrap();
         guard
@@ -414,7 +413,7 @@ async fn watcher_ingests_into_persistent_target() {
     // The watcher must also stamp persistent's _table_catalog after the
     // ingest. Without this row, set_table_metadata against the table
     // would error confusingly even though the table exists. This is
-    // the C1 fix from the post-merge architectural review.
+    // a requirement of the persistent-target ingest path.
     let catalog_rows: i64 = engine
         .lock()
         .unwrap()

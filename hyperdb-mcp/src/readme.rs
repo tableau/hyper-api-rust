@@ -3,401 +3,270 @@
 
 //! LLM-facing README returned by the `get_readme` tool.
 //!
-//! Structured as: purpose → tool index → parameter rules → SQL quirks →
-//! examples. Optimized for token efficiency: every sentence earns its
-//! place. When tools or features change, update this string and the
-//! `readme_tests.rs` coverage will fail loudly if a tool name was missed.
+//! Written in a compact pseudo-code / schema notation (legend at the top of
+//! the string): tool signatures as `tool(required, optional?=default) →
+//! result`, `a|b` alternatives, `*` defaults, and terse fragments instead of
+//! prose. The notation buys room for more facts within the byte budget that
+//! `readme_tests.rs` enforces. Order: purpose → database model → chart →
+//! tool index → parameter rules → SQL quirks → examples → tips. When tools
+//! or features change, update this string; `readme_tests.rs` fails loudly if
+//! a tool name or a pinned contract phrase goes missing.
 
-pub const README: &str = "\
-# HyperDB MCP
+pub const README: &str = r##"# HyperDB MCP
 
-## What this is
+In-process SQL analytics on the Tableau Hyper engine. In: CSV|JSON|JSONL|Parquet|Arrow IPC|Apache Iceberg.
+SQL: PostgreSQL-compatible, Salesforce Data Cloud dialect. Out: Parquet|Iceberg|Arrow IPC|CSV|.hyper.
+Use for any tabular analysis, SQL, file transform, or chart; prefer over ad-hoc Python/shell (faster
+parsing, native SQL, state stays re-queryable without re-loading).
 
-HyperDB MCP is an in-process SQL analytics service powered by the Tableau
-Hyper database engine. Load data from CSV / JSON / JSONL / Parquet /
-Arrow IPC / Apache Iceberg, query with PostgreSQL-compatible SQL
-(Salesforce Data Cloud SQL dialect), and export results to Parquet,
-Iceberg, Arrow IPC, CSV, or .hyper.
-
-## When to use this MCP
-
-Whenever the user asks to analyze tabular data, run SQL, transform a
-file, or build a chart from a query. Prefer this MCP over ad-hoc Python
-or shell pipelines: it parses files faster, runs SQL natively, and keeps
-intermediate state in a local database the LLM can re-query without
-re-loading.
+Notation: `tool`(required, optional?) → result · `a|b` one of · `*` or `?=v` default · `≡` same as · ✓ supported ·
+✗ unsupported · ⚠ gotcha. File paths absolute; relative rejected.
 
 ## Database model — queryable memory
 
-Every session has TWO databases, plus optional user-attached ones:
-
-- **Local database** (ephemeral and the default destination). Created
-  fresh per session, deleted on exit, and addressed as `\"local\"`.
-  Unqualified SQL routes here; use it for scratch data.
-- **Persistent database** (alias `\"persistent\"`). Survives across
-  sessions as queryable long-term structured memory. Disabled with
-  `--ephemeral-only`.
-- **Attached databases** via `attach_database`. Each lives in its own
-  `.hyper` file under a user-chosen canonical lowercase alias. Attachments
-  are read-only by default; pass `writable: true` when writes are needed.
-
-### Persistent as memory
-
-Use persistent for reference data, preferences, accumulated results, or
-anything the user asks to remember or query in a future session.
-
 ```
-load_data({ table: \"project_decisions\", data: \"[...]\", persist: true })
-query({ sql: \"SELECT * FROM project_decisions\", database: \"persistent\" })
+local*: ephemeral (fresh per session, deleted on exit); unqualified SQL lands here; scratch data
+persistent: survives sessions = long-term structured memory (reference data, preferences, accumulated
+  results, anything to remember or query later); off under --ephemeral-only
+<alias>: attach_database → user-chosen name for its own .hyper file, canonical lowercase alias; read-only unless writable: true
+remember: few scraps (variables, flags, summaries, JSON, queue entries) → kv_*, no schema/DDL · rows to
+  filter/JOIN/aggregate → table (load_data | execute CREATE TABLE) · both local (lost on restart)
+  unless database: "persistent"
+database: "local"* | "persistent" | <alias>, case-insensitive; writes need a writable attachment. On:
+  query execute load_data load_file load_files watch_directory describe sample chart export
+  set_table_metadata kv_*
+persist: true ≡ database: "persistent" (database wins if both set). On: load_data load_file load_files watch_directory kv_*
+execute: database only · load_iceberg: always local · copy_query: target_database
+fully-qualified SQL (power users; prefer database where a tool takes it):
+  INSERT INTO "persistent"."public"."customers" SELECT ...
+e.g. load_data({table: "project_decisions", data: "[...]", persist: true})
+     query({sql: "SELECT * FROM project_decisions", database: "persistent"})
 ```
-
-### KV store vs. a custom table — which to remember with
-
-When you need to remember something, pick the lighter tool:
-
-- **A few scraps** — variables, flags, summaries, JSON, queue entries —
-  use the key-value store (`kv_set` / `kv_get`); no schema or DDL.
-- **Structured rows** you'll filter, JOIN, or aggregate — use a real
-  table (`load_data` / `execute CREATE TABLE`), so SQL can reason over
-  typed columns.
-
-Both persist the same way: default is the local database (lost on
-restart); pass `database: \"persistent\"` to keep either one across
-sessions. The KV and `load_*` tools also accept the `persist: true`
-shorthand; `execute` takes `database` only.
-
-### Routing data to a destination
-
-- **`database` parameter** (preferred for tools that build their own
-  SQL): `query`, `execute`, `load_data`, `load_file`, `load_files`,
-  `watch_directory`, `describe`, `sample`, `chart`, `export`, and
-  `set_table_metadata` accept `database: \"persistent\"`,
-  `database: \"local\"`, or any user-attached alias (write tools require
-  a writable attachment). Case-insensitive. Defaults to local.
-- **`persist: true` shorthand** on `load_data`, `load_file`,
-  `load_files`, `watch_directory` — equivalent to
-  `database: \"persistent\"`.
-- **Fully-qualified SQL** for power users:
-  `INSERT INTO \"persistent\".\"public\".\"customers\" SELECT ...`
 
 ### Chart delivery and presentation
 
-Long and Unicode labels are not truncated or auto-sized; if they clip,
-increase `width` or `height`.
-Log bars start at the positive lower bound, not zero.
+`chart`(sql, chart_type: bar|line|scatter|histogram, x?, y?, series?, title?, format?: png|svg (else
+from output_path extension, else png),
+width?=800, height?=480, bins?=20, ...) — a bounded quick diagnostic, not a dashboard system.
+Long-format data: numeric y, optional series. x, y required for bar|line|scatter; histogram bins x.
+```
+delivery: no output_path → PNG (default) or SVG returned inline, no file · output_path → file written
+  (parents created) and returned inline · inline=false → disk only (no path ⇒ auto-generated temp
+  file) · existing file → PERMISSION_DENIED unless overwrite=true; an open database is never replaced ·
+  explicit format and path extension, if both given, must agree (.png|.svg only)
+database: routes the SQL to local|persistent|attached
+size: width 200-4096, height 150-4096 (clamped). Long and Unicode labels are not truncated or
+  auto-sized; if they clip, increase width or height
+bar_orientation: vertical* | horizontal (rankings); bars only
+label_values=true: each original y scalar written beside its bar
+show_legend: true by default; false to suppress the legend
+color_map: {series name → "#rrggbb"}, needs series; unlisted series use the default palette
+label_points=true: labels line/scatter points, suppresses their legend
+y_scale: linear (default) | log, on the data-role y measure (horizontal bars: physical x axis). Log
+  values and ranges: finite, strictly positive (> 0); zero and negative invalid; logarithmic
+  histograms unsupported; an explicit range must contain every plotted value. Log bars start at the
+  positive lower bound, not zero
+x_range, y_range: [min, max]; finite, strictly increasing, representable; omit to auto-scale
+x_range: line|scatter → axis bounds only; out-of-range points still counted in rows_plotted, rendered
+  invisibly (clipped), never moved · histogram → binning extent; outside values excluded from the bins
+  (not folded into edge bins), rows_plotted counts binned values only, stats.excluded_out_of_range =
+  dropped count, an x_range containing no data renders empty at that extent (no error) · bar → ignored (categorical x)
+bins: clamped 1..=500
+x axis: line|scatter DATE|TIMESTAMP|TIMESTAMPTZ → proportional time axis (automatic) · numeric →
+  numeric · TEXT → categorical · x_as_category=true → even spacing for temporal observations · bars
+  always categorical
+```
 
-`chart` is a bounded quick diagnostic, not a dashboard system. With no
-`output_path`, its PNG (default) or SVG is returned `inline` and no file
-is written. Supplying `output_path` writes the file and still returns it
-inline; set `inline=false` for disk-only output (an omitted path then gets
-an auto-generated temp file). Set `overwrite=false` to refuse an existing
-destination. The path extension and explicit `format`, when both supplied,
-must agree. Use `database` to route the SQL to local, persistent, or an
-attached database.
-
-Bars are vertical by default; set `bar_orientation` to `horizontal` for
-rankings. `label_values=true` writes each original y scalar beside its
-bar. `show_legend` defaults to true; set it false to suppress the legend.
-With a `series` column, `color_map` maps series names to hex colors;
-`label_points=true` labels line/scatter points and suppresses their legend.
-`y_scale` defaults to `linear`; `log`
-applies to the data-role y measure, including the physical x axis of
-horizontal bars. Log values and ranges must be finite and strictly
-positive (> 0): zero and negative values are invalid, logarithmic
-histograms are unsupported, and an explicit range must contain every
-plotted value. Explicit `x_range` and `y_range` bounds must also be finite,
-strictly increasing, and representable.
-
-`x_range` means something different per chart type. On line/scatter it sets
-the axis bounds only: out-of-range points are still counted in
-`rows_plotted` but render invisibly (clipped), never moved. On a histogram
-it is the binning extent, and values outside it are **excluded from the
-bins** rather than folded into the edge bins, so `rows_plotted` counts only
-the values actually binned and `excluded_out_of_range` appears in the stats
-block reporting how many were dropped. A histogram `x_range` containing no
-data renders empty at the requested extent instead of erroring. Bar charts
-ignore `x_range` entirely (their x positions are categorical). `bins` is
-clamped to 1..=500.
-
-Line/scatter DATE, TIMESTAMP, and TIMESTAMPTZ x values use a proportional
-time axis automatically. TEXT is categorical; set `x_as_category=true`
-to deliberately give temporal observations even spacing. Bars always
-treat x as categorical.
-
-Every successful database-routed tool response carries canonical
-`resolved_database`: `\"local\"`, `\"persistent\"`, or the lowercase attached
-alias. `copy_query` also retains `target_database`.
+Every successful database-routed tool response carries canonical `resolved_database`: "local",
+"persistent", or the lowercase attached alias. `copy_query` also retains `target_database`.
 
 ## Tool index
 
 ### Query
-- `query` — run a read-only SELECT / WITH / EXPLAIN / SHOW / VALUES.
-- `execute` — run one or more DDL/DML statements as an atomic batch.
-  `sql` is an array; multi-element batches run inside a transaction
-  (all commit or all roll back). Disabled in read-only mode.
-- `query_data` — ingest inline JSON or CSV and run one SQL query in a
-  single call (table is temporary).
-- `query_file` — same as `query_data` but reads from a file path. The
-  fastest path when the user asks \"what's in this file?\".
+- `query`(sql, database?) → rows; read-only SELECT|WITH|EXPLAIN|SHOW|VALUES; max 10,000 rows (check
+  `truncated`, `total_rows`)
+- `execute`(sql: [stmt, ...], database?) — DDL/DML; several elements = one transaction (all commit or
+  all roll back), one = auto-commit. Disabled in read-only mode
+- `query_data`(data, sql, format?: json|csv, table_name?="data", schema?) — inline JSON array or CSV +
+  one query, temporary table; format auto-detected (`[`/`{` → JSON, else CSV)
+- `query_file`(path, sql, table_name?="data", schema?, json_extract_path?) — same for a CSV|JSON|JSONL|
+  Parquet|Arrow IPC file; fastest answer to "what's in this file?"
+- `schema`: partial override `{"col": "BIGINT"}`, rest inferred · `json_extract_path`: dot path to a
+  nested JSON array, numeric segments index arrays (`content.0`), stringified JSON parsed en route
 
 ### Load
-
-**Format preference (ingest and export):** Parquet (fastest, server-side,
-preserves every type incl. NUMERIC precision / DATE / TIMESTAMP — best for
-large data) > Arrow IPC (very fast, no compression; schema overrides
-rejected since its schema is authoritative) > CSV (portable but types are
-inferred on load / lost on export) > JSON / JSONL (small or irregular data
-only — parsed row-by-row). Iceberg is a directory of Parquet for data-lake
-interop; `.hyper` export snapshots every table for Tableau.
-
-- `load_file` — load one CSV / JSON / JSONL / Parquet / Arrow IPC file
-  into a named database table. `mode`: `replace` (default) /
-  `append` / `merge`. Use `merge` to upsert by `merge_key` (column
-  name or list); new columns in the incoming file are auto-added via
-  `ALTER TABLE`.
-- `load_files` — load many files in parallel. Files must share a
-  schema (or be unioned). `merge` mode is not supported here — call
-  `load_file` per-file if you need merge.
-- `load_data` — load inline JSON / CSV into a named database table.
-- `load_iceberg` — load an Apache Iceberg table by absolute path to its
-  root directory; supports snapshot pinning via `metadata_filename` or
-  `version_as_of`.
+Format preference (ingest and export): Parquet (fastest, server-side, keeps every type incl. NUMERIC
+precision/DATE/TIMESTAMP; large data) > Arrow IPC (very fast, uncompressed; authoritative schema, so
+overrides rejected) > CSV (portable; types inferred on load, lost on export) > JSON|JSONL (small or
+irregular only; row-by-row). Iceberg: directory of Parquet, data-lake interop. `.hyper` export:
+snapshot of every table, for Tableau.
+- `load_file`(path, table, mode?: replace*|append|merge, merge_key?, schema?, json_extract_path?,
+  database?, persist?) — one CSV|JSON|JSONL|Parquet|Arrow IPC file → table. merge: upsert by
+  `merge_key` (column or list); new incoming columns auto-added via `ALTER TABLE` (Parameter rules)
+- `load_files`(files: [{path, table, mode?: replace*|append, schema?, json_extract_path?}],
+  concurrency?, database?, persist?) — parallel, one table each. ⚠ No merge: `load_file` per file
+- `load_data`(table, data, format?: json|csv, mode?: replace*|append, schema?, database?, persist?) —
+  inline JSON/CSV → table; replace drops and recreates
+- `load_iceberg`(path, table, mode?: replace*|append, metadata_filename?, version_as_of?) — Apache
+  Iceberg table root directory (`metadata/`, `data/`); pin a snapshot by `metadata_filename` (e.g.
+  "v2.metadata.json"; latest*) or `version_as_of`
 
 ### Inspect
-- `describe` — list local tables (no args) or describe one table
-  (`table` arg) with columns, types, row count, and prose metadata.
-  **Defaults to the local database** — pass `database: \"persistent\"`
-  (or an attached alias) to list/inspect durable tables. `status` reports
-  table *counts* only, never names, so check the right database here
-  before assuming a persistent table is missing.
-- `sample` — return schema + first N rows of a table. Use this before
-  writing a non-trivial query.
-- `inspect_file` — dry-run schema inference on a CSV / Parquet / Arrow
-  IPC file without loading it.
-- `status` — plugin and native/API identity; daemon/Hyper connection facts;
-  local/persistent paths; table count; disk usage; watchers; attachments;
-  read-only flag.
-  `engine.connection` gives the `hyperd` endpoint in the forms another
-  Hyper client needs: `transport` (`tcp` / `unix_domain_socket` /
-  `named_pipe`), `host` + `port` (TCP only, else null), `socket_path`
-  (IPC only, else null), and `connection_descriptor` — the scheme-
-  qualified string `hyperd` emits and the Hyper API accepts, e.g.
-  `tab.tcp://host:port`. TCP on every platform today.
-  Both full and degraded responses report `default_database: \"local\"`.
-  When
-  `engine_busy: true`, the response is partial and non-definitive:
-  `hyperd_running: false` is inconclusive; retry `status` for full
-  statistics after the in-progress operation completes.
+- `describe`(table?, database?) — no table → list tables; table → columns, types, row count, prose
+  metadata. ⚠ Local by default: pass `database: "persistent"` (or an alias) for durable tables;
+  `status` gives table counts, never names, so check here before assuming a table is missing
+- `sample`(table, n?, database?) → schema + first N rows; use before a non-trivial query
+- `inspect_file`(path, sample_rows?, json_extract_path?) — dry-run schema inference on a CSV|Parquet|
+  Arrow IPC|JSON file, no load
+- `status`() → plugin and native/API identity; daemon/Hyper connection facts; local/persistent paths;
+  table count; disk usage; watchers; attachments; read-only flag; `default_database: "local"` (full or
+  degraded). `engine.connection`, the `hyperd` endpoint for another Hyper client: `transport`
+  tcp|unix_domain_socket|named_pipe · `host`, `port` (TCP only, else null) · `socket_path` (IPC only,
+  else null) · `connection_descriptor`, the scheme-qualified string `hyperd` emits and the Hyper API
+  accepts (`tab.tcp://host:port`). Shared daemon → IPC; private `hyperd` (`--no-daemon` or daemon
+  fallback) → TCP. ⚠ `engine_busy: true` → partial, non-definitive response; `hyperd_running: false`
+  is inconclusive; retry `status` for full statistics after the in-progress operation completes
 
 ### Export
-- `export` — write a table or query result to a file (Parquet, Iceberg,
-  Arrow IPC, CSV, .hyper). A `.hyper` export leaves the source unchanged
-  but creates/replaces the destination file and materializes every user
-  table into it — a faithful backup: NOT NULL, DEFAULT, COLLATE, ASSUMED
-  PRIMARY KEY, and ASSUMED UNIQUE all survive (Hyper never accepts
-  enforced PRIMARY KEY / UNIQUE / FOREIGN KEY / CHECK at CREATE TABLE, so
-  no source table carries those). The response carries a `schema_fidelity`
-  object (`fully_preserved` plus per-class counts and an `unpreserved`
-  list naming each `table` + `column`) — check it before trusting an
-  export as a backup.
-- `chart` — render a bar / line / scatter / histogram PNG or SVG from a
-  SQL query as a quick diagnostic. Use long-format data (numeric y;
-  optional `series` grouping). See `Chart delivery and presentation`.
-- `copy_query` — run a SELECT across local + attached databases and
-  insert the result into a target table (`mode`: `create`, `append`,
-  `replace`). Cross-database analytics in one tool call.
+- `export`(path, format: parquet|iceberg|arrow_ipc|csv|hyper, sql? | table?, overwrite?, format_options?,
+  database?) — table or query result → file (iceberg: directory); `sql` or `table` required except
+  hyper (exports everything, ignores both); both given → `sql` wins. Existing destination →
+  PERMISSION_DENIED unless `overwrite: true`; iceberg replaces only an Iceberg table directory, hyper
+  only a `.hyper` file, never an open database. `database` = source; sql-mode unqualified names resolve
+  there. `.hyper` export leaves the source unchanged and writes every user table to the destination, a
+  faithful backup: NOT NULL, DEFAULT, COLLATE, ASSUMED PRIMARY KEY, ASSUMED UNIQUE survive (Hyper never
+  accepts enforced PRIMARY KEY/UNIQUE/FOREIGN KEY/CHECK at CREATE TABLE, so no source table has them).
+  Check `schema_fidelity` {`fully_preserved`, per-class counts, `unpreserved`: [{`table`, `column`}]}
+  before trusting an export as a backup
+- `format_options` → hyperd `COPY ... WITH (...)`; exact hyperd names, scalar values; ignored for hyper.
+  parquet: `codec` snappy*|zstd|gzip|uncompressed|…, `rows_per_row_group` · iceberg: parquet's +
+  `table_scheme` metastore*|filesystem, `max_file_size` (bytes) · csv: `header` (true*), `delimiter`
+  (","*), `null` (""*), `quote`
+- `chart` — see Chart delivery and presentation
+- `copy_query`(sql, target_table, mode: create|append|replace, target_database?, temp_attach?:
+  [attach_database args]) — SELECT|WITH|VALUES across local + attached (qualified: `src.public.t`) →
+  `public` schema of `target_database` (local*; else writable). `temp_attach`: this call only,
+  auto-detached even on failure; aliases must be unused
 
 ### Saved queries & metadata
-- `save_query` — save a named read-only SQL query for later reuse.
-- `delete_query` — delete a named saved query.
-- `set_table_metadata` — update prose metadata (source_url, purpose,
-  notes, license, source_description) on an existing table catalog entry.
-  Local and persistent tables share one name-keyed persistent catalog;
-  writable user-attached databases have per-database catalogs.
+- `save_query`(name, sql, description?) — named read-only query → resources
+  `hyper://queries/{name}/definition`, `.../result` (re-runs on read); survives restarts unless
+  `--ephemeral-only`; duplicate name rejected (`delete_query` first)
+- `delete_query`(name) — missing name: no-op → `{"deleted": false}`
+- `set_table_metadata`(table, source_url?, purpose?, notes?, license?, source_description?, data_url?,
+  database?) — prose metadata on an existing table catalog entry; omitted unchanged, "" clears. Local
+  and persistent tables share one name-keyed persistent catalog; writable user-attached databases have
+  per-database catalogs
 
 ### Multi-database
-- `attach_database` — attach an additional .hyper database under an
-  alias. Pass `writable: true` to allow writes through it.
-- `detach_database` — detach a previously attached database.
-- `list_attached_databases` — list current attachments.
+- `attach_database`(alias, path, writable?=false, on_missing?: error*|create, kind?: local_file*) —
+  alias: SQL identifier, not `local`. `writable: true` allows writes through it. `on_missing: "create"`
+  makes an empty file (needs `writable: true`; parent directory must exist)
+- `detach_database`(alias) · `list_attached_databases`() → current attachments
 
 ### Directory watching
-- `watch_directory` — watch a directory and auto-ingest matching files
-  as they appear.
-- `unwatch_directory` — stop watching a previously registered
-  directory.
+- `watch_directory`(path, table, max_concurrent?=4 (≤32), database?, persist?) — producer writes
+  `x.csv` atomically (tmp + rename), then empty `x.csv.ready`; watcher appends x.csv to `table`,
+  deletes both on success; on failure moves both to `failed/` + `x.csv.error` JSON (no retry)
+- `unwatch_directory`(path) — stop
 
 ### Key-value store (scratchpad)
-- `kv_set` — save a variable / state / summary / JSON string under a
-  store + key. Returns `{stored, created, value_bytes}`. Pass
-  `overwrite: false` to skip writes that would clobber an existing key
-  (response: `{stored: false, existed: true}`). Pass
-  `value_path: <absolute path>` to store a file's contents server-side
-  instead of inlining `value` (exactly one of `value` / `value_path`;
-  reads any path the server process can read — no sandbox; files over
-  64 MiB are rejected before reading).
-- `kv_set_many` — atomic batch write. Pass an `entries` array of
-  `{key, value}` objects. All keys validated up front; an invalid key
-  aborts the whole batch without writing anything. `overwrite: false`
-  skips existing keys. Returns counts plus `total_bytes`, which counts
-  submitted values and may exceed bytes persisted when entries skip.
-- `kv_get` — read a value by store + key.
-- `kv_delete` — delete a key.
-- `kv_list` — list keys in a store. Pass `values: true` to return
-  `{entries: [{key, value}, ...]}` instead of `{keys: [...]}` — reads
-  the whole store in one call (eliminates N×`kv_get`).
-- `kv_list_stores` — list store namespaces that hold data in a database.
-- `kv_size` — count keys and total value bytes in a store. Returns
-  `{size, bytes}`.
-- `kv_pop` — destructively read-and-remove the lowest-keyed entry
-  (lexicographic key order, not insertion order).
-- `kv_clear` — delete all keys in a store.
+- `kv_set`(store, key, value | value_path, overwrite?=true) → `{stored, created, value_bytes}`;
+  `overwrite: false` + existing key → `{stored: false, existed: true}`. `value_path`: absolute path,
+  contents stored server-side instead of `value` (exactly one of the two; any path the server process
+  can read, no sandbox; over 64 MiB rejected before reading)
+- `kv_set_many`(store, entries: [{key, value}], overwrite?=true) — atomic batch; keys validated up
+  front, one invalid key aborts it, nothing written; `overwrite: false` skips existing keys →
+  `{stored, created, overwritten|skipped, total_bytes}` (submitted values; may exceed bytes persisted
+  when entries skip)
+- `kv_get`(store, key) → `{found, value}` · `kv_delete`(store, key) · `kv_clear`(store) — delete all keys
+- `kv_list`(store, values?) → `{keys: [...]}`; `values: true` → `{entries: [{key, value}, ...]}`, whole
+  store in one call (no N×`kv_get`)
+- `kv_list_stores`() → store namespaces holding data in a database · `kv_size`(store) → `{size, bytes}`
+- `kv_pop`(store) → `{found, key, value}` — destructive read-and-remove of the lowest-keyed entry (lexicographic key order, not
+  insertion order)
 
-Every kv_* tool takes the same optional `database` parameter as the data
-tools. Omit it and the store lives in the local database (lost on
-restart); pass `\"persistent\"` (or `persist: true`) to persist across
-restarts, or any attached alias to target that database. Every user-attached
-target must be writable, even for readers, because the backing table may
-need initialization. The global `--read-only` guard blocks the five KV
-mutators but not the four readers. Each database has its own isolated set
-of stores. Enrich analytical tables with KV
-metadata via LEFT JOIN — always filter `kv.store_name = '<namespace>'`
-to avoid row multiplication, and keep the KV table in the same database
-as the joined table. See the `hyper://schema/kv` resource for the join
-template, and `KV store vs. a custom table` above for when to reach for
-this instead of a real table.
+Stores appear on first write. Every kv_* tool also takes `database?`/`persist?`: local* (lost on
+restart); "persistent" or `persist: true` survives; an attached alias targets that database. Every
+user-attached target must be writable, even for readers (the backing table may need initialization).
+`--read-only` blocks the five KV mutators, not the four readers. Each database has its own isolated
+stores. Enrich tables via LEFT JOIN: always filter `kv.store_name = '<namespace>'` (else rows
+multiply); keep the KV table in the joined table's database; template: `hyper://schema/kv` resource.
 
-**Querying JSON in a KV value:** Values are TEXT. To query JSON
-structure, cast first: `SELECT value::json ->> 'field' FROM
-_hyperdb_kv_store WHERE store_name = '...'`. The `->` / `->>` /
-`JSON_EACH(...)` operators work AFTER the `::json` cast. Applying `->`
-or `->>` to raw TEXT fails with SQLSTATE 42601 (\"requires a structured
-data type\"). `JSON_VALUE(...)` is not implemented in this engine — use
-the `::json` cast instead.
+**Querying JSON in a KV value:** values are TEXT; cast first: `SELECT value::json ->> 'field' FROM
+_hyperdb_kv_store WHERE store_name = '...'`. `->`, `->>`, `JSON_EACH(...)` work after `::json`; on raw
+TEXT → SQLSTATE 42601 ("requires a structured data type"). `JSON_VALUE(...)` not implemented; cast.
 
-**::numeric truncation gotcha:** A bare `::numeric` cast defaults to
-scale 0 and truncates decimal places. Example: `41.54178215::numeric`
-→ `42`. Always specify precision and scale: `::numeric(20,10)`.
+**`::numeric` gotcha:** bare `::numeric` is scale 0, drops decimals: `41.54178215::numeric` → `42`.
+Give precision and scale: `::numeric(20,10)`.
 
 ### Introspection
-- `get_readme` — this document. Call once at the start of a session.
+- `get_readme`() — this document; call once at session start
 
 ## Parameter rules
 
-- **File paths must be absolute.** Relative paths are rejected.
-- **Identifiers fold to lowercase** unless double-quoted. `SELECT * FROM
-  Sales` reads `sales`. Use `\"Sales\"` to preserve case.
-- **`query` is read-only.** SELECT / WITH / EXPLAIN / SHOW / VALUES
-  only. For DDL / DML use `execute`.
-- **Read-only mode** (`--read-only` flag on the server) guards exactly:
-  `execute`, `load_data`, `load_file`, `load_files`, `load_iceberg`,
-  `watch_directory`, `save_query`, `delete_query`, `set_table_metadata`,
-  `copy_query`, `kv_set`, `kv_set_many`, `kv_delete`, `kv_pop`, and
-  `kv_clear`. A writable `attach_database` or `on_missing: \"create\"` is
-  also guarded, while a read-only attachment remains available.
-  Queries and inspection, `chart`, and detach/list operations remain
-  available. unwatch_directory remains allowed; export formats, including
-  Hyper, remain allowed. Hyper export does not mutate its source database,
-  but it does create or replace its materialized destination file.
-- **Persistent-file contention:** only a reserved persistent attachment
-  lock is reported as `RESOURCE_BUSY`. Run `hyperdb-mcp doctor`, compare
-  client/daemon identities, close the possible owner (Hyper, Tableau, or
-  another process), or copy/select another `.hyper` file, then retry.
-- **Table names** in `load_*` and `query_data` / `query_file` accept
-  unquoted identifiers; the server lowercases them.
-- **`copy_query` modes:** `create` requires the target not exist;
-  `append` requires it does; `replace` drops and recreates atomically.
-- **`load_file` merge mode:** `mode = \"merge\"` requires `merge_key`
-  (column name or list of column names). Rows whose key matches an
-  existing row UPDATE; non-matching rows INSERT. Columns present in
-  the incoming file but not the target are auto-added via
-  `ALTER TABLE ADD COLUMN` (nullable; existing rows fill with NULL).
-  **Type changes on existing columns are rejected** — use `replace`
-  or apply a `schema` override. The DELETE+INSERT pair is not
-  transactional (Hyper auto-commits DDL); a mid-run failure leaves
-  partial state, same as `replace`.
+- Identifiers fold to lowercase unless double-quoted: `SELECT * FROM Sales` reads `sales`; `"Sales"`
+  keeps case. Table names in `load_*`, `query_data`, `query_file`: unquoted identifiers, lowercased.
+- Query SQL is read-only in every tool taking it (`query`, `query_data`, `query_file`, `export`,
+  `chart`, `save_query`, ...): one SELECT|WITH|EXPLAIN|SHOW|VALUES, even without `--read-only`; a write
+  behind `WITH` or `EXPLAIN (ANALYZE)` is refused. DDL/DML → `execute`.
+- `--read-only` server flag guards exactly: execute, load_data, load_file, load_files, load_iceberg,
+  watch_directory, save_query, delete_query, set_table_metadata, copy_query, kv_set, kv_set_many,
+  kv_delete, kv_pop, kv_clear, plus a writable `attach_database` or `on_missing: "create"`. Read-only
+  attachments, queries, inspection, `chart`, detach/list stay available.
+  unwatch_directory remains allowed; export formats, including Hyper, remain allowed. Hyper export does not mutate its source
+  database, but it does create or replace its materialized destination file.
+- Persistent-file contention: only a reserved persistent attachment lock is reported as
+  `RESOURCE_BUSY`. Run `hyperdb-mcp doctor`, compare client/daemon identities, close the possible owner
+  (Hyper, Tableau, or another process) or copy/select another `.hyper` file, then retry.
+- `copy_query` mode: create (target must not exist; CREATE TABLE AS) | append (must exist; INSERT
+  INTO ... SELECT) | replace (drop and recreate, atomically).
+- `load_file` merge (needs `merge_key`): key match → row deleted, incoming row inserted (target columns
+  absent from the file → NULL; duplicate incoming keys all insert) · no match → INSERT · new file
+  column → `ALTER TABLE ADD COLUMN` (nullable, existing rows NULL) · type change on an existing column
+  → rejected (use replace or a `schema` override). ⚠ DELETE+INSERT is not transactional (Hyper
+  auto-commits DDL): a mid-run failure leaves partial state, same as replace.
 
 ## SQL dialect quick-reference
 
-PostgreSQL-compatible with Salesforce Data Cloud SQL extensions. Key
-differences from standard PostgreSQL:
+PostgreSQL-compatible plus Salesforce Data Cloud SQL extensions. Differences:
 
-- **No `information_schema` / `pg_catalog`.** Use `describe` / `sample`
-  instead.
-- **No JSON / JSONB / UUID / SERIAL / BIGSERIAL / geometry types.**
-  Atomic types only: SMALLINT, INTEGER, BIGINT, REAL, DOUBLE PRECISION,
-  NUMERIC(p,s), BOOLEAN, TEXT, CHAR(n), VARCHAR(n), BYTES, DATE, TIME,
-  TIMESTAMP, TIMESTAMPTZ, INTERVAL, plus arrays of any atomic type.
-- **`external(path, format => '...')`** — read Parquet / CSV / Iceberg
-  directly from disk inside a query without first loading it as a
-  table. Usable in the FROM clause.
-- **Physical `NullType` Parquet columns are unreadable** — what a writer
-  emits for an all-null optional column in one partition. Hyper rejects
-  the *whole file* with `42804` (\"a data type that cannot be read by
-  Hyper ... hinting at a corrupted file\"); the file is not corrupt, and
-  selecting only the other columns does not help. A `schema` override
-  cannot fix it either: the override becomes a cast in the projection,
-  which the engine never evaluates. Re-type the column at the writer
-  (e.g. cast it to DOUBLE) and regenerate. `inspect_file` reports such a
-  column as type `NULL`; `load_file`, `load_files`, and `query_file`
-  fail fast and name it.
-- **`to_char` is date/time only.** `to_char(TIMESTAMP '2020-01-02
-  03:04:05', 'YYYY-MM-DD')` → `2020-01-02` and `to_char(DATE
-  '2020-01-02', 'YYYY')` → `2020` both work. There is **no numeric
-  overload** — integer and NUMERIC arguments alike fail with `42601
-  unsupported data types in call to 'to_char'`, e.g.
-  `to_char(123.456, 'FM990.00')`. That is an argument-type error, not a
-  missing function: a function Hyper genuinely lacks returns `42883`, as
-  `format()` does.
-- **`expr::TEXT` is the numeric-formatting idiom** and preserves scale:
-  `CAST(9.5 AS NUMERIC(8,2))::TEXT` → `9.50`. Reach for this instead of
-  `to_char` on a number, and whenever you need exact decimal output.
-- **A NUMERIC too large for an `f64` comes back as a JSON string**, not a
-  number, so no precision is lost in the result: `99999999999999999.99`
-  arrives as `\"99999999999999999.99\"`. Values that fit an `f64` — which
-  includes anything with 15 or fewer significant digits — stay JSON
-  numbers, so `9.50` arrives as `9.5`. Parse such a field as a decimal
-  string rather than assuming a number, and note it may already be exact
-  text if you applied `::TEXT` above.
-- **`APPROX_COUNT_DISTINCT(expr)`** — approximate cardinality, 5-100x
-  faster than `COUNT(DISTINCT ...)` at high cardinality, on TEXT as well
-  as numeric keys. It accelerates the distinct step only, so a per-row
-  `a || '-' || b` inside `expr` is paid either way and can swamp the win:
-  prefer a numeric composite key (`a * 1000 + b`).
-- **No `QUALIFY`** — absent from the grammar, so it fails the statement
-  with SQLSTATE `42601` (syntax error; a missing *function* would be
-  `42883`). Wrap the window in a subquery or CTE and filter outside. The
-  rewrite is exactly equivalent and costs nothing measurable:
-  ```
-  SELECT * FROM (SELECT k, ROW_NUMBER() OVER (PARTITION BY p
-    ORDER BY c DESC) AS rnk FROM t) s WHERE rnk <= 5
-  ```
-- **Window functions:** all standard ones plus `modified_rank()` (like
-  `rank()` but assigns the LOWEST rank on ties). `IGNORE NULLS` /
-  `RESPECT NULLS` only on `last_value`.
-- **`DISTINCT ON (expr, ...)`, `GROUPING SETS`, `ROLLUP`, `CUBE`,
-  `FILTER (WHERE ...)`, ordered-set aggregates (`MODE()`,
-  `PERCENTILE_CONT()`, `PERCENTILE_DISC()` with `WITHIN GROUP`)** all
-  supported.
-- **CTEs:** `WITH` and `WITH RECURSIVE`. CTEs evaluate once per query.
-- **`TOP N`** is accepted alongside `LIMIT`.
-- **No AI scalar functions** (`AI_CLASSIFY`, `AI_SENTIMENT`, etc. — those
-  are Data Cloud federation features, not Hyper).
-- **No `ON CONFLICT` / `INSERT ... ON DUPLICATE KEY`.** Pass an array of
-  statements to `execute` and they run atomically inside a transaction:
-  ```
-  execute({ \"sql\": [
-    \"UPDATE settings SET value = 'dark' WHERE key = 'theme'\",
-    \"INSERT INTO settings (key, value) SELECT 'theme', 'dark'
-       WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key = 'theme')\"
-  ]})
-  ```
-  Single-element arrays auto-commit (same as the legacy single-statement
-  shape). Mixing DDL with DML in one batch is rejected — Hyper aborts
-  such transactions with SQLSTATE 0A000. Issue DDL in its own `execute`
-  call. Do NOT include `BEGIN` / `COMMIT` / `ROLLBACK` / `SAVEPOINT` in
-  batch elements — the tool manages the transaction for you and these
-  are rejected up front.
+- ✗ `information_schema`, `pg_catalog` → `describe`/`sample`. ✗ JSON, JSONB, UUID, SERIAL, BIGSERIAL,
+  geometry. Atomic types only: SMALLINT, INTEGER, BIGINT, REAL, DOUBLE PRECISION, NUMERIC(p,s),
+  BOOLEAN, TEXT, CHAR(n), VARCHAR(n), BYTES, DATE, TIME, TIMESTAMP, TIMESTAMPTZ, INTERVAL, + arrays of
+  any atomic type.
+- ✓ `external(path, format => '...')` in FROM: read Parquet|CSV|Iceberg from disk, no load.
+- ⚠ Physical `NullType` Parquet column (a writer's all-null optional column in one partition) → Hyper
+  rejects the whole file, `42804` ("a data type that cannot be read by Hyper ... hinting at a corrupted
+  file"). Not corrupt; selecting other columns doesn't help; a `schema` override can't fix it (it
+  becomes a projection cast the engine never evaluates). Re-type it at the writer (e.g. cast to
+  DOUBLE), regenerate. `inspect_file` shows type `NULL`; `load_file`, `load_files`, `query_file` fail
+  fast naming it.
+- ⚠ `to_char` is date/time only: `to_char(TIMESTAMP '2020-01-02 03:04:05', 'YYYY-MM-DD')` →
+  `2020-01-02`, `to_char(DATE '2020-01-02', 'YYYY')` → `2020`. No numeric overload: integer and
+  NUMERIC alike → `42601 unsupported data types in call to 'to_char'` (e.g. `to_char(123.456,
+  'FM990.00')`), an argument-type error; a truly missing function is `42883`, like `format()`.
+- ✓ `expr::TEXT` formats numbers, keeps scale: `CAST(9.5 AS NUMERIC(8,2))::TEXT` → `9.50`. Use it
+  instead of `to_char` on numbers and for exact decimal output.
+- ⚠ NUMERIC too large for `f64` → JSON string, no precision lost: `99999999999999999.99` →
+  `"99999999999999999.99"`. Fits `f64` (any ≤15 significant digits) → JSON number: `9.50` → `9.5`.
+  Parse such fields as decimal strings; after `::TEXT` they are exact text.
+- ✓ `APPROX_COUNT_DISTINCT(expr)`: approximate cardinality, 5-100x faster than `COUNT(DISTINCT ...)`
+  at high cardinality, TEXT or numeric. Speeds only the distinct step: per-row `a || '-' || b` in
+  `expr` is paid either way and can swamp the win; prefer a numeric key (`a * 1000 + b`).
+- ✗ `QUALIFY`: not in the grammar → `42601` (syntax; a missing function would be `42883`). Filter a
+  subquery/CTE instead (exactly equivalent, no measurable cost): `SELECT * FROM (SELECT k,
+  ROW_NUMBER() OVER (PARTITION BY p ORDER BY c DESC) AS rnk FROM t) s WHERE rnk <= 5`
+- ✓ All standard window functions + `modified_rank()` (`rank()` but LOWEST rank on ties); `IGNORE
+  NULLS`/`RESPECT NULLS` only on `last_value`.
+- ✓ `DISTINCT ON (expr, ...)`, `GROUPING SETS`, `ROLLUP`, `CUBE`, `FILTER (WHERE ...)`, ordered-set
+  aggregates (`MODE()`, `PERCENTILE_CONT()`, `PERCENTILE_DISC()` + `WITHIN GROUP`), `WITH`, `WITH
+  RECURSIVE` (each CTE evaluated once per query), `TOP N` alongside `LIMIT`.
+- ✗ AI scalar functions (`AI_CLASSIFY`, `AI_SENTIMENT`, ...): Data Cloud federation, not Hyper.
+- ✗ `ON CONFLICT`, `INSERT ... ON DUPLICATE KEY` → statement array to `execute`, run atomically (see
+  the upsert example). ⚠ DDL + DML in one batch rejected (Hyper aborts it, SQLSTATE 0A000): DDL in its
+  own `execute`. ⚠ No `BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT` elements: the tool manages the
+  transaction and rejects them up front.
 
 Full reference: https://developer.salesforce.com/docs/data/data-cloud-query-guide/references/dc-sql-reference
 
@@ -405,82 +274,41 @@ Full reference: https://developer.salesforce.com/docs/data/data-cloud-query-guid
 
 ```
 // Quickest path: query a file without loading it as a table
-query_file({
-  \"path\": \"/tmp/sales.csv\",
-  \"sql\": \"SELECT region, SUM(amount) FROM data GROUP BY region\"
-})
-
+query_file({ "path": "/tmp/sales.csv", "sql": "SELECT region, SUM(amount) FROM data GROUP BY region" })
 // Inspect a file before committing to a load
-inspect_file({ \"path\": \"/tmp/sales.csv\" })
-
-// Loaded-table workflow (best when you'll run multiple queries)
-load_file({ \"path\": \"/tmp/sales.csv\", \"table\": \"sales\" })
-sample({ \"table\": \"sales\" })
-query({ \"sql\": \"SELECT region, SUM(amount) FROM sales GROUP BY region\" })
-
+inspect_file({ "path": "/tmp/sales.csv" })
+// Loaded-table workflow (best for multiple queries)
+load_file({ "path": "/tmp/sales.csv", "table": "sales" }); sample({ "table": "sales" })
+query({ "sql": "SELECT region, SUM(amount) FROM sales GROUP BY region" })
 // Cross-database join via attachment
-attach_database({ \"alias\": \"lookup\", \"path\": \"/data/dim.hyper\" })
-query({
-  \"sql\": \"SELECT s.region, d.country_name, SUM(s.amount) \
-          FROM sales s JOIN lookup.public.dim_region d ON s.region = d.code \
-          GROUP BY s.region, d.country_name\"
-})
-
-// Read Parquet directly inside a query — no load step
-query({
-  \"sql\": \"SELECT COUNT(*) FROM external('/tmp/events.parquet', format => 'parquet')\"
-})
-
+attach_database({ "alias": "lookup", "path": "/data/dim.hyper" })
+query({ "sql": "SELECT s.region, d.country_name, SUM(s.amount) FROM sales s
+  JOIN lookup.public.dim_region d ON s.region = d.code GROUP BY s.region, d.country_name" })
+// Read Parquet directly inside a query, no load step
+query({ "sql": "SELECT COUNT(*) FROM external('/tmp/events.parquet', format => 'parquet')" })
 // Export a query result
-export({
-  \"sql\": \"SELECT * FROM sales WHERE amount > 1000\",
-  \"path\": \"/tmp/big_sales.parquet\",
-  \"format\": \"parquet\"
-})
-
-// Refresh existing rows + auto-add new columns (upsert by job_id).
-// Use this when you re-parsed source data with extra fields and want
-// to update the table in place without dropping it.
-load_file({
-  \"path\": \"/tmp/extract_failures-with-host.json\",
-  \"table\": \"extract_timing_failures\",
-  \"mode\": \"merge\",
-  \"merge_key\": \"job_id\"
-})
-
-// Single-statement execute (auto-commit, same as before)
-execute({
-  \"sql\": [\"DELETE FROM events WHERE created_at < CURRENT_DATE - INTERVAL '90' DAY\"]
-})
-
-// Atomic upsert — both statements commit together or both roll back
-execute({
-  \"sql\": [
-    \"UPDATE settings SET value = 'dark' WHERE key = 'theme'\",
-    \"INSERT INTO settings (key, value) SELECT 'theme', 'dark' \
-       WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key = 'theme')\"
-  ],
-  \"database\": \"persistent\"
-})
-
+export({ "sql": "SELECT * FROM sales WHERE amount > 1000", "path": "/tmp/big.parquet", "format": "parquet" })
+// Re-parsed source gained fields: upsert by job_id, auto-add columns, refresh in place, no drop
+load_file({ "path": "/tmp/failures.json", "table": "failures", "mode": "merge", "merge_key": "job_id" })
+// Single-statement execute (auto-commit)
+execute({ "sql": ["DELETE FROM events WHERE created_at < CURRENT_DATE - INTERVAL '90' DAY"] })
+// Atomic upsert: both statements commit together or both roll back
+execute({ "database": "persistent", "sql": [
+  "UPDATE settings SET value = 'dark' WHERE key = 'theme'",
+  "INSERT INTO settings (key, value) SELECT 'theme', 'dark'
+     WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key = 'theme')" ] })
 // Chart
-chart({
-  \"sql\": \"SELECT region, SUM(amount) AS total FROM sales GROUP BY region\",
-  \"chart_type\": \"bar\",
-  \"x\": \"region\",
-  \"y\": \"total\"
-})
+chart({ "sql": "SELECT region, SUM(amount) AS total FROM sales GROUP BY region",
+  "chart_type": "bar", "x": "region", "y": "total" })
 ```
 
 ## Tips for picking the right tool
 
-- One-shot \"what's in this file?\" → `query_file` or `inspect_file`.
-- Repeated analysis on the same data → `load_file` once, then `query`.
-- File too large to fit in memory comfortably → `external()` inside
-  `query` (streams from disk).
-- Joining datasets across .hyper files → `attach_database` + `query`.
-- Materializing a query result as a new table → `copy_query`.
-- Need a picture for the user → `chart`.
-- Re-parsed source data with new columns and want to update existing
-  table in place → `load_file` with `mode: \"merge\"`.
-";
+- one-shot "what's in this file?" → `query_file` or `inspect_file`
+- repeated analysis of the same data → `load_file` once, then `query`
+- file too large for memory → `external()` inside `query` (streams from disk)
+- join across .hyper files → `attach_database` + `query`
+- materialize a query result as a table → `copy_query`
+- a picture for the user → `chart`
+- re-parsed source with new columns, update in place → `load_file` with `mode: "merge"`
+"##;

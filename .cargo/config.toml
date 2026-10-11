@@ -7,7 +7,7 @@ download-hyperd = "run --release --package hyperdb-bootstrap --bin hyperdb-boots
 # Use mold on Linux to avoid lld OOM-crashing on large debug link jobs
 # (CI ubuntu-latest runners have ~7 GB RAM; linking the full workspace in
 # debug mode with lld exhausts it and triggers a Bus error / signal 7).
-# mold is pre-installed on ubuntu-latest since actions/runner-images 20240310.
+# CI installs mold via apt in every Linux job that builds code.
 # No effect on macOS or Windows (target cfg guards the override).
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"

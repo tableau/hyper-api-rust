@@ -1,12 +1,12 @@
 // Copyright (c) 2026, Salesforce, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Connection pool example demonstrating async connection pooling with deadpool.
+//! Connection pool example demonstrating async connection pooling.
 //!
 //! This example shows how to use the connection pool for efficient connection
 //! reuse in async applications with multiple concurrent tasks.
 //!
-//! Run with: cargo run --example `connection_pool` --features pool
+//! Run with: cargo run -p hyperdb-api --example connection_pool
 
 use std::time::Duration;
 
@@ -44,10 +44,7 @@ async fn main() -> Result<()> {
 
     // Get a connection to set up the schema
     {
-        let conn = pool
-            .get()
-            .await
-            .map_err(|e| hyperdb_api::Error::internal(e.to_string()))?;
+        let conn = pool.get().await?;
         conn.execute_command(
             "CREATE TABLE counters (
                 id INT NOT NULL,
@@ -102,7 +99,11 @@ async fn main() -> Result<()> {
     }
 
     println!("\nAll tasks completed!");
-    println!("Pool status: {} connections in use", pool.status().size);
+    let status = pool.status();
+    println!(
+        "Pool status: {} connections open, {} idle",
+        status.size, status.idle
+    );
 
     Ok(())
 }

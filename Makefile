@@ -99,15 +99,14 @@ build-api-release:
 	cargo build --release -p hyperdb-api-core -p hyperdb-api
 
 # Run tests (debug) with proper environment
-# Mirrors the CI `test` job so a local pass means a CI pass. It previously
-# covered only 3 of the 8 crates, which made its pass count look like whole-
-# workspace coverage when it was a subset -- use `test-api` for the narrow run.
+# Mirrors the CI `test` job so a local pass means a CI pass; use `test-api`
+# for the narrow API-only run.
 #
 # Excludes match CI: hyperdb-api-node needs napi-rs plus a Node toolchain and
-# has its own workflow, and hyperdb-bootstrap runs separately below because it
-# does not need hyperd. hyperdb-compile-check declares its own [workspace], so
-# `--workspace` cannot see it -- and until this target included it, nothing in
-# CI or the Makefile ran that published crate's tests at all.
+# is built and smoke-tested by the node-bindings job, and hyperdb-bootstrap
+# runs separately below because it does not need hyperd. hyperdb-compile-check
+# declares its own [workspace], so `--workspace` cannot see it and the last
+# command below runs its tests explicitly.
 test:
 	@echo "Environment:"
 	@echo "  HYPERD_PATH=$(HYPERD_PATH)"
@@ -147,7 +146,7 @@ download-hyperd:
 	cargo run --release -p hyperdb-bootstrap --bin hyperdb-bootstrap -- download $(ARGS)
 
 # Network-only check: probe each supported platform's wheel URL for the pinned
-# release and cross-check its digest against PyPI. Intended for CI (nightly +
+# release and cross-check its digest against PyPI. Intended for CI (weekly +
 # on PRs touching hyperd-version.toml).
 verify-hyperd-pin:
 	cargo run --release -p hyperdb-bootstrap --bin hyperdb-bootstrap -- verify $(ARGS)

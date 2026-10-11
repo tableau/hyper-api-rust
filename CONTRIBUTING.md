@@ -15,7 +15,7 @@ Use GitHub Issues page to submit issues, enhancement requests and discuss ideas.
 ### Bug Reports and Fixes
 
 - If you find a bug, please search for it in the [Issues](https://github.com/tableau/hyper-api-rust/issues), and if it isn't already tracked,
-   [create a new issue](https://github.com/tableau/hyper-api-rust/issues/new). Fill out the "Bug Report" section of the issue template. Even if an Issue is closed, feel free to comment and add details, it will still
+   [create a new issue](https://github.com/tableau/hyper-api-rust/issues/new). Include the crate and version, your OS, the `hyperd --version` output, a minimal reproduction, and the expected vs. actual behavior. Even if an Issue is closed, feel free to comment and add details, it will still
    be reviewed.
 - Issues that have already been identified as a bug (note: able to reproduce) will be labelled `bug`.
 - If you'd like to submit a fix for a bug, [send a Pull Request](#creating-a-pull-request) and mention the Issue number.
@@ -140,7 +140,7 @@ GPG signing is also supported — see [GitHub's signing-commits guide](https://d
 7. **Submit** a Pull Request against the `main` branch and refer to the issue(s) you are fixing. Try not to pollute your pull request with unintended changes. Keep it simple and small.
 8. **Sign** the Salesforce CLA (you will be prompted to do so when submitting the Pull Request)
 
-> **NOTE**: Be sure to [sync your fork](https://help.github.com/articles/syncing-a-fork/) before making a pull request.
+> **NOTE**: Be sure to [sync your fork](https://docs.github.com/en/pull-requests/how-tos/work-with-forks/syncing-a-fork) before making a pull request.
 
 ## Contributor License Agreement ("CLA")
 
@@ -274,4 +274,4 @@ Please follow our [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## License
 
-By contributing your code, you agree to license your contribution under the terms of our project [MIT](LICENSE-MIT) and [Apache-2.0](LICENSE-APACHE) dual license, and to sign the [Salesforce CLA](https://cla.salesforce.com/sign-cla).
+By contributing your code, you agree to license your contribution under the terms of our project [MIT](LICENSE-MIT.txt) and [Apache-2.0](LICENSE-APACHE.txt) dual license, and to sign the [Salesforce CLA](https://cla.salesforce.com/sign-cla).

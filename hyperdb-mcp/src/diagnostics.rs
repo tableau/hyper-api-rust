@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
-use crate::daemon::discovery::{DaemonRecord, PortScan, RawDiscoveryRead};
+use crate::daemon::control::HealthEndpoint;
+use crate::daemon::discovery::{DaemonRecord, RawDiscoveryRead};
 
 const MAX_LAUNCHER_INFO_BYTES: usize = 16 * 1024;
 const MAX_REPORTED_STRING_BYTES: usize = 4 * 1024;
@@ -272,7 +273,9 @@ struct DoctorDaemonSection {
     state: DoctorDaemonState,
     pid: Option<u32>,
     hyperd_endpoint: Option<String>,
-    health_port: Option<u16>,
+    health_endpoint: Option<String>,
+    /// Whether a daemon currently holds the single-instance lock.
+    lock: DoctorLockState,
     started_at: Option<String>,
     version: Option<String>,
     mcp_version: Option<String>,
@@ -308,24 +311,26 @@ pub struct DoctorReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DoctorMoment(pub(crate) u64);
 
-/// Finite monotonic deadline shared by doctor scans and probes.
+/// Whether the daemon lock is held, observed without taking it for long or
+/// creating it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DoctorLockState {
+    /// The lock file does not exist, so no daemon has ever run here.
+    Absent,
+    /// A daemon holds the lock (running, starting or stopping).
+    Held,
+    /// The lock file exists and nothing holds it.
+    Free,
+    /// The lock could not be inspected.
+    Unknown,
+}
+
+/// Finite monotonic deadline shared by doctor probes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DoctorDeadline(pub(crate) u64);
 
-/// Bounded candidate-scan request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DoctorScanRequest {
-    pub(crate) ports: PortScan,
-    pub(crate) deadline: DoctorDeadline,
-}
-
-/// A candidate location returned by the bounded scanner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DoctorScanCandidate {
-    pub(crate) responding_port: u16,
-}
-
-/// Raw outcome from fetching enriched `STATUS` at one candidate port.
+/// Raw outcome from fetching enriched `STATUS` at the recorded health endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DoctorStatusProbe {
     Unreachable,
@@ -335,7 +340,6 @@ pub(crate) enum DoctorStatusProbe {
 /// Finite collection policy supplied independently of process globals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DoctorCollectRequest {
-    pub(crate) ports: PortScan,
     pub(crate) timeout: Duration,
 }
 
@@ -352,7 +356,6 @@ pub(crate) enum DoctorDaemonState {
     Oversized,
     ParsedUnreachable,
     LiveFromDiscovery,
-    LiveFromScan,
 }
 
 /// One recorded discovery fact that disagrees with fresh enriched `STATUS`.
@@ -381,24 +384,24 @@ pub(crate) enum DoctorDaemonWarning {
     MalformedDiscovery,
     OversizedDiscovery,
     DiscoveryCandidateUnreachable {
-        responding_port: u16,
+        health_endpoint: String,
     },
     StaleOrReplacedDiscovery {
         mismatches: Vec<DiscoveryFactMismatch>,
     },
-    StatusHealthPortMismatch {
-        responding_port: u16,
-        reported_port: u16,
+    StatusHealthEndpointMismatch {
+        recorded_endpoint: String,
+        reported_endpoint: String,
     },
     MalformedStatus {
-        responding_port: u16,
+        health_endpoint: String,
     },
 }
 
-/// Fresh daemon facts accepted only after candidate-port verification.
+/// Fresh daemon facts accepted only after verification against the recorded health endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VerifiedDoctorDaemon {
-    pub(crate) responding_port: u16,
+    pub(crate) health_endpoint: String,
     pub(crate) record: DaemonRecord,
 }
 
@@ -416,8 +419,7 @@ pub(crate) struct DoctorDaemonReport {
 /// mutation, and unbounded network operations.
 pub(crate) struct DoctorCollectorDependencies<'a> {
     pub(crate) read_raw_discovery: &'a dyn Fn() -> RawDiscoveryRead,
-    pub(crate) probe_enriched_status: &'a dyn Fn(u16, DoctorDeadline) -> DoctorStatusProbe,
-    pub(crate) scan_candidates: &'a dyn Fn(DoctorScanRequest) -> Vec<DoctorScanCandidate>,
+    pub(crate) probe_enriched_status: &'a dyn Fn(&str, DoctorDeadline) -> DoctorStatusProbe,
     pub(crate) now: &'a dyn Fn() -> DoctorMoment,
     pub(crate) deadline_after: &'a dyn Fn(DoctorMoment, Duration) -> DoctorDeadline,
 }
@@ -451,8 +453,8 @@ pub(crate) fn collect_doctor_daemon(
     };
 
     if let Some(recorded) = discovery_record.as_ref() {
-        let responding_port = recorded.info().health_port;
-        match verify_status_candidate(dependencies, responding_port, deadline, &mut warnings) {
+        let health_endpoint = recorded.info().health_endpoint.clone();
+        match verify_status_candidate(dependencies, &health_endpoint, deadline, &mut warnings) {
             Some(fresh) => {
                 let mismatches = discovery_fact_mismatches(recorded, &fresh);
                 if !mismatches.is_empty() {
@@ -461,7 +463,7 @@ pub(crate) fn collect_doctor_daemon(
                 return DoctorDaemonReport {
                     state: DoctorDaemonState::LiveFromDiscovery,
                     verified: Some(VerifiedDoctorDaemon {
-                        responding_port,
+                        health_endpoint,
                         record: fresh,
                     }),
                     warnings,
@@ -469,30 +471,9 @@ pub(crate) fn collect_doctor_daemon(
             }
             None if warnings.is_empty() => {
                 warnings
-                    .push(DoctorDaemonWarning::DiscoveryCandidateUnreachable { responding_port });
+                    .push(DoctorDaemonWarning::DiscoveryCandidateUnreachable { health_endpoint });
             }
             None => {}
-        }
-    }
-
-    for candidate in (dependencies.scan_candidates)(DoctorScanRequest {
-        ports: request.ports,
-        deadline,
-    }) {
-        if let Some(record) = verify_status_candidate(
-            dependencies,
-            candidate.responding_port,
-            deadline,
-            &mut warnings,
-        ) {
-            return DoctorDaemonReport {
-                state: DoctorDaemonState::LiveFromScan,
-                verified: Some(VerifiedDoctorDaemon {
-                    responding_port: candidate.responding_port,
-                    record,
-                }),
-                warnings,
-            };
         }
     }
 
@@ -505,27 +486,31 @@ pub(crate) fn collect_doctor_daemon(
 
 fn verify_status_candidate(
     dependencies: &DoctorCollectorDependencies<'_>,
-    responding_port: u16,
+    health_endpoint: &str,
     deadline: DoctorDeadline,
     warnings: &mut Vec<DoctorDaemonWarning>,
 ) -> Option<DaemonRecord> {
     let DoctorStatusProbe::Response(response) =
-        (dependencies.probe_enriched_status)(responding_port, deadline)
+        (dependencies.probe_enriched_status)(health_endpoint, deadline)
     else {
         return None;
     };
     let Ok(record) = serde_json::from_str::<DaemonRecord>(&response) else {
-        warnings.push(DoctorDaemonWarning::MalformedStatus { responding_port });
+        warnings.push(DoctorDaemonWarning::MalformedStatus {
+            health_endpoint: health_endpoint.to_owned(),
+        });
         return None;
     };
     if record.identity().is_none() {
-        warnings.push(DoctorDaemonWarning::MalformedStatus { responding_port });
+        warnings.push(DoctorDaemonWarning::MalformedStatus {
+            health_endpoint: health_endpoint.to_owned(),
+        });
         return None;
     }
-    if record.info().health_port != responding_port {
-        warnings.push(DoctorDaemonWarning::StatusHealthPortMismatch {
-            responding_port,
-            reported_port: record.info().health_port,
+    if record.info().health_endpoint != health_endpoint {
+        warnings.push(DoctorDaemonWarning::StatusHealthEndpointMismatch {
+            recorded_endpoint: health_endpoint.to_owned(),
+            reported_endpoint: record.info().health_endpoint.clone(),
         });
         return None;
     }
@@ -612,9 +597,12 @@ pub fn collect_doctor_report(
     let daemon_report = collect_real_doctor_daemon(
         discovery_path.as_deref(),
         state_error_kind,
-        crate::daemon::discovery::resolve_port_scan(),
+        state_dir.as_deref(),
     );
-    let daemon = doctor_daemon_section(&daemon_report);
+    let mut daemon = doctor_daemon_section(&daemon_report);
+    daemon.lock = state_dir
+        .as_deref()
+        .map_or(DoctorLockState::Unknown, probe_daemon_lock);
     let catalog = crate::server::HyperMcpServer::doctor_catalog_snapshot(options.read_only)?;
 
     let mut warnings = installation
@@ -623,6 +611,14 @@ pub fn collect_doctor_report(
         .map(identity_doctor_warning)
         .collect::<Vec<_>>();
     warnings.extend(daemon_report.warnings.iter().map(daemon_doctor_warning));
+    if let Some(error) = state_dir.as_deref().and_then(untrusted_state_dir_error) {
+        warnings.push(doctor_warning(
+            "untrusted_state_dir",
+            format!(
+                "The daemon state directory is not trusted, so doctor did not read its record, connect to its socket or inspect its lock: {error}"
+            ),
+        ));
+    }
     if let Some(kind) = state_error_kind {
         warnings.push(doctor_warning(
             "daemon_state_path_unavailable",
@@ -860,9 +856,14 @@ pub fn render_doctor_human(report: &DoctorReport) -> String {
     if let Some(endpoint) = report.daemon.hyperd_endpoint.as_deref() {
         let _ = writeln!(output, "  Hyperd endpoint: {}", escape_human(endpoint));
     }
-    if let Some(port) = report.daemon.health_port {
-        let _ = writeln!(output, "  Health port: {port}");
+    if let Some(endpoint) = report.daemon.health_endpoint.as_deref() {
+        let _ = writeln!(output, "  Health endpoint: {}", escape_human(endpoint));
     }
+    let _ = writeln!(
+        output,
+        "  Daemon lock: {}",
+        lock_state_label(report.daemon.lock)
+    );
     if let Some(started_at) = report.daemon.started_at.as_deref() {
         let _ = writeln!(output, "  Started: {}", escape_human(started_at));
     }
@@ -1051,13 +1052,50 @@ fn resolve_configured_hyperd(
     )
 }
 
+/// Look at the daemon lock without creating it. Taking it for an instant is
+/// the only way to learn whether it is held; a daemon that starts in that
+/// instant simply retries.
+fn probe_daemon_lock(state_dir: &Path) -> DoctorLockState {
+    if untrusted_state_dir_error(state_dir).is_some() {
+        return DoctorLockState::Unknown;
+    }
+    let lock_path = state_dir.join(crate::daemon::lock::LOCK_FILE_NAME);
+    match std::fs::symlink_metadata(&lock_path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return DoctorLockState::Unknown,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return DoctorLockState::Absent,
+        Err(_) => return DoctorLockState::Unknown,
+    }
+    // `is_held` opens without creating, so a lock file that vanished since
+    // the check above is not recreated by a read-only probe.
+    match crate::daemon::lock::DaemonLock::is_held(state_dir) {
+        Ok(false) => DoctorLockState::Free,
+        Ok(true) => DoctorLockState::Held,
+        Err(_) => DoctorLockState::Unknown,
+    }
+}
+
+/// Why `state_dir` must not be trusted (owned by someone else, or writable by
+/// group or others), or `None` when it is trusted or does not exist. Doctor
+/// neither reads a record from, connects through, nor locks in such a
+/// directory: anything in it could have been planted by another account.
+fn untrusted_state_dir_error(state_dir: &Path) -> Option<io::Error> {
+    crate::daemon::state_perms::verify_state_dir_trusted(state_dir)
+        .err()
+        .filter(|error| error.kind() != io::ErrorKind::NotFound)
+}
+
 fn collect_real_doctor_daemon(
     discovery_path: Option<&Path>,
     state_error_kind: Option<io::ErrorKind>,
-    ports: PortScan,
+    state_dir: Option<&Path>,
 ) -> DoctorDaemonReport {
     let origin = Instant::now();
-    let probing_scan = std::cell::Cell::new(false);
+    let untrusted = state_dir.and_then(untrusted_state_dir_error);
+    let (discovery_path, state_error_kind, state_dir) = match &untrusted {
+        Some(error) => (None, Some(error.kind()), None),
+        None => (discovery_path, state_error_kind, state_dir),
+    };
     let read_raw_discovery = || match discovery_path {
         Some(path) => crate::daemon::discovery::read_discovery_file_raw(path),
         None => RawDiscoveryRead::Unreadable {
@@ -1065,38 +1103,21 @@ fn collect_real_doctor_daemon(
             kind: state_error_kind.unwrap_or(io::ErrorKind::NotFound),
         },
     };
-    let probe_enriched_status = |port: u16, deadline: DoctorDeadline| {
-        // Preserve the established scan handshake, but verify each identified
-        // port immediately instead of gathering PONGs across the whole range.
-        // Discovery candidates already have a recorded identity and go
-        // straight to the stronger fresh STATUS verification.
-        if probing_scan.get() {
-            match send_doctor_command(port, "PING", origin, deadline) {
-                Ok(response) if is_identified_doctor_pong(&response) => {}
-                _ => return DoctorStatusProbe::Unreachable,
-            }
-        }
-
-        match send_doctor_command(port, "STATUS", origin, deadline) {
+    let probe_enriched_status = |recorded: &str, deadline: DoctorDeadline| {
+        // The record is untrusted input: only the endpoint this state
+        // directory implies is ever connected to, so a tampered record cannot
+        // point doctor at an arbitrary socket.
+        let Some(endpoint) = state_dir.and_then(|dir| HealthEndpoint::from_record(recorded, dir))
+        else {
+            return DoctorStatusProbe::Unreachable;
+        };
+        match send_doctor_command(&endpoint, "STATUS", origin, deadline) {
             Ok(response) => DoctorStatusProbe::Response(response),
             Err(error) if error.kind() == io::ErrorKind::InvalidData => {
                 DoctorStatusProbe::Response(String::new())
             }
             Err(_) => DoctorStatusProbe::Unreachable,
         }
-    };
-    let scan_candidates = |request: DoctorScanRequest| {
-        probing_scan.set(true);
-        let mut candidates = Vec::new();
-        for offset in 0..request.ports.span {
-            let Some(port) = request.ports.base.checked_add(offset) else {
-                break;
-            };
-            candidates.push(DoctorScanCandidate {
-                responding_port: port,
-            });
-        }
-        candidates
     };
     let now = || DoctorMoment(elapsed_millis(origin));
     let deadline_after = |now: DoctorMoment, timeout: Duration| {
@@ -1105,14 +1126,12 @@ fn collect_real_doctor_daemon(
     let dependencies = DoctorCollectorDependencies {
         read_raw_discovery: &read_raw_discovery,
         probe_enriched_status: &probe_enriched_status,
-        scan_candidates: &scan_candidates,
         now: &now,
         deadline_after: &deadline_after,
     };
     collect_doctor_daemon(
         &dependencies,
         DoctorCollectRequest {
-            ports,
             timeout: DOCTOR_DAEMON_TIMEOUT,
         },
     )
@@ -1143,21 +1162,20 @@ fn duration_millis(duration: Duration) -> u64 {
 }
 
 fn send_doctor_command(
-    port: u16,
+    endpoint: &HealthEndpoint,
     command: &str,
     origin: Instant,
     deadline: DoctorDeadline,
 ) -> io::Result<String> {
     use std::io::{Read, Write};
 
-    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let connect_timeout = doctor_network_timeout(origin, deadline)?;
-    let mut stream = std::net::TcpStream::connect_timeout(&address, connect_timeout)?;
+    let mut stream = crate::daemon::control::connect(endpoint, connect_timeout)?;
     let message = format!("{command}\n");
     let mut written = 0;
     while written < message.len() {
         let timeout = doctor_network_timeout(origin, deadline)?;
-        stream.set_write_timeout(Some(timeout))?;
+        stream.set_io_timeout(timeout)?;
         match stream.write(&message.as_bytes()[written..]) {
             Ok(0) => {
                 return Err(io::Error::new(
@@ -1175,7 +1193,7 @@ fn send_doctor_command(
     let mut chunk = [0_u8; 1024];
     loop {
         let timeout = doctor_network_timeout(origin, deadline)?;
-        stream.set_read_timeout(Some(timeout))?;
+        crate::daemon::health::rearm_io_timeout(&mut stream, timeout)?;
         let remaining_capacity = MAX_STATUS_RESPONSE_BYTES
             .saturating_add(1)
             .saturating_sub(response.len());
@@ -1223,18 +1241,14 @@ fn send_doctor_command(
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
 }
 
-fn is_identified_doctor_pong(response: &str) -> bool {
-    let mut tokens = response.split_whitespace();
-    tokens.next() == Some("PONG") && tokens.next() == Some(crate::daemon::health::PONG_TOKEN)
-}
-
 fn doctor_daemon_section(report: &DoctorDaemonReport) -> DoctorDaemonSection {
     let Some(verified) = report.verified.as_ref() else {
         return DoctorDaemonSection {
             state: report.state,
             pid: None,
             hyperd_endpoint: None,
-            health_port: None,
+            health_endpoint: None,
+            lock: DoctorLockState::Unknown,
             started_at: None,
             version: None,
             mcp_version: None,
@@ -1246,7 +1260,8 @@ fn doctor_daemon_section(report: &DoctorDaemonReport) -> DoctorDaemonSection {
         state: report.state,
         pid: Some(verified.record.info().pid),
         hyperd_endpoint: Some(bounded_string(&verified.record.info().hyperd_endpoint)),
-        health_port: Some(verified.record.info().health_port),
+        health_endpoint: Some(bounded_string(&verified.record.info().health_endpoint)),
+        lock: DoctorLockState::Unknown,
         started_at: Some(bounded_string(&verified.record.info().started_at)),
         version: Some(bounded_string(&verified.record.info().version)),
         mcp_version: identity.map(|identity| bounded_string(identity.mcp_version())),
@@ -1328,10 +1343,11 @@ fn daemon_doctor_warning(warning: &DoctorDaemonWarning) -> DoctorWarning {
             "daemon_discovery_oversized",
             "The daemon discovery file is valid but larger than any legitimate record should be; it was left unchanged.",
         ),
-        DoctorDaemonWarning::DiscoveryCandidateUnreachable { responding_port } => doctor_warning(
+        DoctorDaemonWarning::DiscoveryCandidateUnreachable { health_endpoint } => doctor_warning(
             "daemon_discovery_candidate_unreachable",
             format!(
-                "The recorded daemon candidate on port {responding_port} did not return fresh enriched STATUS."
+                "The recorded daemon candidate at {} did not return fresh enriched STATUS.",
+                bounded_string(health_endpoint)
             ),
         ),
         DoctorDaemonWarning::StaleOrReplacedDiscovery { mismatches } => {
@@ -1345,19 +1361,22 @@ fn daemon_doctor_warning(warning: &DoctorDaemonWarning) -> DoctorWarning {
                 format!("Fresh daemon STATUS disagreed with the discovery record: {facts}."),
             )
         }
-        DoctorDaemonWarning::StatusHealthPortMismatch {
-            responding_port,
-            reported_port,
+        DoctorDaemonWarning::StatusHealthEndpointMismatch {
+            recorded_endpoint,
+            reported_endpoint,
         } => doctor_warning(
-            "daemon_status_health_port_mismatch",
+            "daemon_status_health_endpoint_mismatch",
             format!(
-                "STATUS from port {responding_port} reported health port {reported_port}; the candidate was rejected."
+                "STATUS from {} reported health endpoint {}; the candidate was rejected.",
+                bounded_string(recorded_endpoint),
+                bounded_string(reported_endpoint)
             ),
         ),
-        DoctorDaemonWarning::MalformedStatus { responding_port } => doctor_warning(
+        DoctorDaemonWarning::MalformedStatus { health_endpoint } => doctor_warning(
             "daemon_status_malformed",
             format!(
-                "Port {responding_port} returned malformed or unenriched STATUS; the candidate was rejected."
+                "{} returned malformed or unenriched STATUS; the candidate was rejected.",
+                bounded_string(health_endpoint)
             ),
         ),
     }
@@ -1466,7 +1485,15 @@ const fn daemon_state_label(state: DoctorDaemonState) -> &'static str {
         DoctorDaemonState::Oversized => "oversized",
         DoctorDaemonState::ParsedUnreachable => "parsed_unreachable",
         DoctorDaemonState::LiveFromDiscovery => "live_from_discovery",
-        DoctorDaemonState::LiveFromScan => "live_from_scan",
+    }
+}
+
+const fn lock_state_label(state: DoctorLockState) -> &'static str {
+    match state {
+        DoctorLockState::Absent => "absent",
+        DoctorLockState::Held => "held",
+        DoctorLockState::Free => "free",
+        DoctorLockState::Unknown => "unknown",
     }
 }
 
@@ -1684,10 +1711,12 @@ pub(crate) fn real_network_test_guard() -> std::sync::MutexGuard<'static, ()> {
 mod tests {
     use std::cell::RefCell;
     use std::ffi::OsStr;
-    use std::io;
+    use std::io::{self, Read as _, Write as _};
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    #[cfg(unix)]
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -1695,17 +1724,20 @@ mod tests {
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
+    use crate::daemon::control::{ControlListener, ControlStream, HealthEndpoint};
     use crate::daemon::discovery::{
-        DaemonBuildIdentity, DaemonInfo, DaemonRecord, DiscoveryBytes, PortScan, RawDiscoveryRead,
+        DaemonBuildIdentity, DaemonInfo, DaemonRecord, DiscoveryBytes, RawDiscoveryRead,
         read_discovery_file_raw,
     };
     use crate::daemon::health::{DaemonState, HealthListener};
+    use crate::daemon::lock::{DaemonLock, LOCK_FILE_NAME};
 
     use super::{
         DiscoveryFactMismatch, DoctorCollectRequest, DoctorCollectorDependencies,
-        DoctorDaemonState, DoctorDaemonWarning, DoctorDeadline, DoctorMoment, DoctorScanCandidate,
-        DoctorScanRequest, DoctorStatusProbe, ReportedPath, collect_doctor_daemon,
-        collect_real_doctor_daemon, real_network_test_guard,
+        DoctorDaemonState, DoctorDaemonWarning, DoctorDeadline, DoctorLockState, DoctorMoment,
+        DoctorStatusProbe, MAX_STATUS_RESPONSE_BYTES, ReportedPath, collect_doctor_daemon,
+        collect_real_doctor_daemon, probe_daemon_lock, real_network_test_guard,
+        send_doctor_command,
     };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1742,11 +1774,11 @@ mod tests {
         }
     }
 
-    fn enriched_status(pid: u32, health_port: u16, build: &str, executable: &str) -> Value {
+    fn enriched_status(pid: u32, health_endpoint: &str, build: &str, executable: &str) -> Value {
         json!({
             "pid": pid,
             "hyperd_endpoint": "127.0.0.1:54321",
-            "health_port": health_port,
+            "health_endpoint": health_endpoint,
             "started_at": "2026-08-13T12:34:56Z",
             "version": "0.7.0",
             "identity": {
@@ -1756,455 +1788,135 @@ mod tests {
         })
     }
 
-    fn listener_daemon_info(pid: u32, health_port: u16) -> DaemonInfo {
+    fn listener_daemon_info(pid: u32, health_endpoint: &HealthEndpoint) -> DaemonInfo {
         DaemonInfo {
             pid,
             hyperd_endpoint: "127.0.0.1:54321".to_string(),
-            health_port,
+            health_endpoint: health_endpoint.as_str().to_owned(),
             started_at: "2026-08-13T12:34:56Z".to_string(),
             version: "0.7.0".to_string(),
         }
     }
 
-    fn adjacent_fake_and_health_listeners() -> (std::net::TcpListener, HealthListener) {
-        for _ in 0..128 {
-            let fake = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-            let fake_port = fake.local_addr().unwrap().port();
-            let Some(health_port) = fake_port.checked_add(1) else {
-                continue;
+    /// The endpoint a daemon with state directory `dir` would serve.
+    fn endpoint_in(dir: &TempDir) -> HealthEndpoint {
+        HealthEndpoint::for_new_daemon(dir.path()).expect("health endpoint for the test state dir")
+    }
+
+    /// Write `status` as the state directory's `daemon.json` and return its path.
+    fn write_discovery(dir: &TempDir, status: &Value) -> std::path::PathBuf {
+        let path = dir.path().join("daemon.json");
+        std::fs::write(&path, serde_json::to_vec(status).unwrap()).unwrap();
+        path
+    }
+
+    /// Accept one client on a fake peer, giving up after `window` or once
+    /// `stop` is set.
+    fn accept_client(
+        listener: &mut ControlListener,
+        window: Duration,
+        stop: &AtomicBool,
+    ) -> Result<Option<ControlStream>, String> {
+        let deadline = Instant::now() + window;
+        while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
+            match listener.accept_timeout(Duration::from_millis(20)) {
+                Ok(Some(stream)) => return Ok(Some(stream)),
+                Ok(None) => {}
+                Err(error) => return Err(format!("fake peer accept failed: {error}")),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Read the one command line a doctor probe sends.
+    fn read_command(stream: &mut ControlStream) -> Result<String, String> {
+        stream
+            .set_io_timeout(Duration::from_secs(2))
+            .map_err(|error| format!("fake peer set timeout failed: {error}"))?;
+        let mut command = Vec::new();
+        let mut byte = [0_u8; 1];
+        loop {
+            match stream.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) if byte[0] == b'\n' => break,
+                Ok(_) => command.push(byte[0]),
+                Err(error) => return Err(format!("fake peer command read failed: {error}")),
+            }
+        }
+        Ok(String::from_utf8_lossy(&command).into_owned())
+    }
+
+    /// Keep a fake peer's end open until the client hangs up (or a bounded
+    /// wait elapses). Closing first can make a later `set_io_timeout` on the
+    /// client fail on macOS, which would mask the behavior under test.
+    fn hold_until_client_closes(stream: &mut ControlStream) {
+        if stream.set_io_timeout(Duration::from_secs(1)).is_err() {
+            return;
+        }
+        let mut scratch = [0_u8; 256];
+        while matches!(stream.read(&mut scratch), Ok(count) if count > 0) {}
+    }
+
+    /// A fake STATUS peer: accepts one client, records its command, and
+    /// answers with `reply` followed by a newline.
+    fn spawn_status_peer(
+        mut listener: ControlListener,
+        reply: String,
+    ) -> std::thread::JoinHandle<Result<String, String>> {
+        std::thread::spawn(move || {
+            let stop = AtomicBool::new(false);
+            let Some(mut stream) = accept_client(&mut listener, Duration::from_secs(3), &stop)?
+            else {
+                return Err("status peer never received a connection".to_string());
             };
-            if let Ok(health) = HealthListener::bind(health_port) {
-                return (fake, health);
-            }
-        }
-        panic!("could not reserve adjacent OS-selected loopback listeners after 128 attempts");
-    }
-
-    fn health_listener_with_adjacent_followers(
-        follower_count: u16,
-    ) -> (HealthListener, Vec<std::net::TcpListener>) {
-        for _ in 0..128 {
-            let health = HealthListener::bind(0).unwrap();
-            let Some(last_port) = health.port.checked_add(follower_count) else {
-                continue;
-            };
-            let mut followers = Vec::with_capacity(usize::from(follower_count));
-            for port in health.port + 1..=last_port {
-                let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) else {
-                    break;
-                };
-                followers.push(listener);
-            }
-            if followers.len() == usize::from(follower_count) {
-                return (health, followers);
-            }
-        }
-        panic!("could not reserve a contiguous OS-selected loopback range");
-    }
-
-    fn run_invalid_status_then_later_daemon_attempt() -> Vec<String> {
-        use std::io::{BufRead as _, BufReader, Write as _};
-
-        let tmp = TempDir::new().unwrap();
-        let (fake_listener, health_listener) = adjacent_fake_and_health_listeners();
-        let fake_port = fake_listener.local_addr().unwrap().port();
-        let health_port = health_listener.port;
-        fake_listener.set_nonblocking(true).unwrap();
-
-        let stop_fake = Arc::new(AtomicBool::new(false));
-        let fake_stop = Arc::clone(&stop_fake);
-        let served_ping = Arc::new(AtomicUsize::new(0));
-        let fake_served_ping = Arc::clone(&served_ping);
-        let served_status = Arc::new(AtomicUsize::new(0));
-        let fake_served_status = Arc::clone(&served_status);
-        let (fake_ready_sender, fake_ready_receiver) = mpsc::sync_channel(1);
-        let wrong_port_status = enriched_status(
-            9_090,
-            health_port,
-            "0.7.0.rwrong-port",
-            "/opt/hyperdb/wrong-port-daemon",
-        )
-        .to_string();
-        let fake_server = std::thread::spawn(move || -> Result<(), String> {
-            fake_ready_sender
-                .send(())
-                .map_err(|_| "fake candidate readiness receiver closed".to_string())?;
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while !fake_stop.load(Ordering::Acquire) && Instant::now() < deadline {
-                let mut stream = match fake_listener.accept() {
-                    Ok((stream, _)) => stream,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(2));
-                        continue;
-                    }
-                    Err(error) => return Err(format!("fake candidate accept failed: {error}")),
-                };
-                stream
-                    .set_read_timeout(Some(Duration::from_millis(200)))
-                    .map_err(|error| error.to_string())?;
-                let mut command = String::new();
-                let read_result =
-                    BufReader::new(stream.try_clone().map_err(|error| error.to_string())?)
-                        .read_line(&mut command);
-                match read_result {
-                    Ok(0) if command.is_empty() => continue,
-                    Err(error)
-                        if command.is_empty()
-                            && matches!(
-                                error.kind(),
-                                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                            ) =>
-                    {
-                        continue;
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        return Err(format!(
-                            "fake candidate command read failed after {} bytes: {error}",
-                            command.len()
-                        ));
-                    }
-                }
-                let (response, served) = match command.trim() {
-                    "PING" => ("PONG hyperdb-mcp 0.7.0\n".to_string(), &fake_served_ping),
-                    "STATUS" => (format!("{wrong_port_status}\n"), &fake_served_status),
-                    other => return Err(format!("fake candidate received {other:?}")),
-                };
-                stream
-                    .write_all(response.as_bytes())
-                    .map_err(|error| error.to_string())?;
-                served.fetch_add(1, Ordering::AcqRel);
-            }
-            Ok(())
-        });
-
-        let health_state = Arc::new(DaemonState::new());
-        let health_info = Arc::new(Mutex::new(listener_daemon_info(9_191, health_port)));
-        let run_state = Arc::clone(&health_state);
-        let run_info = Arc::clone(&health_info);
-        let (health_ready_sender, health_ready_receiver) = mpsc::sync_channel(1);
-        let health_server = std::thread::spawn(move || {
-            let _ = health_ready_sender.send(());
-            health_listener.run(run_state, run_info);
-        });
-
-        let mut failures = Vec::new();
-        let fake_ready = fake_ready_receiver
-            .recv_timeout(Duration::from_millis(500))
-            .is_ok();
-        if !fake_ready {
-            failures.push("fake candidate did not signal readiness within 500ms".to_string());
-        }
-        let health_ready = health_ready_receiver
-            .recv_timeout(Duration::from_millis(500))
-            .is_ok();
-        if !health_ready {
-            failures.push("later HealthListener did not signal readiness within 500ms".to_string());
-        }
-
-        let report = if fake_ready && health_ready {
-            if let Ok(report) = catch_unwind(AssertUnwindSafe(|| {
-                collect_real_doctor_daemon(
-                    Some(&tmp.path().join("missing-daemon.json")),
-                    None,
-                    PortScan {
-                        base: fake_port,
-                        span: 2,
-                    },
-                )
-            })) {
-                Some(report)
-            } else {
-                failures.push("doctor collector panicked during adjacent scan".to_string());
-                None
-            }
-        } else {
-            None
-        };
-
-        stop_fake.store(true, Ordering::Release);
-        health_state.request_shutdown();
-        match fake_server.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => failures.push(error),
-            Err(_) => failures.push("fake candidate server panicked".to_string()),
-        }
-        if health_server.join().is_err() {
-            failures.push("later HealthListener server panicked".to_string());
-        }
-
-        let ping_count = served_ping.load(Ordering::Acquire);
-        let status_count = served_status.load(Ordering::Acquire);
-        if ping_count == 0 || status_count == 0 {
-            failures.push(format!(
-                "fake candidate served PING {ping_count} time(s) and STATUS {status_count} time(s); both must be demonstrated"
-            ));
-        }
-        if let Some(report) = report {
-            if report.state != DoctorDaemonState::LiveFromScan {
-                failures.push(format!(
-                    "adjacent scan state was {:?}, expected LiveFromScan",
-                    report.state
-                ));
-            }
-            match report.verified.as_ref() {
-                Some(verified)
-                    if verified.responding_port == health_port
-                        && verified.record.info().health_port == health_port
-                        && verified.record.info().pid == 9_191 => {}
-                other => failures.push(format!(
-                    "later real HealthListener did not supply exact fresh facts: {other:?}"
-                )),
-            }
-            if !report.warnings.iter().any(|warning| {
-                matches!(
-                    warning,
-                    DoctorDaemonWarning::StatusHealthPortMismatch {
-                        responding_port,
-                        reported_port,
-                    } if *responding_port == fake_port && *reported_port == health_port
-                )
-            }) {
-                failures.push(format!(
-                    "first candidate's wrong-port STATUS was not retained as a warning: {:?}",
-                    report.warnings
-                ));
-            }
-        }
-
-        failures
+            let command = read_command(&mut stream)?;
+            stream
+                .write_all(format!("{reply}\n").as_bytes())
+                .map_err(|error| format!("status peer write failed: {error}"))?;
+            hold_until_client_closes(&mut stream);
+            Ok(command)
+        })
     }
 
     #[test]
-    fn real_scan_skips_invalid_status_candidate_and_finds_later_daemon() {
-        const MAX_SCENARIO_ATTEMPTS: usize = 3;
-
+    fn real_health_listener_answers_doctor_within_budget() {
         let _network_guard = real_network_test_guard();
-        let mut attempt_failures = Vec::new();
-        for attempt in 1..=MAX_SCENARIO_ATTEMPTS {
-            let failures = run_invalid_status_then_later_daemon_attempt();
-            if failures.is_empty() {
-                return;
-            }
-            attempt_failures.push(format!("attempt {attempt}:\n{}", failures.join("\n")));
-        }
-
-        panic!(
-            "adjacent candidate scan failed all {MAX_SCENARIO_ATTEMPTS} bounded attempts:\n{}",
-            attempt_failures.join("\n")
-        );
-    }
-
-    #[test]
-    fn real_scan_verifies_early_daemon_before_slow_later_ports() {
-        use std::io::{BufRead as _, BufReader, Write as _};
-
-        const FOLLOWER_COUNT: u16 = 4;
-
-        let _network_guard = real_network_test_guard();
-        let (health_listener, slow_listeners) =
-            health_listener_with_adjacent_followers(FOLLOWER_COUNT);
-        let health_port = health_listener.port;
-
-        let health_state = Arc::new(DaemonState::new());
-        let health_info = Arc::new(Mutex::new(listener_daemon_info(7_171, health_port)));
-        let run_state = Arc::clone(&health_state);
-        let run_info = Arc::clone(&health_info);
-        let health_server = std::thread::spawn(move || health_listener.run(run_state, run_info));
-
-        let stop_slow_peers = Arc::new(AtomicBool::new(false));
-        let slow_peer_commands = Arc::new(AtomicUsize::new(0));
-        let mut slow_servers = Vec::new();
-        for listener in slow_listeners {
-            listener.set_nonblocking(true).unwrap();
-            let stop = Arc::clone(&stop_slow_peers);
-            let command_count = Arc::clone(&slow_peer_commands);
-            slow_servers.push(std::thread::spawn(move || -> Result<(), String> {
-                let deadline = Instant::now() + Duration::from_secs(2);
-                while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
-                    let mut stream = match listener.accept() {
-                        Ok((stream, _)) => stream,
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(Duration::from_millis(2));
-                            continue;
-                        }
-                        Err(error) => {
-                            return Err(format!("slow follower accept failed: {error}"));
-                        }
-                    };
-                    stream
-                        .set_read_timeout(Some(Duration::from_millis(200)))
-                        .map_err(|error| error.to_string())?;
-                    let mut command = String::new();
-                    let read_result =
-                        BufReader::new(stream.try_clone().map_err(|error| error.to_string())?)
-                            .read_line(&mut command);
-                    match read_result {
-                        Ok(0) if command.is_empty() => continue,
-                        Err(error)
-                            if command.is_empty()
-                                && matches!(
-                                    error.kind(),
-                                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                                ) =>
-                        {
-                            continue;
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            return Err(format!(
-                                "slow follower command read failed after {} bytes: {error}",
-                                command.len()
-                            ));
-                        }
-                    }
-                    if command.trim() != "PING" {
-                        return Err(format!(
-                            "slow follower received unexpected command {command:?}"
-                        ));
-                    }
-                    command_count.fetch_add(1, Ordering::AcqRel);
-
-                    let response_at = Instant::now() + Duration::from_millis(110);
-                    while !stop.load(Ordering::Acquire) && Instant::now() < response_at {
-                        std::thread::sleep(Duration::from_millis(2));
-                    }
-                    if stop.load(Ordering::Acquire) {
-                        break;
-                    }
-                    match stream.write_all(b"PONG hyperdb-mcp 0.7.0\n") {
-                        Ok(()) => {}
-                        Err(error)
-                            if matches!(
-                                error.kind(),
-                                io::ErrorKind::BrokenPipe
-                                    | io::ErrorKind::ConnectionReset
-                                    | io::ErrorKind::NotConnected
-                            ) => {}
-                        Err(error) => {
-                            return Err(format!("slow follower PONG failed: {error}"));
-                        }
-                    }
-                }
-                Ok(())
-            }));
-        }
-
-        let tmp = TempDir::new().unwrap();
-        let missing_discovery = tmp.path().join("missing-daemon.json");
-        let (result_sender, result_receiver) = mpsc::channel();
-        let collector = std::thread::spawn(move || {
-            let started = Instant::now();
-            let report = collect_real_doctor_daemon(
-                Some(&missing_discovery),
-                None,
-                PortScan {
-                    base: health_port,
-                    span: FOLLOWER_COUNT + 1,
-                },
-            );
-            let _ = result_sender.send((report, started.elapsed()));
-        });
-
-        let bounded_result = result_receiver.recv_timeout(Duration::from_millis(650));
-        stop_slow_peers.store(true, Ordering::Release);
-        health_state.request_shutdown();
-        let slow_results = slow_servers
-            .into_iter()
-            .map(|server| server.join().unwrap())
-            .collect::<Vec<_>>();
-        health_server.join().unwrap();
-        collector.join().unwrap();
-
-        let mut failures = slow_results
-            .into_iter()
-            .filter_map(Result::err)
-            .collect::<Vec<_>>();
-        match bounded_result {
-            Ok((report, elapsed)) => {
-                if elapsed > Duration::from_millis(650) {
-                    failures.push(format!(
-                        "early-daemon scan completed after its 650ms watchdog: {elapsed:?}"
-                    ));
-                }
-                if report.state != DoctorDaemonState::LiveFromScan {
-                    failures.push(format!(
-                        "early-daemon scan state was {:?}, expected LiveFromScan",
-                        report.state
-                    ));
-                }
-                match report.verified {
-                    Some(verified)
-                        if verified.responding_port == health_port
-                            && verified.record.info().health_port == health_port
-                            && verified.record.info().pid == 7_171 => {}
-                    other => failures.push(format!(
-                        "healthy first port did not supply exact fresh daemon facts: {other:?}"
-                    )),
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => failures.push(
-                "later identified peers starved the healthy first port past 650ms".to_string(),
-            ),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                failures.push("early-daemon collector disconnected without a report".to_string());
-            }
-        }
-        let later_commands = slow_peer_commands.load(Ordering::Acquire);
-        if later_commands != 0 {
-            failures.push(format!(
-                "{later_commands} later peer command(s) ran after the healthy first port"
-            ));
-        }
-
-        assert!(
-            failures.is_empty(),
-            "early daemon scan failures:\n{}",
-            failures.join("\n")
-        );
-    }
-
-    #[test]
-    fn real_health_listener_accept_cadence_fits_doctor_budget() {
-        let _network_guard = real_network_test_guard();
-        let listener = HealthListener::bind(0).unwrap();
-        let port = listener.port;
-        let state = Arc::new(DaemonState::new());
-        let info = Arc::new(Mutex::new(listener_daemon_info(8_181, port)));
+        let dir = TempDir::new().unwrap();
+        let endpoint = endpoint_in(&dir);
+        let listener = HealthListener::bind(&endpoint).unwrap();
+        let state = Arc::new(DaemonState::new(endpoint.clone()));
+        let info = Arc::new(Mutex::new(listener_daemon_info(8_181, &endpoint)));
         let run_state = Arc::clone(&state);
         let run_info = Arc::clone(&info);
+        // Start serving late so the doctor's connection waits in the accept
+        // backlog, pinning that the listener's accept cadence fits the budget.
         let listener_thread = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(75));
             listener.run(run_state, run_info);
         });
 
-        let tmp = TempDir::new().unwrap();
-        let missing_discovery = tmp.path().join("missing-daemon.json");
-        let started = Instant::now();
-        let report = collect_real_doctor_daemon(
-            Some(&missing_discovery),
-            None,
-            PortScan {
-                base: port,
-                span: 1,
-            },
+        let discovery = write_discovery(
+            &dir,
+            &enriched_status(8_181, endpoint.as_str(), "0.7.0.rrecorded", "/opt/recorded"),
         );
+        let started = Instant::now();
+        let report = collect_real_doctor_daemon(Some(&discovery), None, Some(dir.path()));
         let elapsed = started.elapsed();
 
         state.request_shutdown();
         listener_thread.join().unwrap();
 
         let mut failures = Vec::new();
-        if report.state != DoctorDaemonState::LiveFromScan {
+        if report.state != DoctorDaemonState::LiveFromDiscovery {
             failures.push(format!(
-                "real HealthListener state was {:?}, expected LiveFromScan",
+                "real HealthListener state was {:?}, expected LiveFromDiscovery",
                 report.state
             ));
         }
         match report.verified {
             Some(verified)
-                if verified.responding_port == port
-                    && verified.record.info().health_port == port
+                if verified.health_endpoint == endpoint.as_str()
+                    && verified.record.info().health_endpoint == endpoint.as_str()
                     && verified.record.info().pid == 8_181 => {}
             other => failures.push(format!(
                 "real HealthListener did not yield exact fresh daemon facts: {other:?}"
@@ -2224,47 +1936,133 @@ mod tests {
     }
 
     #[test]
-    fn real_doctor_collector_enforces_global_deadline_against_slow_drip() {
-        use std::io::{BufRead as _, BufReader, Write as _};
-        use std::net::{Shutdown, TcpListener};
-
+    fn real_doctor_reports_a_mismatched_status_endpoint_and_discards_the_peer() {
         let _network_guard = real_network_test_guard();
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        listener.set_nonblocking(true).unwrap();
+        let dir = TempDir::new().unwrap();
+        let endpoint = endpoint_in(&dir);
+        let listener = ControlListener::bind(&endpoint).unwrap();
+        let reported = "/somewhere/else/daemon.sock";
+        let peer = spawn_status_peer(
+            listener,
+            enriched_status(707, reported, "0.7.0.rwrong", "/opt/hyperdb/wrong-daemon").to_string(),
+        );
+        let discovery = write_discovery(
+            &dir,
+            &enriched_status(
+                707,
+                endpoint.as_str(),
+                "0.7.0.rwrong",
+                "/opt/hyperdb/wrong-daemon",
+            ),
+        );
+
+        let report = collect_real_doctor_daemon(Some(&discovery), None, Some(dir.path()));
+        let observed_command = peer.join().unwrap();
+
+        assert_eq!(observed_command.as_deref(), Ok("STATUS"));
+        assert!(
+            report.verified.is_none(),
+            "a mismatched peer must not verify"
+        );
+        assert_eq!(report.state, DoctorDaemonState::ParsedUnreachable);
+        assert_eq!(
+            report.warnings,
+            vec![DoctorDaemonWarning::StatusHealthEndpointMismatch {
+                recorded_endpoint: endpoint.as_str().to_owned(),
+                reported_endpoint: reported.to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn real_doctor_reports_an_oversized_status_as_malformed() {
+        let _network_guard = real_network_test_guard();
+        let dir = TempDir::new().unwrap();
+        let endpoint = endpoint_in(&dir);
+        let mut listener = ControlListener::bind(&endpoint).unwrap();
+        let server = std::thread::spawn(move || -> Result<(), String> {
+            let stop = AtomicBool::new(false);
+            let Some(mut stream) = accept_client(&mut listener, Duration::from_secs(3), &stop)?
+            else {
+                return Err("oversized peer never received a connection".to_string());
+            };
+            read_command(&mut stream)?;
+            // More than the fixed cap and never a newline; the client closing
+            // early surfaces as a write error, which is the expected outcome.
+            let flood = vec![b'a'; MAX_STATUS_RESPONSE_BYTES + 4096];
+            let _ = stream.write_all(&flood);
+            hold_until_client_closes(&mut stream);
+            Ok(())
+        });
+        let discovery = write_discovery(
+            &dir,
+            &enriched_status(
+                909,
+                endpoint.as_str(),
+                "0.7.0.rbig",
+                "/opt/hyperdb/big-daemon",
+            ),
+        );
+
+        let report = collect_real_doctor_daemon(Some(&discovery), None, Some(dir.path()));
+        server.join().unwrap().unwrap();
+
+        assert!(report.verified.is_none());
+        assert_eq!(
+            report.warnings,
+            vec![DoctorDaemonWarning::MalformedStatus {
+                health_endpoint: endpoint.as_str().to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn send_doctor_command_rejects_a_response_past_the_size_cap() {
+        let _network_guard = real_network_test_guard();
+        let dir = TempDir::new().unwrap();
+        let endpoint = endpoint_in(&dir);
+        let mut listener = ControlListener::bind(&endpoint).unwrap();
+        let server = std::thread::spawn(move || -> Result<(), String> {
+            let stop = AtomicBool::new(false);
+            let Some(mut stream) = accept_client(&mut listener, Duration::from_secs(3), &stop)?
+            else {
+                return Err("size-cap peer never received a connection".to_string());
+            };
+            read_command(&mut stream)?;
+            let flood = vec![b'a'; MAX_STATUS_RESPONSE_BYTES + 4096];
+            let _ = stream.write_all(&flood);
+            hold_until_client_closes(&mut stream);
+            Ok(())
+        });
+
+        let origin = Instant::now();
+        let error = send_doctor_command(&endpoint, "STATUS", origin, DoctorDeadline(2_000))
+            .expect_err("a response past the cap must be rejected");
+        server.join().unwrap().unwrap();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn real_doctor_collector_enforces_global_deadline_against_slow_drip() {
+        let _network_guard = real_network_test_guard();
+        let dir = TempDir::new().unwrap();
+        let endpoint = endpoint_in(&dir);
+        let mut listener = ControlListener::bind(&endpoint).unwrap();
         let stop_writer = Arc::new(AtomicBool::new(false));
         let server_stop = Arc::clone(&stop_writer);
         let server = std::thread::spawn(move || -> Result<(), String> {
-            let accept_deadline = Instant::now() + Duration::from_secs(2);
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        if server_stop.load(Ordering::Acquire) || Instant::now() >= accept_deadline
-                        {
-                            return Err("slow-drip peer never received a connection".to_string());
-                        }
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(error) => return Err(format!("slow-drip accept failed: {error}")),
-                }
+            let Some(mut stream) =
+                accept_client(&mut listener, Duration::from_secs(2), &server_stop)?
+            else {
+                return Err("slow-drip peer never received a connection".to_string());
             };
-            stream
-                .set_nodelay(true)
-                .map_err(|error| error.to_string())?;
-            stream
-                .set_read_timeout(Some(Duration::from_millis(200)))
-                .map_err(|error| error.to_string())?;
-            let mut command = String::new();
-            BufReader::new(stream.try_clone().map_err(|error| error.to_string())?)
-                .read_line(&mut command)
-                .map_err(|error| error.to_string())?;
-            if command.trim() != "PING" {
+            let command = read_command(&mut stream)?;
+            if command != "STATUS" {
                 return Err(format!(
                     "slow-drip peer received unexpected command {command:?}"
                 ));
             }
-
             let write_deadline = Instant::now() + Duration::from_secs(2);
             while !server_stop.load(Ordering::Acquire) && Instant::now() < write_deadline {
                 if stream.write_all(b"x").is_err() || stream.flush().is_err() {
@@ -2272,23 +2070,24 @@ mod tests {
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
-            let _ = stream.shutdown(Shutdown::Both);
+            let _ = stream.finish();
             Ok(())
         });
 
-        let tmp = TempDir::new().unwrap();
-        let missing_discovery = tmp.path().join("missing-daemon.json");
+        let discovery = write_discovery(
+            &dir,
+            &enriched_status(
+                616,
+                endpoint.as_str(),
+                "0.7.0.rdrip",
+                "/opt/hyperdb/drip-daemon",
+            ),
+        );
+        let state_dir = dir.path().to_path_buf();
         let (result_sender, result_receiver) = mpsc::channel();
         let collector = std::thread::spawn(move || {
             let started = Instant::now();
-            let report = collect_real_doctor_daemon(
-                Some(&missing_discovery),
-                None,
-                PortScan {
-                    base: port,
-                    span: 1,
-                },
-            );
+            let report = collect_real_doctor_daemon(Some(&discovery), None, Some(&state_dir));
             let _ = result_sender.send((report, started.elapsed()));
         });
 
@@ -2310,7 +2109,7 @@ mod tests {
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => failures.push(
-                "real collector exceeded 650ms because each drip reset its socket read timeout"
+                "real collector exceeded 650ms because each drip reset its read timeout"
                     .to_string(),
             ),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -2337,52 +2136,32 @@ mod tests {
     /// so the candidate is reported unreachable instead.
     #[test]
     fn real_doctor_reports_a_silent_peer_close_as_unreachable_not_malformed() {
-        use std::io::{BufRead as _, BufReader};
-        use std::net::TcpListener;
-
         let _network_guard = real_network_test_guard();
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let dir = TempDir::new().unwrap();
+        let endpoint = endpoint_in(&dir);
+        let mut listener = ControlListener::bind(&endpoint).unwrap();
         let server = std::thread::spawn(move || -> Result<String, String> {
-            let (stream, _) = listener
-                .accept()
-                .map_err(|error| format!("silent-close peer accept failed: {error}"))?;
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .map_err(|error| error.to_string())?;
-            let mut command = String::new();
-            BufReader::new(&stream)
-                .read_line(&mut command)
-                .map_err(|error| format!("silent-close peer read failed: {error}"))?;
+            let stop = AtomicBool::new(false);
+            let Some(mut stream) = accept_client(&mut listener, Duration::from_secs(3), &stop)?
+            else {
+                return Err("silent-close peer never received a connection".to_string());
+            };
+            let command = read_command(&mut stream)?;
             // Close having written nothing at all.
             drop(stream);
-            Ok(command.trim().to_string())
+            Ok(command)
         });
 
-        let tmp = TempDir::new().unwrap();
-        let discovery_path = tmp.path().join("daemon.json");
-        std::fs::write(
-            &discovery_path,
-            serde_json::to_vec(&enriched_status(
+        let discovery = write_discovery(
+            &dir,
+            &enriched_status(
                 4_242,
-                port,
+                endpoint.as_str(),
                 "0.7.0.rsilent",
                 "/opt/hyperdb/bin/hyperdb-mcp",
-            ))
-            .unwrap(),
-        )
-        .unwrap();
-
-        // `span: 0` leaves the port scan with no candidates, so the report
-        // reflects the discovery candidate's outcome alone.
-        let report = collect_real_doctor_daemon(
-            Some(&discovery_path),
-            None,
-            PortScan {
-                base: port,
-                span: 0,
-            },
+            ),
         );
+        let report = collect_real_doctor_daemon(Some(&discovery), None, Some(dir.path()));
         let observed_command = server.join().unwrap();
 
         let mut failures = Vec::new();
@@ -2404,7 +2183,7 @@ mod tests {
         }
         if report.warnings
             != vec![DoctorDaemonWarning::DiscoveryCandidateUnreachable {
-                responding_port: port,
+                health_endpoint: endpoint.as_str().to_owned(),
             }]
         {
             failures.push(format!(
@@ -2421,30 +2200,202 @@ mod tests {
         );
     }
 
+    /// The record is untrusted input: an endpoint other than the one the state
+    /// directory implies must never be connected to, even when a live peer is
+    /// listening there.
+    #[cfg(unix)]
+    #[test]
+    fn real_doctor_never_connects_to_a_recorded_endpoint_outside_the_state_dir() {
+        let _network_guard = real_network_test_guard();
+        let state = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let foreign_endpoint = endpoint_in(&elsewhere);
+        let mut listener = ControlListener::bind(&foreign_endpoint).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let peer_stop = Arc::clone(&stop);
+        let connections = Arc::new(AtomicUsize::new(0));
+        let peer_connections = Arc::clone(&connections);
+        let peer = std::thread::spawn(move || -> Result<(), String> {
+            while let Some(stream) =
+                accept_client(&mut listener, Duration::from_secs(2), &peer_stop)?
+            {
+                peer_connections.fetch_add(1, Ordering::AcqRel);
+                drop(stream);
+            }
+            Ok(())
+        });
+
+        let discovery = write_discovery(
+            &state,
+            &enriched_status(
+                1_313,
+                foreign_endpoint.as_str(),
+                "0.7.0.rforeign",
+                "/opt/hyperdb/foreign-daemon",
+            ),
+        );
+        let report = collect_real_doctor_daemon(Some(&discovery), None, Some(state.path()));
+        // Give a wrongly-issued connection time to arrive before stopping.
+        std::thread::sleep(Duration::from_millis(100));
+        stop.store(true, Ordering::Release);
+        peer.join().unwrap().unwrap();
+
+        assert_eq!(connections.load(Ordering::Acquire), 0);
+        assert!(report.verified.is_none());
+        assert_eq!(report.state, DoctorDaemonState::ParsedUnreachable);
+        assert_eq!(
+            report.warnings,
+            vec![DoctorDaemonWarning::DiscoveryCandidateUnreachable {
+                health_endpoint: foreign_endpoint.as_str().to_owned(),
+            }]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_doctor_rejects_a_recorded_path_that_is_not_the_state_dirs_socket() {
+        let state = TempDir::new().unwrap();
+        let record = state.path().join("other.sock");
+        let discovery = write_discovery(
+            &state,
+            &enriched_status(
+                1_414,
+                &record.to_string_lossy(),
+                "0.7.0.rother",
+                "/opt/hyperdb/other-daemon",
+            ),
+        );
+        let report = collect_real_doctor_daemon(Some(&discovery), None, Some(state.path()));
+        assert_eq!(report.state, DoctorDaemonState::ParsedUnreachable);
+        assert!(report.verified.is_none());
+        assert_eq!(
+            report.warnings,
+            vec![DoctorDaemonWarning::DiscoveryCandidateUnreachable {
+                health_endpoint: record.to_string_lossy().into_owned(),
+            }]
+        );
+
+        // Without a resolvable state directory nothing is ever connected to.
+        let report = collect_real_doctor_daemon(Some(&discovery), None, None);
+        assert_eq!(report.state, DoctorDaemonState::ParsedUnreachable);
+        assert!(report.verified.is_none());
+    }
+
+    /// A state directory another account can write to is never read from,
+    /// connected through or locked: a planted socket sees no connection and
+    /// no lock file appears.
+    #[cfg(unix)]
+    #[test]
+    fn real_doctor_ignores_an_untrusted_state_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _network_guard = real_network_test_guard();
+        let state = TempDir::new().unwrap();
+        let endpoint = endpoint_in(&state);
+        let mut listener = ControlListener::bind(&endpoint).unwrap();
+        let discovery = write_discovery(
+            &state,
+            &enriched_status(1_515, endpoint.as_str(), "0.7.0.rplanted", "/opt/planted"),
+        );
+        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o770)).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let peer_stop = Arc::clone(&stop);
+        let connections = Arc::new(AtomicUsize::new(0));
+        let peer_connections = Arc::clone(&connections);
+        let peer = std::thread::spawn(move || -> Result<(), String> {
+            while let Some(stream) =
+                accept_client(&mut listener, Duration::from_secs(2), &peer_stop)?
+            {
+                peer_connections.fetch_add(1, Ordering::AcqRel);
+                drop(stream);
+            }
+            Ok(())
+        });
+
+        let report = collect_real_doctor_daemon(Some(&discovery), None, Some(state.path()));
+        let lock = probe_daemon_lock(state.path());
+        std::thread::sleep(Duration::from_millis(100));
+        stop.store(true, Ordering::Release);
+        peer.join().unwrap().unwrap();
+
+        assert_eq!(connections.load(Ordering::Acquire), 0);
+        assert!(report.verified.is_none());
+        assert_eq!(report.state, DoctorDaemonState::Unreadable);
+        assert_eq!(lock, DoctorLockState::Unknown);
+        assert!(
+            !state
+                .path()
+                .join(crate::daemon::lock::LOCK_FILE_NAME)
+                .exists(),
+            "doctor must not create the lock file"
+        );
+        assert!(crate::diagnostics::untrusted_state_dir_error(state.path()).is_some());
+    }
+
+    #[test]
+    fn lock_probe_reports_an_absent_lock_without_creating_it() {
+        let dir = TempDir::new().unwrap();
+        assert_eq!(probe_daemon_lock(dir.path()), DoctorLockState::Absent);
+        assert!(
+            !dir.path().join(LOCK_FILE_NAME).exists(),
+            "probing must not create the lock file"
+        );
+    }
+
+    #[test]
+    fn lock_probe_reports_a_free_lock_once_its_holder_is_gone() {
+        let dir = TempDir::new().unwrap();
+        drop(
+            DaemonLock::try_acquire(dir.path())
+                .unwrap()
+                .expect("first acquire"),
+        );
+        assert_eq!(probe_daemon_lock(dir.path()), DoctorLockState::Free);
+        // The probe took the lock for an instant and must have released it.
+        assert!(
+            DaemonLock::try_acquire(dir.path()).unwrap().is_some(),
+            "the probe must not leave the lock held"
+        );
+    }
+
+    #[test]
+    fn lock_probe_reports_a_held_lock() {
+        let dir = TempDir::new().unwrap();
+        let _held = DaemonLock::try_acquire(dir.path())
+            .unwrap()
+            .expect("acquire");
+        assert_eq!(probe_daemon_lock(dir.path()), DoctorLockState::Held);
+    }
+
+    #[test]
+    fn lock_probe_reports_a_non_file_lock_path_as_unknown() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join(LOCK_FILE_NAME)).unwrap();
+        assert_eq!(probe_daemon_lock(dir.path()), DoctorLockState::Unknown);
+    }
+
     #[test]
     fn collect_doctor_state_matrix_is_pure() {
         struct Case {
             name: &'static str,
             raw: RawFixture,
-            scan_ports: Vec<u16>,
-            status_responses: Vec<(u16, Value)>,
+            status_responses: Vec<(&'static str, Value)>,
             expected_state: DoctorDaemonState,
-            expected_live: Option<(u32, u16, &'static str)>,
+            expected_live: Option<(u32, &'static str, &'static str)>,
             expected_warnings: Vec<DoctorDaemonWarning>,
         }
 
         let discovery_live = enriched_status(
             4_242,
-            7_486,
+            "/virtual/live/daemon.sock",
             "0.7.0.rdiscovery",
             "/opt/hyperdb/discovery-daemon",
         );
-        let scan_live = enriched_status(5_151, 7_487, "0.7.0.rscan", "/opt/hyperdb/scanned-daemon");
         let cases = vec![
             Case {
                 name: "missing",
                 raw: RawFixture::Missing,
-                scan_ports: vec![],
                 status_responses: vec![],
                 expected_state: DoctorDaemonState::Missing,
                 expected_live: None,
@@ -2453,7 +2404,6 @@ mod tests {
             Case {
                 name: "unreadable",
                 raw: RawFixture::Unreadable(io::ErrorKind::PermissionDenied),
-                scan_ports: vec![],
                 status_responses: vec![],
                 expected_state: DoctorDaemonState::Unreadable,
                 expected_live: None,
@@ -2464,7 +2414,6 @@ mod tests {
             Case {
                 name: "malformed",
                 raw: RawFixture::Malformed,
-                scan_ports: vec![],
                 status_responses: vec![],
                 expected_state: DoctorDaemonState::Malformed,
                 expected_live: None,
@@ -2473,7 +2422,6 @@ mod tests {
             Case {
                 name: "oversized",
                 raw: RawFixture::Oversized,
-                scan_ports: vec![],
                 status_responses: vec![],
                 expected_state: DoctorDaemonState::Oversized,
                 expected_live: None,
@@ -2483,34 +2431,23 @@ mod tests {
                 name: "parsed-unreachable",
                 raw: RawFixture::Parsed(enriched_status(
                     4_040,
-                    7_485,
+                    "/virtual/stale/daemon.sock",
                     "0.7.0.rstale",
                     "/opt/hyperdb/stale-daemon",
                 )),
-                scan_ports: vec![],
                 status_responses: vec![],
                 expected_state: DoctorDaemonState::ParsedUnreachable,
                 expected_live: None,
                 expected_warnings: vec![DoctorDaemonWarning::DiscoveryCandidateUnreachable {
-                    responding_port: 7_485,
+                    health_endpoint: "/virtual/stale/daemon.sock".to_string(),
                 }],
             },
             Case {
                 name: "live-from-discovery",
                 raw: RawFixture::Parsed(discovery_live.clone()),
-                scan_ports: vec![],
-                status_responses: vec![(7_486, discovery_live)],
+                status_responses: vec![("/virtual/live/daemon.sock", discovery_live)],
                 expected_state: DoctorDaemonState::LiveFromDiscovery,
-                expected_live: Some((4_242, 7_486, "0.7.0.rdiscovery")),
-                expected_warnings: vec![],
-            },
-            Case {
-                name: "live-from-scan",
-                raw: RawFixture::Missing,
-                scan_ports: vec![7_487],
-                status_responses: vec![(7_487, scan_live)],
-                expected_state: DoctorDaemonState::LiveFromScan,
-                expected_live: Some((5_151, 7_487, "0.7.0.rscan")),
+                expected_live: Some((4_242, "/virtual/live/daemon.sock", "0.7.0.rdiscovery")),
                 expected_warnings: vec![],
             },
         ];
@@ -2523,27 +2460,16 @@ mod tests {
                 operations.borrow_mut().push("raw-reader".to_string());
                 case.raw.read()
             };
-            let probe_enriched_status = |port: u16, deadline: DoctorDeadline| {
+            let probe_enriched_status = |endpoint: &str, deadline: DoctorDeadline| {
                 operations
                     .borrow_mut()
-                    .push(format!("status-prober:{port}:{}", deadline.0));
+                    .push(format!("status-prober:{endpoint}:{}", deadline.0));
                 case.status_responses
                     .iter()
-                    .find(|(candidate, _)| *candidate == port)
+                    .find(|(candidate, _)| *candidate == endpoint)
                     .map_or(DoctorStatusProbe::Unreachable, |(_, response)| {
                         DoctorStatusProbe::Response(response.to_string())
                     })
-            };
-            let scan_candidates = |request: DoctorScanRequest| {
-                operations.borrow_mut().push(format!(
-                    "bounded-scanner:{}:{}:{}",
-                    request.ports.base, request.ports.span, request.deadline.0
-                ));
-                case.scan_ports
-                    .iter()
-                    .copied()
-                    .map(|responding_port| DoctorScanCandidate { responding_port })
-                    .collect()
             };
             let now = || {
                 operations.borrow_mut().push("clock".to_string());
@@ -2562,15 +2488,10 @@ mod tests {
             let dependencies = DoctorCollectorDependencies {
                 read_raw_discovery: &read_raw_discovery,
                 probe_enriched_status: &probe_enriched_status,
-                scan_candidates: &scan_candidates,
                 now: &now,
                 deadline_after: &deadline_after,
             };
             let request = DoctorCollectRequest {
-                ports: PortScan {
-                    base: 7_485,
-                    span: 4,
-                },
                 timeout: Duration::from_millis(275),
             };
 
@@ -2586,10 +2507,10 @@ mod tests {
                     }
                     match (report.verified.as_ref(), case.expected_live) {
                         (None, None) => {}
-                        (Some(verified), Some((pid, port, build))) => {
-                            if verified.responding_port != port
+                        (Some(verified), Some((pid, endpoint, build))) => {
+                            if verified.health_endpoint != endpoint
                                 || verified.record.info().pid != pid
-                                || verified.record.info().health_port != port
+                                || verified.record.info().health_endpoint != endpoint
                                 || verified
                                     .record
                                     .identity()
@@ -2632,7 +2553,6 @@ mod tests {
                 .filter(|operation| {
                     !operation.starts_with("raw-reader")
                         && !operation.starts_with("status-prober")
-                        && !operation.starts_with("bounded-scanner")
                         && !operation.starts_with("clock")
                         && !operation.starts_with("deadline")
                 })
@@ -2664,30 +2584,36 @@ mod tests {
         struct Case {
             name: &'static str,
             raw: RawFixture,
-            scan_ports: Vec<u16>,
-            probes: Vec<(u16, ProbeFixture)>,
+            probes: Vec<(&'static str, ProbeFixture)>,
             expected_state: DoctorDaemonState,
             expected_fresh_pid: Option<u32>,
-            expected_probed_ports: Vec<u16>,
-            expected_scan: bool,
+            expected_probed: Vec<&'static str>,
             expected_warnings: Vec<DoctorDaemonWarning>,
         }
 
         let recorded_executable =
             ReportedPath::from_os_str(OsStr::new("/opt/hyperdb/recorded-daemon"));
         let fresh_executable = ReportedPath::from_os_str(OsStr::new("/opt/hyperdb/fresh-daemon"));
-        let recorded = enriched_status(101, 8_000, "0.7.0.rrecorded", &recorded_executable.display);
-        let fresh = enriched_status(202, 8_000, "0.7.0.rfresh", &fresh_executable.display);
+        let recorded = enriched_status(
+            101,
+            "/virtual/a/daemon.sock",
+            "0.7.0.rrecorded",
+            &recorded_executable.display,
+        );
+        let fresh = enriched_status(
+            202,
+            "/virtual/a/daemon.sock",
+            "0.7.0.rfresh",
+            &fresh_executable.display,
+        );
         let cases = vec![
             Case {
                 name: "discovery-is-refetched-and-fresh-facts-win",
                 raw: RawFixture::Parsed(recorded),
-                scan_ports: vec![],
-                probes: vec![(8_000, ProbeFixture::Response(fresh))],
+                probes: vec![("/virtual/a/daemon.sock", ProbeFixture::Response(fresh))],
                 expected_state: DoctorDaemonState::LiveFromDiscovery,
                 expected_fresh_pid: Some(202),
-                expected_probed_ports: vec![8_000],
-                expected_scan: false,
+                expected_probed: vec!["/virtual/a/daemon.sock"],
                 expected_warnings: vec![DoctorDaemonWarning::StaleOrReplacedDiscovery {
                     mismatches: vec![
                         DiscoveryFactMismatch::Pid {
@@ -2706,105 +2632,68 @@ mod tests {
                 }],
             },
             Case {
-                name: "discovery-status-health-port-must-match-responder",
+                name: "discovery-status-health-endpoint-must-match-responder",
                 raw: RawFixture::Parsed(enriched_status(
                     303,
-                    8_001,
+                    "/virtual/b/daemon.sock",
                     "0.7.0.rrecorded",
                     "/opt/hyperdb/discovery-candidate",
                 )),
-                scan_ports: vec![],
                 probes: vec![(
-                    8_001,
+                    "/virtual/b/daemon.sock",
                     ProbeFixture::Response(enriched_status(
                         404,
-                        9_001,
+                        "/virtual/other/daemon.sock",
                         "0.7.0.rfresh",
                         "/opt/hyperdb/other-daemon",
                     )),
                 )],
                 expected_state: DoctorDaemonState::ParsedUnreachable,
                 expected_fresh_pid: None,
-                expected_probed_ports: vec![8_001],
-                expected_scan: true,
-                expected_warnings: vec![DoctorDaemonWarning::StatusHealthPortMismatch {
-                    responding_port: 8_001,
-                    reported_port: 9_001,
+                expected_probed: vec!["/virtual/b/daemon.sock"],
+                expected_warnings: vec![DoctorDaemonWarning::StatusHealthEndpointMismatch {
+                    recorded_endpoint: "/virtual/b/daemon.sock".to_string(),
+                    reported_endpoint: "/virtual/other/daemon.sock".to_string(),
                 }],
             },
             Case {
                 name: "malformed-discovery-status-is-not-live-evidence",
                 raw: RawFixture::Parsed(enriched_status(
                     505,
-                    8_002,
+                    "/virtual/c/daemon.sock",
                     "0.7.0.rrecorded",
                     "/opt/hyperdb/discovery-candidate",
                 )),
-                scan_ports: vec![],
-                probes: vec![(8_002, ProbeFixture::Malformed)],
+                probes: vec![("/virtual/c/daemon.sock", ProbeFixture::Malformed)],
                 expected_state: DoctorDaemonState::ParsedUnreachable,
                 expected_fresh_pid: None,
-                expected_probed_ports: vec![8_002],
-                expected_scan: true,
+                expected_probed: vec!["/virtual/c/daemon.sock"],
                 expected_warnings: vec![DoctorDaemonWarning::MalformedStatus {
-                    responding_port: 8_002,
+                    health_endpoint: "/virtual/c/daemon.sock".to_string(),
                 }],
             },
             Case {
-                name: "scan-hit-is-refetched-before-becoming-live",
+                name: "missing-discovery-probes-nothing",
                 raw: RawFixture::Missing,
-                scan_ports: vec![8_003],
-                probes: vec![(
-                    8_003,
-                    ProbeFixture::Response(enriched_status(
-                        606,
-                        8_003,
-                        "0.7.0.rscan-fresh",
-                        "/opt/hyperdb/scan-fresh-daemon",
-                    )),
-                )],
-                expected_state: DoctorDaemonState::LiveFromScan,
-                expected_fresh_pid: Some(606),
-                expected_probed_ports: vec![8_003],
-                expected_scan: true,
-                expected_warnings: vec![],
-            },
-            Case {
-                name: "scan-status-health-port-must-match-responder",
-                raw: RawFixture::Missing,
-                scan_ports: vec![8_004],
-                probes: vec![(
-                    8_004,
-                    ProbeFixture::Response(enriched_status(
-                        707,
-                        9_004,
-                        "0.7.0.rwrong-port",
-                        "/opt/hyperdb/wrong-port-daemon",
-                    )),
-                )],
+                probes: vec![],
                 expected_state: DoctorDaemonState::Missing,
                 expected_fresh_pid: None,
-                expected_probed_ports: vec![8_004],
-                expected_scan: true,
-                expected_warnings: vec![DoctorDaemonWarning::StatusHealthPortMismatch {
-                    responding_port: 8_004,
-                    reported_port: 9_004,
-                }],
+                expected_probed: vec![],
+                expected_warnings: vec![],
             },
         ];
 
         let mut failures = Vec::new();
         for case in cases {
             let raw_before = case.raw.clone();
-            let probed_ports = RefCell::new(Vec::new());
-            let scan_requests = RefCell::new(Vec::new());
+            let probed = RefCell::new(Vec::new());
             let read_raw_discovery = || case.raw.read();
-            let probe_enriched_status = |port: u16, deadline: DoctorDeadline| {
-                probed_ports.borrow_mut().push((port, deadline));
+            let probe_enriched_status = |endpoint: &str, deadline: DoctorDeadline| {
+                probed.borrow_mut().push((endpoint.to_owned(), deadline));
                 match case
                     .probes
                     .iter()
-                    .find(|(candidate, _)| *candidate == port)
+                    .find(|(candidate, _)| *candidate == endpoint)
                     .map(|(_, response)| response)
                 {
                     Some(ProbeFixture::Response(response)) => {
@@ -2815,14 +2704,6 @@ mod tests {
                     }
                     None => DoctorStatusProbe::Unreachable,
                 }
-            };
-            let scan_candidates = |request: DoctorScanRequest| {
-                scan_requests.borrow_mut().push(request);
-                case.scan_ports
-                    .iter()
-                    .copied()
-                    .map(|responding_port| DoctorScanCandidate { responding_port })
-                    .collect()
             };
             let now = || DoctorMoment(60_000);
             let deadline_after = |now: DoctorMoment, timeout: Duration| {
@@ -2835,15 +2716,10 @@ mod tests {
             let dependencies = DoctorCollectorDependencies {
                 read_raw_discovery: &read_raw_discovery,
                 probe_enriched_status: &probe_enriched_status,
-                scan_candidates: &scan_candidates,
                 now: &now,
                 deadline_after: &deadline_after,
             };
             let request = DoctorCollectRequest {
-                ports: PortScan {
-                    base: 8_000,
-                    span: 5,
-                },
                 timeout: Duration::from_millis(125),
             };
 
@@ -2880,18 +2756,18 @@ mod tests {
                 )),
             }
 
-            let actual_ports = probed_ports
+            let actual_probed = probed
                 .borrow()
                 .iter()
-                .map(|(port, _)| *port)
+                .map(|(endpoint, _)| endpoint.clone())
                 .collect::<Vec<_>>();
-            if actual_ports != case.expected_probed_ports {
+            if actual_probed != case.expected_probed {
                 failures.push(format!(
-                    "{}: STATUS probes were {actual_ports:?}, expected {:?}",
-                    case.name, case.expected_probed_ports
+                    "{}: STATUS probes were {actual_probed:?}, expected {:?}",
+                    case.name, case.expected_probed
                 ));
             }
-            if probed_ports
+            if probed
                 .borrow()
                 .iter()
                 .any(|(_, deadline)| *deadline != DoctorDeadline(60_125))
@@ -2900,29 +2776,6 @@ mod tests {
                     "{}: STATUS probe did not receive the finite shared deadline",
                     case.name
                 ));
-            }
-
-            let expected_scan_requests = usize::from(case.expected_scan);
-            if scan_requests.borrow().len() != expected_scan_requests {
-                failures.push(format!(
-                    "{}: bounded scanner call count was {}, expected {expected_scan_requests}",
-                    case.name,
-                    scan_requests.borrow().len()
-                ));
-            }
-            for scan_request in scan_requests.borrow().iter() {
-                if scan_request.ports
-                    != (PortScan {
-                        base: 8_000,
-                        span: 5,
-                    })
-                    || scan_request.deadline != DoctorDeadline(60_125)
-                {
-                    failures.push(format!(
-                        "{}: scan request was not bounded to five ports and 125ms: {scan_request:?}",
-                        case.name
-                    ));
-                }
             }
             if case.raw != raw_before {
                 failures.push(format!(
@@ -2976,7 +2829,7 @@ mod tests {
         let info = record.info();
         assert_eq!(info.pid, 4242);
         assert_eq!(info.hyperd_endpoint, "127.0.0.1:54321");
-        assert_eq!(info.health_port, 7485);
+        assert_eq!(info.health_endpoint, "/virtual/state/daemon.sock");
         assert_eq!(info.started_at, "2026-08-13T12:34:56Z");
         assert_eq!(info.version, "0.7.0");
 
@@ -2997,7 +2850,7 @@ mod tests {
         let old_wire = json!({
             "pid": 4242,
             "hyperd_endpoint": "127.0.0.1:54321",
-            "health_port": 7485,
+            "health_endpoint": "/virtual/state/daemon.sock",
             "started_at": "2026-08-13T12:34:56Z",
             "version": "0.7.0"
         });
@@ -3008,7 +2861,7 @@ mod tests {
         let enriched_wire = json!({
             "pid": 4242,
             "hyperd_endpoint": "127.0.0.1:54321",
-            "health_port": 7485,
+            "health_endpoint": "/virtual/state/daemon.sock",
             "started_at": "2026-08-13T12:34:56Z",
             "version": "0.7.0",
             "identity": {

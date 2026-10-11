@@ -116,7 +116,7 @@ pub struct ArrowInserter<'conn> {
     chunk_count: usize,
     /// Start time for timing the insert operation.
     start_time: Instant,
-    /// Flush threshold in bytes. Data is buffered until this threshold is reached.
+    /// Flush threshold in bytes. Controls how often an explicit flush happens.
     flush_threshold: usize,
     /// Bytes buffered since the last flush.
     buffered_bytes: usize,
@@ -240,7 +240,8 @@ impl<'conn> ArrowInserter<'conn> {
 
     /// Sets a custom flush threshold in bytes.
     ///
-    /// Data is buffered until the threshold is reached, then flushed to the server.
+    /// Data is written to the socket as each chunk is inserted; the threshold
+    /// only controls how often an explicit flush and progress log happen.
     /// Default is 16 MB (matching `HyperBinary` Inserter).
     ///
     /// # Example
@@ -441,8 +442,8 @@ impl<'conn> ArrowInserter<'conn> {
     ///   raw IPC and `RecordBatch` paths cannot be mixed.
     /// - Returns [`Error::FeatureNotSupported`] / [`Error::Server`] if the lazy COPY
     ///   session fails to open.
-    /// - Returns [`Error::Server`] / [`Error::Io`] if the server rejects
-    ///   the data or the socket write fails.
+    /// - Returns [`Error::Server`] if the server rejects the data, or
+    ///   [`Error::Connection`] if the socket write fails.
     pub fn insert_raw(&mut self, data: &[u8]) -> Result<()> {
         if data.is_empty() {
             return Ok(());
@@ -493,7 +494,6 @@ impl<'conn> ArrowInserter<'conn> {
     /// # Ok(())
     /// # }
     /// ```
-    /// println!("Inserted {} rows", rows);
     pub fn execute(mut self) -> Result<u64> {
         // Finalize the IPC StreamWriter if insert_batch() was used.
         // `into_inner()` calls `finish()` internally (writing the EOS marker)
@@ -513,17 +513,12 @@ impl<'conn> ArrowInserter<'conn> {
             }
         }
 
-        if self.writer.is_none() {
+        let Some(writer) = self.writer.take() else {
             // No data was sent
             return Ok(0);
-        }
+        };
 
-        let rows = self
-            .writer
-            .take()
-            .map(hyperdb_api_core::client::CopyInWriter::finish)
-            .transpose()?
-            .unwrap_or(0);
+        let rows = writer.finish()?;
 
         let duration_ms = u64::try_from(self.start_time.elapsed().as_millis()).unwrap_or(u64::MAX);
         info!(
@@ -619,15 +614,8 @@ impl<'conn> ArrowInserter<'conn> {
     /// - Returns [`Error::Conversion`] wrapping the underlying Arrow IPC
     ///   writer error if the schema or batch cannot be serialized (e.g.
     ///   dictionary misalignment, encoding failure).
-    /// - Returns [`Error::Server`] / [`Error::Io`] if the server rejects
-    ///   the data or the socket write fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics internally only if the IPC writer state is corrupted —
-    /// callers cannot trigger this from the public API. The `batch_ipc_writer`
-    /// is consulted via `as_mut().unwrap()` after it has just been set to
-    /// `Some`, so the unwrap is unreachable.
+    /// - Returns [`Error::Server`] if the server rejects the data, or
+    ///   [`Error::Connection`] if the socket write fails.
     pub fn insert_batch(&mut self, batch: &arrow::record_batch::RecordBatch) -> Result<()> {
         if self.insert_mode == Some(InsertMode::RawIpc) {
             return Err(Error::invalid_operation(
@@ -655,7 +643,7 @@ impl<'conn> ArrowInserter<'conn> {
         // Write the record batch — this appends batch IPC bytes to the internal Vec
         self.batch_ipc_writer
             .as_mut()
-            .expect("IPC writer must exist")
+            .ok_or_else(|| Error::internal("IPC writer must exist"))?
             .write(batch)
             .map_err(|e| Error::conversion(format!("Failed to write Arrow batch: {e}")))?;
 

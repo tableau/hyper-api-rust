@@ -22,28 +22,23 @@ use std::fmt;
 
 /// A wrapper that ensures a SQL identifier is properly escaped when formatted.
 ///
-/// This is a zero-cost abstraction that performs escaping lazily during formatting.
-/// Identifiers are conditionally quoted:
-/// - Simple lowercase identifiers (`users`, `my_table`) are not quoted
-/// - Identifiers with uppercase letters are quoted to preserve case
-/// - Identifiers with special characters are quoted
+/// The identifier is **always** quoted, with embedded `"` doubled. Quoting
+/// unconditionally is deliberate: the engine reserves keywords such as `order`,
+/// `user` and `table`, and a bare reserved word is a syntax error (it broke
+/// every `COPY` into such a table). Reserved words cannot be detected reliably
+/// from the client, and for a plain lowercase name `"users"` and `users` are the
+/// same relation, so the extra quotes never change meaning.
 ///
 /// # Example
 ///
 /// ```
 /// use hyperdb_api_core::protocol::escape::SqlIdentifier;
 ///
-/// // Simple identifiers are not quoted
-/// assert_eq!(format!("{}", SqlIdentifier("users")), "users");
-/// assert_eq!(format!("{}", SqlIdentifier("my_table")), "my_table");
-///
-/// // Uppercase letters are quoted to preserve case
+/// assert_eq!(format!("{}", SqlIdentifier("users")), "\"users\"");
+/// // Reserved words survive
+/// assert_eq!(format!("{}", SqlIdentifier("order")), "\"order\"");
+/// // Case is preserved
 /// assert_eq!(format!("{}", SqlIdentifier("Segment")), "\"Segment\"");
-///
-/// // Special characters require quoting
-/// assert_eq!(format!("{}", SqlIdentifier("my-table")), "\"my-table\"");
-/// assert_eq!(format!("{}", SqlIdentifier("my table")), "\"my table\"");
-///
 /// // Internal quotes are escaped
 /// assert_eq!(format!("{}", SqlIdentifier("my\"table")), "\"my\"\"table\"");
 /// ```
@@ -52,25 +47,7 @@ pub struct SqlIdentifier<'a>(pub &'a str);
 
 impl fmt::Display for SqlIdentifier<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Check if identifier needs quoting:
-        // 1. Not a valid unquoted identifier (has spaces, hyphens, etc.)
-        // 2. Contains uppercase letters (to preserve case - PostgreSQL case-folds unquoted identifiers)
-        let needs_quoting =
-            !is_valid_unquoted_identifier(self.0) || self.0.chars().any(char::is_uppercase);
-
-        if needs_quoting {
-            f.write_str("\"")?;
-            for c in self.0.chars() {
-                if c == '"' {
-                    f.write_str("\"\"")?;
-                } else {
-                    write!(f, "{c}")?;
-                }
-            }
-            f.write_str("\"")
-        } else {
-            f.write_str(self.0)
-        }
+        fmt::Display::fmt(&QuotedIdentifier(self.0), f)
     }
 }
 
@@ -144,10 +121,13 @@ pub fn is_valid_unquoted_identifier(s: &str) -> bool {
 /// ```
 /// use hyperdb_api_core::protocol::escape::format_table_name;
 ///
-/// assert_eq!(format_table_name(None, None, "users"), "users");
-/// assert_eq!(format_table_name(None, Some("public"), "users"), "public.users");
-/// assert_eq!(format_table_name(Some("mydb"), Some("public"), "users"), "mydb.public.users");
-/// assert_eq!(format_table_name(None, None, "my-table"), "\"my-table\"");
+/// assert_eq!(format_table_name(None, None, "users"), "\"users\"");
+/// assert_eq!(format_table_name(None, Some("public"), "users"), "\"public\".\"users\"");
+/// assert_eq!(
+///     format_table_name(Some("mydb"), Some("public"), "users"),
+///     "\"mydb\".\"public\".\"users\""
+/// );
+/// assert_eq!(format_table_name(None, None, "order"), "\"order\"");
 /// ```
 #[must_use]
 pub fn format_table_name(database: Option<&str>, schema: Option<&str>, table: &str) -> String {
@@ -176,7 +156,7 @@ pub fn format_table_name(database: Option<&str>, schema: Option<&str>, table: &s
 /// ```
 /// use hyperdb_api_core::protocol::escape::escape_identifier;
 ///
-/// assert_eq!(escape_identifier("table"), "table");
+/// assert_eq!(escape_identifier("table"), "\"table\"");
 /// assert_eq!(escape_identifier("Segment"), "\"Segment\"");
 /// ```
 #[must_use]
@@ -186,22 +166,17 @@ pub fn escape_identifier(identifier: &str) -> String {
 
 /// A SQL identifier that is **always** quoted, whatever it contains.
 ///
-/// [`SqlIdentifier`] omits the quotes when a name is already a legal bare
-/// identifier, which is fine for display but unsafe for generated DDL:
-/// [`is_valid_unquoted_identifier`] deliberately does not know the reserved
-/// word list, so an all-lowercase keyword such as `select` or `order` passes
-/// the check and is emitted bare, producing a syntax error. Quoting
-/// unconditionally sidesteps the whole question — `"users"` and `users` name
-/// the same relation, so the extra quotes never change meaning.
-///
-/// Use this for any identifier written into SQL that the engine must parse.
+/// Since [`SqlIdentifier`] now quotes unconditionally too, the two render
+/// identically; this type remains as the explicit spelling of that intent.
+/// `"users"` and `users` name the same relation, so the extra quotes never
+/// change meaning, and reserved words such as `order` stay legal.
 ///
 /// # Example
 ///
 /// ```
 /// use hyperdb_api_core::protocol::escape::QuotedIdentifier;
 ///
-/// // Reserved words survive, where SqlIdentifier would emit them bare
+/// // Reserved words survive
 /// assert_eq!(format!("{}", QuotedIdentifier("select")), "\"select\"");
 /// assert_eq!(format!("{}", QuotedIdentifier("users")), "\"users\"");
 /// // Internal quotes are doubled
@@ -248,21 +223,12 @@ mod tests {
 
     #[test]
     fn test_sql_identifier_display() {
-        // Valid unquoted identifiers with only lowercase should not be quoted
-        assert_eq!(format!("{}", SqlIdentifier("table")), "table");
-        assert_eq!(format!("{}", SqlIdentifier("my_table")), "my_table");
-        assert_eq!(format!("{}", SqlIdentifier("table1")), "table1");
-        assert_eq!(format!("{}", SqlIdentifier("_private")), "_private");
-        assert_eq!(format!("{}", SqlIdentifier("my$var")), "my$var");
-
-        // Identifiers with uppercase letters should be quoted to preserve case
+        // Always quoted, including reserved words and plain lowercase names
+        assert_eq!(format!("{}", SqlIdentifier("table")), "\"table\"");
+        assert_eq!(format!("{}", SqlIdentifier("order")), "\"order\"");
+        assert_eq!(format!("{}", SqlIdentifier("my_table")), "\"my_table\"");
         assert_eq!(format!("{}", SqlIdentifier("Segment")), "\"Segment\"");
-        assert_eq!(format!("{}", SqlIdentifier("CustomerID")), "\"CustomerID\"");
-        assert_eq!(format!("{}", SqlIdentifier("Table")), "\"Table\"");
-
-        // Invalid unquoted identifiers should be quoted
         assert_eq!(format!("{}", SqlIdentifier("my-table")), "\"my-table\"");
-        assert_eq!(format!("{}", SqlIdentifier("my table")), "\"my table\"");
         assert_eq!(format!("{}", SqlIdentifier("1table")), "\"1table\"");
         assert_eq!(format!("{}", SqlIdentifier("my\"table")), "\"my\"\"table\"");
         assert_eq!(format!("{}", SqlIdentifier("")), "\"\"");
@@ -290,40 +256,36 @@ mod tests {
 
     #[test]
     fn test_format_table_name() {
-        assert_eq!(format_table_name(None, None, "users"), "users");
+        assert_eq!(format_table_name(None, None, "users"), "\"users\"");
+        assert_eq!(format_table_name(None, None, "order"), "\"order\"");
         assert_eq!(
             format_table_name(None, Some("public"), "users"),
-            "public.users"
+            "\"public\".\"users\""
         );
         assert_eq!(
             format_table_name(Some("mydb"), Some("public"), "users"),
-            "mydb.public.users"
+            "\"mydb\".\"public\".\"users\""
         );
-        // Test with names that need quoting
-        assert_eq!(format_table_name(None, None, "my-table"), "\"my-table\"");
         assert_eq!(
             format_table_name(None, Some("my schema"), "users"),
-            "\"my schema\".users"
+            "\"my schema\".\"users\""
         );
     }
 
     #[test]
     fn test_sql_identifier_in_format() {
-        // Demonstrate zero-allocation composability
-        let table = "users";
-        let column = "Customer ID";
         let sql = format!(
             "SELECT {} FROM {}",
-            SqlIdentifier(column),
-            SqlIdentifier(table)
+            SqlIdentifier("Customer ID"),
+            SqlIdentifier("users")
         );
-        assert_eq!(sql, "SELECT \"Customer ID\" FROM users");
+        assert_eq!(sql, "SELECT \"Customer ID\" FROM \"users\"");
     }
 
     // Backward compat function tests
     #[test]
     fn test_escape_identifier() {
-        assert_eq!(escape_identifier("table"), "table");
+        assert_eq!(escape_identifier("table"), "\"table\"");
         assert_eq!(escape_identifier("Segment"), "\"Segment\"");
     }
 

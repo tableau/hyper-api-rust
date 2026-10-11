@@ -88,8 +88,9 @@ let config = SalesforceAuthConfig::new(login_url, client_id)?
 `DataCloudTokenProvider` caches both the OAuth Access Token and the DC JWT
 independently. The OAuth Access Token (~2-hour lifetime) is only refreshed when
 genuinely expired, avoiding unnecessary refresh token rotation. The DC JWT is
-refreshed proactively based on both expiry and age. `get_token()` returns a
+refreshed when it is within 5 minutes of expiry. `get_token()` returns a
 cached token when valid, or transparently performs the full flow when needed.
+`AuthenticatedGrpcClient` additionally refreshes it once it is older than 15 minutes.
 
 ### SharedTokenProvider
 
@@ -105,6 +106,7 @@ let provider_clone = provider.clone();
 tokio::spawn(async move {
     let token = provider_clone.get_token().await?;
     // use token.bearer_token() as the Authorization header
+    Ok::<(), hyperdb_api_salesforce::SalesforceAuthError>(())
 });
 ```
 
@@ -233,15 +235,15 @@ cargo run -p hyperdb-api-salesforce --example salesforce_auth_example
 
 | Error | Cause and Solution |
 |-------|-------------------|
-| `invalid_grant: user hasn't approved this consumer` | Pre-authorize the user (Step 3 above) |
-| `invalid_client_id` | Verify Consumer Key matches exactly |
-| `Private key error: failed to parse private key` | Convert to PKCS#8: `openssl pkcs8 -topk8 -nocrypt -in keypair.key -out private.key` |
-| `invalid_grant: authentication failure` | Check username, login URL, and certificate match |
-| `DC JWT exchange failed` | Verify Data Cloud license and `cdp_query_api` scope |
-| `client_secret is required for Password and RefreshToken auth modes` | Add `.client_secret(...)` to your config |
+| `authorization failed: invalid_grant - user hasn't approved this consumer` | Pre-authorize the user (Step 3 above) |
+| `authorization failed: invalid_client_id - ...` | Verify Consumer Key matches exactly |
+| `private key error: failed to parse private key (expected PKCS#8 PEM format): ...` | Convert to PKCS#8: `openssl pkcs8 -topk8 -nocrypt -in keypair.key -out private.key` |
+| `authorization failed: invalid_grant - authentication failure` | Check username, login URL, and certificate match |
+| `authorization failed: ...` or `HTTP error: ...` after a `DC JWT exchange failed` warning in the logs | Verify Data Cloud license and `cdp_query_api` scope |
+| `configuration error: client_secret is required for Password and RefreshToken auth modes` | Add `.client_secret(...)` to your config |
 
 ---
 
 ## License
 
-Apache-2.0 — see [LICENSE-APACHE](../LICENSE-APACHE).
+Licensed under either of [Apache License, Version 2.0](https://github.com/tableau/hyper-api-rust/blob/main/LICENSE-APACHE.txt) or [MIT license](https://github.com/tableau/hyper-api-rust/blob/main/LICENSE-MIT.txt), at your option.

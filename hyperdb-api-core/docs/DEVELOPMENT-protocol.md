@@ -1,7 +1,7 @@
-# hyper-protocol Development Guide
+# hyperdb-api-core `protocol` module: Development Guide
 
-Contributor-facing documentation for the `hyper-protocol` crate. For the
-user-facing overview, see [README.md](README.md).
+Contributor-facing documentation for the `protocol` module of the internal `hyperdb-api-core` crate. For the
+user-facing overview, see the [hyperdb-api README](../../hyperdb-api/README.md).
 
 ---
 
@@ -59,7 +59,7 @@ into the original buffer via `bytes::Bytes::split_to()`.
 The `escape` module uses the newtype-with-Display pattern (`SqlIdentifier`,
 `SqlLiteral`) rather than functions returning `String`. This avoids intermediate
 allocations when escaping is used inside `format!()` calls -- which is the
-primary use case in `hyperapi`'s SQL generation code. See the module-level doc
+primary use case in `hyperdb-api`'s SQL generation code. See the module-level doc
 comment in `escape.rs` for the full rationale.
 
 ---
@@ -89,10 +89,10 @@ cargo install --locked kani-verifier
 cargo kani setup
 
 # Run all proofs
-cargo kani -p hyper-protocol
+cargo kani -p hyperdb-api-core
 
 # Run a specific proof
-cargo kani -p hyper-protocol --harness read_i32_no_panic
+cargo kani -p hyperdb-api-core --harness read_i32_no_panic
 ```
 
 ### Limitations
@@ -154,7 +154,7 @@ unit tests instead.
 Each module has inline `#[cfg(test)] mod tests` blocks:
 
 ```bash
-cargo test -p hyper-protocol
+cargo test -p hyperdb-api-core
 ```
 
 ### Doc Tests
@@ -162,13 +162,13 @@ cargo test -p hyper-protocol
 Public functions with `/// # Example` blocks are compiled and run by:
 
 ```bash
-cargo test -p hyper-protocol --doc
+cargo test -p hyperdb-api-core --doc
 ```
 
 ### Checking Documentation
 
 ```bash
-RUSTDOCFLAGS="-D warnings" cargo doc -p hyper-protocol --no-deps
+RUSTDOCFLAGS="-D warnings" cargo doc -p hyperdb-api-core --no-deps
 ```
 
 This catches broken intra-doc links and missing docs (the crate enables
@@ -187,17 +187,16 @@ This catches broken intra-doc links and missing docs (the crate enables
   functions), `ParseError` is in `types.rs` (used by type conversions). A
   future cleanup could unify them, but they are stable and the separation
   matches the module boundary.
-- **`is_valid_unquoted_identifier` does not check reserved words.** The current
-  implementation checks syntax only (letter/underscore start, alphanumeric
-  body). SQL reserved words like `select` are not detected, so they will be
-  emitted unquoted. In practice this is harmless for Hyper's parser, but could
-  be tightened.
+- **`is_valid_unquoted_identifier` does not check reserved words.** It checks
+  syntax only, so `select` or `order` pass. This is why `SqlIdentifier` quotes
+  unconditionally rather than consulting it: a bare reserved word is a syntax
+  error in Hyper, and `"users"` and `users` are the same identifier.
 
 ---
 
 ## Related Documentation
 
-- [README.md](README.md) -- User-facing overview, key differences from PostgreSQL
-- [hyper-types README](../hyper-types/README.md) -- Type system and binary serialization
-- [hyper-client README](../hyper-client/README.md) -- Connection management
-- [AGENTS.md](../AGENTS.md) -- AI assistant guidance for the full workspace
+- [hyperdb-api README](../../hyperdb-api/README.md) -- User-facing overview; see [Key Differences from PostgreSQL](../../DEVELOPMENT.md#key-differences-from-postgresql) for protocol deviations
+- [Types development guide](DEVELOPMENT-types.md) -- Type system and binary serialization
+- [Client development guide](DEVELOPMENT-client.md) -- Connection management
+- [AGENTS.md](../../AGENTS.md) -- AI assistant guidance for the full workspace

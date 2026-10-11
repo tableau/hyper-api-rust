@@ -835,7 +835,7 @@ fn tcp_vs_grpc_query(row_count: i64) -> String {
     TCP_VS_GRPC_QUERY_TEMPLATE.replace("{row_count}", &row_count.to_string())
 }
 
-/// Runs a TCP-vs-gRPC query comparison on a synthesized 100M-row 4-column
+/// Runs a TCP-vs-gRPC query comparison on a synthesized row_count-row 4-column
 /// result that matches the `measurements` schema. One Hyper process in
 /// `ListenMode::Both` serves both transports, and the query has no
 /// attached-database dependency, so the comparison isolates
@@ -843,8 +843,8 @@ fn tcp_vs_grpc_query(row_count: i64) -> String {
 ///
 /// Produces three rows:
 /// - TCP (streaming)
-/// - gRPC streaming (the new `Connection::execute_query` → chunk stream path)
-/// - gRPC buffered (the existing `execute_query_to_arrow` path — materializes
+/// - gRPC streaming (streaming via `Connection::execute_query`)
+/// - gRPC buffered (buffered via `execute_query_to_arrow` — materializes
 ///   the whole Arrow IPC payload in client memory before decoding)
 fn run_tcp_vs_grpc_query_benchmark(row_count: i64, _db_path: &str) -> Result<()> {
     use hyperdb_api::Parameters;
@@ -892,9 +892,7 @@ fn run_tcp_vs_grpc_query_benchmark(row_count: i64, _db_path: &str) -> Result<()>
     // Use SYNC transfer mode for a fair TCP-vs-gRPC comparison: in SYNC
     // the server streams the whole result as one server-streaming RPC,
     // which mirrors TCP's COPY TO STDOUT shape and avoids the
-    // per-ADAPTIVE-chunk round-trips whose row-count cap ("the server
-    // stops after one chunk and the client has to ask for more") would
-    // under-report row counts if the client doesn't poll repeatedly.
+    // per-ADAPTIVE-chunk round-trips.
     let transfer_mode = hyperdb_api::grpc::TransferMode::Sync;
 
     // Test buffered first to verify the server can send all rows before
@@ -1141,9 +1139,8 @@ fn main() -> Result<()> {
         run_query_benchmarks(&connection, row_count)?;
     }
 
-    // Phase 5b: TCP vs gRPC query comparison on the same populated
-    // `measurements` table (reuses the single-threaded insert's output, so
-    // no extra INSERT cost beyond the query work itself).
+    // Phase 5b: TCP vs gRPC on a generate_series source with the
+    // `measurements` shape (gRPC cannot attach the local .hyper file).
     run_tcp_vs_grpc_query_benchmark(row_count, db_path)?;
 
     // Print comparison summary

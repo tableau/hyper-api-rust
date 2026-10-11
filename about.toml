@@ -1,0 +1,39 @@
+# cargo-about configuration: generates THIRD-PARTY-LICENSES.txt for the two
+# binaries that ship inside the npm platform packages (hyperdb-mcp and the
+# hyperdb-api-node addon). Run from the workspace root:
+#
+#   cargo about generate --manifest-path hyperdb-mcp/Cargo.toml about.hbs
+#   cargo about generate --manifest-path hyperdb-api-node/Cargo.toml about.hbs
+#
+# `accepted` mirrors the `[licenses] allow` list in deny.toml; keep the two in
+# step. A dependency under any other license fails generation, so a new
+# license cannot reach a published binary unnoticed.
+
+accepted = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+# The npm packages are published for these platforms only (see
+# .github/workflows/npm-build-publish.yml); dependencies that exist only for
+# other targets are not in the binaries and are not listed.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
+
+# Dev- and build-only crates are not linked into the shipped binaries.
+ignore-dev-dependencies = true
+ignore-build-dependencies = true

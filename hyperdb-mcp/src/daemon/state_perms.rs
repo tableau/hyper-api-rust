@@ -48,6 +48,71 @@ const STATE_DIR_MODE: u32 = 0o700;
 /// File mode for state files: readable and writable only by the owner.
 const STATE_FILE_MODE: u32 = 0o600;
 
+/// Check that `dir` is a state directory only the current user can write to.
+///
+/// On Unix the state directory is what keeps other users away from the control
+/// socket, the lock and the discovery record, so it is checked rather than
+/// assumed: it must be owned by the effective user and carry no group or other
+/// write bit. [`ensure_owner_only_dir`] tightens the mode of a directory this
+/// user owns, so in practice the check fails for a directory someone else owns
+/// (which `chmod` cannot fix) and for a filesystem that refuses `chmod`. The
+/// daemon calls this after `ensure_owner_only_dir` and refuses to start on an
+/// error; a client calls it on its own, without creating or changing anything,
+/// and goes straight to local mode.
+///
+/// A symlink to a directory is judged by its target. On Windows the default
+/// location is per-user through ACL inheritance and the pipe DACL is the
+/// boundary, so this always succeeds there.
+///
+/// # Errors
+/// Returns `PermissionDenied` naming the path when the directory is not owned
+/// by the current user or is writable by its group or by others, and the
+/// underlying error when it cannot be inspected.
+pub fn verify_state_dir_trusted(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = std::fs::metadata(dir)?;
+        if !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                format!("the state directory {} is not a directory", dir.display()),
+            ));
+        }
+        // SAFETY: `geteuid` takes no arguments, reads no memory and cannot fail.
+        let effective_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != effective_uid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "the state directory {} is owned by another user (uid {}); \
+                     set HYPERDB_STATE_DIR to a directory you own",
+                    dir.display(),
+                    metadata.uid()
+                ),
+            ));
+        }
+        let mode = metadata.mode() & 0o777;
+        if mode & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "the state directory {} is writable by its group or by others (mode \
+                     {mode:04o}); remove the group and other write bits",
+                    dir.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
 /// Create `dir`, and any parents this call creates, restricted to the owning
 /// user.
 ///
@@ -692,5 +757,65 @@ mod tests {
             !path.exists(),
             "no record must be published when its mode could not be restricted"
         );
+    }
+
+    #[test]
+    fn trusted_check_accepts_an_owner_only_directory() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("state");
+        ensure_owner_only_dir(&dir).unwrap();
+        verify_state_dir_trusted(&dir).expect("a 0700 directory we own is trusted");
+    }
+
+    #[test]
+    fn trusted_check_refuses_a_group_or_other_writable_directory() {
+        let tmp = TempDir::new().unwrap();
+        for mode in [0o770, 0o707, 0o777, 0o720] {
+            let dir = tmp.path().join(format!("state-{mode:o}"));
+            ensure_owner_only_dir(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            let error = verify_state_dir_trusted(&dir)
+                .expect_err("a directory writable by group or others must be refused");
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied,
+                "mode {mode:o}"
+            );
+            assert!(
+                error.to_string().contains(&dir.display().to_string()),
+                "the error must name the path: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_check_tolerates_group_and_other_read() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("state");
+        ensure_owner_only_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        verify_state_dir_trusted(&dir).expect("read and traverse for others is not a write risk");
+    }
+
+    #[test]
+    fn trusted_check_refuses_a_directory_owned_by_someone_else() {
+        // SAFETY: `geteuid` takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root owns "/" too, so there is nothing foreign to point at
+        }
+        let error = verify_state_dir_trusted(Path::new("/"))
+            .expect_err("the root directory is owned by root, not by this user");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            error.to_string().contains("owned by another user"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn trusted_check_reports_a_missing_directory() {
+        let tmp = TempDir::new().unwrap();
+        let error = verify_state_dir_trusted(&tmp.path().join("absent")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 }

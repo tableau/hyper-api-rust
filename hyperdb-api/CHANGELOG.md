@@ -7,6 +7,166 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING:** the `arrow` dependency moved from **59** to **60**. Arrow types
+  appear in this crate's public API, so consumers must move to `arrow` 60 in
+  lockstep. No source change was needed on our side. `parquet` (used by
+  `hyperdb-mcp`) moved to 60 with it.
+- `hyperdb-api` now re-exports `arrow`, `chrono` and `geo_types` from the crate
+  root, and the README states the policy: a major bump of a re-exported crate
+  is a `hyperdb-api` major.
+- **Breaking:** `PreparedStatement::query` and `AsyncPreparedStatement::query`
+  now return a rowset borrowing the *statement* (`Rowset<'stmt>` /
+  `AsyncRowset<'stmt>`), not just the connection. Previously a rowset could
+  outlive its statement, and dropping the statement then deadlocked on the
+  connection lock the rowset still held. The compiler now rejects that code.
+- **BREAKING: `SqlType` is `#[non_exhaustive]`, and so are the struct variants
+  of `SqlType` (`Numeric`, `Varchar`, `Char`) and of `Error` (`Connection`,
+  `Server`, `Closed`, `Cancelled`, `Column`, `ColumnIndexOutOfBounds`,
+  `Internal`) and `ColumnErrorKind::TypeMismatch`.** Match `SqlType` with a
+  wildcard arm, end any pattern that names variant fields with `..`, and build
+  these values with the constructors (`SqlType::numeric`, `Error::server`, ...)
+  instead of struct expressions. This lets a minor release add a type or a
+  field without a major bump.
+- **Arrow `Decimal128` / `Decimal256` columns whose precision is outside
+  `1..=38` (or whose scale exceeds the precision) now map to `SqlType::Text`**
+  rather than an invalid `NUMERIC`, like other unmapped Arrow types.
+- **`QueryAs::new` and `QueryScalar::new` now take `&[&dyn ToSqlParam]`**
+  instead of `&[&dyn Debug]`. These constructors are emitted by the
+  `query_as!` / `query_scalar!` macros and are not meant to be called
+  directly, but code that did call them must now pass `ToSqlParam` values.
+- **BREAKING: `hyperdb_api::grpc` no longer re-exports `GrpcClient`,
+  `GrpcClientSync` or `GrpcError`.** They are the raw `hyperdb-api-core`
+  clients and carry `tonic` / `prost` types, which the core crate declares
+  unstable. Use `GrpcConnection` / `GrpcConnectionAsync` (or the unified
+  `Connection`); failures surface as `hyperdb_api::Error`. The module now also
+  exports `GrpcColumnInfo`, which `GrpcQueryResult::columns` returns.
+- **BREAKING: escape hatches that returned `hyperdb-api-core` types are no
+  longer public.** `Connection::tcp_client`, `AsyncConnection::async_tcp_client`,
+  `AsyncConnection::from_async_client`, `HyperProcess::connection_endpoint`,
+  `ColumnDefinition::to_types_column_definition` and
+  `impl From<hyperdb_api_core::types::ColumnDefinition> for ColumnDefinition`
+  are removed from the public API. Replacements:
+  `HyperProcess::connection_endpoint_string()` (the endpoint
+  `Connection::new` connects to, as a `String`) and
+  `AsyncConnection::copy_in_hyperbinary` (below), which replaces hand-written
+  COPY loops over `async_tcp_client`.
+- **BREAKING: the async pool no longer exposes `deadpool` types.**
+  `pool::Pool` and `pool::PooledConnection` were aliases of
+  `deadpool::managed::Pool` / `Object`; they are now `hyperdb-api` types, and
+  `pool::ConnectionManager` is crate-private. `Pool::get` returns
+  `hyperdb_api::Result<PooledConnection>` — a wait or create timeout is
+  `Error::Timeout`, a closed pool is `Error::InvalidOperation`, and a failed
+  connect is the underlying error — so the
+  `.map_err(|e| Error::internal(e.to_string()))` adapter is no longer needed.
+  A connection that fails its recycle check (or whose recycle times out) is
+  discarded and replaced, never reported to the caller. `Pool::status` returns
+  `PoolStatus` (as `ConnectionPool` does), and `PooledConnection::take` frees
+  the slot. The `deadpool` version is no longer part of this crate's semver
+  surface. The deadpool-only API is gone with it: `Pool::resize`, `retain`,
+  `timeout_get`, `manager` and `weak`, `status().waiting`, and
+  `Object::id`, `metrics`, `AsRef` and `AsMut`.
+- **BREAKING: `hyperdb_api::grpc::TransferMode` is now a `hyperdb-api-core`
+  enum (`Sync`, `Async`, `Adaptive`)** instead of the prost-generated type, so
+  no protobuf type appears in `GrpcConfig::transfer_mode` or
+  `ConnectionBuilder::transfer_mode`. `Adaptive` stays the default; the
+  protocol's `Unspecified` value is no longer constructible.
+- **BREAKING: `GrpcColumnInfo` no longer has public fields.** Use
+  `GrpcColumnInfo::name()` and `type_name()`.
+- **`HyperProcess` makes a caller-supplied `domain_socket_directory`
+  absolute.** A relative directory produced an endpoint string such as
+  `rs-123/hyper` that `Connection::new` could not resolve; the endpoint now
+  always starts with `/` on Unix.
+
+### Added
+
+- **`AsyncConnection::copy_in_hyperbinary`** streams a pre-encoded
+  `HyperBinary` buffer (for example from `InsertChunk`) into a table with
+  `COPY ... FROM STDIN`, slicing it under `hyperd`'s COPY packet cap, and
+  returns the inserted row count. The buffer must start with exactly one
+  HyperBinary header (the first `InsertChunk::take()` of a fresh or cleared
+  chunk); a headerless buffer is rejected with `Error::InvalidOperation`. The
+  future is not cancel-safe: dropping it mid-write leaves the connection
+  reporting unhealthy, so a pool evicts it on the next checkout.
+- **`HyperProcess::connection_endpoint_string`**, and `Pool::close` /
+  `Pool::is_closed` on the async pool.
+- **TLS for TCP connections.** Until now every TCP connection was plaintext,
+  whatever the server offered. `ConnectionBuilder::tls` and
+  `AsyncConnectionBuilder::tls` take a `TlsMode` or a `TlsConfig` (both
+  re-exported from the crate root) with libpq `sslmode` semantics: `Disable`
+  (the default), `Prefer`, `Require`, `VerifyCa` and `VerifyFull`, plus a root
+  certificate, a client certificate for mutual TLS, and a server-name
+  override. `Prefer` falls back to plaintext only when the server declines
+  TLS, never after a failed handshake or verification. A query cancel for a
+  TLS session is sent over TLS. `Connection::is_tls` and
+  `AsyncConnection::is_tls` report whether the session is encrypted.
+  - Over a Unix domain socket or a named pipe, `Prefer` connects in plaintext
+    and the modes that require TLS fail with `Error::FeatureNotSupported`. A
+    gRPC connection picks TLS through its `https://` scheme and rejects
+    `tls()` the same way.
+  - The `Connection::connect*` shortcuts and `Connection::new` stay
+    plaintext.
+  - **BREAKING:** `PoolConfig` and `SyncPoolConfig` gain a public `tls` field
+    and a `tls()` builder, applied to every connection the pool opens, so a
+    struct-literal `PoolConfig { .. }` no longer compiles. The async pool now
+    opens connections through `AsyncConnectionBuilder`: a malformed port in
+    its endpoint is an `Error::Config` instead of silently becoming 7483, and
+    an authenticated pool on a Unix-socket or named-pipe endpoint connects
+    there instead of misreading the path as a TCP host. On a gRPC endpoint a
+    `create_mode` other than `DoNotCreate` now fails `Pool::get` with
+    `Error::FeatureNotSupported` instead of being ignored, as it already did
+    for the sync pool.
+  - TLS session resumption is disabled: `hyperd` requests client certificates
+    without an OpenSSL session ID context, so it aborts every resumed
+    handshake (and a cancel would resume).
+
+### Fixed
+
+- **Reserved-word table and column names** (`order`, `user`, `table`, ...) no
+  longer break generated SQL. `TableDefinition::qualified_name`, `table_name`,
+  `schema_name`, `database_name`, `to_drop_sql` and the `MappedInserter`
+  staging statements now always double-quote identifiers, so every inserter's
+  `COPY` works on such tables. The generated SQL text changes (`users` becomes
+  `"users"`); the identifiers resolved are the same.
+
+- **`query_as!` / `query_scalar!` silently dropped their `$N` bind
+  arguments.** The arguments were stringified and never sent, so any query
+  with a placeholder failed at the server with "expected to have 0
+  parameter(s)". They are now encoded and bound through the same path as
+  `Connection::fetch_all_as_params`.
+- **`ConnectionBuilder::query_timeout` and
+  `AsyncConnectionBuilder::query_timeout` were recorded and never applied.**
+  The timeout is now set as the session's `query_timeout` right after
+  connecting, so `hyperd` cancels a statement that runs longer (SQLSTATE
+  57014, "canceled"). A zero timeout and a timeout on a gRPC connection are
+  rejected at `build()` instead of being ignored.
+- **`AsyncConnection::without_database` and `AsyncConnection::connect_with_auth`
+  could not reach a Unix domain socket or named pipe.** They parsed every
+  endpoint as `host:port`, so a socket path failed with "failed to lookup
+  address information". Like their sync counterparts, they now go through
+  `AsyncConnectionBuilder`, which also makes a malformed port an
+  `Error::Config` instead of a silent fallback to port 7483, and lets
+  `without_database` connect to a gRPC endpoint.
+
+- **`Date`, `Timestamp` and `OffsetTimestamp` query parameters were bound with
+  the wrong epoch.** `ToSqlParam::encode_param` sent absolute Julian-based
+  values, but Hyper's binary `Bind` expects PostgreSQL-epoch values (days /
+  microseconds since 2000-01-01) and applies the Julian offset itself, so a
+  bound `2024-01-15` came back as `8736-02-22`. The parameters now send
+  PG-epoch values. The `Inserter` (HyperBinary COPY) path was unaffected.
+- **`Inserter::add_numeric` and `AsyncInserter::add_numeric` ignored the
+  value's own scale.** The unscaled integer was written as-is, so
+  `Numeric::new(12345, 1)` (1234.5) inserted into a `NUMERIC(10, 2)` column was
+  stored as `123.45` — a silent 10× magnitude error. The value is now rescaled
+  to the column's declared scale; a value that would lose non-zero digits or
+  overflow is rejected with `Error::Conversion` instead of being stored wrong.
+- **`HyperProcess` no longer deletes a caller-supplied socket directory on
+  drop.** Drop removed any IPC socket directory whose basename started with
+  `hyper-`, so a `domain_socket_directory` such as `~/hyper-data` was wiped with
+  everything in it. Only the temp directory the process created itself is
+  removed now.
+
 ## [1.0.0-rc.4] - 2026-09-08
 
 ### Fixed

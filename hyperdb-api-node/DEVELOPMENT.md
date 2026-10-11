@@ -13,8 +13,7 @@ bindings on top of the Rust `hyperdb-api` crate.
 ┌───────────────────────────────────────────────────────┐
 │  JS extensions                                        │
 │  index.js   — native loader + tagged templates,       │
-│               parameterized queries, event hooks,     │
-│               Symbol.asyncDispose, RowData.toJSON     │
+│               Symbol.asyncDispose, async iteration    │
 │  pool.mjs   — ConnectionPool (pure JS)                │
 │  arrow.mjs  — Arrow convenience helpers (pure JS)     │
 ├───────────────────────────────────────────────────────┤
@@ -29,11 +28,11 @@ bindings on top of the Rust `hyperdb-api` crate.
 
 **Key architecture decisions:**
 
-- **Sync Rust, async JS.** The Rust `Connection` is synchronous internally.
-  Each async JS method runs the blocking Rust code on a `tokio::task::spawn_blocking`
-  thread pool, returning a Promise to JavaScript.
-- **Thread safety.** Connections are wrapped in `Arc<Mutex<...>>` for safe
-  concurrent access from the JS event loop.
+- **Async Rust, async JS.** Each `#[napi] async fn` awaits the matching
+  `hyperdb_api::AsyncConnection` method on the napi tokio runtime and returns a
+  Promise.
+- **Shared connection.** `Connection` holds an `Arc<hyperdb_api::AsyncConnection>`,
+  so concurrent calls share it without a JS-side lock.
 - **Eager result collection.** `executeQuery()` collects all rows into memory
   before returning. For large result sets, use streaming or Arrow APIs.
 
@@ -57,11 +56,11 @@ classDiagram
         +executeQueryStream(sql) QueryStream
         +executeQueryColumnar(sql) ColumnarStream
         +executeQueryToArrow(sql) Buffer
-        +executeQueryParams(sql, params) RowData[]
+        +prepare(sql) PreparedStatement
+        +queryObjects(sql) object[]
         +sql(strings, ...values) RowData[]
         +command(strings, ...values) number
         +querySchema(sql) ResultColumnInfo[]
-        +on(event, listener) this
         +close() void
     }
 
@@ -116,7 +115,7 @@ classDiagram
         +toString() string
     }
 
-    class Inserter {
+    class RowInserter {
         +bufferedRowCount: number
         +addRow(values) void
         +addRows(rows) void
@@ -145,8 +144,6 @@ classDiagram
         +getTimestampMs(i) number
         +getJson(i) string
         +getString(i) string
-        +setColumnNames(names) this
-        +toJSON() object
     }
 
     class ColumnarChunk {
@@ -164,13 +161,6 @@ classDiagram
         +index: number
     }
 
-    class QueryEvent {
-        +sql: string
-        +durationMs: number
-        +rowCount: number
-        +type: string
-    }
-
     HyperProcess ..> Connection : creates
     ConnectionBuilder ..> Connection : builds
     ConnectionPool o-- Connection : pools
@@ -179,13 +169,12 @@ classDiagram
     Connection ..> ColumnarStream : returns
     Connection ..> RowData : returns
     Connection ..> ResultColumnInfo : returns
-    Connection ..> QueryEvent : emits
 
     Catalog --> Connection : uses
     Catalog ..> TableDefinition : manages
 
-    Inserter --> Connection : uses
-    Inserter --> TableDefinition : uses
+    RowInserter --> Connection : uses
+    RowInserter --> TableDefinition : uses
 
     TableDefinition --> SqlType : column types
 
@@ -204,7 +193,7 @@ classDiagram
 | `lib.rs` | Module declarations |
 | `connection.rs` | `Connection`, `ConnectionBuilder` — napi-rs bindings |
 | `process.rs` | `HyperProcess` — manages the `hyperd` server process |
-| `inserter.rs` | `Inserter` — COPY protocol bulk inserts |
+| `inserter.rs` | `RowInserter` — COPY protocol bulk inserts |
 | `catalog.rs` | `Catalog` — DDL operations (create/drop tables/schemas) |
 | `result.rs` | `RowData`, `ResultColumnInfo` — query result types |
 | `query_stream.rs` | `QueryStream` — streaming row-oriented results |
@@ -238,8 +227,8 @@ classDiagram
 |------|---------|
 | `__test__/smoke.mjs` | Smoke tests covering all major features |
 | `__test__/benchmark.mjs` | Insert and query performance benchmarks |
-| `examples/complete-api-tour.mts` | Full TypeScript API tour (19 sections) |
-| `examples/complete-api-tour.mjs` | Same tour in plain JavaScript |
+| `examples/complete-api-tour.mts` | TypeScript tour of the main features |
+| `examples/complete-api-tour.mjs` | JavaScript variant of the tour (prepared-statement flavor) |
 | `examples/typed-analytics.mts` | TypeScript analytics pipeline |
 | `examples/arrow-analytics.mjs` | Arrow integration deep-dive |
 | `examples/generate-demo-data.mjs` | Demo data generator |
@@ -250,9 +239,10 @@ classDiagram
 ### Prerequisites
 
 1. **Rust toolchain** — install via [rustup](https://rustup.rs/)
-2. **Node.js** >= 21
-3. **npm** >= 9
-4. **`hyperd` binary** — set `HYPERD_PATH` environment variable
+2. **`protoc`** — required by the `hyperdb-api-core` build script (`brew install protobuf`, `apt-get install protobuf-compiler`, or `choco install protoc`)
+3. **Node.js** >= 21
+4. **npm** >= 9
+5. **`hyperd` binary** — run `make download-hyperd` from the repo root; `HyperProcess` finds `.hyperd/current` by walking up from the working directory. Set an absolute `HYPERD_PATH` to override it.
 
 ### Build steps
 
@@ -289,14 +279,14 @@ Always build in release mode before running benchmarks.
 ## Running Tests
 
 ```bash
-# Requires HYPERD_PATH to be set
+# Requires hyperd: run `make download-hyperd` first (or set an absolute HYPERD_PATH)
 npm test
 ```
 
 Tests use Node.js built-in `assert` module (no external test framework).
 The smoke test (`__test__/smoke.mjs`) covers: connections, queries, inserts,
 streams, columnar, pool, tagged templates, parameterized queries, BigInt,
-dates, JSON, event hooks, and resource disposal.
+dates, JSON, and resource disposal.
 
 Test artifacts are written to `test_results/` (gitignored).
 
@@ -331,12 +321,11 @@ for the end-to-end flow.
 |----------|---------|
 | macOS ARM64 | `hyperdb-api-node-darwin-arm64` |
 | Linux x64 (glibc) | `hyperdb-api-node-linux-x64-gnu` |
-| Linux x64 (musl) | `hyperdb-api-node-linux-x64-musl` |
-| Linux ARM64 | `hyperdb-api-node-linux-arm64-gnu` |
 | Windows x64 | `hyperdb-api-node-win32-x64-msvc` |
 
-macOS x64 (Intel) builds are currently disabled — see [`npm-build-publish.yml`](../.github/workflows/npm-build-publish.yml)
-matrix; we'll re-enable once `macos-13` runner availability is reliable.
+Only these three platforms are published; macOS x64 (Intel), Linux x64 (musl) and
+Linux ARM64 have no prebuilt package. See the [`npm-build-publish.yml`](../.github/workflows/npm-build-publish.yml)
+matrix.
 
 The build/publish pipeline lives in
 [`.github/workflows/npm-build-publish.yml`](../.github/workflows/npm-build-publish.yml);
@@ -366,10 +355,11 @@ proper cross-platform release.
 Step-by-step guide for exposing a new Rust method to JavaScript:
 
 1. **Implement in Rust** — add the method to the appropriate `src/*.rs` file
-   with the `#[napi]` attribute. Use `tokio::task::spawn_blocking` for blocking
-   operations.
-2. **Add JS wrapper (if needed)** — if the method needs parameter escaping,
-   event hooks, or other JS-level behavior, add a wrapper in `index.js`.
+   with the `#[napi]` attribute. Await the `hyperdb_api::AsyncConnection` method
+   directly; use `tokio::task::spawn_blocking` only for CPU-heavy work (as
+   `RowInserter::execute` does for row encoding).
+2. **Add JS wrapper (if needed)** — if the method needs template rewriting
+   or other JS-level behavior, add a wrapper in `index.js`.
 3. **Update TypeScript declarations** — add the method signature and JSDoc
    comment to `index.d.ts`. The `.d.ts` is hand-written, not generated.
 4. **Add tests** — add a test case to `__test__/smoke.mjs`.
@@ -380,18 +370,18 @@ Step-by-step guide for exposing a new Rust method to JavaScript:
 ```rust
 // src/connection.rs
 #[napi]
-impl JsConnection {
-    /// Does something useful.
-    /// @param input - Description of the parameter.
-    /// @returns The result description.
+impl Connection {
+    /// Runs a command and reports the affected row count.
+    /// @param sql - The SQL command to run.
+    /// @returns A description of the affected rows.
     #[napi]
-    pub async fn my_new_method(&self, input: String) -> napi::Result<String> {
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
-            let guard = conn.lock().unwrap();
-            // ... use guard ...
-            Ok("result".to_string())
-        }).await.unwrap()
+    pub async fn my_new_method(&self, sql: String) -> Result<String> {
+        let affected = self
+            .inner
+            .execute_command(&sql)
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(format!("{affected} rows affected"))
     }
 }
 ```
@@ -407,10 +397,8 @@ For functionality that lives entirely in JavaScript (no Rust changes):
 4. **Update README** — if user-facing, add to `README.md`.
 
 JS extensions in `index.js` include: tagged template literals (`conn.sql`,
-`conn.command`), parameterized queries (`executeQueryParams`,
-`executeCommandParams`), query event hooks (`conn.on('query', ...)`),
-`Symbol.asyncDispose`/`Symbol.dispose`, `RowData.toJSON()`,
-`QueryStream[Symbol.asyncIterator]`, and `createExtractTable()`.
+`conn.command`, `conn.sqlTyped`), `conn.queryObjects()`, `conn.transaction()`, `Symbol.asyncDispose`/`Symbol.dispose`, and
+`QueryStream[Symbol.asyncIterator]`.
 
 ## Updating `index.d.ts` When the API Changes
 

@@ -68,6 +68,14 @@ pub enum Error {
     #[error("failed to parse version TOML: {0}")]
     TomlParse(#[source] toml::de::Error),
 
+    /// The release `version` is not a plain version string. It is used as a
+    /// directory name that [`install`](crate::install()) may delete and
+    /// recreate, so path separators, `..` and the like are rejected.
+    #[error(
+        "invalid hyperd version {0:?}: expected a plain version string such as \"0.0.26479\" (ASCII letters, digits, '.', '-', '_', '+'; no path separators)"
+    )]
+    InvalidVersion(String),
+
     /// The downloaded ZIP archive was malformed or could not be extracted.
     #[error("zip error: {0}")]
     Zip(#[source] zip::result::ZipError),

@@ -393,9 +393,10 @@ impl<T: ToSqlParam> ToSqlParam for Option<T> {
 
 impl ToSqlParam for Date {
     fn encode_param(&self) -> Option<Vec<u8>> {
-        // Date is stored as i32 Julian day offset from 2000-01-01.
-        // Big-endian per the PG Bind protocol (format code 1).
-        Some(self.to_julian_day().to_be_bytes().to_vec())
+        // Sent as i32 days since 2000-01-01 (the PostgreSQL date epoch), big-endian
+        // per the PG Bind protocol (format code 1). The server adds the Julian
+        // epoch itself, so the absolute Julian day number must not be sent here.
+        Some(self.days().to_be_bytes().to_vec())
     }
 
     fn sql_oid(&self) -> Oid {
@@ -424,8 +425,9 @@ impl ToSqlParam for Time {
 
 impl ToSqlParam for Timestamp {
     fn encode_param(&self) -> Option<Vec<u8>> {
-        // Timestamp is stored as i64 microseconds since 2000-01-01.
-        Some(self.to_microseconds().to_be_bytes().to_vec())
+        // Sent as i64 microseconds since 2000-01-01 (the PostgreSQL timestamp
+        // epoch); the server applies the Julian offset itself.
+        Some(self.microseconds().to_be_bytes().to_vec())
     }
 
     fn sql_oid(&self) -> Oid {
@@ -439,8 +441,8 @@ impl ToSqlParam for Timestamp {
 
 impl ToSqlParam for OffsetTimestamp {
     fn encode_param(&self) -> Option<Vec<u8>> {
-        // OffsetTimestamp is stored as i64 microseconds UTC since 2000-01-01.
-        Some(self.to_microseconds_utc().to_be_bytes().to_vec())
+        // Sent as i64 UTC microseconds since 2000-01-01 (the PostgreSQL epoch).
+        Some(self.timestamp().microseconds().to_be_bytes().to_vec())
     }
 
     fn sql_oid(&self) -> Oid {

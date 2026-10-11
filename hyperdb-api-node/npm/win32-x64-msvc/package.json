@@ -10,7 +10,11 @@
   "files": [
     "hyperdb-api-node.win32-x64-msvc.node",
     "hyperd.exe",
-    "LICENSE-HYPERD"
+    "LICENSE-HYPERD",
+    "THIRD-PARTY-LICENSES.txt",
+    "LICENSE-MIT.txt",
+    "LICENSE-APACHE.txt",
+    "NOTICE"
   ],
   "description": "hyperdb-api-node native binding for Windows x64 (MSVC)",
   "license": "MIT OR Apache-2.0",

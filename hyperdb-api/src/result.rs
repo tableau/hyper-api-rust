@@ -8,74 +8,8 @@
 //! - [`RowIterator`] — C++-like iterator for simple row-by-row processing
 //! - [`ResultSchema`] — Column metadata (names and types)
 //!
-//! # Streaming Design
-//!
-//! Query results are streamed from the server in chunks of up to
-//! [`DEFAULT_BINARY_CHUNK_SIZE`] rows (64K). Only one chunk is held in memory
-//! at a time, so memory usage is `O(chunk_size)` regardless of total result
-//! size — safe for billion-row results.
-//!
-//! # Iteration Patterns
-//!
-//! Two patterns are available, both streaming with constant memory:
-//!
-//! ## Pattern 1: Chunked (`next_chunk()`) — batch processing
-//!
-//! Best for high-throughput scenarios. Error checking happens once per chunk
-//! (~64K rows), and you get direct `Vec<Row>` iteration with good cache
-//! locality. Natural for batch operations, vectorized processing, or
-//! parallelizing across chunks.
-//!
-//! ```no_run
-//! # use hyperdb_api::{Connection, CreateMode, Result};
-//! # fn example(conn: &Connection) -> Result<()> {
-//! let mut result = conn.execute_query("SELECT * FROM table")?;
-//! while let Some(chunk) = result.next_chunk()? {
-//!     for row in &chunk {
-//!         let id: Option<i32> = row.get(0);
-//!         let value: Option<f64> = row.get(1);
-//!     }
-//! }
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! ## Pattern 2: Iterator (`rows()`) — simple row-by-row
-//!
-//! Best for simple iteration where you process one row at a time. Each item
-//! is `Result<Row>` since chunk fetches can fail, so error checking happens
-//! per-row. The extra iterator wrapper adds slight overhead compared to
-//! `next_chunk()`.
-//!
-//! ```no_run
-//! # use hyperdb_api::{Connection, Result};
-//! # fn example(conn: &Connection) -> Result<()> {
-//! let result = conn.execute_query("SELECT * FROM table")?;
-//! for row in result.rows() {
-//!     let row = row?;  // Handle potential errors
-//!     let id: Option<i32> = row.get(0);
-//!     let value: Option<f64> = row.get(1);
-//! }
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! **When to use which:**
-//! - `rows()` — simple iteration, one row at a time, small overhead acceptable
-//! - `next_chunk()` — maximum performance, large result sets, batch operations
-//!
-//! # Type Coercion
-//!
-//! The generic `row.get::<T>()` method supports automatic widening coercion:
-//!
-//! | Request Type | Coerces From |
-//! |---|---|
-//! | `i32` | `i16` |
-//! | `i64` | `i32`, `i16` |
-//! | `f64` | `f32` |
-//!
-//! Direct accessors (`row.get_i32()`, `row.get_f64()`) skip coercion for
-//! slightly better performance when the exact type is known.
+//! See [`Rowset`] for streaming and iteration guidance and [`RowValue`] for
+//! the type coercions applied by `row.get::<T>()`.
 
 use std::sync::Arc;
 
@@ -88,7 +22,7 @@ use hyperdb_api_core::types::SqlType;
 use crate::arrow_result::{ArrowRowset, FromArrowValue};
 use crate::error::Result;
 
-/// Default chunk size for streaming queries (64K rows).
+/// Default chunk size for TCP streaming queries (64K rows).
 pub(crate) const DEFAULT_BINARY_CHUNK_SIZE: usize = 65536;
 
 // =============================================================================
@@ -123,9 +57,7 @@ pub struct Row {
     /// from an `Arc`) so that metadata-dependent decoders like
     /// [`Self::get_numeric`] can look up `SqlType` per column without
     /// the caller plumbing scale through manually. `None` only in the
-    /// unusual case a row is constructed outside `next_chunk` (no such
-    /// path exists in-tree today; the field is `Option` so future
-    /// schemas-unavailable paths remain compilable).
+    /// unusual case a row is constructed outside `next_chunk`.
     schema: Option<Arc<ResultSchema>>,
 }
 
@@ -221,8 +153,9 @@ impl Row {
     /// Gets a typed value at the given column index, returning a `Result`
     /// with a descriptive error on failure.
     ///
-    /// Use this in [`FromRow`] implementations for better error messages
-    /// than bare `row.get(idx).ok_or(...)`.
+    /// Prefer this over [`Row::get`] when a NULL or type mismatch should be an
+    /// error. Inside [`FromRow`] implementations use
+    /// [`RowAccessor::position`](crate::RowAccessor::position) instead.
     ///
     /// # Example
     ///
@@ -403,8 +336,11 @@ impl Row {
 
     /// Gets raw bytes at the given column index.
     ///
-    /// For TCP rows, returns the raw binary data. For Arrow rows, this method
-    /// is not available and returns None.
+    /// Returns `None` if the value is NULL or `idx` is out of range.
+    ///
+    /// For TCP rows this is the raw HyperBinary encoding of any column type.
+    /// For Arrow rows only `BYTEA` (Arrow `Binary`/`LargeBinary`) columns
+    /// yield bytes; other types return `None`.
     #[inline]
     pub fn get_bytes(&self, idx: usize) -> Option<Vec<u8>> {
         match &self.inner {
@@ -628,6 +564,19 @@ impl Row {
 }
 
 /// Trait for types that can be extracted from a Row.
+///
+/// # Type Coercion
+///
+/// The generic `row.get::<T>()` method supports automatic widening coercion:
+///
+/// | Request Type | Coerces From |
+/// |---|---|
+/// | `i32` | `i16` |
+/// | `i64` | `i32`, `i16` |
+/// | `f64` | `f32` |
+///
+/// Direct accessors (`row.get_i32()`, `row.get_f64()`) skip coercion for
+/// slightly better performance when the exact type is known.
 pub trait RowValue: Sized {
     /// Extract a value from a Row at the given column index.
     fn from_row(row: &Row, idx: usize) -> Option<Self>;
@@ -957,10 +906,21 @@ impl ResultSchema {
 /// # }
 /// ```
 ///
+/// # Iteration Patterns
+///
+/// Two streaming patterns are available:
+///
+/// - [`next_chunk`](Self::next_chunk): best for high-throughput and batch
+///   work. Errors are checked once per chunk and each chunk is a plain
+///   `Vec<Row>`.
+/// - [`rows`](Self::rows): best for simple row-by-row processing. Each item
+///   is a `Result<Row>` because fetching a later chunk can fail.
+///
 /// # Memory Behavior
 ///
 /// - Only one chunk is held in memory at a time
-/// - Default chunk size is 64K rows (~few MB depending on row width)
+/// - Over TCP a chunk holds up to 65,536 rows (~few MB depending on row
+///   width); over gRPC a chunk is one Arrow record batch as sent by the server
 /// - Memory usage is `O(chunk_size)`, not `O(total_rows)`
 /// - Safe for billion-row results
 pub struct Rowset<'conn> {
@@ -974,12 +934,13 @@ pub struct Rowset<'conn> {
     /// the column's `SqlType` without the caller plumbing scale
     /// through manually.
     schema_cache: Option<Arc<ResultSchema>>,
-    /// For one-shot prepared statements (the internal
+    /// For one-shot prepared statements (the
     /// [`crate::Connection::query_params`] path), hold the statement
     /// handle here so its `Drop`-time `close_statement` fires *after*
     /// the rowset releases its connection lock. Dropping the statement
     /// before the rowset would deadlock because the inner stream owns
-    /// the connection's `MutexGuard`.
+    /// the connection's `MutexGuard`. Field order matters: `inner` must be
+    /// declared before this field so it drops first.
     _statement_guard: Option<hyperdb_api_core::client::OwnedPreparedStatement>,
 }
 
@@ -995,7 +956,7 @@ impl std::fmt::Debug for Rowset<'_> {
 enum RowsetInner<'conn> {
     /// TCP streaming result (uses `QueryStream`).
     Tcp(QueryStream<'conn>),
-    /// Arrow-based result from gRPC (all data loaded).
+    /// Arrow result streamed from gRPC, one `RecordBatch` per chunk.
     Arrow(ArrowRowset),
     /// TCP streaming result from a prepared-statement execute.
     Prepared(hyperdb_api_core::client::PreparedQueryStream<'conn>),
@@ -1033,7 +994,7 @@ impl<'conn> Rowset<'conn> {
 
     #[expect(
         clippy::used_underscore_binding,
-        reason = "underscore-prefixed parameter retained for trait-method signature compatibility"
+        reason = "the `_statement_guard` field is underscore-prefixed because it is held only for its drop order"
     )]
     /// Attaches a `OwnedPreparedStatement` that should be dropped
     /// **after** this rowset is consumed. Used by the one-shot
@@ -1165,7 +1126,8 @@ impl<'conn> Rowset<'conn> {
 
     /// Returns the next chunk of rows from the result set.
     ///
-    /// Each chunk contains up to `chunk_size` rows (default 64K).
+    /// Over TCP each chunk holds up to 65,536 rows; over gRPC each chunk is one
+    /// Arrow record batch as sent by the server.
     /// Returns `Ok(None)` when all rows have been consumed.
     ///
     /// # Example
@@ -1186,8 +1148,14 @@ impl<'conn> Rowset<'conn> {
     /// # Errors
     ///
     /// - Returns [`crate::Error::Server`] if the server sends an `ErrorResponse`
-    ///   while streaming the result set.
-    /// - Returns [`crate::Error::Io`] on transport-level I/O failures.
+    ///   while streaming the result set (over TCP this includes a query
+    ///   cancelled with SQLSTATE `57014`).
+    /// - Returns [`crate::Error::Connection`] if reading from the transport
+    ///   fails, or [`crate::Error::Closed`] if the server closes the
+    ///   connection mid-stream.
+    /// - Over gRPC, returns [`crate::Error::Cancelled`] or
+    ///   [`crate::Error::Timeout`] if the call is cancelled or its deadline
+    ///   expires.
     /// - Returns [`crate::Error::Conversion`] if an Arrow IPC chunk cannot be decoded.
     pub fn next_chunk(&mut self) -> Result<Option<Vec<Row>>> {
         // Pull the next raw chunk from the underlying transport first;
@@ -1255,8 +1223,8 @@ impl<'conn> Rowset<'conn> {
     /// # Error Handling
     ///
     /// Unlike C++ which uses exceptions, Rust requires explicit error handling.
-    /// Each item in the iterator is a `Result<LightweightRow>` to handle
-    /// potential network or protocol errors during streaming.
+    /// Each item is a `Result<`[`Row`]`>` so that errors fetching later chunks
+    /// surface during iteration.
     ///
     /// # Comparison with `next_chunk()`
     ///
@@ -1275,6 +1243,9 @@ impl<'conn> Rowset<'conn> {
     }
 
     /// Collects all rows into a Vec.
+    ///
+    /// Buffers the entire result in memory. For large results, iterate with
+    /// [`next_chunk`](Self::next_chunk) or [`rows`](Self::rows) instead.
     ///
     /// This is a convenience method that handles error collection more elegantly
     /// than the standard `collect::<Result<Vec<_>, _>>()` pattern.
@@ -1306,6 +1277,9 @@ impl<'conn> Rowset<'conn> {
     }
 
     /// Collects the first column of each row into a Vec.
+    ///
+    /// Buffers the entire result in memory. For large results, iterate with
+    /// [`next_chunk`](Self::next_chunk) or [`rows`](Self::rows) instead.
     ///
     /// This is useful for single-column queries or when you only need one column.
     ///
@@ -1340,6 +1314,9 @@ impl<'conn> Rowset<'conn> {
     }
 
     /// Collects the first column, filtering out NULL values.
+    ///
+    /// Buffers the entire result in memory. For large results, iterate with
+    /// [`next_chunk`](Self::next_chunk) or [`rows`](Self::rows) instead.
     ///
     /// This is useful when you know the column doesn't contain NULLs or want to ignore them.
     ///
@@ -1492,7 +1469,7 @@ impl<'conn> Rowset<'conn> {
 /// # Memory Behavior
 ///
 /// Memory usage remains constant regardless of result set size:
-/// - Internally fetches 64K rows at a time
+/// - Internally fetches one chunk at a time (up to 65,536 rows over TCP)
 /// - Previous chunks are dropped when exhausted
 /// - Safe for billion-row results
 ///

@@ -24,8 +24,9 @@
 //! Both the OAuth Access Token and the DC JWT are cached independently.
 //! The OAuth Access Token is only refreshed when genuinely expired, to avoid
 //! unnecessary OAuth Refresh Token rotation that would invalidate tokens
-//! held by other connections.  The DC JWT is refreshed proactively based
-//! on both its expiry time and its age (maxAge check).
+//! held by other connections.  The DC JWT is refreshed when fewer than 5
+//! minutes of its lifetime remain; [`DataCloudToken::needs_refresh`] adds an
+//! age check for callers that want earlier refresh.
 //!
 //! # Example: JWT Bearer Token Flow
 //!

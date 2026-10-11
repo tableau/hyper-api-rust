@@ -1,0 +1,27 @@
+Third-party software in this binary
+===================================
+
+This binary statically links the open-source Rust crates listed below. Each
+crate is used under the license shown. The license texts follow the list.
+
+Crates by license
+-----------------
+{{#each overview}}
+{{{name}}}: {{count}}
+{{/each}}
+
+License texts
+-------------
+{{#each licenses}}
+================================================================================
+{{{name}}}
+================================================================================
+
+Used by:
+{{#each used_by}}
+  - {{{crate.name}}} {{{crate.version}}}
+{{/each}}
+
+{{{text}}}
+
+{{/each}}

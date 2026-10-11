@@ -1,15 +1,15 @@
-# hyper-client Development Guide
+# hyperdb-api-core `client` module: Development Guide
 
-Contributor-facing documentation for the `hyper-client` crate -- the connection layer
-between `hyperapi` (high-level API) and `hyper-protocol` (wire protocol).
+Contributor-facing documentation for the `client` module of the internal `hyperdb-api-core` crate -- the connection layer
+between `hyperdb-api` (high-level API) and the `protocol` module (wire protocol).
 
-For user-facing documentation, see [README.md](README.md).
+For user-facing documentation, see the [hyperdb-api README](../../hyperdb-api/README.md).
 
 ---
 
 ## Architecture Overview
 
-`hyper-client` provides two transport families with both sync and async variants:
+The `client` module provides two transport families with both sync and async variants:
 
 | Transport | Protocol | Capabilities | Variants |
 |-----------|----------|-------------|----------|
@@ -27,7 +27,7 @@ src/
   connection.rs           # RawConnection<S> -- sync wire protocol engine
   async_connection.rs     # AsyncRawConnection<S> -- async wire protocol engine
   auth.rs                 # Authentication: cleartext, MD5, SCRAM-SHA-256
-  tls.rs                  # TLS config and rustls integration
+  tls.rs                  # TlsConfig/TlsMode, SSLRequest negotiation, verifiers, TLS cancel
   cancel.rs               # Cancellable trait (transport-agnostic cancel)
   endpoint.rs             # ConnectionEndpoint (TCP, Unix, Named Pipe)
   sync_stream.rs          # SyncStream (TCP/Unix/Pipe wrapper for sync I/O)
@@ -52,7 +52,6 @@ tests/
   client_tests.rs         # Sync client integration tests
   copy_tests.rs           # COPY protocol tests
   prepared_statement_tests.rs
-  tls_tests.rs            # TLS with self-signed certs (rcgen)
   async_copy_cancel_tests.rs
 ```
 
@@ -93,7 +92,7 @@ COPY IN uses the PostgreSQL COPY subprotocol:
 5. Server responds with `CommandComplete` + `ReadyForQuery`
 
 Supported formats: `HYPERBINARY` (default), `ARROWSTREAM`, `CSV`.
-The higher-level `hyperapi::Inserter` handles binary encoding; `CopyInWriter` is
+The higher-level `hyperdb_api::Inserter` handles binary encoding; `CopyInWriter` is
 a transport-level data pump.
 
 ### Connection Health and Desynchronization
@@ -152,7 +151,7 @@ directory) into Rust types via `tonic-build`. The generated code lives in
 To regenerate after proto changes:
 
 ```bash
-cargo build -p hyper-client
+cargo build -p hyperdb-api-core
 ```
 
 ---
@@ -178,13 +177,21 @@ handshake are documented in `auth.rs` module-level rustdoc.
 
 ## TLS Internals
 
-TLS is implemented via `rustls` (pure Rust, no OpenSSL dependency). The
-implementation lives in `tls.rs` and `tls::rustls_impl`.
+TLS for PG-wire TCP connections uses `rustls` (pure Rust, no OpenSSL) and
+lives in `tls.rs`. `Config::with_tls` takes a `TlsConfig`; `hyperdb-api`'s
+connection builders and pools pass theirs through it. The rustdoc on
+`client::tls` is the reference for the details:
 
-- Root certificates: system roots via `webpki-roots` + optional custom CA
-- Client certificates: optional mutual TLS (mTLS)
-- Key formats: PEM (PKCS#8 or PKCS#1 for private keys)
-- TLS modes: `Disable`, `Prefer`, `Require`, `VerifyCA`, `VerifyFull`
+- `TlsMode` follows libpq's `sslmode` names, with sqlx's choices where they
+  differ: `Disable` is the default, and `Prefer` falls back to plaintext only
+  when the server declines the `SSLRequest`, never after a failed handshake
+  or certificate check.
+- A configured root certificate is the only trust anchor. `VerifyFull`
+  without one trusts the bundled `webpki-roots`; the OS store and
+  `~/.postgresql/` are never read.
+- A cancel request for a TLS session goes over TLS, never plaintext.
+- Session resumption is disabled: `hyperd` aborts a resumed handshake with
+  `internal_error`.
 
 gRPC TLS is handled separately by `tonic`'s built-in TLS support, configured
 via `GrpcConfig` (auto-detected from `https://` endpoints).
@@ -198,7 +205,7 @@ via `GrpcConfig` (auto-detected from `https://` endpoints).
 Integration tests require a running Hyper server. The `tests/common/mod.rs` module
 provides `TestServer`, which:
 
-1. Starts a `HyperProcess` (via `hyperapi` dev-dependency)
+1. Starts a `HyperProcess` (via `hyperdb-api` dev-dependency)
 2. Creates a temporary database
 3. Provides `Config` and `Client` helpers for the test
 4. Cleans up on drop
@@ -207,7 +214,7 @@ provides `TestServer`, which:
 use crate::common::TestServer;
 
 #[test]
-fn test_something() -> hyperapi::Result<()> {
+fn test_something() -> hyperdb_api::Result<()> {
     let server = TestServer::new()?;
     let client = server.connect()?;
     // ... test with real server ...
@@ -215,26 +222,30 @@ fn test_something() -> hyperapi::Result<()> {
 }
 ```
 
-Test output (databases, logs) goes to `hyper-client/test_results/`.
+Test output (databases, logs) goes to `hyperdb-api-core/test_results/`.
 
 ### Running Tests
 
 ```bash
-# All hyper-client tests (requires hyperd on PATH or HYPERD_PATH set)
-cargo test -p hyper-client
+# All hyperdb-api-core tests (requires HYPERD_PATH or a discoverable .hyperd/current)
+cargo test -p hyperdb-api-core
 
 # Unit tests only (no server needed)
-cargo test -p hyper-client --lib
+cargo test -p hyperdb-api-core --lib
 
 # Specific test file
-cargo test -p hyper-client --test client_tests
+cargo test -p hyperdb-api-core --test client_tests
 ```
 
 ### TLS Tests
 
-`tls_tests.rs` generates self-signed certificates at runtime using `rcgen`
-(dev-dependency) to test TLS handshake, mTLS, and certificate verification
-without requiring pre-generated certificates.
+The unit tests in `tls.rs` run the client against a fake PG-wire server on a
+local thread, which answers the `SSLRequest` and runs a rustls server. They
+cover the verifiers, each `SSLRequest` answer, and cancel over TLS, which
+`hyperd` cannot prove because it accepts a plaintext cancel too. The end-to-end tests against a real `hyperd`
+started with `ssl_key` / `ssl_certificate` are in
+`hyperdb-api/tests/tls_tests.rs`. Both generate their certificates at runtime
+with `rcgen`.
 
 ### Writing New Tests
 
@@ -242,7 +253,7 @@ without requiring pre-generated certificates.
 - Use `TestServer::without_database()` for tests that manage databases explicitly
 - Use `#[test]` for sync tests, `#[tokio::test]` for async tests
 - Keep test databases in `test_results/` (auto-managed by `TestServer`)
-- gRPC tests live in `hyperapi/tests/` since they exercise the full stack
+- gRPC tests live in `hyperdb-api/tests/` since they exercise the full stack
 
 ---
 
@@ -250,7 +261,7 @@ without requiring pre-generated certificates.
 
 | Feature | Dependencies Added | What It Enables |
 |---------|--------------------|-----------------|
-| `salesforce-auth` | `hyperapi-salesforce`, `chrono`, `arrow` | `AuthenticatedGrpcClient`, `with_data_cloud_token()` on `GrpcConfig` |
+| `salesforce-auth` | `hyperdb-api-salesforce`, `arrow` | `AuthenticatedGrpcClient`, `with_data_cloud_token()` on `GrpcConfig` |
 
 Everything else (TCP clients, gRPC clients, TLS, auth) is always available.
 
@@ -295,16 +306,15 @@ See `cancel.rs` for the full rationale.
 - `GrpcClient` duplicates query-building logic between `execute_query_with_options`
   and `execute_query_with_params_and_options` -- should be unified
 - `AsyncClient` lacks a streaming query mode equivalent to `QueryStream`
-- Connection pooling exists as `deadpool` integration but is not yet exposed
-  as a first-class API in this crate
-- `TlsConfig` / `TlsMode` are defined but not yet wired into `Config`'s
-  builder (TLS is configured at a lower level currently)
+- Connection pooling is not part of this crate. It lives in `hyperdb-api`'s
+  `pool` module, which wraps `deadpool` behind its own `Pool` and
+  `PooledConnection` types
 
 ---
 
 ## Related Documentation
 
-- [Root DEVELOPMENT.md](../DEVELOPMENT.md) -- workspace-wide build, test, CI
-- [hyper-protocol README](../hyper-protocol/README.md) -- wire protocol details
-- [hyper-types README](../hyper-types/README.md) -- type system and binary formats
-- [hyperapi README](../hyperapi/README.md) -- high-level API built on this crate
+- [Root DEVELOPMENT.md](../../DEVELOPMENT.md) -- workspace-wide build, test, CI
+- [Protocol development guide](DEVELOPMENT-protocol.md) -- wire protocol details
+- [Types development guide](DEVELOPMENT-types.md) -- type system and binary formats
+- [hyperdb-api README](../../hyperdb-api/README.md) -- high-level API built on this crate

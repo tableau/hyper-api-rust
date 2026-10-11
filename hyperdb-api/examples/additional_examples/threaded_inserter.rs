@@ -12,7 +12,10 @@
 //! The pattern separates data encoding (CPU-bound) from network I/O, allowing
 //! multiple cores to prepare data while a single thread handles transmission.
 //!
-//! Run with: cargo run -p hyperdb-api --example `threaded_inserter`
+//! Run with: `cargo run -p hyperdb-api --example threaded_inserter -- [--workers N] [--rows N] [--chunk-size N]`
+//!
+//! Requires the pinned `hyperd`: run `make download-hyperd` once, or set an
+//! absolute `HYPERD_PATH`.
 
 #![allow(
     clippy::cast_precision_loss,

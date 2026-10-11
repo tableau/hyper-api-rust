@@ -162,7 +162,7 @@ impl std::fmt::Debug for AuthMode {
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SalesforceAuthConfig {
     /// Salesforce login URL (e.g., "<https://login.salesforce.com>" or custom domain)
     pub(crate) login_url: Url,
@@ -185,6 +185,23 @@ pub struct SalesforceAuthConfig {
 
     /// Maximum number of retries for transient failures
     pub(crate) max_retries: u32,
+}
+
+impl std::fmt::Debug for SalesforceAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SalesforceAuthConfig")
+            .field("login_url", &self.login_url)
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("auth_mode", &self.auth_mode)
+            .field("dataspace", &self.dataspace)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("max_retries", &self.max_retries)
+            .finish()
+    }
 }
 
 impl SalesforceAuthConfig {
@@ -349,4 +366,22 @@ pub(crate) fn is_known_salesforce_host(host: &str) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    #[test]
+    fn config_debug_redacts_client_secret() {
+        let config = SalesforceAuthConfig::new("https://login.salesforce.com", "client-id-123")
+            .expect("config")
+            .client_secret("hunter2-client-secret");
+        let dbg = format!("{config:?}");
+        assert!(!dbg.contains("hunter2-client-secret"), "{dbg}");
+        assert!(
+            dbg.contains("client-id-123"),
+            "non-secret fields stay: {dbg}"
+        );
+    }
 }

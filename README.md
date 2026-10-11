@@ -56,13 +56,13 @@ executable, obtained with `make download-hyperd`. See
 - **Dual Architecture** — sync (`Connection`) and async (`AsyncConnection`) APIs
 - **Typed Row Mapping** — `#[derive(FromRow)]` structs, including streaming `stream_as` for constant-memory typed queries
 - **Compile-time SQL Validation** — opt-in `query_as!` macro checks SQL against your schema at build time (red squigglies in VS Code)
-- **Connection Pooling** — async pooling via `deadpool` for high-concurrency applications
+- **Connection Pooling** — async connection pooling for high-concurrency applications
 - **Key-Value Store** — string-native `KvStore` / `AsyncKvStore` backed by a single fixed table
 - **Arrow Integration** — insert and read data in Arrow IPC stream format
 - **gRPC Transport** — read-only access with Arrow IPC and load balancing support
 - **Full Type Support** — all Hyper types including Numeric, Geography, Intervals
 - **Salesforce Auth** — OAuth 2.0 and JWT Bearer Token flows for Data Cloud
-- **TLS** — via rustls (always-on, pure Rust)
+- **TLS** — for TCP connections and pools, with libpq `sslmode` semantics, via rustls (always-on, pure Rust)
 - **Formal Verification** — Kani proof harnesses for model-checked correctness
 
 ## Quick Start
@@ -115,7 +115,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-hyperdb-api = { path = "hyperdb-api" }
+hyperdb-api = "1.0"
 ```
 
 #### Installing the CLIs
@@ -261,7 +261,7 @@ The API ships 14 examples in `hyperdb-api/examples/` plus 2 companion crate exam
 | `async_usage` | `AsyncConnection` and Tokio patterns |
 | `threaded_inserter` | Multi-threaded bulk insertion with `InsertChunk`/`ChunkSender` |
 | `grpc_query` | gRPC transport, Arrow IPC results |
-| `connection_pool` | Async connection pooling with deadpool |
+| `connection_pool` | Async connection pooling |
 | `transactions` | RAII guards, multi-table rollback, DDL, reconnect semantics |
 
 ### Running Examples
@@ -291,13 +291,20 @@ window functions, CTEs, complex JOINs, and type-safe query composition:
 
 ```toml
 [dependencies]
-sea-query = "0.32"
-sea-query-hyperdb = { path = "sea-query-hyperdb" }
+sea-query = "1.0"
+sea-query-hyperdb = "1.0"
 ```
 
 ```rust
-use sea_query::{Query, Expr, Iden};
+use sea_query::{Expr, ExprTrait, Iden, Query};
 use sea_query_hyperdb::HyperQueryBuilder;
+
+#[derive(Iden)]
+enum Users {
+    Table,
+    Name,
+    Age,
+}
 
 let sql = Query::select()
     .column(Users::Name)
@@ -315,7 +322,7 @@ and Refresh Token flows:
 
 ```toml
 [dependencies]
-hyperdb-api-salesforce = { path = "hyperdb-api-salesforce" }
+hyperdb-api-salesforce = "1.0"
 ```
 
 ```rust

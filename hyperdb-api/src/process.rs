@@ -212,9 +212,14 @@ pub struct HyperProcess {
     /// The transport mode this process was started with.
     transport_mode: TransportMode,
     /// The socket directory for UDS connections (Unix only).
-    /// This directory is automatically cleaned up on drop.
+    /// Removed on drop only when [`Self::owns_socket_directory`] is set.
     #[cfg(unix)]
     socket_directory: Option<PathBuf>,
+    /// `true` when this process created `socket_directory` itself (the default
+    /// temp directory). A caller-supplied `domain_socket_directory` is never
+    /// ours to delete — it may hold unrelated data.
+    #[cfg(unix)]
+    owns_socket_directory: bool,
     /// The pipe name for Named Pipe connections (Windows only).
     #[cfg(windows)]
     pipe_name: Option<String>,
@@ -277,8 +282,8 @@ impl HyperProcess {
     /// process-wide [`IPC_INSTANCE_SEQ`] counter. The suffix is load-bearing:
     /// two concurrently-live IPC `HyperProcess` instances in one process must
     /// not share a socket path, or the second bind fails and surfaces as a
-    /// 60 s callback timeout. The `hyper-` prefix is also load-bearing — `Drop`
-    /// only cleans up directories whose basename `starts_with("hyper-")`.
+    /// 60 s callback timeout. `Drop` removes this directory
+    /// (and only this one) via `owns_socket_directory`.
     #[cfg(unix)]
     fn default_socket_dir() -> PathBuf {
         let seq = IPC_INSTANCE_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -417,27 +422,34 @@ impl HyperProcess {
 
         // Create socket directory for UDS if needed (Unix only)
         #[cfg(unix)]
-        let socket_directory: Option<PathBuf> = if transport_mode == TransportMode::Ipc {
-            // Use custom directory if provided, otherwise create temp directory
-            let dir = if let Some(custom_dir) =
-                parameters.and_then(|p| p.domain_socket_directory.as_ref())
-            {
-                custom_dir.clone()
+        let (socket_directory, owns_socket_directory): (Option<PathBuf>, bool) =
+            if transport_mode == TransportMode::Ipc {
+                // Use custom directory if provided, otherwise create temp directory
+                let (dir, owned) = if let Some(custom_dir) =
+                    parameters.and_then(|p| p.domain_socket_directory.as_ref())
+                {
+                    // Absolutized: the directory is rendered into the endpoint
+                    // string, and a relative path would be taken for a TCP
+                    // host when handed back to `Connection::new`.
+                    (
+                        std::path::absolute(custom_dir).unwrap_or_else(|_| custom_dir.clone()),
+                        false,
+                    )
+                } else {
+                    // Create a temp directory for the socket. The basename carries a
+                    // per-process monotonic suffix (`hyper-<pid>-<seq>`) so two
+                    // concurrently-live IPC instances in one process never share a
+                    // socket path — see `Self::default_socket_dir`.
+                    let temp_dir = Self::default_socket_dir();
+                    std::fs::create_dir_all(&temp_dir).map_err(|e| {
+                        Error::connection_with_io("Failed to create socket directory", e)
+                    })?;
+                    (temp_dir, true)
+                };
+                (Some(dir), owned)
             } else {
-                // Create a temp directory for the socket. The basename carries a
-                // per-process monotonic suffix (`hyper-<pid>-<seq>`) so two
-                // concurrently-live IPC instances in one process never share a
-                // socket path — see `Self::default_socket_dir`.
-                let temp_dir = Self::default_socket_dir();
-                std::fs::create_dir_all(&temp_dir).map_err(|e| {
-                    Error::connection_with_io("Failed to create socket directory", e)
-                })?;
-                temp_dir
+                (None, false)
             };
-            Some(dir)
-        } else {
-            None
-        };
 
         // On non-Unix platforms there is no UDS socket directory; the variable
         // is only referenced inside `#[cfg(unix)]` blocks so we do not need a
@@ -738,6 +750,8 @@ impl HyperProcess {
             log_dir: resolved_log_dir,
             #[cfg(unix)]
             socket_directory,
+            #[cfg(unix)]
+            owns_socket_directory,
             #[cfg(windows)]
             pipe_name,
         })
@@ -828,10 +842,10 @@ impl HyperProcess {
     /// Parses a connection descriptor to extract host:port, socket path, or pipe path.
     ///
     /// Input formats:
-    /// - "tab.tcp://host:port" → "host:port"
-    /// - "tab.domain://<dir>/domain/<name>" → "<dir>/domain/<name>" (socket path)
-    /// - "tab.pipe://<host>/pipe/<name>" → "<host>/pipe/<name>" (named pipe)
-    /// - "tcp.grpc://host:port" → "host:port"
+    /// - `tab.tcp://host:port` → `host:port`
+    /// - `tab.domain://<dir>/domain/<name>` → `<dir>/domain/<name>` (socket path)
+    /// - `tab.pipe://<host>/pipe/<name>` → `<host>/pipe/<name>` (named pipe)
+    /// - `tcp.grpc://host:port` → `host:port`
     fn parse_connection_descriptor(descriptor: &str) -> Result<String> {
         // Handle domain socket format
         if let Some(rest) = descriptor.strip_prefix("tab.domain://") {
@@ -979,11 +993,22 @@ impl HyperProcess {
 
     /// Returns the connection endpoint for this process.
     ///
-    /// This returns a [`ConnectionEndpoint`] that can be used to connect
-    /// to this Hyper instance via TCP, Unix Domain Socket, or Named Pipe.
-    #[must_use]
-    pub fn connection_endpoint(&self) -> Option<&ConnectionEndpoint> {
+    /// This is the endpoint [`Connection::new`](crate::Connection::new) connects
+    /// to: TCP, Unix Domain Socket, or Named Pipe.
+    pub(crate) fn connection_endpoint(&self) -> Option<&ConnectionEndpoint> {
         self.connection_endpoint.as_ref()
+    }
+
+    /// Returns the endpoint to connect to this process, rendered as a string.
+    ///
+    /// Unlike [`endpoint`](Self::endpoint), which is always the TCP
+    /// `host:port`, this is the endpoint [`Connection::new`](crate::Connection::new)
+    /// actually uses: a Unix socket path or named pipe when the process was
+    /// started with an IPC listen mode. Returns `None` if the process has no
+    /// connectable endpoint yet.
+    #[must_use]
+    pub fn connection_endpoint_string(&self) -> Option<String> {
+        self.connection_endpoint.as_ref().map(ToString::to_string)
     }
 
     /// Returns the log directory where hyperd writes its log files.
@@ -1176,14 +1201,13 @@ impl Drop for HyperProcess {
             let _ = self.do_shutdown(Some(Duration::from_secs(5)));
         }
 
-        // Clean up socket directory if we created one
+        // Clean up the socket directory only if we created it. A caller-supplied
+        // directory is left alone, even if its name happens to start with `hyper-`.
         #[cfg(unix)]
-        if let Some(ref dir) = self.socket_directory {
-            // Only clean up if it's a temp directory we created (contains our PID)
-            let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if dir_name.starts_with("hyper-") {
-                let _ = std::fs::remove_dir_all(dir);
-            }
+        if self.owns_socket_directory
+            && let Some(ref dir) = self.socket_directory
+        {
+            let _ = std::fs::remove_dir_all(dir);
         }
     }
 }
@@ -1204,6 +1228,23 @@ pub(crate) const NO_DEFAULT_PARAMETERS: &str = "no_default_parameters";
 /// Default log configuration for hyperd: file-based JSON logging.
 const DEFAULT_LOG_CONFIG: &str = "file,json,all,hyperd,0";
 
+/// Transport used for client connections to a [`HyperProcess`].
+///
+/// `HyperProcess` uses [`TransportMode::Tcp`] unless [`Parameters::set_transport_mode`]
+/// selects otherwise. [`TransportMode::Ipc`] (Unix domain sockets on Unix, named pipes
+/// on Windows) has lower connect and round-trip latency but slower large streamed
+/// reads than TCP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransportMode {
+    /// Use IPC (Unix domain sockets on Unix, named pipes on Windows).
+    #[default]
+    Ipc,
+
+    /// Use TCP/IP connections.
+    /// Required when connecting from remote clients or when IPC is not available.
+    Tcp,
+}
+
 /// Parameters for configuring the Hyper server.
 ///
 /// When starting a [`HyperProcess`], a set of default parameters are automatically applied
@@ -1222,7 +1263,7 @@ const DEFAULT_LOG_CONFIG: &str = "file,json,all,hyperd,0";
 /// | `default_database_version` | `3` | File format version for newly created `.hyper` databases (v3 adds 128-bit NUMERIC support, required for DECIMAL128 parquet columns) |
 ///
 /// To disable these defaults, add the `no_default_parameters` key (for example
-/// `params.set("no_default_parameters", "")` via [`Parameters::set`].
+/// `params.set("no_default_parameters", "")`) via [`Parameters::set`].
 ///
 /// # Listen Modes
 ///
@@ -1253,52 +1294,13 @@ const DEFAULT_LOG_CONFIG: &str = "file,json,all,hyperd,0";
 /// # Transport Modes
 ///
 /// Use [`set_transport_mode`](Parameters::set_transport_mode) to control whether Hyper uses
-/// TCP or IPC (Unix Domain Sockets):
+/// TCP or IPC (Unix domain sockets on Unix, named pipes on Windows). TCP is the default:
 ///
 /// ```
 /// use hyperdb_api::{Parameters, TransportMode};
 ///
 /// let mut params = Parameters::new();
-/// params.set_transport_mode(TransportMode::Tcp); // Force TCP instead of IPC
-/// ```
-///
-/// Transport mode for `HyperProcess` connections.
-///
-/// Controls whether the server uses TCP or Unix Domain Sockets (IPC) for connections.
-/// On Unix systems, IPC is the default for better local performance.
-/// On Windows, TCP is always used.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TransportMode {
-    /// Use IPC (Unix Domain Sockets on Unix, Named Pipes on Windows).
-    /// This is the default mode and provides better performance for local connections.
-    #[default]
-    Ipc,
-
-    /// Use TCP/IP connections.
-    /// Required when connecting from remote clients or when IPC is not available.
-    Tcp,
-}
-
-/// Parameters for configuring the Hyper server.
-///
-/// When starting a [`HyperProcess`], a set of default parameters are automatically applied
-/// (matching the C++ `HyperProcess` behavior). You can override these defaults or disable
-/// them entirely by adding the `no_default_parameters` key (for example
-/// `params.set("no_default_parameters", "")` via [`Parameters::set`].
-///
-/// # Transport Modes
-///
-/// Use [`set_transport_mode`](Self::set_transport_mode) to control whether Hyper uses
-/// TCP or IPC (Unix Domain Sockets on Unix systems).
-///
-/// # Example
-///
-/// ```
-/// use hyperdb_api::{Parameters, TransportMode};
-///
-/// let mut params = Parameters::new();
-/// params.set("log_file_size_limit", "100k");
-/// params.set_transport_mode(TransportMode::Tcp); // Force TCP instead of IPC
+/// params.set_transport_mode(TransportMode::Ipc); // opt into Unix domain sockets / named pipes
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct Parameters {
@@ -1327,8 +1329,8 @@ impl Parameters {
 
     /// Sets the transport mode (TCP or IPC/UDS).
     ///
-    /// By default, `HyperProcess` uses IPC (Unix Domain Sockets on Unix) for better
-    /// performance. Use `TransportMode::Tcp` if you need TCP connections.
+    /// By default, `HyperProcess` uses TCP. Pass `TransportMode::Ipc` to use Unix domain
+    /// sockets (Unix) or named pipes (Windows).
     ///
     /// # Example
     ///
@@ -1336,7 +1338,7 @@ impl Parameters {
     /// use hyperdb_api::{Parameters, TransportMode};
     ///
     /// let mut params = Parameters::new();
-    /// params.set_transport_mode(TransportMode::Tcp); // Use TCP instead of IPC
+    /// params.set_transport_mode(TransportMode::Ipc); // opt into IPC
     /// ```
     pub fn set_transport_mode(&mut self, mode: TransportMode) -> &mut Self {
         self.transport_mode = Some(mode);
@@ -1527,7 +1529,7 @@ mod tests {
 
     /// Two IPC instances in one process must derive *distinct* default socket
     /// directories, or their sockets collide and the second bind 60 s-timeouts.
-    /// Also guards the `hyper-` prefix that `Drop`'s cleanup keys on.
+    /// Also guards the `hyper-` prefix that marks these directories in the temp dir.
     #[cfg(unix)]
     #[test]
     fn default_socket_dir_names_are_unique_and_prefixed() {
@@ -1538,7 +1540,7 @@ mod tests {
             let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
             assert!(
                 name.starts_with("hyper-"),
-                "socket dir basename must keep the `hyper-` prefix so Drop cleans it up: {name}"
+                "socket dir basename must keep the `hyper-` prefix: {name}"
             );
         }
     }

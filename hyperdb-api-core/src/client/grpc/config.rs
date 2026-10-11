@@ -9,7 +9,41 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use super::proto::hyper_service::query_param::TransferMode;
+use super::proto::hyper_service::query_param::TransferMode as ProtoTransferMode;
+
+/// How the server delivers query results.
+///
+/// This is the crate's own enum rather than the generated protobuf one, so
+/// regenerating the proto does not change the public API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransferMode {
+    /// All results arrive in the `ExecuteQuery` response (simple; subject to
+    /// the server's 100 s timeout).
+    Sync,
+    /// The `ExecuteQuery` response carries only a header; results are fetched
+    /// with `GetQueryResult`.
+    Async,
+    /// The first chunk arrives inline and the rest is streamed through
+    /// `GetQueryResult` (the default, and recommended).
+    #[default]
+    Adaptive,
+}
+
+impl From<TransferMode> for ProtoTransferMode {
+    fn from(mode: TransferMode) -> Self {
+        match mode {
+            TransferMode::Sync => ProtoTransferMode::Sync,
+            TransferMode::Async => ProtoTransferMode::Async,
+            TransferMode::Adaptive => ProtoTransferMode::Adaptive,
+        }
+    }
+}
+
+impl From<TransferMode> for i32 {
+    fn from(mode: TransferMode) -> Self {
+        ProtoTransferMode::from(mode).into()
+    }
+}
 
 /// Default maximum message size for gRPC requests/responses (64 MB).
 ///

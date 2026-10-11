@@ -18,6 +18,7 @@ use crate::chart::{
 };
 use crate::engine::{
     Engine, StatementKind, classify_statement, is_read_only_sql, lock_engine_recovering_poison,
+    require_read_only_sql,
 };
 use crate::error::{ErrorCode, McpError};
 use crate::export::{ExportOptions, export_to_file};
@@ -54,6 +55,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlformat::{FormatOptions, Indent, QueryParams as SqlQueryParams};
 use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// Number of rows returned by the `hyper://tables/{name}/sample` JSON
@@ -152,7 +154,7 @@ present in multiple stores (row multiplication).
 pub struct QueryDataParams {
     /// JSON array of objects or CSV text.
     pub data: String,
-    /// SQL query to run against the data. Reference the table by
+    /// Read-only SQL query to run against the data. Reference the table by
     /// `table_name` (default `data`).
     pub sql: String,
     /// Data format: `"json"` or `"csv"`. Auto-detected from the first byte
@@ -172,7 +174,7 @@ pub struct QueryDataParams {
 pub struct QueryFileParams {
     /// Absolute path to a CSV / JSON / JSONL / Parquet / Arrow IPC file.
     pub path: String,
-    /// SQL query to run. Reference the file's rows by `table_name`
+    /// Read-only SQL query to run. Reference the file's rows by `table_name`
     /// (default `data`), e.g. `SELECT * FROM data`.
     pub sql: String,
     /// Table name the SQL references the file's rows as. Default `data`.
@@ -332,15 +334,13 @@ pub struct LoadFilesEntry {
     pub table: String,
     /// Absolute path to a CSV, Parquet, Arrow IPC, or JSON file.
     pub path: String,
-    /// `"replace"` (default), `"append"`, or `"merge"` — see
-    /// [`LoadFileParams::mode`] for semantics.
+    /// `"replace"` (default) or `"append"`; `"merge"` is rejected.
     pub mode: Option<String>,
     /// Partial schema override keyed by column name.
     pub schema: Option<Value>,
     /// Optional JSON extract path — see `LoadFileParams::json_extract_path`.
     pub json_extract_path: Option<String>,
-    /// When `mode = "merge"`, the column(s) to match on for upsert. See
-    /// [`LoadFileParams::merge_key`].
+    /// Rejected if set: `load_files` does not support merge.
     pub merge_key: Option<MergeKey>,
 }
 
@@ -353,7 +353,7 @@ pub struct LoadFilesParams {
     pub files: Vec<LoadFilesEntry>,
     /// Maximum number of concurrent ingest tasks. Each task checks out
     /// its own connection from a pool sized to match. Default:
-    /// `min(files.len(), 8)`. Large parquet ingests are I/O-bound on
+    /// `min(files.len(), 8)`; capped at 16. Large parquet ingests are I/O-bound on
     /// hyperd's side; more connections don't help past a certain point
     /// and can starve the primary connection.
     pub concurrency: Option<u32>,
@@ -515,11 +515,11 @@ pub struct ChartParams {
     pub title: Option<String>,
     /// Output format: "png" (default) or "svg"
     pub format: Option<String>,
-    /// Width in pixels (default 800)
+    /// Width in pixels (default 800, clamped to 200-4096)
     pub width: Option<u32>,
-    /// Height in pixels (default 480)
+    /// Height in pixels (default 480, clamped to 150-4096)
     pub height: Option<u32>,
-    /// Number of bins for histograms (default 20)
+    /// Number of bins for histograms (default 20, max 500)
     pub bins: Option<u32>,
     /// Force the x column to evenly spaced categorical positions. By default,
     /// line/scatter DATE, TIMESTAMP, and TIMESTAMPTZ values use proportional
@@ -572,9 +572,10 @@ pub struct ChartParams {
     /// image is returned inline. Defaults to true so MCP clients can
     /// display the chart without a separate file-read round-trip.
     pub inline: Option<bool>,
-    /// When false, refuse to overwrite an existing file at `output_path`
-    /// and return `PERMISSION_DENIED` without touching it. Defaults to
-    /// true (overwrite silently), matching the `export` tool.
+    /// Whether to replace an existing file at `output_path`. Defaults to
+    /// false: an existing file is refused with `PERMISSION_DENIED`; pass
+    /// true to replace it. A database this session has open is never
+    /// replaced.
     pub overwrite: Option<bool>,
     /// Target database alias for unqualified name resolution in the
     /// chart's SQL. Omit to query the local database. Pass
@@ -641,7 +642,7 @@ pub struct InspectFileParams {
 /// Parameters for the `export` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ExportParams {
-    /// SQL query to export (if omitted, exports whole table)
+    /// Read-only SQL query to export (if omitted, exports whole table)
     pub sql: Option<String>,
     /// Table name (used if sql omitted)
     pub table: Option<String>,
@@ -652,9 +653,11 @@ pub struct ExportParams {
     /// root with a `metadata/` and `data/` subdir); for all other
     /// formats it is a single file.
     pub format: String,
-    /// If false, refuse to overwrite an existing file at `path` and return
-    /// a `PERMISSION_DENIED` error instead. Defaults to true (overwrite
-    /// silently) to match pre-flag behavior.
+    /// Whether to replace an existing destination. Defaults to false: an
+    /// existing destination is refused with `PERMISSION_DENIED`; pass true
+    /// to replace it. `iceberg` replaces only an Iceberg table directory,
+    /// `hyper` only a `.hyper` file, and a database this session has open
+    /// is never replaced.
     pub overwrite: Option<bool>,
     /// Optional per-format options passed through into hyperd's `COPY
     /// (query) TO '…' WITH (…)` clause. Keys must match hyperd's own
@@ -1149,10 +1152,9 @@ impl HyperMcpServer {
             watchers: Arc::new(crate::watcher::WatcherRegistry::new()),
             saved_queries,
             subscriptions: Arc::new(SubscriptionRegistry::new()),
-            // The catalog policy is now uniform: seed `_table_catalog`
-            // whenever MCP creates a fresh `.hyper` file. The opt-out
-            // `--bare` path was removed; users wanting a pristine file
-            // can `DROP TABLE _table_catalog` after creation.
+            // `_table_catalog` is seeded whenever MCP creates a fresh
+            // `.hyper` file; users wanting a pristine file can
+            // `DROP TABLE _table_catalog` after creation.
             attachments: Arc::new(AttachRegistry::new()),
             workspace_path: persistent_path,
             read_only,
@@ -1226,6 +1228,18 @@ impl HyperMcpServer {
     #[must_use]
     pub fn attachments_handle(&self) -> Arc<AttachRegistry> {
         Arc::clone(&self.attachments)
+    }
+
+    /// The files `export` and `chart` must never write to: the ephemeral
+    /// and persistent databases and every attached file.
+    fn protected_paths(&self, engine: &Engine) -> Vec<PathBuf> {
+        let mut paths = vec![engine.ephemeral_path().to_path_buf()];
+        paths.extend(engine.persistent_path().map(Path::to_path_buf));
+        paths.extend(self.attachments.list().into_iter().map(|entry| {
+            let AttachSource::LocalFile { path } = entry.source;
+            path
+        }));
+        paths
     }
 
     /// Whether the server is running in read-only mode.
@@ -1522,8 +1536,7 @@ impl HyperMcpServer {
     }
 
     /// Idempotently create and reconcile `_table_catalog` on first call
-    /// per engine. No-op in bare or read-only mode (read-only can't
-    /// mutate; bare callers never wanted the catalog in the first place).
+    /// per engine. No-op in read-only mode, which cannot mutate.
     ///
     /// Catalog failures during bootstrap are logged at WARN but do not
     /// fail the outer tool call — a broken catalog should never block a
@@ -1632,7 +1645,7 @@ impl HyperMcpServer {
     where
         F: FnOnce(&mut Engine) -> Result<R, McpError>,
     {
-        let (result, daemon_health_port, connection_lost) = {
+        let (result, daemon_health_endpoint, connection_lost) = {
             let mut guard = self.ensure_engine()?;
             // `&mut` because transactional paths need
             // `Engine::execute_in_transaction`, whose RAII guard borrows the
@@ -1640,11 +1653,11 @@ impl HyperMcpServer {
             // engine already lives behind this exclusive `Mutex`, so no
             // caller was ever sharing it concurrently.
             let engine = guard.as_mut().expect("ensure_engine guarantees Some");
-            let daemon_health_port = engine.daemon_health_port();
+            let daemon_health_endpoint = engine.daemon_health_endpoint_handle().cloned();
             // Bootstrap the catalog exactly once per engine. Intentionally
             // runs *inside* `with_engine` (not `ensure_engine`) so the
             // catalog SQL can see errors classified via the normal error
-            // path. No-op in bare or read-only mode.
+            // path. No-op in read-only mode.
             self.ensure_catalog_ready(engine);
             let result = f(engine);
             let connection_lost = result
@@ -1671,31 +1684,34 @@ impl HyperMcpServer {
                 }
             }
             drop(guard);
-            (result, daemon_health_port, connection_lost)
+            (result, daemon_health_endpoint, connection_lost)
         };
 
-        // Health-plane TCP I/O must not hold the engine mutex. The captured
-        // port is authoritative for the daemon this engine actually uses;
+        // Health-plane I/O must not hold the engine mutex. The captured
+        // endpoint is authoritative for the daemon this engine actually uses;
         // `None` means local fallback and therefore no daemon report.
         if connection_lost {
-            if let Some(port) = daemon_health_port {
-                crate::daemon::health::report_hyperd_error_to_daemon(port);
+            if let Some(endpoint) = &daemon_health_endpoint {
+                crate::daemon::health::report_hyperd_error_to_daemon(endpoint);
             }
         } else {
-            self.maybe_send_heartbeat(daemon_health_port);
+            self.maybe_send_heartbeat(daemon_health_endpoint.as_ref());
         }
         result
     }
 
     /// Best-effort heartbeat to keep the daemon alive while this client is active.
     /// Debounced: only sends if more than 60 seconds have elapsed since the last heartbeat,
-    /// avoiding a new TCP connection on every tool call.
+    /// avoiding a new connection on every tool call.
     ///
-    /// Accepts the daemon health port captured while the engine was locked so
+    /// Accepts the daemon health endpoint captured while the engine was locked so
     /// this method never needs to re-lock `self.engine` after guard release.
-    fn maybe_send_heartbeat(&self, daemon_health_port: Option<u16>) {
+    fn maybe_send_heartbeat(
+        &self,
+        daemon_health_endpoint: Option<&crate::daemon::control::HealthEndpoint>,
+    ) {
         const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-        let Some(port) = daemon_health_port else {
+        let Some(endpoint) = daemon_health_endpoint else {
             return;
         };
 
@@ -1710,7 +1726,7 @@ impl HyperMcpServer {
             true
         });
         if should_send {
-            let _ = crate::daemon::health::send_command(port, "HEARTBEAT");
+            let _ = crate::daemon::health::send_command(endpoint, "HEARTBEAT");
         }
     }
 
@@ -1719,7 +1735,7 @@ impl HyperMcpServer {
     /// the mutex — so diagnostics never hang behind a stalled data-plane op.
     ///
     /// Includes everything answerable from `self` fields + a fast daemon-health
-    /// check (read `daemon.json` + one PING to the known health port, max
+    /// check (read `daemon.json` + one PING to the known health endpoint, max
     /// ~300ms). Omits `table_count`, `total_rows`, `disk_usage_bytes`,
     /// `ephemeral_path`, and `logs` (which require the engine / SQL against
     /// hyperd).
@@ -1727,10 +1743,9 @@ impl HyperMcpServer {
     /// Clients should check `engine_busy: true` and retry `status` later if
     /// they need the full stats, or wait for the in-progress operation to finish.
     fn status_degraded(&self) -> Result<Value, McpError> {
-        // Use discover() — NOT find_running_daemon(). discover() reads the
-        // daemon.json file + one PING to the known health port (~1ms if alive,
-        // 300ms timeout if dead). find_running_daemon() adds a 16-port scan on
-        // failure (up to 4.8s), which would defeat the "instant response" goal.
+        // discover() reads the daemon.json file + one PING to the recorded
+        // health endpoint (~1ms if alive, 300ms timeout if dead), which keeps
+        // the "instant response" goal.
         let (hyperd_running, engine_block) =
             if let Some(info) = crate::daemon::discovery::discover() {
                 (
@@ -1738,7 +1753,7 @@ impl HyperMcpServer {
                     json!({
                         "mode": "daemon",
                         "hyperd_endpoint": info.hyperd_endpoint,
-                        "daemon_health_port": info.health_port,
+                        "daemon_health_endpoint": info.health_endpoint,
                         "connection": crate::engine::describe_endpoint(&info.hyperd_endpoint),
                     }),
                 )
@@ -1749,7 +1764,7 @@ impl HyperMcpServer {
                     json!({
                         "mode": "local",
                         "hyperd_endpoint": null,
-                        "daemon_health_port": null,
+                        "daemon_health_endpoint": null,
                         "connection": null,
                     }),
                 )
@@ -1759,7 +1774,7 @@ impl HyperMcpServer {
                     json!({
                         "mode": "daemon",
                         "hyperd_endpoint": null,
-                        "daemon_health_port": null,
+                        "daemon_health_endpoint": null,
                         "connection": null,
                     }),
                 )
@@ -1921,6 +1936,7 @@ impl HyperMcpServer {
         Parameters(params): Parameters<QueryDataParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self.with_engine(|engine| {
+            require_read_only_sql("query_data", &params.sql)?;
             let tname = params.table_name.unwrap_or_else(|| "data".into());
             let temp_table = format!("_tmp_{}_{}", tname, rand_suffix());
             let fmt = params.format.unwrap_or_else(|| detect_format(&params.data));
@@ -1941,9 +1957,12 @@ impl HyperMcpServer {
             let query_sql = replace_identifier(&params.sql, &tname, &temp_table);
             // Drop the scratch table whether the query succeeds or fails —
             // propagating the query error with `?` before the drop would
-            // orphan the temp table (it then surfaces in `describe`).
-            let query_result = engine.execute_query_to_json(&query_sql);
-            let _ = engine.execute_command(&format!("DROP TABLE IF EXISTS \"{temp_table}\""));
+            // orphan the temp table (it then surfaces in `describe`). The
+            // rewritten SQL is checked again: `table_name` is the caller's,
+            // and substituting it can change how the statement tokenizes.
+            let query_result = require_read_only_sql("query_data", &query_sql)
+                .and_then(|()| engine.execute_query_to_json(&query_sql));
+            let _ = engine.execute_command(&drop_scratch_table_sql(&temp_table));
             let rows = query_result?;
 
             Ok(json!({
@@ -1969,6 +1988,7 @@ impl HyperMcpServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self.with_engine(|engine| {
             crate::attach::validate_input_path(&params.path, "data file")?;
+            require_read_only_sql("query_file", &params.sql)?;
             let tname = params.table_name.unwrap_or_else(|| "data".into());
             let temp_table = format!("_tmp_{}_{}", tname, rand_suffix());
             let schema_override = crate::schema::normalize_schema_param(params.schema.as_ref())?;
@@ -2004,9 +2024,12 @@ impl HyperMcpServer {
             let query_sql = replace_identifier(&params.sql, &tname, &temp_table);
             // Drop the scratch table whether the query succeeds or fails —
             // propagating the query error with `?` before the drop would
-            // orphan the temp table (it then surfaces in `describe`).
-            let query_result = engine.execute_query_to_json(&query_sql);
-            let _ = engine.execute_command(&format!("DROP TABLE IF EXISTS \"{temp_table}\""));
+            // orphan the temp table (it then surfaces in `describe`). The
+            // rewritten SQL is checked again: `table_name` is the caller's,
+            // and substituting it can change how the statement tokenizes.
+            let query_result = require_read_only_sql("query_file", &query_sql)
+                .and_then(|()| engine.execute_query_to_json(&query_sql));
+            let _ = engine.execute_command(&drop_scratch_table_sql(&temp_table));
             let rows = query_result?;
 
             Ok(json!({
@@ -2282,7 +2305,7 @@ impl HyperMcpServer {
                 return Self::err_content(McpError::new(
                     ErrorCode::InvalidArgument,
                     format!(
-                        "load_files does not support mode=merge yet (entry {idx}, table \
+                        "load_files does not support mode=merge (entry {idx}, table \
                          '{}'). Call load_file once per file when you need merge semantics.",
                         entry.table
                     ),
@@ -2694,12 +2717,7 @@ impl HyperMcpServer {
         Parameters(params): Parameters<QueryParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self.with_engine(|engine| {
-            if !is_read_only_sql(&params.sql) {
-                return Err(McpError::new(
-                    ErrorCode::SqlError,
-                    "The query tool only accepts read-only SQL (SELECT, WITH, EXPLAIN, SHOW, VALUES). Use the execute tool for DDL/DML.",
-                ));
-            }
+            require_read_only_sql("query", &params.sql)?;
             // Optional database routing — temporarily redirect search_path
             // for the duration of this call. Restored on guard drop.
             let target_db = self.resolve_db(engine, params.database.as_deref(), None, false)?;
@@ -2803,9 +2821,8 @@ impl HyperMcpServer {
             let (per_statement, affected_total, operation): (Vec<Value>, u64, &'static str) =
                 engine.with_search_path(target_db.as_deref(), |engine| {
                 if params.sql.len() == 1 {
-                    // Singletons skip BEGIN/COMMIT — same auto-commit behavior
-                    // as the pre-batch `execute` tool, and DDL singletons stay
-                    // legal (Hyper auto-commits DDL anyway).
+                    // Singletons skip BEGIN/COMMIT and run in auto-commit mode,
+                    // so DDL singletons stay legal (Hyper auto-commits DDL anyway).
                     let stmt = &params.sql[0];
                     let t = crate::stats::StatsTimer::start();
                     let affected = engine.execute_command(stmt)?;
@@ -2949,11 +2966,21 @@ impl HyperMcpServer {
                 ));
             }
 
-            // If the caller passed an explicit output path, validate it.
-            // Auto-generated paths land in a temp dir and don't need this gate.
-            if let Some(out) = params.output_path.as_deref() {
-                crate::attach::validate_output_path(out, "chart output")?;
-            }
+            // If the caller passed an explicit output path, validate it and
+            // write to the validated path. Auto-generated paths land in a
+            // temp dir and don't need this gate.
+            let output_path = match params.output_path.as_deref() {
+                Some(out) => {
+                    let path = crate::attach::validate_output_path(out, "chart output")?;
+                    crate::attach::refuse_protected_destination(
+                        &path,
+                        &self.protected_paths(engine),
+                        "chart",
+                    )?;
+                    Some(path)
+                }
+                None => None,
+            };
             // Resolve format up front — the path extension may imply it,
             // and we need the format before we can auto-generate a path.
             let format = crate::chart::resolve_chart_format(
@@ -2996,8 +3023,8 @@ impl HyperMcpServer {
                 x_measure_column,
             )?;
 
-            // Parse color_map: skip entries whose hex string is malformed,
-            // logging them via the description rather than hard-failing.
+            // Parse color_map: entries whose hex string is malformed are
+            // silently dropped and fall back to the default palette.
             let color_map = params
                 .color_map
                 .as_ref()
@@ -3041,10 +3068,10 @@ impl HyperMcpServer {
             // tool error instead of a half-delivered response.
             let disposition = crate::chart::resolve_chart_disposition(
                 params.inline.unwrap_or(true),
-                params.output_path.as_deref(),
+                output_path.as_deref(),
                 opts.format,
             );
-            let overwrite = params.overwrite.unwrap_or(true);
+            let overwrite = params.overwrite.unwrap_or(false);
             if let Some(path) = disposition.path() {
                 crate::chart::write_chart_to_disk(path, &chart.bytes, overwrite)?;
             }
@@ -3060,7 +3087,12 @@ impl HyperMcpServer {
                     ChartFormat::Svg => "svg",
                 };
                 let wants_inline = disposition.wants_inline();
-                let output_path_str = disposition.path().map(|p| p.to_string_lossy().into_owned());
+                // Report the path as the caller gave it; the write went to
+                // its validated form, the same file.
+                let output_path_str = params
+                    .output_path
+                    .clone()
+                    .or_else(|| disposition.path().map(|p| p.to_string_lossy().into_owned()));
 
                 let mut stats = serde_json::Map::new();
                 stats.insert("operation".into(), json!("chart"));
@@ -3214,12 +3246,14 @@ impl HyperMcpServer {
         }
     }
 
-    /// Dry-run schema inference on a file (CSV, Parquet, Arrow IPC) without
-    /// ingesting it. Returns the inferred schema plus per-column diagnostics
-    /// (`null_count`, `min`, `max`, `sample_values`) so an LLM can construct
-    /// a safer `schema` override for `load_file` / `load_data`.
+    /// Dry-run schema inference on a CSV, JSON, JSONL, Parquet, or Arrow IPC file.
+    ///
+    /// Nothing is ingested. Returns the inferred schema plus per-column
+    /// diagnostics (`null_count`, `sample_values`, and CSV-only `min` / `max`)
+    /// so an LLM can construct a safer `schema` override for `load_file` /
+    /// `load_data`.
     #[tool(
-        description = "Dry-run schema inference on a CSV / Parquet / Arrow IPC file without ingesting. Returns the schema load_file would use (including the full-file numeric widening pass), plus per-column null_count, min, max, and sample_values. Use this BEFORE load_file if you are unsure about types or ran into a SchemaMismatch / numeric overflow — then pass an explicit `schema` override on the subsequent load_file call. Use `json_extract_path` to inspect a nested data array inside a JSON wrapper file (e.g., MCP tool responses saved to disk)."
+        description = "Dry-run schema inference on a CSV / JSON / JSONL / Parquet / Arrow IPC file without ingesting. Returns the schema load_file would use (including the full-file numeric widening pass), plus per-column null_count and sample_values (CSV/JSON) and min/max (CSV only). Use this BEFORE load_file if you are unsure about types or ran into a SchemaMismatch / numeric overflow — then pass an explicit `schema` override on the subsequent load_file call. Use `json_extract_path` to inspect a nested data array inside a JSON wrapper file (e.g., MCP tool responses saved to disk)."
     )]
     #[expect(
         clippy::unused_self,
@@ -3253,16 +3287,13 @@ impl HyperMcpServer {
     /// Export query results or a table to CSV, Parquet, Arrow IPC,
     /// Apache Iceberg, or a new `.hyper` file.
     #[tool(
-        description = "Export a query result or table to a file via hyperd's native server-side writers; every format round-trips back through `load_file` / `load_iceberg`. `format`: parquet (recommended default) / csv / arrow_ipc / iceberg / hyper. Requires `sql` or `table` — except `iceberg` and `hyper`, and `hyper` ignores both and snapshots every user table into a `.hyper` file openable in Tableau Desktop (a faithful backup; check `schema_fidelity` in the response). `path` is a single file except `iceberg`, which is a directory hyperd creates. `format_options` passes through to hyperd's `COPY ... WITH (...)` (e.g. parquet `codec`, csv `delimiter`). `database` selects the source. See get_readme for per-format tradeoffs."
+        description = "Export a query result or table to a file via hyperd's native server-side writers; every format round-trips back through `load_file` / `load_iceberg`. `format`: parquet (recommended default) / csv / arrow_ipc / iceberg / hyper. Requires `sql` or `table` — except `hyper`, which ignores both and snapshots every user table into a `.hyper` file openable in Tableau Desktop (a faithful backup; check `schema_fidelity` in the response). `path` is a single file except `iceberg`, which is a directory hyperd creates. `format_options` passes through to hyperd's `COPY ... WITH (...)` (e.g. parquet `codec`, csv `delimiter`). `database` selects the source. See get_readme for per-format tradeoffs."
     )]
     fn export(
         &self,
         Parameters(params): Parameters<ExportParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self.with_engine(|engine| {
-            // Validate output path: must be absolute, no `..` components.
-            // (Iceberg "exports" to a directory; the same rules apply.)
-            crate::attach::validate_output_path(&params.path, "export")?;
             // `format_options` must be a JSON object if supplied. Anything
             // else (array, string, number, null) is a caller error — reject
             // with a clear message rather than silently dropping it.
@@ -3311,7 +3342,8 @@ impl HyperMcpServer {
                 table: effective_table,
                 path: params.path,
                 format: params.format,
-                overwrite: params.overwrite.unwrap_or(true),
+                overwrite: params.overwrite.unwrap_or(false),
+                protected_paths: self.protected_paths(engine),
                 format_options,
                 source_db: target_db.clone(),
             };
@@ -3375,10 +3407,9 @@ impl HyperMcpServer {
         if let Err(e) = self.check_writable("save_query") {
             return Self::err_content(e);
         }
-        // Enforce read-only SQL at save time. This is belt-and-braces: the
-        // result resource runs via `execute_query_to_json` which would
-        // reject DDL/DML anyway, but rejecting here produces a clearer
-        // error and prevents the row landing in the meta-table at all.
+        // Enforce read-only SQL at save time. This is the only guard: the
+        // result resource re-runs the stored SQL verbatim via
+        // `execute_query_to_json`, which does not classify statements.
         if !is_read_only_sql(&params.sql) {
             return Self::err_content(McpError::new(
                 ErrorCode::SqlError,
@@ -3920,11 +3951,11 @@ impl HyperMcpServer {
     )]
     #[expect(
         clippy::unused_self,
-        reason = "the #[tool] macro dispatches on &self; signature must match the rest of the tool surface even though this tool is stateless"
+        reason = "kept as a &self method for a uniform tool surface; this tool is stateless"
     )]
     #[expect(
         clippy::unnecessary_wraps,
-        reason = "uniform Result<CallToolResult, rmcp::ErrorData> across all tools so the #[tool_router] dispatcher has one signature shape"
+        reason = "uniform Result<CallToolResult, rmcp::ErrorData> return type across all tools"
     )]
     fn get_readme(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -4027,8 +4058,8 @@ impl HyperMcpServer {
         // Reject if any active watcher targets this alias. Otherwise the
         // watcher's pool would keep ingesting into the now-detached
         // workspace path; or, if the user re-attached the same alias to
-        // a different file, into the wrong database. Fixed by stopping
-        // the watcher first via `unwatch_directory`.
+        // a different file, into the wrong database. The caller must stop
+        // the watcher with `unwatch_directory` first.
         if let Ok(watchers) = self.watchers.watchers.lock() {
             let conflict = watchers
                 .values()
@@ -4064,15 +4095,9 @@ impl HyperMcpServer {
         }
     }
 
-    /// List currently attached databases.
+    /// List currently attached databases with a best-effort visible-table count.
     ///
-    /// Named `list_attached_databases` (not `list_attached`) so it
-    /// sits alongside `attach_database` / `detach_database` as a
-    /// symmetric verb-database trio. The earlier `list_attached`
-    /// name broke the pattern and consistently misled LLM callers
-    /// into hallucinating `list_attached_databases` anyway, so the
-    /// tool now matches the name the models were already reaching
-    /// for.
+    /// Named to pair with `attach_database` / `detach_database`.
     #[tool(
         description = "List every database currently attached under an alias: kind, path/endpoint, writable flag, attach time, and (best-effort) a count of visible public-schema tables."
     )]
@@ -4227,7 +4252,7 @@ impl HyperMcpServer {
             // stub and the data it describes can't diverge — a new
             // engine might not even have the catalog materialized yet.
             // Skipped when the destination is an attached database
-            // (their catalog isn't ours) or when the server is bare /
+            // (their catalog isn't ours) or when the server is
             // read-only. `after_ingest_catalog_update` logs WARN on
             // failure, matching how `load_file` / `load_data` /
             // `execute` register their provenance.
@@ -5283,13 +5308,10 @@ fn validate_execute_batch(stmts: &[String]) -> Result<(), McpError> {
             )
             .with_suggestion("Remove the empty element or replace it with a real statement."));
         }
-        // Classification is comment-aware and only inspects the leading
-        // keyword, so it returns a meaningful answer even for input
-        // that happens to be multi-statement. We don't try to detect
-        // multi-statement input client-side — Hyper's own
-        // "Multi-part queries" / SQLSTATE 0A000 error is mapped at
-        // [error.rs:130-134] to a clear "split into separate array
-        // elements" suggestion, so the LLM gets the same actionable
+        // Multi-statement input classifies as `Other` and passes through:
+        // Hyper's own "Multi-part queries" / SQLSTATE 0A000 error is
+        // mapped at [error.rs:130-134] to a clear "split into separate
+        // array elements" suggestion, so the LLM gets the same actionable
         // hint after one round-trip.
         match classify_statement(stmt) {
             StatementKind::ReadOnly => {
@@ -5385,6 +5407,16 @@ fn rand_suffix() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     format!("{}", t.as_nanos() % 1_000_000_000)
+}
+
+/// `DROP` statement for a `query_data` / `query_file` scratch table. The name
+/// embeds the caller-supplied `table_name`, so it must be quoted as an
+/// identifier rather than wrapped in bare quotes.
+fn drop_scratch_table_sql(temp_table: &str) -> String {
+    format!(
+        "DROP TABLE IF EXISTS \"{}\"",
+        temp_table.replace('"', "\"\"")
+    )
 }
 
 /// Replace whole-word occurrences of the identifier `needle` with
@@ -5637,6 +5669,24 @@ fn perform_copy(
 }
 
 #[cfg(test)]
+mod drop_scratch_table_tests {
+    use super::drop_scratch_table_sql;
+
+    #[test]
+    fn drop_sql_escapes_embedded_quotes() {
+        assert_eq!(
+            drop_scratch_table_sql("_tmp_data_1"),
+            "DROP TABLE IF EXISTS \"_tmp_data_1\""
+        );
+        // A `table_name` of `x"; DROP TABLE victim; --` must stay one identifier.
+        assert_eq!(
+            drop_scratch_table_sql("_tmp_x\"; DROP TABLE victim; --_1"),
+            "DROP TABLE IF EXISTS \"_tmp_x\"\"; DROP TABLE victim; --_1\""
+        );
+    }
+}
+
+#[cfg(test)]
 mod replace_identifier_tests {
     use super::replace_identifier;
 
@@ -5810,36 +5860,42 @@ mod kv_value_path_size_tests {
 #[cfg(test)]
 mod heartbeat_debounce_tests {
     use std::io::{BufRead, BufReader, Write};
-    use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::{Arc, Barrier};
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
+    use crate::daemon::control::{ControlListener, ControlStream, HealthEndpoint};
+
     use super::HyperMcpServer;
 
+    /// A per-test state directory and the (not yet bound) endpoint inside it.
+    /// Kept short so the socket path stays under the platform's `sun_path`
+    /// limit.
+    fn test_endpoint() -> (tempfile::TempDir, HealthEndpoint) {
+        let dir = tempfile::tempdir().expect("create heartbeat test state dir");
+        let endpoint = HealthEndpoint::for_new_daemon(dir.path()).expect("heartbeat endpoint");
+        (dir, endpoint)
+    }
+
     struct HeldHeartbeatPeer {
-        port: u16,
+        _dir: tempfile::TempDir,
+        endpoint: HealthEndpoint,
         release: Option<Sender<()>>,
         handle: Option<JoinHandle<Result<Vec<String>, String>>>,
     }
 
     impl HeldHeartbeatPeer {
         fn spawn() -> Self {
+            let (dir, endpoint) = test_endpoint();
             let listener =
-                TcpListener::bind(("127.0.0.1", 0)).expect("bind controlled heartbeat listener");
-            listener
-                .set_nonblocking(true)
-                .expect("make controlled heartbeat listener nonblocking");
-            let port = listener
-                .local_addr()
-                .expect("controlled heartbeat listener address")
-                .port();
+                ControlListener::bind(&endpoint).expect("bind controlled heartbeat listener");
             let (release_tx, release_rx) = mpsc::channel();
             let handle =
-                std::thread::spawn(move || hold_heartbeat_responses(&listener, &release_rx));
+                std::thread::spawn(move || hold_heartbeat_responses(listener, &release_rx));
             Self {
-                port,
+                _dir: dir,
+                endpoint,
                 release: Some(release_tx),
                 handle: Some(handle),
             }
@@ -5869,19 +5925,17 @@ mod heartbeat_debounce_tests {
     }
 
     fn hold_heartbeat_responses(
-        listener: &TcpListener,
+        mut listener: ControlListener,
         release: &Receiver<()>,
     ) -> Result<Vec<String>, String> {
         let hard_deadline = Instant::now() + Duration::from_secs(5);
         let mut streams = Vec::new();
         loop {
-            loop {
-                match listener.accept() {
-                    Ok((stream, _)) => streams.push(stream),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(error) => {
-                        return Err(format!("controlled heartbeat accept failed: {error}"));
-                    }
+            match listener.accept_timeout(Duration::from_millis(2)) {
+                Ok(Some(stream)) => streams.push(stream),
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(format!("controlled heartbeat accept failed: {error}"));
                 }
             }
 
@@ -5892,25 +5946,22 @@ mod heartbeat_debounce_tests {
             if Instant::now() >= hard_deadline {
                 return Err("controlled heartbeat listener was never released".to_string());
             }
-            std::thread::sleep(Duration::from_millis(2));
         }
 
         // Accept any connections already queued when the release signal won
-        // the race with the nonblocking accept above.
+        // the race with the accept above.
         let drain_deadline = Instant::now() + Duration::from_millis(50);
         while Instant::now() < drain_deadline {
-            match listener.accept() {
-                Ok((stream, _)) => streams.push(stream),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+            match listener.accept_timeout(Duration::from_millis(5)) {
+                Ok(Some(stream)) => streams.push(stream),
+                Ok(None) => {}
                 Err(error) => return Err(format!("heartbeat queue drain failed: {error}")),
             }
         }
 
         let mut commands = Vec::with_capacity(streams.len());
         for mut stream in streams {
-            commands.push(read_heartbeat_command(&stream)?);
+            commands.push(read_heartbeat_command(&mut stream)?);
             stream
                 .write_all(b"OK\n")
                 .map_err(|error| format!("acknowledge held heartbeat: {error}"))?;
@@ -5918,43 +5969,32 @@ mod heartbeat_debounce_tests {
         Ok(commands)
     }
 
-    fn read_heartbeat_command(stream: &TcpStream) -> Result<String, String> {
+    fn read_heartbeat_command(stream: &mut ControlStream) -> Result<String, String> {
         stream
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .map_err(|error| format!("set heartbeat read timeout: {error}"))?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(1)))
-            .map_err(|error| format!("set heartbeat write timeout: {error}"))?;
-        let reader = stream
-            .try_clone()
-            .map_err(|error| format!("clone heartbeat stream: {error}"))?;
+            .set_io_timeout(Duration::from_secs(1))
+            .map_err(|error| format!("set heartbeat I/O timeout: {error}"))?;
         let mut command = String::new();
-        BufReader::new(reader)
+        BufReader::new(&mut *stream)
             .read_line(&mut command)
             .map_err(|error| format!("read heartbeat command: {error}"))?;
         Ok(command)
     }
 
     fn collect_immediate_heartbeats(
-        listener: &TcpListener,
+        mut listener: ControlListener,
         window: Duration,
     ) -> Result<Vec<String>, String> {
-        listener
-            .set_nonblocking(true)
-            .map_err(|error| format!("make follow-up listener nonblocking: {error}"))?;
         let deadline = Instant::now() + window;
         let mut commands = Vec::new();
         while Instant::now() < deadline {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    commands.push(read_heartbeat_command(&stream)?);
+            match listener.accept_timeout(Duration::from_millis(2)) {
+                Ok(Some(mut stream)) => {
+                    commands.push(read_heartbeat_command(&mut stream)?);
                     stream
                         .write_all(b"OK\n")
                         .map_err(|error| format!("acknowledge follow-up heartbeat: {error}"))?;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(2));
-                }
+                Ok(None) => {}
                 Err(error) => return Err(format!("follow-up heartbeat accept failed: {error}")),
             }
         }
@@ -5982,10 +6022,10 @@ mod heartbeat_debounce_tests {
             let server = Arc::clone(&server);
             let barrier = Arc::clone(&barrier);
             let completed = completed_tx.clone();
-            let port = peer.port;
+            let endpoint = peer.endpoint.clone();
             callers.push(std::thread::spawn(move || {
                 barrier.wait();
-                server.maybe_send_heartbeat(Some(port));
+                server.maybe_send_heartbeat(Some(&endpoint));
                 let _ = completed.send(());
             }));
         }
@@ -6016,27 +6056,22 @@ mod heartbeat_debounce_tests {
         // Preserve the existing best-effort rule: even a refused connection
         // consumes the debounce interval, so an immediate retry does not
         // create a heartbeat storm while the daemon is unavailable.
-        let reservation =
-            TcpListener::bind(("127.0.0.1", 0)).expect("reserve a closed heartbeat port");
-        let failed_port = reservation
-            .local_addr()
-            .expect("closed heartbeat port address")
-            .port();
-        drop(reservation);
+        // An endpoint nothing is bound to refuses the connection.
+        let (_failed_dir, failed_endpoint) = test_endpoint();
         *server
             .last_heartbeat
             .lock()
             .expect("heartbeat timestamp mutex") = Instant::now()
             .checked_sub(HEARTBEAT_INTERVAL)
             .expect("60-second heartbeat interval fits before current instant");
-        server.maybe_send_heartbeat(Some(failed_port));
+        server.maybe_send_heartbeat(Some(&failed_endpoint));
 
-        let follow_up_listener = TcpListener::bind(("127.0.0.1", failed_port))
-            .expect("bind follow-up listener on refused heartbeat port");
+        let follow_up_listener = ControlListener::bind(&failed_endpoint)
+            .expect("bind follow-up listener on refused heartbeat endpoint");
         let follow_up = std::thread::spawn(move || {
-            collect_immediate_heartbeats(&follow_up_listener, Duration::from_millis(300))
+            collect_immediate_heartbeats(follow_up_listener, Duration::from_millis(300))
         });
-        server.maybe_send_heartbeat(Some(failed_port));
+        server.maybe_send_heartbeat(Some(&failed_endpoint));
         let follow_up_commands = follow_up.join();
 
         let mut failures = Vec::new();

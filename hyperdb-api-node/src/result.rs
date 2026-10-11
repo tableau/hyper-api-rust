@@ -115,7 +115,7 @@ pub(crate) fn extract_row(
 /// A row from a query result.
 ///
 /// Use the typed accessor methods to get column values by index (0-based).
-/// Returns `null` for NULL values or type mismatches.
+/// Accessors return `null` for NULL values or type mismatches; `getInt32` throws when a BIGINT value does not fit.
 #[napi]
 #[derive(Debug)]
 pub struct RowData {
@@ -270,9 +270,9 @@ impl RowData {
         }
     }
 
-    /// Gets a JSON column value as a parsed string (ready for JSON.parse in JS).
+    /// Gets a JSON column value as its raw JSON text.
     ///
-    /// Returns the raw JSON text. Use `JSON.parse(row.getJSON(idx))` in JS.
+    /// Use `JSON.parse(row.getJson(idx))` in JS to obtain an object.
     #[napi]
     pub fn get_json(&self, index: u32) -> Option<String> {
         match self.values.get(index as usize)? {
@@ -371,7 +371,7 @@ impl RowData {
 mod hex {
     #[expect(
         clippy::format_collect,
-        reason = "readable hex/string formatting loop; refactoring to fold! obscures intent"
+        reason = "readable hex/string formatting loop; per-byte `format!` keeps the encoder a one-liner; getString on a BYTEA cell is not a hot path"
     )]
     pub(super) fn encode(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -379,7 +379,7 @@ mod hex {
 }
 
 // =============================================================================
-// ResultSchemaInfo - Column metadata returned to JS
+// ResultColumnInfo - Column metadata returned to JS
 // =============================================================================
 
 /// Metadata about a column in a query result.

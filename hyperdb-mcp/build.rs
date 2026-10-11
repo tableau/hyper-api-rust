@@ -27,7 +27,7 @@
 //! identifies them, so no timestamp is appended.
 //!
 //! Falls back to `unknown` on any failure (no git binary, not a repo,
-//! detached state, etc.) so the crate still builds for consumers who
+//! etc.) so the crate still builds for consumers who
 //! obtained the source as a tarball.
 //!
 //! `Cargo.lock` is excluded from the dirty check via a git pathspec —
@@ -41,9 +41,9 @@ fn main() {
     // one directory into the workspace `.git`.
     println!("cargo:rerun-if-changed=../.git/HEAD");
     println!("cargo:rerun-if-changed=../.git/refs/heads");
-    // Changes in the git index also affect dirty-ness (staging/unstaging
-    // files flips the tree's dirty state without HEAD moving). Touching
-    // `.git/index` reruns us so the `-dirty` marker stays honest.
+    // Staging or unstaging rewrites `.git/index`, which reruns this script.
+    // Unstaged edits to tracked files do not, so the `-dirty` marker is
+    // best-effort until HEAD, a branch ref, or the index next changes.
     println!("cargo:rerun-if-changed=../.git/index");
 
     let hash = Command::new("git")
@@ -60,18 +60,12 @@ fn main() {
     // permanently mark every build dirty even though the source tree
     // itself matches HEAD.
     //
-    // We also exclude `Cargo.lock` from the dirty check via a pathspec.
-    // Rationale: release-please bumps `[workspace.package].version` in
-    // `Cargo.toml` but does NOT update `Cargo.lock`. When CI checks
-    // out the release tag and runs `cargo build --release`, cargo
-    // silently reconciles the lockfile in-place, dirtying the
-    // worktree. Without the exclude, every release binary gets
-    // stamped `<hash>-dirty-<timestamp>` even though the source is
-    // pristine. Cargo.lock churn at build time is not a logical
-    // source change and shouldn't trip the marker. Any *other*
-    // modified tracked file (including a deliberately-edited
-    // Cargo.lock alongside a code change) still trips it because
-    // `git status --porcelain` will list it.
+    // `Cargo.lock` is excluded from the dirty check via a pathspec. The
+    // release-please workflow syncs `Cargo.lock` in the release PR; this
+    // exclusion is a safety net for a release commit whose lockfile is still
+    // stale, which `cargo build` would rewrite in place. Any other modified
+    // tracked file, including a `Cargo.lock` edited alongside a code change,
+    // still trips the marker.
     //
     // `:(exclude,top)` is git's portable long-form pathspec magic:
     // `top` anchors at the repo root (so a hypothetical sub-crate

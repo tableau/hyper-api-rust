@@ -161,7 +161,7 @@ if [[ -f "${NODE_LIB}" ]]; then
   (
     cd "${ROOT}/hyperdb-api-node"
     npm pkg set "version=${VERSION}"
-    for p in darwin-arm64 linux-arm64-gnu linux-x64-gnu linux-x64-musl win32-x64-msvc; do
+    for p in darwin-arm64 linux-x64-gnu win32-x64-msvc; do
       npm pkg set "optionalDependencies.hyperdb-api-node-$p=${VERSION}"
     done
     npm pack --quiet

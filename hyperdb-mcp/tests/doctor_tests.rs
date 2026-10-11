@@ -4,12 +4,12 @@
 //! Native CLI contracts for the side-effect-free `doctor` report.
 
 use std::ffi::{OsStr, OsString};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use hyperdb_mcp::daemon::control::HealthEndpoint;
 use hyperdb_mcp::daemon::discovery::DaemonInfo;
 use hyperdb_mcp::daemon::health::{self, DaemonState, HealthListener};
 use serde_json::{Value, json};
@@ -48,6 +48,8 @@ enum SnapshotNode {
     Directory,
     File(Vec<u8>),
     Symlink(PathBuf),
+    /// A socket, FIFO or device: recorded by kind, never read.
+    Special,
 }
 
 #[derive(Debug)]
@@ -61,21 +63,22 @@ struct DoctorSandbox {
     wrapper_package_path: PathBuf,
     platform_package_path: PathBuf,
     launcher_executable_path: PathBuf,
-    isolated_daemon_port: u16,
-    _isolated_daemon_listener: TcpListener,
 }
 
 impl DoctorSandbox {
     fn new() -> Self {
+        // `<state dir>/daemon.sock` must fit in `sockaddr_un.sun_path` (103
+        // bytes on macOS). The default temp root is already ~60 bytes there,
+        // so on Unix root the sandbox under the short `/tmp` instead.
+        #[cfg(unix)]
+        let temp_dir = tempfile::Builder::new()
+            .prefix("hdbdoc")
+            .tempdir_in("/tmp")
+            .expect("create isolated doctor test root");
+        #[cfg(not(unix))]
         let temp_dir = TempDir::new().expect("create isolated doctor test root");
         let root =
             canonicalize_for_test(temp_dir.path()).expect("canonicalize isolated doctor test root");
-        let isolated_daemon_listener = TcpListener::bind(("127.0.0.1", 0))
-            .expect("reserve an OS-assigned foreign daemon-isolation port");
-        let isolated_daemon_port = isolated_daemon_listener
-            .local_addr()
-            .expect("read daemon-isolation listener address")
-            .port();
         Self {
             state_dir: root.join("state-must-not-be-created"),
             persistent_path: root
@@ -86,8 +89,6 @@ impl DoctorSandbox {
             wrapper_package_path: root.join("npm/wrapper/package.json"),
             platform_package_path: root.join("npm/platform/package.json"),
             launcher_executable_path: root.join("npm/platform/hyperdb-mcp"),
-            isolated_daemon_port,
-            _isolated_daemon_listener: isolated_daemon_listener,
             _temp_dir: temp_dir,
             root,
         }
@@ -122,7 +123,6 @@ impl DoctorSandbox {
             Some(self.persistent_path.as_os_str()),
             launcher_metadata,
             Some(hyperd_path),
-            self.isolated_daemon_port,
         )
     }
 
@@ -132,14 +132,12 @@ impl DoctorSandbox {
         persistent_environment: Option<&OsStr>,
         launcher_metadata: &str,
         hyperd_path: Option<&OsStr>,
-        daemon_port: u16,
     ) -> Output {
         self.run_with_home_options(
             args,
             persistent_environment,
             launcher_metadata,
             hyperd_path,
-            daemon_port,
             self.home_dir.as_os_str(),
         )
     }
@@ -150,7 +148,6 @@ impl DoctorSandbox {
         persistent_environment: Option<&OsStr>,
         launcher_metadata: &str,
         hyperd_path: Option<&OsStr>,
-        daemon_port: u16,
         home_profile: &OsStr,
     ) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_hyperdb-mcp"));
@@ -174,7 +171,6 @@ impl DoctorSandbox {
             .env("TEMP", &self.runtime_tmp_dir)
             .env("HYPERDB_STATE_DIR", &self.state_dir)
             .env("HYPERDB_MCP_LAUNCHER_INFO", launcher_metadata)
-            .env("HYPERDB_DAEMON_PORT", daemon_port.to_string())
             .env("NO_COLOR", "1")
             .args(args);
         if let Some(path) = persistent_environment {
@@ -233,45 +229,66 @@ impl DoctorSandbox {
 
 #[derive(Debug)]
 struct RunningHealthListener {
-    port: u16,
+    endpoint: HealthEndpoint,
     info: DaemonInfo,
     state: Arc<DaemonState>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl RunningHealthListener {
-    fn start() -> Self {
-        let listener = HealthListener::bind(0).expect("bind OS-assigned health-listener port");
-        let port = listener.port;
+    /// Bind the real health listener on `<sandbox state dir>/daemon.sock`,
+    /// creating the state directory first (a real daemon owns it).
+    fn start(sandbox: &DoctorSandbox) -> Self {
+        Self::start_reporting(sandbox, None)
+    }
+
+    /// Like [`Self::start`], but the STATUS reply (not the record we return in
+    /// `info`) carries `reported_endpoint` instead of the bound one, to model a
+    /// daemon whose status disagrees with its discovery record.
+    fn start_reporting(sandbox: &DoctorSandbox, reported_endpoint: Option<&str>) -> Self {
+        std::fs::create_dir_all(&sandbox.state_dir).expect("create daemon state directory");
+        let endpoint = HealthEndpoint::for_new_daemon(&sandbox.state_dir)
+            .expect("derive the health endpoint for the sandbox state directory");
+        #[cfg(unix)]
+        assert_eq!(
+            Path::new(endpoint.as_str()),
+            sandbox.state_dir.join("daemon.sock"),
+            "the health endpoint must be exactly <state dir>/daemon.sock"
+        );
+        let listener = HealthListener::bind(&endpoint).expect("bind real health listener");
         let info = DaemonInfo {
             pid: std::process::id(),
             hyperd_endpoint: "127.0.0.1:54321".to_owned(),
-            health_port: port,
+            health_endpoint: endpoint.as_str().to_owned(),
             started_at: "2026-08-14T12:34:56Z".to_owned(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
         };
-        let state = Arc::new(DaemonState::new());
-        let shared_info = Arc::new(Mutex::new(info.clone()));
+        let state = Arc::new(DaemonState::new(endpoint.clone()));
+        let mut reported_info = info.clone();
+        if let Some(reported) = reported_endpoint {
+            reported.clone_into(&mut reported_info.health_endpoint);
+        }
+        let shared_info = Arc::new(Mutex::new(reported_info));
         let run_state = Arc::clone(&state);
         let handle = std::thread::spawn(move || listener.run(run_state, shared_info));
         Self {
-            port,
+            endpoint,
             info,
             state,
             handle: Some(handle),
         }
     }
 
-    fn prime_accept_sleep(&self) {
-        let response = health::send_command(self.port, "PING")
+    fn prime_listener(&self) {
+        let response = health::send_command(&self.endpoint, "PING")
             .expect("real health listener must answer the priming PING");
         assert!(
             response.starts_with("PONG hyperdb-mcp "),
             "unexpected health-listener PING response: {response:?}"
         );
-        // The response comes from a per-connection worker. Give the accept
-        // thread a small scheduling window to re-enter its real 100 ms
-        // WouldBlock sleep before launching the already-warm doctor child.
+        // The PONG comes from a per-connection worker; yield briefly so the
+        // accept thread is back in its readiness wait before the doctor
+        // child connects.
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
 }
@@ -331,6 +348,8 @@ fn snapshot_tree(root: &Path) -> Vec<(PathBuf, SnapshotNode)> {
             } else if metadata.is_dir() {
                 entries.push((relative, SnapshotNode::Directory));
                 visit(root, &path, entries);
+            } else if !metadata.is_file() {
+                entries.push((relative, SnapshotNode::Special));
             } else {
                 let bytes = std::fs::read(&path).unwrap_or_else(|error| {
                     panic!("read snapshot file {}: {error}", path.display())
@@ -608,8 +627,20 @@ fn live_daemon_human_parity_failure(report: &Value, human: &str) -> Option<Strin
             missing.push(format!("human live identity omitted {expected:?}"));
         }
     }
-    for (key, label) in [("pid", "PID"), ("health_port", "Health port")] {
-        let Some(value) = daemon.get(key).and_then(Value::as_u64) else {
+    match daemon.get("pid").and_then(Value::as_u64) {
+        Some(pid) => {
+            let expected = format!("  PID: {pid}");
+            if !human.contains(&expected) {
+                missing.push(format!("human live identity omitted {expected:?}"));
+            }
+        }
+        None => missing.push("daemon.pid missing from live identity".to_owned()),
+    }
+    for (key, label) in [
+        ("health_endpoint", "Health endpoint"),
+        ("lock", "Daemon lock"),
+    ] {
+        let Some(value) = daemon.get(key).and_then(Value::as_str) else {
             missing.push(format!("daemon.{key} missing from live identity"));
             continue;
         };
@@ -653,7 +684,7 @@ fn live_daemon_fact_failure(
         daemon.get("state").and_then(Value::as_str),
         daemon.get("pid").and_then(Value::as_u64),
         daemon.get("hyperd_endpoint").and_then(Value::as_str),
-        daemon.get("health_port").and_then(Value::as_u64),
+        daemon.get("health_endpoint").and_then(Value::as_str),
         daemon.get("started_at").and_then(Value::as_str),
         daemon.get("version").and_then(Value::as_str),
     );
@@ -661,7 +692,7 @@ fn live_daemon_fact_failure(
         Some(expected_state),
         Some(u64::from(expected.pid)),
         Some(expected.hyperd_endpoint.as_str()),
-        Some(u64::from(expected.health_port)),
+        Some(expected.health_endpoint.as_str()),
         Some(expected.started_at.as_str()),
         Some(expected.version.as_str()),
     );
@@ -918,7 +949,21 @@ fn doctor_cli_json_and_human_smoke_is_side_effect_free() {
         .expect("daemon section must contain one typed discovery state");
     assert_eq!(
         daemon_state, "missing",
-        "OS-assigned pinned isolation port must prevent a resident developer daemon from changing this smoke test"
+        "the isolated state directory must prevent a resident developer daemon from changing this smoke test"
+    );
+
+    assert_eq!(
+        daemon.get("lock").and_then(Value::as_str),
+        Some("absent"),
+        "a state directory without a lock file must report the lock as absent"
+    );
+    assert!(
+        daemon.get("health_endpoint").is_none_or(Value::is_null),
+        "a missing daemon has no health endpoint"
+    );
+    assert!(
+        !daemon.contains_key("health_port"),
+        "the TCP health port is gone from the typed report"
     );
 
     let mut reported_paths = Vec::new();
@@ -1054,7 +1099,7 @@ fn doctor_human_output_escapes_and_bounds_reported_paths() {
     assert_eq!(
         daemon_state(&report),
         Some("missing"),
-        "OS-assigned pinned isolation port must keep the edge-case report daemon-independent"
+        "the isolated state directory must keep the edge-case report daemon-independent"
     );
     assert_eq!(snapshot_tree(&sandbox.root), before);
     sandbox.assert_no_artifacts();
@@ -1160,7 +1205,6 @@ fn doctor_persistent_tilde_sources_match_runtime_and_preserve_cli_semantics() {
             case.persistent_environment.map(OsStr::new),
             &launcher_metadata,
             Some(missing_hyperd.as_os_str()),
-            sandbox.isolated_daemon_port,
         );
         if !output.status.success() {
             failures.push(format!(
@@ -1257,7 +1301,6 @@ fn doctor_persistent_tilde_sources_match_runtime_and_preserve_cli_semantics() {
         Some(OsStr::new("~/ignored-while-disabled.hyper")),
         &launcher_metadata,
         Some(missing_hyperd.as_os_str()),
-        sandbox.isolated_daemon_port,
     );
     if disabled.status.success() {
         match serde_json::from_slice::<Value>(&disabled.stdout) {
@@ -1338,7 +1381,6 @@ fn doctor_persistent_tilde_sources_match_runtime_and_preserve_cli_semantics() {
             None,
             &launcher_metadata,
             Some(missing_hyperd.as_os_str()),
-            sandbox.isolated_daemon_port,
         );
         if output.status.code() != Some(2)
             || !output.stdout.is_empty()
@@ -1376,7 +1418,6 @@ fn doctor_relative_persistent_path_normalizes_parent_and_matches_runtime() {
         Some(OsStr::new("ignored-environment.hyper")),
         &launcher_metadata,
         Some(missing_hyperd.as_os_str()),
-        sandbox.isolated_daemon_port,
     );
     let report = parse_json_report(
         &json_output,
@@ -1442,7 +1483,6 @@ fn doctor_relative_persistent_path_normalizes_parent_and_matches_runtime() {
         Some(OsStr::new("ignored-environment.hyper")),
         &launcher_metadata,
         Some(missing_hyperd.as_os_str()),
-        sandbox.isolated_daemon_port,
     );
     assert_success(
         &human_output,
@@ -1496,7 +1536,6 @@ fn doctor_nested_tilde_home_expands_once_and_preserves_raw_input() {
         Some(OsStr::new("~/ignored-environment.hyper")),
         &launcher_metadata,
         Some(missing_hyperd.as_os_str()),
-        sandbox.isolated_daemon_port,
         nested_home.as_os_str(),
     );
     let report = parse_json_report(&json_output, "hyperdb-mcp doctor --json with HOME=~/outer");
@@ -1560,7 +1599,6 @@ fn doctor_nested_tilde_home_expands_once_and_preserves_raw_input() {
         Some(OsStr::new("~/ignored-environment.hyper")),
         &launcher_metadata,
         Some(missing_hyperd.as_os_str()),
-        sandbox.isolated_daemon_port,
         nested_home.as_os_str(),
     );
     assert_success(&human_output, "hyperdb-mcp doctor with HOME=~/outer");
@@ -1627,7 +1665,6 @@ fn doctor_non_utf8_persistent_environment_reports_observed_and_effective_paths()
         Some(configured.raw.as_os_str()),
         &launcher_metadata,
         Some(missing_hyperd.as_os_str()),
-        sandbox.isolated_daemon_port,
     );
     let report = parse_json_report(
         &output,
@@ -1721,7 +1758,6 @@ fn doctor_hyperd_path_diagnostics_match_runtime_resolution() {
             Some(sandbox.persistent_path.as_os_str()),
             &launcher_metadata,
             Some(configured.raw.as_os_str()),
-            sandbox.isolated_daemon_port,
         );
         let report = parse_json_report(
             &output,
@@ -1769,7 +1805,7 @@ fn doctor_hyperd_path_diagnostics_match_runtime_resolution() {
             );
         }
         if daemon_state(&report) != Some("missing") {
-            failures.push("non-UTF-8 case escaped the pinned daemon port".to_owned());
+            failures.push("non-UTF-8 case escaped the isolated daemon state directory".to_owned());
         }
         if snapshot_tree(&sandbox.root) != before {
             failures.push("non-UTF-8 HYPERD_PATH case changed filesystem bytes".to_owned());
@@ -1790,7 +1826,6 @@ fn doctor_hyperd_path_diagnostics_match_runtime_resolution() {
             Some(sandbox.persistent_path.as_os_str()),
             &launcher_metadata,
             Some(configured_directory.as_os_str()),
-            sandbox.isolated_daemon_port,
         );
         let report = parse_json_report(
             &output,
@@ -1827,7 +1862,9 @@ fn doctor_hyperd_path_diagnostics_match_runtime_resolution() {
             ));
         }
         if daemon_state(&report) != Some("missing") {
-            failures.push("empty-directory case escaped the pinned daemon port".to_owned());
+            failures.push(
+                "empty-directory case escaped the isolated daemon state directory".to_owned(),
+            );
         }
         if snapshot_tree(&sandbox.root) != before {
             failures.push("empty-directory HYPERD_PATH case changed filesystem bytes".to_owned());
@@ -1846,7 +1883,6 @@ fn doctor_hyperd_path_diagnostics_match_runtime_resolution() {
             Some(sandbox.persistent_path.as_os_str()),
             &launcher_metadata,
             Some(OsStr::new("")),
-            sandbox.isolated_daemon_port,
         );
         let report = parse_json_report(
             &output,
@@ -1880,7 +1916,8 @@ fn doctor_hyperd_path_diagnostics_match_runtime_resolution() {
             );
         }
         if daemon_state(&report) != Some("missing") {
-            failures.push("empty UTF-8 case escaped the pinned daemon port".to_owned());
+            failures
+                .push("empty UTF-8 case escaped the isolated daemon state directory".to_owned());
         }
         if snapshot_tree(&sandbox.root) != before {
             failures.push("empty UTF-8 HYPERD_PATH case changed filesystem bytes".to_owned());
@@ -1904,7 +1941,6 @@ fn doctor_hyperd_path_diagnostics_match_runtime_resolution() {
             Some(sandbox.persistent_path.as_os_str()),
             &launcher_metadata,
             Some(configured_stem.as_os_str()),
-            sandbox.isolated_daemon_port,
         );
         let report = parse_json_report(
             &output,
@@ -1935,7 +1971,8 @@ fn doctor_hyperd_path_diagnostics_match_runtime_resolution() {
             failures.push("accepted Windows HYPERD_PATH must suppress upward fallback".to_owned());
         }
         if daemon_state(&report) != Some("missing") {
-            failures.push("Windows .exe case escaped the pinned daemon port".to_owned());
+            failures
+                .push("Windows .exe case escaped the isolated daemon state directory".to_owned());
         }
         if snapshot_tree(&sandbox.root) != before {
             failures.push("Windows .exe HYPERD_PATH case changed filesystem bytes".to_owned());
@@ -1961,17 +1998,15 @@ fn doctor_cli_reports_live_from_discovery_via_real_health_listener() {
         let launcher_metadata = sandbox.launcher_metadata("hyperdb-mcp-test-wrapper");
         let missing_hyperd = sandbox.root.join("missing-hyperd");
 
-        // Warm the already-built child before starting the real listener. The
-        // accept loop no longer runs on a sleep cadence for the child to land
-        // inside, but keeping process-loader latency out of the measured
-        // attempt still makes the retry loop below cheaper.
+        // Warm the already-built child before starting the real listener.
+        // Keeping process-loader latency out of the measured attempt makes
+        // the repeated attempts below (every attempt must pass) cheaper.
         let warm_before = snapshot_tree(&sandbox.root);
         let warm = sandbox.run_with_options(
             &["doctor", "--json"],
             Some(sandbox.persistent_path.as_os_str()),
             &launcher_metadata,
             Some(missing_hyperd.as_os_str()),
-            sandbox.isolated_daemon_port,
         );
         let warm_report = parse_json_report(&warm, "warm hyperdb-mcp doctor --json");
         if daemon_state(&warm_report) != Some("missing") {
@@ -1985,21 +2020,19 @@ fn doctor_cli_reports_live_from_discovery_via_real_health_listener() {
             ));
         }
 
-        let listener = RunningHealthListener::start();
-        std::fs::create_dir_all(&sandbox.state_dir).expect("create discovery fixture directory");
+        let listener = RunningHealthListener::start(&sandbox);
         let discovery_path = sandbox.state_dir.join("daemon.json");
         let discovery_bytes =
             serde_json::to_vec_pretty(&listener.info).expect("serialize discovery fixture");
         std::fs::write(&discovery_path, &discovery_bytes).expect("write discovery fixture");
         let before = snapshot_tree(&sandbox.root);
 
-        listener.prime_accept_sleep();
+        listener.prime_listener();
         let output = sandbox.run_with_options(
             &["doctor", "--json"],
             Some(sandbox.persistent_path.as_os_str()),
             &launcher_metadata,
             Some(missing_hyperd.as_os_str()),
-            listener.port,
         );
         let report = parse_json_report(
             &output,
@@ -2011,14 +2044,19 @@ fn doctor_cli_reports_live_from_discovery_via_real_health_listener() {
         {
             failures.push(format!("attempt {attempt}: {failure}"));
         }
+        if report["daemon"]["lock"] != "absent" {
+            failures.push(format!(
+                "attempt {attempt}: no lock file exists, so daemon.lock must be absent: {}",
+                report["daemon"]["lock"]
+            ));
+        }
         if attempt == 1 {
-            listener.prime_accept_sleep();
+            listener.prime_listener();
             let human_output = sandbox.run_with_options(
                 &["doctor"],
                 Some(sandbox.persistent_path.as_os_str()),
                 &launcher_metadata,
                 Some(missing_hyperd.as_os_str()),
-                listener.port,
             );
             assert_success(
                 &human_output,
@@ -2057,73 +2095,83 @@ fn doctor_cli_reports_live_from_discovery_via_real_health_listener() {
     );
 }
 
+/// A daemon record that the live listener contradicts must surface the typed
+/// `daemon_status_health_endpoint_mismatch` warning, without touching disk.
 #[test]
-fn doctor_cli_reports_live_from_scan_via_real_health_listener() {
-    const ATTEMPTS: usize = 4;
-    let mut failures = Vec::new();
+fn doctor_cli_warns_when_status_reports_a_different_health_endpoint() {
+    let sandbox = DoctorSandbox::new();
+    let launcher_metadata = sandbox.launcher_metadata("hyperdb-mcp-test-wrapper");
+    let missing_hyperd = sandbox.root.join("missing-hyperd");
+    let listener = RunningHealthListener::start_reporting(&sandbox, Some("/elsewhere/daemon.sock"));
+    let discovery_bytes =
+        serde_json::to_vec_pretty(&listener.info).expect("serialize discovery fixture");
+    std::fs::write(sandbox.state_dir.join("daemon.json"), &discovery_bytes)
+        .expect("write discovery fixture");
+    let before = snapshot_tree(&sandbox.root);
 
-    for attempt in 1..=ATTEMPTS {
-        let sandbox = DoctorSandbox::new();
-        let launcher_metadata = sandbox.launcher_metadata("hyperdb-mcp-test-wrapper");
-        let missing_hyperd = sandbox.root.join("missing-hyperd");
+    listener.prime_listener();
+    let output = sandbox.run_with_options(
+        &["doctor", "--json"],
+        Some(sandbox.persistent_path.as_os_str()),
+        &launcher_metadata,
+        Some(missing_hyperd.as_os_str()),
+    );
+    let report = parse_json_report(
+        &output,
+        "hyperdb-mcp doctor --json against mismatching status",
+    );
+    assert_exact_top_level_keys(&report);
+    assert!(
+        has_warning_code(&report, "daemon_status_health_endpoint_mismatch"),
+        "doctor must warn about the status/record endpoint mismatch: {report}"
+    );
+    assert_ne!(
+        daemon_state(&report),
+        Some("live_from_discovery"),
+        "a contradicted record must not be reported as a live daemon"
+    );
+    assert_eq!(
+        snapshot_tree(&sandbox.root),
+        before,
+        "doctor must not change the sandbox"
+    );
+    drop(listener);
+}
 
-        let warm_before = snapshot_tree(&sandbox.root);
-        let warm = sandbox.run_with_options(
-            &["doctor", "--json"],
-            Some(sandbox.persistent_path.as_os_str()),
-            &launcher_metadata,
-            Some(missing_hyperd.as_os_str()),
-            sandbox.isolated_daemon_port,
-        );
-        let warm_report = parse_json_report(&warm, "warm hyperdb-mcp doctor --json");
-        if daemon_state(&warm_report) != Some("missing") {
-            failures.push(format!(
-                "attempt {attempt}: warmup escaped pinned missing-daemon isolation"
-            ));
-        }
-        if snapshot_tree(&sandbox.root) != warm_before {
-            failures.push(format!(
-                "attempt {attempt}: warmup changed filesystem bytes"
-            ));
-        }
+/// The lock file is only inspected when it already exists: a held lock is
+/// reported as `held`, a released one as `free`, and doctor never alters it.
+#[test]
+fn doctor_cli_reports_daemon_lock_state_without_changing_it() {
+    use hyperdb_mcp::daemon::lock::DaemonLock;
 
-        let listener = RunningHealthListener::start();
-        let before = snapshot_tree(&sandbox.root);
-        listener.prime_accept_sleep();
+    let sandbox = DoctorSandbox::new();
+    let launcher_metadata = sandbox.launcher_metadata("hyperdb-mcp-test-wrapper");
+    let missing_hyperd = sandbox.root.join("missing-hyperd");
+    std::fs::create_dir_all(&sandbox.state_dir).expect("create state directory");
+
+    let held = DaemonLock::try_acquire(&sandbox.state_dir)
+        .expect("take the daemon lock")
+        .expect("the lock must be free in a fresh sandbox");
+    let before = snapshot_tree(&sandbox.root);
+    let run = || {
         let output = sandbox.run_with_options(
             &["doctor", "--json"],
             Some(sandbox.persistent_path.as_os_str()),
             &launcher_metadata,
             Some(missing_hyperd.as_os_str()),
-            listener.port,
         );
-        let report = parse_json_report(
-            &output,
-            "hyperdb-mcp doctor --json against scanned HealthListener",
-        );
-        if let Some(failure) = live_daemon_fact_failure(&report, "live_from_scan", &listener.info) {
-            failures.push(format!("attempt {attempt}: {failure}"));
-        }
-        if snapshot_tree(&sandbox.root) != before {
-            failures.push(format!(
-                "attempt {attempt}: scan doctor changed filesystem bytes"
-            ));
-        }
-        if sandbox.state_dir.exists() {
-            failures.push(format!(
-                "attempt {attempt}: scan doctor created a daemon state directory"
-            ));
-        }
-        sandbox.assert_no_artifacts();
-        assert_all_strings_bounded(&report);
-        drop(listener);
-    }
+        parse_json_report(&output, "hyperdb-mcp doctor --json with a lock file")
+    };
 
-    assert!(
-        failures.is_empty(),
-        "real scanned HealthListener regressions:\n{}",
-        failures.join("\n")
-    );
+    let report = run();
+    assert_eq!(report["daemon"]["lock"], "held", "{report}");
+    assert_eq!(snapshot_tree(&sandbox.root), before);
+
+    drop(held);
+    let before = snapshot_tree(&sandbox.root);
+    let report = run();
+    assert_eq!(report["daemon"]["lock"], "free", "{report}");
+    assert_eq!(snapshot_tree(&sandbox.root), before);
 }
 
 /// `--help` is the recovery surface available even when neither MCP nor
@@ -2266,20 +2314,35 @@ fn cli_help_matches_hyperd_and_read_only_contract() {
         }
     }
 
-    if !(daemon_help.contains("auto-spawn")
-        && daemon_help.contains("scan")
-        && daemon_help.contains("foreground")
-        && daemon_help.contains("exact"))
+    for stale in ["--port", "hyperdb_daemon_port"] {
+        if daemon_help.contains(stale) || root_help.contains(stale) {
+            failures.push(format!(
+                "help must not mention {stale}: the daemon has no TCP port"
+            ));
+        }
+        if static_cli.contains(stale) {
+            failures.push(format!(
+                "README CLI reference must not mention {stale}: the daemon has no TCP port"
+            ));
+        }
+    }
+    if !(daemon_help.contains("foreground")
+        && daemon_help.contains("one daemon runs per state directory")
+        && daemon_help.contains("hyperdb_state_dir")
+        && daemon_help.contains("unix socket or named pipe")
+        && daemon_help.contains("not on a tcp port"))
     {
         failures.push(
-            "daemon help must distinguish auto-spawn port scanning from the foreground daemon's exact/base-port bind"
+            "daemon help must say one foreground daemon runs per state directory (HYPERDB_STATE_DIR) on a Unix socket or named pipe, not a TCP port"
                 .to_owned(),
         );
     }
-    if daemon_help.contains("daemon scans from the base port to find a free port") {
+    if !(daemon_help.contains("--idle-timeout")
+        && daemon_help.contains("stop")
+        && daemon_help.contains("status"))
+    {
         failures.push(
-            "foreground daemon help must not promise startup scanning that it does not perform"
-                .to_owned(),
+            "daemon help must list --idle-timeout and the stop/status subcommands".to_owned(),
         );
     }
 
@@ -2294,13 +2357,12 @@ fn cli_help_matches_hyperd_and_read_only_contract() {
                 .to_owned(),
         );
     }
-    if !(static_cli.contains("hyperdb_daemon_port")
-        && static_cli.contains("auto-spawn")
-        && static_cli.contains("configured/base")
-        && static_cli.contains("exact"))
-    {
+    if !static_cli.contains("hyperdb_state_dir") {
+        failures.push("static README CLI reference must mention HYPERDB_STATE_DIR".to_owned());
+    }
+    if !(static_cli.contains("socket") && static_cli.contains("named pipe")) {
         failures.push(
-            "static README CLI reference must distinguish HYPERDB_DAEMON_PORT auto-spawn discovery from foreground configured/base binding"
+            "static README CLI reference must describe the per-user socket or named pipe health channel"
                 .to_owned(),
         );
     }

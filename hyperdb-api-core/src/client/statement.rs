@@ -1,7 +1,7 @@
 // Copyright (c) 2026, Salesforce, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Prepared statement handling.
+//! Wire format codes and result-column metadata shared by the query and prepared-statement paths.
 
 use super::error::{Error, Result};
 use crate::types::Oid;
@@ -111,7 +111,7 @@ pub(crate) fn bind_format_codes(
 /// significantly impact performance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ColumnFormat {
-    /// Text format (human-readable ASCII).
+    /// PostgreSQL text format (format code `0`, UTF-8).
     ///
     /// Values are sent as UTF-8 strings. Slower but human-readable.
     /// Use for debugging or when compatibility with text-based tools is needed.

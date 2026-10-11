@@ -206,7 +206,7 @@ AsyncConnection::commit(&self)              // -> #[doc(hidden)] #[deprecated]
 AsyncConnection::rollback(&self)            // -> #[doc(hidden)] #[deprecated]
 ```
 
-At 0.3 these methods still existed and still worked, so a build saw compiler warnings rather than errors. **They were removed in 1.0.0.** If the guard's `&mut conn` borrow is impossible in your code, the replacements are `begin_transaction_unguarded` / `commit_unguarded` / `rollback_unguarded` — see [docs/TRANSACTIONS.md](docs/TRANSACTIONS.md#unguarded-transaction-control).
+At 0.3 these methods still existed and still worked, so a build saw compiler warnings rather than errors. **They were removed in 1.0.0.** If the guard's `&mut conn` borrow is impossible in your code, the replacements are `begin_transaction_unguarded` / `commit_unguarded` / `rollback_unguarded` — see [docs/TRANSACTIONS.md](../../TRANSACTIONS.md#unguarded-transaction-control).
 
 ### Migration recipe
 
@@ -268,7 +268,7 @@ Two in-tree holdouts remain, both by design rather than oversight — they are t
 The `FromRow` trait was redesigned around a new [`RowAccessor`] type and a new [`#[derive(FromRow)]`][derive] proc-macro. The blanket tuple impls (1/2/3/4-tuple) were deleted; hand-written impls have a new signature.
 
 [`RowAccessor`]: https://docs.rs/hyperdb-api/latest/hyperdb_api/struct.RowAccessor.html
-[derive]: https://docs.rs/hyperdb-api/latest/hyperdb_api/derive.FromRow.html
+[derive]: https://docs.rs/hyperdb-api-derive/latest/hyperdb_api_derive/derive.FromRow.html
 
 ### What's changed
 

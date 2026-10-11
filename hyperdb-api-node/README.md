@@ -8,14 +8,13 @@ This package provides a native Node.js addon that gives JavaScript and TypeScrip
 
 - **Async-first** — all I/O methods return Promises
 - **Tagged template literals** — `conn.sql\`SELECT * FROM t WHERE id = ${id}\`` — safe by default
-- **Apache Arrow integration** — query results as Arrow Tables at 15M+ rows/sec
+- **Apache Arrow integration** — query results as Arrow Tables at 25M+ rows/sec
 - **Native performance** — compiled Rust, no FFI overhead at runtime
 - **Full TypeScript support** — hand-written `.d.ts` declarations with full IntelliSense
 - **Connection pooling** — configurable min/max, idle timeout, acquire timeout
 - **Multiple query APIs** — row-oriented, columnar, Arrow IPC, tagged templates
 - **Resource management** — `Symbol.asyncDispose` for `await using` (Node 22+)
-- **Query tracing** — `conn.on('query', ...)` hooks for logging/metrics
-- **Cross-platform** — macOS (ARM & x64), Linux, Windows
+- **Cross-platform** — macOS (Apple Silicon), Linux x64 (glibc), Windows x64
 
 ## Class Overview
 
@@ -25,7 +24,7 @@ ConnectionBuilder ─builds─▶ Connection ──returns──▶ QueryStream 
 ConnectionPool ──pools──▶ Connection ──returns──▶ ColumnarStream ──yields──▶ ColumnarChunk
 
 Catalog ──uses──▶ Connection          TableDefinition ──uses──▶ SqlType
-Inserter ──uses──▶ Connection + TableDefinition
+RowInserter ──uses──▶ Connection + TableDefinition
 ```
 
 For a detailed class diagram with all methods and properties, see
@@ -50,13 +49,9 @@ npm will automatically install the correct prebuilt binary for your platform via
 |---|---|---|
 | macOS | ARM64 (Apple Silicon) | `hyperdb-api-node-darwin-arm64` |
 | Linux | x64 (glibc) | `hyperdb-api-node-linux-x64-gnu` |
-| Linux | x64 (musl/Alpine) | `hyperdb-api-node-linux-x64-musl` |
-| Linux | ARM64 (glibc) | `hyperdb-api-node-linux-arm64-gnu` |
 | Windows | x64 (MSVC) | `hyperdb-api-node-win32-x64-msvc` |
 
-> **macOS x64 (Intel) is not currently published** while we wait for `macos-13`
-> GitHub Actions runners to become reliably available. Build from source for
-> Intel Macs in the meantime.
+> **Only the three platforms above are published.** macOS x64 (Intel), Linux x64 (musl/Alpine) and Linux ARM64 have no prebuilt package, so `require('hyperdb-api-node')` fails there unless you [build from source](#build-from-source). `make download-hyperd` provides `hyperd` only for macOS (ARM64 and x64), Linux x64 (glibc) and Windows x64.
 
 ### Build from source
 
@@ -92,7 +87,7 @@ import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 const {
   HyperProcess, Connection, CreateMode, Catalog,
-  TableDefinition, SqlType, Inserter,
+  TableDefinition, SqlType, RowInserter,
 } = require('hyperdb-api-node') as typeof import('hyperdb-api-node');
 import type { RowData } from 'hyperdb-api-node';
 
@@ -107,7 +102,7 @@ tableDef.addColumn('score', SqlType.double(), true);
 await new Catalog(conn).createTable(tableDef);
 
 // Insert data
-const inserter = new Inserter(conn, tableDef);
+const inserter = new RowInserter(conn, tableDef);
 inserter.addRows([[1, 'Alice', 95.5], [2, 'Bob', null], [3, 'Charlie', 88.0]]);
 console.log(`Inserted ${await inserter.execute()} rows`);
 
@@ -140,8 +135,13 @@ Manages a local Hyper server process (`hyperd`).
 ```typescript
 const hyper = new HyperProcess();             // auto-detect hyperd location
 const hyper = new HyperProcess('/path/to/hyperd'); // or specify path
+// TCP, with hyperd settings passed through unchanged (here: serve TLS)
+const hyper = new HyperProcess(undefined, {
+  transport: 'tcp',
+  parameters: { ssl_key: 'server.key', ssl_certificate: 'server.pem' },
+});
 
-hyper.endpoint;  // e.g., "localhost:7483"
+hyper.endpoint;  // e.g., "127.0.0.1:7483", or a socket path with transport: 'ipc'
 hyper.isOpen;    // true
 
 // Convenience: connect directly
@@ -172,6 +172,7 @@ const schema = await conn.querySchema('SELECT * FROM users');
 
 conn.database;  // 'db.hyper' or null
 conn.isAlive;   // true
+conn.isTls;     // true if the session is encrypted with TLS
 await conn.close(); // MUST be called when done
 ```
 
@@ -186,6 +187,18 @@ const conn = await new ConnectionBuilder('localhost:7483')
   .createMode(CreateMode.CreateIfNotExists)
   .user('admin').password('secret')
   .loginTimeout(5000)
+  .build();
+```
+
+`tls()` turns on TLS for a TCP connection, with libpq `sslmode` names:
+`'disable'` (the default), `'prefer'`, `'require'`, `'verify-ca'` and
+`'verify-full'`. `Connection.connect` and the other static factories stay
+plaintext.
+
+```typescript
+const conn = await new ConnectionBuilder('hyper.example.com:7483')
+  .database('my.hyper')
+  .tls({ mode: 'verify-full', rootCert: 'ca.pem' }) // also clientCert, clientKey, serverName
   .build();
 ```
 
@@ -283,12 +296,12 @@ await catalog.getTableNames('public');       // ['users', 'products']
 await catalog.dropTable('public.users');
 ```
 
-### `Inserter`
+### `RowInserter`
 
 High-performance bulk data inserter using the COPY protocol.
 
 ```typescript
-const inserter = new Inserter(conn, tableDef);
+const inserter = new RowInserter(conn, tableDef);
 
 inserter.addRow([1, 'Widget', 19.99]);          // one at a time
 inserter.addRows([                               // or batch
@@ -299,7 +312,7 @@ inserter.addRows([                               // or batch
 console.log(inserter.bufferedRowCount);          // 3
 const count = await inserter.execute();          // send to server, returns row count
 
-// Inserter can be reused after execute()
+// RowInserter can be reused after execute()
 inserter.addRow([4, 'Another', 7.77]);
 await inserter.execute();
 ```
@@ -343,7 +356,7 @@ for await (const row of conn.executeQueryStream('SELECT * FROM big_table')) {
 | JSON | `getJson(i)` -> `JSON.parse()` | `string` |
 | Any type | `getString(i)` | `string` (fallback) |
 
-**Writing (JS -> Hyper) — via Inserter or tagged templates:**
+**Writing (JS -> Hyper) — via RowInserter or tagged templates:**
 
 | JS Type | SQL Type |
 |---|---|
@@ -351,13 +364,13 @@ for await (const row of conn.executeQueryStream('SELECT * FROM big_table')) {
 | `string` | TEXT |
 | `boolean` | BOOLEAN |
 | `null` / `undefined` | NULL |
-| `Buffer` | BYTEA |
+| `Buffer` | BYTEA (`RowInserter` only) |
 | `Date` | TIMESTAMP (via `toISOString()`) |
 | `{}` (plain object) | JSON (via `JSON.stringify()`) |
 
 ### Tagged Template Literals
 
-The idiomatic way to write safe queries. Values are automatically escaped to SQL literals -- no SQL injection possible:
+The idiomatic way to write safe queries. Each `${value}` becomes a `$n` parameter of a server-side prepared statement -- no SQL injection possible:
 
 ```js
 const rows = await conn.sql`SELECT * FROM users WHERE name = ${name} AND age > ${minAge}`;
@@ -365,22 +378,29 @@ await conn.command`INSERT INTO users (id, name) VALUES (${id}, ${name})`;
 await conn.command`UPDATE users SET score = ${score} WHERE id = ${id}`;
 ```
 
-Supported value types: `number`, `string`, `boolean`, `null`, `Buffer`.
+Supported value types: `number`, `bigint`, `string`, `boolean`, `null`, `Date`.
 
-### Parameterized Queries
+### Prepared Statements
 
 `$1`/`$2` placeholder syntax (alternative to tagged templates):
 
 ```typescript
-const rows = await conn.executeQueryParams(
-  'SELECT * FROM users WHERE name = $1 AND age > $2', ['Alice', 30]
-);
-await conn.executeCommandParams(
-  'INSERT INTO users (id, name, score) VALUES ($1, $2, $3)', [1, 'Alice', 95.5]
-);
+const stmt = conn.prepare('SELECT * FROM users WHERE name = $1 AND age > $2');
+try {
+  const rows = await stmt.query(['Alice', 30]);
+} finally {
+  await stmt.close();
+}
+
+const insert = conn.prepare('INSERT INTO users (id, name, score) VALUES ($1, $2, $3)');
+try {
+  await insert.execute([1, 'Alice', 95.5]);
+} finally {
+  await insert.close();
+}
 ```
 
-Supported parameter types: `number`, `string`, `boolean`, `null`, `Buffer`. Values are escaped -- no SQL injection possible.
+Supported parameter types: `number`, `bigint`, `string`, `boolean`, `null`. Values are bound to a server-side prepared statement, so no SQL injection is possible.
 
 ### `ConnectionPool`
 
@@ -401,7 +421,7 @@ const users = await pool.queryParams('SELECT * FROM users WHERE age > $1', [18])
 // Custom logic with auto acquire/release
 const result = await pool.use(async (conn) => {
   await conn.executeCommand('BEGIN');
-  await conn.executeCommandParams('INSERT INTO logs VALUES ($1)', ['event']);
+  await conn.command`INSERT INTO logs VALUES (${'event'})`;
   await conn.executeCommand('COMMIT');
   return 'ok';
 });
@@ -417,25 +437,16 @@ await pool.close();
 | `idleTimeoutMs` | 30000 | Close idle connections after this many ms |
 | `acquireTimeoutMs` | 30000 | Max ms to wait for a connection (0 = no limit) |
 | `createMode` | `CreateIfNotExists` | Database creation mode |
+| `tls` | none | TLS options for every connection, as for `ConnectionBuilder.tls()` |
 
-### `RowData` Extras
+### Lossless integers and keyed rows
 
 ```js
 row.getBigInt(0);            // lossless 64-bit as BigInt (e.g., 9007199254740993n)
-row.toJSON();                // { "0": "1", "1": "Alice", "2": "95.5" }
 
-// Schema-aware keys
-row.setColumnNames(schema.map(c => c.name));
-row.toJSON();                // { id: "1", name: "Alice", score: "95.5" }
-```
-
-### Query Event Hooks
-
-```js
-conn.on('query', ({ sql, durationMs, rowCount, type }) => {
-  console.log(`[${type}] ${sql} — ${durationMs}ms, ${rowCount} rows`);
-});
-conn.off('query', listener); // unsubscribe
+// Plain objects keyed by column name (values are text representations)
+const objs = await conn.queryObjects('SELECT id, name FROM users');
+const typed = await conn.sqlTyped`SELECT id, name FROM users WHERE id = ${1}`;
 ```
 
 ### Resource Management (`await using`)
@@ -511,28 +522,17 @@ const count = await insertFromTable(conn, tableDef, arrowTable);
 
 ## Benchmark Results
 
-Measured on **Apple M3 Max**, Node.js v24, release build, 1M rows.
-
-Table schema: `measurements(id INT NOT NULL, sensor_id INT, value DOUBLE, timestamp BIGINT)` — 24 bytes/row.
-
-### Query Performance
+Measured on **Apple M3 Max**, Node.js v24.18.0, release build, hyperd `0.0.26359`, 10M rows for inserts and 1M rows for scans. Table schema: `measurements(id INT NOT NULL, sensor_id INT, value DOUBLE, timestamp BIGINT)` — 24 bytes/row.
 
 | Benchmark | Rows/sec | MB/s | Notes |
 |---|---|---|---|
-| **Arrow Full Scan** | 15.5M | 355.4 | `executeQueryToArrow` + `tableFromIPC` — fastest |
-| **Arrow Filtered** | 15.6M | 358.1 | Arrow IPC with `WHERE sensor_id = 5` |
-| **Columnar Full Scan** | 7.9M | 180.9 | `executeQueryColumnar` — no Arrow dependency |
-| **Columnar Filtered** | 5.5M | 125.3 | Columnar stream with `WHERE` filter |
-| Full Scan (eager) | 1.0M | 22.8 | `executeQuery` — all rows in memory |
-| Full Scan (stream) | 836K | 19.1 | `executeQueryStream` — row-level iteration |
-| Full Scan (chunked) | 637K | 14.6 | `nextChunk()` loop with per-row access |
-| Aggregation | 195M | 4464.8 | `GROUP BY` — server-side, 10 result rows |
+| **Arrow Full Scan** | 28.6M | 685.7 | `executeQueryToArrow` — fastest read path |
+| **Columnar Full Scan** | 13.2M | 315.8 | `executeQueryColumnar` — no Arrow dependency |
+| Full Scan (eager) | 1.46M | 35.1 | `executeQuery` — all rows in memory |
+| **Insert (Arrow COPY)** | 41.3M | 991.7 | `ArrowInserter` — fastest insert path |
+| Insert (COPY) | 2.15M | 51.5 | `RowInserter.addRows()` |
 
-### Insert Performance
-
-| Benchmark | Rows/sec | MB/s | Notes |
-|---|---|---|---|
-| **Insert (COPY)** | 1.4M | 31.2 | `Inserter.addRows()` batched in 50K chunks |
+See [docs/BENCHMARK_GUIDE.md](https://github.com/tableau/hyper-api-rust/blob/main/docs/BENCHMARK_GUIDE.md#nodejs-bench--10m-rows-same-schema) for the full table, methodology and host details.
 
 ### Which Query API to Use
 
@@ -549,10 +549,11 @@ The `examples/` directory contains runnable examples:
 
 | Example | Description | Run |
 |---|---|---|
-| `complete-api-tour.mts` | Full 19-section tour in TypeScript | `npx tsx examples/complete-api-tour.mts` |
-| `complete-api-tour.mjs` | Same tour in plain JavaScript | `node examples/complete-api-tour.mjs` |
+| `complete-api-tour.mts` | Tour of the main features in TypeScript | `npx tsx examples/complete-api-tour.mts` |
+| `complete-api-tour.mjs` | JavaScript variant of the tour (prepared-statement flavor) | `node examples/complete-api-tour.mjs` |
 | `typed-analytics.mts` | TypeScript analytics pipeline | `npx tsx examples/typed-analytics.mts` |
 | `arrow-analytics.mjs` | Arrow integration deep-dive | `node examples/arrow-analytics.mjs` |
+| `generate-demo-data.mjs` | Demo data generator | `node examples/generate-demo-data.mjs` |
 | `hyper-explorer/` | Web-based database inspector & generator | See below |
 
 All examples require `HYPERD_PATH` to be set.
@@ -571,4 +572,4 @@ A full-stack web application (React + Express) for inspecting and generating `.h
 
 ## License
 
-Apache-2.0
+Licensed under either of [Apache License, Version 2.0](https://github.com/tableau/hyper-api-rust/blob/main/LICENSE-APACHE.txt) or [MIT license](https://github.com/tableau/hyper-api-rust/blob/main/LICENSE-MIT.txt), at your option.

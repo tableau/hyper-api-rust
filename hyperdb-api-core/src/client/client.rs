@@ -75,6 +75,7 @@ use super::prepare;
 use super::row::{Row, StreamRow};
 use super::statement::ParamFormat;
 use super::sync_stream::SyncStream;
+use super::tls::{self, Fallback, Negotiated, TlsConnector};
 
 use crate::protocol::message::Message;
 use crate::types::Oid;
@@ -119,6 +120,9 @@ pub struct Client {
     endpoint: ConnectionEndpoint,
     /// Optional notice receiver callback for server notices/warnings.
     notice_receiver: Option<Arc<NoticeReceiver>>,
+    /// The TLS connector, kept only when TLS was negotiated, so that a cancel
+    /// request for this session goes over TLS too.
+    tls: Option<Arc<TlsConnector>>,
 }
 
 // Manual Debug implementation because NoticeReceiver doesn't implement Debug
@@ -126,12 +130,13 @@ impl std::fmt::Debug for Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Client")
             .field("process_id", &self.process_id)
-            .field("secret_key", &self.secret_key)
+            .field("secret_key", &"<redacted>")
             .field("endpoint", &self.endpoint)
             .field(
                 "notice_receiver",
                 &self.notice_receiver.as_ref().map(|_| "<callback>"),
             )
+            .field("tls", &self.tls.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -139,7 +144,8 @@ impl std::fmt::Debug for Client {
 impl Client {
     /// Connects to a Hyper server using the given configuration.
     ///
-    /// Establishes a TCP connection, performs authentication, and initializes
+    /// Establishes a TCP connection, negotiates TLS when
+    /// [`Config::tls`] asks for it, performs authentication, and initializes
     /// the client. Returns an error if the connection fails or authentication
     /// is rejected.
     ///
@@ -150,7 +156,12 @@ impl Client {
     /// # Errors
     ///
     /// Returns `Error` if:
+    /// - The TLS configuration is invalid or a certificate file cannot be
+    ///   read ([`Error::Config`])
     /// - Connection to the server fails
+    /// - TLS negotiation or certificate verification fails ([`Error::Tls`]),
+    ///   or does not finish within [`Config::connect_timeout`]
+    ///   ([`Error::Timeout`])
     /// - Authentication fails
     /// - Protocol handshake fails
     ///
@@ -180,6 +191,10 @@ impl Client {
             database = config.database().unwrap_or("(none)"),
             "connection-parameters"
         );
+
+        // Built before connecting, so a bad certificate file or option
+        // combination fails without touching the network.
+        let connector = TlsConnector::build(config.tls(), config.host())?;
 
         let endpoint = ConnectionEndpoint::tcp(config.host(), config.port());
         let addr = format!("{}:{}", config.host(), config.port());
@@ -219,7 +234,20 @@ impl Client {
         sock.set_send_buffer_size(4 * 1024 * 1024).ok();
         apply_tcp_keepalive(&sock);
 
-        let stream = SyncStream::tcp(tcp_stream);
+        let (stream, tls) = match connector {
+            None => (SyncStream::tcp(tcp_stream), None),
+            Some(connector) => {
+                // A zero connect timeout means no limit, as in libpq.
+                let timeout = config.connect_timeout().filter(|t| !t.is_zero());
+                let fallback = Fallback::for_mode(config.tls().mode());
+                match tls::negotiate_sync(tcp_stream, &connector, fallback, timeout)? {
+                    Negotiated::Plain(tcp_stream) => (SyncStream::tcp(tcp_stream), None),
+                    Negotiated::Tls(tls_stream) => {
+                        (SyncStream::Tls(Box::new(tls_stream)), Some(connector))
+                    }
+                }
+            }
+        };
         let mut connection = RawConnection::new(stream);
 
         // Perform startup with authentication
@@ -233,6 +261,7 @@ impl Client {
         debug!(
             target: "hyperdb_api",
             process_id,
+            tls = tls.is_some(),
             "connection-established"
         );
 
@@ -242,6 +271,7 @@ impl Client {
             secret_key,
             endpoint,
             notice_receiver: None,
+            tls,
         })
     }
 
@@ -262,6 +292,10 @@ impl Client {
     ///
     /// # Errors
     ///
+    /// - Returns [`Error::FeatureNotSupported`] if [`Config::tls`] requires
+    ///   TLS, which a Unix domain socket does not carry;
+    ///   [`TlsMode::Prefer`](super::tls::TlsMode::Prefer) connects in
+    ///   plaintext.
     /// - Returns [`Error`] (connection) if the Unix domain socket cannot
     ///   be connected.
     /// - Propagates any [`Error`] from the startup handshake
@@ -270,6 +304,7 @@ impl Client {
     pub fn connect_unix(socket_path: impl AsRef<std::path::Path>, config: &Config) -> Result<Self> {
         use std::path::Path;
 
+        tls::reject_on_ipc(config.tls())?;
         let path = socket_path.as_ref();
         info!(
             target: "hyperdb_api",
@@ -315,6 +350,7 @@ impl Client {
             secret_key,
             endpoint,
             notice_receiver: None,
+            tls: None,
         })
     }
 
@@ -327,13 +363,18 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns an error if the Named Pipe cannot be opened (e.g., pipe does not
-    /// exist, all instances are busy after the retry window, or permission is
-    /// denied) or if the authentication handshake fails.
+    /// Returns [`Error::FeatureNotSupported`] if [`Config::tls`] requires TLS,
+    /// which a named pipe does not carry
+    /// ([`TlsMode::Prefer`](super::tls::TlsMode::Prefer) connects in
+    /// plaintext). Returns an error if the Named Pipe cannot be opened (e.g.,
+    /// pipe does not exist, all instances are busy after the retry window, or
+    /// permission is denied) or if the authentication handshake fails.
     #[cfg(windows)]
     pub fn connect_named_pipe(pipe_path: &str, config: &Config) -> Result<Self> {
         use std::fs::OpenOptions;
         use std::time::Instant;
+
+        tls::reject_on_ipc(config.tls())?;
 
         info!(
             target: "hyperdb_api",
@@ -413,6 +454,7 @@ impl Client {
             secret_key,
             endpoint,
             notice_receiver: None,
+            tls: None,
         })
     }
 
@@ -451,6 +493,17 @@ impl Client {
         &self.endpoint
     }
 
+    /// Returns true if this connection negotiated TLS.
+    ///
+    /// False for a plaintext TCP connection, including one where
+    /// [`TlsMode::Prefer`](super::tls::TlsMode::Prefer) fell back after the
+    /// server declined TLS, and for Unix-domain-socket and named-pipe
+    /// connections.
+    #[must_use]
+    pub fn is_tls(&self) -> bool {
+        self.tls.is_some()
+    }
+
     /// Returns the server process ID for this connection.
     #[must_use]
     pub fn process_id(&self) -> i32 {
@@ -471,7 +524,8 @@ impl Client {
     ///
     /// # How It Works
     ///
-    /// 1. Opens a new TCP connection to the same server
+    /// 1. Opens a new connection to the same server; for a TLS session it
+    ///    negotiates TLS on it, never falling back to plaintext
     /// 2. Sends a cancel request containing the process ID and secret key
     /// 3. The server receives this and cancels the running query
     /// 4. The original query will fail with error code 57014 (`query_canceled`)
@@ -528,6 +582,8 @@ impl Client {
     /// - Returns [`Error`] (connection) if the fresh cancel-side socket
     ///   cannot be opened (TCP / UDS / named-pipe, depending on
     ///   [`Self::endpoint`]).
+    /// - Returns [`Error::Tls`] or [`Error::Timeout`] if this is a TLS
+    ///   session and TLS cannot be negotiated on the cancel-side socket.
     /// - Returns [`Error`] (I/O) if writing or flushing the cancel
     ///   request fails.
     pub fn cancel(&self) -> Result<()> {
@@ -546,36 +602,12 @@ impl Client {
         // Open a new connection specifically for the cancel request
         match &self.endpoint {
             ConnectionEndpoint::Tcp { host, port } => {
-                let addr = format!("{host}:{port}");
-                let mut stream = TcpStream::connect(&addr).map_err(|e| {
-                    warn!(
-                        target: "hyperdb_api",
-                        addr = %endpoint_str,
-                        error = %e,
-                        "query-cancel-connect-failed"
-                    );
-                    Error::connection(format!(
-                        "failed to connect for cancel request to {endpoint_str}: {e}"
-                    ))
-                })?;
-                // Cancel is a 16-byte fire-and-forget — disable Nagle so the
-                // request hits the wire without waiting on a coalesce timer.
-                stream.set_nodelay(true).ok();
-
-                // Build and send the cancel request
-                let mut buf = BytesMut::with_capacity(16);
-                frontend::cancel_request(self.process_id, self.secret_key, &mut buf);
-
-                stream.write_all(&buf).map_err(|e| {
-                    warn!(
-                        target: "hyperdb_api",
-                        error = %e,
-                        "query-cancel-send-failed"
-                    );
-                    Error::from_io(e)
-                })?;
-
-                stream.flush().map_err(Error::from_io)?;
+                tls::send_cancel_sync(
+                    &format!("{host}:{port}"),
+                    self.process_id,
+                    self.secret_key,
+                    self.tls.as_deref(),
+                )?;
             }
             #[cfg(unix)]
             ConnectionEndpoint::DomainSocket { directory, name } => {

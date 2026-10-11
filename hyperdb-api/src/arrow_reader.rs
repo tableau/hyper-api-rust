@@ -107,7 +107,7 @@ impl<'conn> ArrowReader<'conn> {
     ///   transport (ArrowReader wraps `COPY TO STDOUT`, which is TCP-only).
     /// - Returns [`crate::Error::Server`] if the server rejects the
     ///   `COPY (<query>) TO STDOUT WITH (format arrowstream)` statement.
-    /// - Returns [`crate::Error::Io`] on transport-level I/O failures.
+    /// - Returns [`crate::Error::Connection`] on transport-level I/O failures.
     pub fn query_to_arrow(&self, select_query: &str) -> Result<Vec<u8>> {
         let copy_query = format!("COPY ({select_query}) TO STDOUT WITH (format arrowstream)");
         let client = self.connection.tcp_client().ok_or_else(|| {

@@ -33,7 +33,7 @@
 
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
-const { Connection, CreateMode } = require('./index.js');
+const { Connection, ConnectionBuilder, CreateMode } = require('./index.js');
 
 /**
  * A connection pool that manages reusable Hyper database connections.
@@ -42,6 +42,7 @@ export class ConnectionPool {
   #endpoint;
   #databasePath;
   #createMode;
+  #tls;
   #min;
   #max;
   #idleTimeoutMs;
@@ -65,6 +66,8 @@ export class ConnectionPool {
    * @param {number} [options.idleTimeoutMs=30000] - Close idle connections after this many ms.
    * @param {number} [options.acquireTimeoutMs=30000] - Max ms to wait for a connection (0 = no limit).
    * @param {string} [options.createMode='CreateIfNotExists'] - Database creation mode.
+   * @param {import('./index.js').TlsOptions} [options.tls] - TLS options for every
+   *   connection, as for `ConnectionBuilder.tls()`. Errors surface from `acquire()`.
    */
   constructor(endpoint, databasePath, options = {}) {
     this.#endpoint = endpoint;
@@ -74,6 +77,7 @@ export class ConnectionPool {
     this.#idleTimeoutMs = options.idleTimeoutMs ?? 30_000;
     this.#acquireTimeoutMs = options.acquireTimeoutMs ?? 30_000;
     this.#createMode = options.createMode ?? CreateMode.CreateIfNotExists;
+    this.#tls = options.tls;
 
     if (this.#idleTimeoutMs > 0) {
       this.#idleTimer = setInterval(() => this.#evictIdle(), this.#idleTimeoutMs / 2);
@@ -141,11 +145,7 @@ export class ConnectionPool {
 
     // Create a new connection if below max
     if (this.size < this.#max) {
-      const conn = await Connection.connect(
-        this.#endpoint,
-        this.#databasePath,
-        this.#createMode,
-      );
+      const conn = await this.#connect();
       this.#active.add(conn);
       return conn;
     }
@@ -301,6 +301,22 @@ export class ConnectionPool {
     this.#active.clear();
 
     await Promise.all(closePromises);
+  }
+
+  /**
+   * Opens a new connection. Only a TLS pool goes through the builder:
+   * `Connection.connect` ignores the create mode on a read-only gRPC
+   * endpoint, while the builder rejects any but `DoNotCreate`.
+   */
+  #connect() {
+    if (this.#tls == null) {
+      return Connection.connect(this.#endpoint, this.#databasePath, this.#createMode);
+    }
+    return new ConnectionBuilder(this.#endpoint)
+      .database(this.#databasePath)
+      .createMode(this.#createMode)
+      .tls(this.#tls)
+      .build();
   }
 
   /** Evicts idle connections that have been unused longer than idleTimeoutMs. */

@@ -5,7 +5,8 @@
 # mirrors the advisory ignore list.
 
 [graph]
-# Check the dependency graph for every workspace crate's default features.
+# A local `cargo deny check` follows each workspace crate's default features;
+# CI runs `--all-features --workspace`, which overrides these two settings.
 all-features = false
 no-default-features = false
 
@@ -19,7 +20,8 @@ feature-depth = 1
 [licenses]
 # We distribute under a dual MIT OR Apache-2.0 license. The allowlist below
 # lists every SPDX identifier we accept from dependencies. Copyleft licenses
-# (GPL, LGPL, AGPL, SSPL) are deliberately absent.
+# (GPL, LGPL, AGPL, SSPL) are deliberately absent. `about.toml`'s `accepted`
+# list must stay identical, or the third-party notices job disagrees with this one.
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
@@ -54,7 +56,7 @@ yanked = "warn"
 # short — each entry needs a comment explaining the mitigation.
 ignore = [
     # `rsa` Marvin Attack: no patch available. The `rsa` crate is used by
-    # `jsonwebtoken` inside `hyperapi-salesforce` for signing client JWTs for
+    # `jsonwebtoken` inside `hyperdb-api-salesforce` for signing client JWTs for
     # Salesforce OAuth — this is *outbound* signing where timing sidechannels
     # are not observable to a remote attacker, so the Marvin Attack threat
     # model does not apply. Re-evaluate when `rsa` publishes the constant-time
@@ -78,13 +80,12 @@ ignore = [
 # Multiple versions of the same crate bloat binaries and increase audit
 # surface. Start permissive (warn) — we'll tighten as the workspace stabilizes.
 multiple-versions = "warn"
-# Downgraded to `warn` until the publishing story is settled for internal
-# helper crates (`hyper-types`, `hyper-protocol`, `hyper-client`). The
-# published crates (`hyperapi`, `hyperapi-salesforce`, `sea-query-hyper`)
-# currently depend on them via `path` without a `version` field — this is
-# fine for local development but `cargo publish` will reject it until the
-# helpers are either inlined into `hyperapi` or published themselves. Track
-# separately; the Microsoft Rust Guidelines adoption does not block on it.
+# `wildcards` stays at `warn` because some workspace dependencies are
+# path-only on purpose: sibling dev-dependencies carry no version, since a
+# versioned one would create a circular crates.io publish order (for example
+# hyperdb-api and hyperdb-api-derive dev-depend on each other), and the
+# unpublished hyperdb-api-node (`publish = false`) depends on hyperdb-api by
+# path. `allow-wildcard-paths` keeps those entries from being flagged.
 wildcards = "warn"
 allow-wildcard-paths = true
 # Explicit allow / deny lists. Empty by default; add entries as needed with

@@ -737,14 +737,25 @@ fn public_docs_database_and_read_only_contract() {
                 .to_owned(),
         );
     }
-    if !(public_cli.contains("hyperdb_daemon_port")
-        && public_cli.contains("auto-spawn")
-        && public_cli.contains("configured/base")
-        && public_cli.contains("exact")
-        && contains_any(public_cli, &["pin", "candidate", "discovery"]))
-    {
+    for stale in ["--port", "hyperdb_daemon_port"] {
+        if public_cli.contains(stale) {
+            failures.push(format!(
+                "public CLI reference must not mention {stale}: the daemon has no TCP port"
+            ));
+        }
+    }
+    if !public_cli.contains("hyperdb_state_dir") {
+        failures.push("public CLI reference must mention HYPERDB_STATE_DIR".to_owned());
+    }
+    if !PUBLIC_README.contains("daemon.sock") {
         failures.push(
-            "public CLI reference must distinguish HYPERDB_DAEMON_PORT auto-spawn discovery from the foreground configured/base exact bind"
+            "README must name the per-user daemon health socket (daemon.sock) in the state directory"
+                .to_owned(),
+        );
+    }
+    if !(public_cli.contains("socket") && public_cli.contains("named pipe")) {
+        failures.push(
+            "public CLI reference must describe the daemon health channel as a per-user socket or named pipe in the state directory"
                 .to_owned(),
         );
     }
@@ -788,7 +799,7 @@ fn public_docs_database_and_read_only_contract() {
 }
 
 /// The executable smoke guide, demo commentary, and unreleased changelog must
-/// describe the surfaces added or corrected in this release candidate.
+/// describe the current KV and smoke-guide surfaces.
 /// This catches mutations to the smoke sequence/result examples and release
 /// note claims that omit mandatory KV response fields or no longer match KV
 /// routing or Hyper-export side effects.

@@ -3,9 +3,10 @@
 
 //! Tests for the `ArrowInserter` API.
 //!
-//! Note: These tests focus on the API behavior and error handling.
-//! Full integration tests with real Arrow data would require the `arrow` crate
-//! as a dev-dependency or pre-generated Arrow IPC test data.
+//! These tests cover construction and its error paths, status accessors,
+//! cancellation and drop behavior, and inserting real Arrow IPC streams
+//! through `insert_data` and `insert_raw`, including with a small flush
+//! threshold.
 
 use hyperdb_api::{ArrowInserter, Catalog, SqlType, TableDefinition};
 
@@ -172,31 +173,6 @@ fn test_arrow_inserter_execute_without_data() {
 }
 
 // =============================================================================
-// ArrowInserter Status Methods Tests
-// =============================================================================
-
-#[test]
-fn test_arrow_inserter_status_methods() {
-    let test = TestConnection::new().expect("Failed to create test connection");
-
-    let table_def = TableDefinition::new("test_status").add_required_column("id", SqlType::int());
-
-    Catalog::new(&test.connection)
-        .create_table(&table_def)
-        .expect("Failed to create table");
-
-    let inserter =
-        ArrowInserter::new(&test.connection, &table_def).expect("Failed to create inserter");
-
-    // Initial state
-    assert!(!inserter.has_data());
-    assert_eq!(inserter.total_bytes(), 0);
-    assert_eq!(inserter.chunk_count(), 0);
-
-    inserter.cancel();
-}
-
-// =============================================================================
 // ArrowInserter Cancel Tests
 // =============================================================================
 
@@ -248,51 +224,122 @@ fn test_arrow_inserter_drop_without_execute() {
 }
 
 // =============================================================================
-// Note on Integration Tests with Real Arrow Data
+// ArrowInserter IPC Insert Tests
 // =============================================================================
-//
-// To test with real Arrow data, you would need to either:
-// 1. Add `arrow` crate as a dev-dependency and generate Arrow IPC streams
-// 2. Include pre-generated Arrow IPC test files
-//
-// Example with arrow crate (if added as dev-dependency):
-// ```rust
-// #[test]
-// fn test_arrow_inserter_with_real_data() {
-//     use arrow::array::Int32Array;
-//     use arrow::datatypes::{DataType, Field, Schema};
-//     use arrow::ipc::writer::StreamWriter;
-//     use arrow::record_batch::RecordBatch;
-//     use std::sync::Arc;
-//
-//     let test = TestConnection::new().expect("Failed to create test connection");
-//
-//     // Create matching table
-//     let table_def = TableDefinition::new("arrow_test")
-//         .add_required_column("id", SqlType::int());
-//     Catalog::new(&test.connection).create_table(&table_def).unwrap();
-//
-//     // Generate Arrow IPC data
-//     let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
-//     let batch = RecordBatch::try_new(
-//         Arc::new(schema.clone()),
-//         vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5]))],
-//     ).unwrap();
-//
-//     let mut buffer = Vec::new();
-//     {
-//         let mut writer = StreamWriter::try_new(&mut buffer, &schema).unwrap();
-//         writer.write(&batch).unwrap();
-//         writer.finish().unwrap();
-//     }
-//
-//     // Insert Arrow data
-//     let mut inserter = ArrowInserter::new(&test.connection, &table_def).unwrap();
-//     inserter.insert_data(&buffer).unwrap();
-//     let rows = inserter.execute().unwrap();
-//
-//     assert_eq!(rows, 5);
-//     let count = test.execute_scalar_i64("SELECT COUNT(*) FROM arrow_test").unwrap();
-//     assert_eq!(count, 5);
-// }
-// ```
+
+#[test]
+fn test_arrow_inserter_insert_data_ipc_stream() {
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::ipc::writer::StreamWriter;
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    let test = TestConnection::new().expect("Failed to create test connection");
+
+    let table_def = TableDefinition::new("arrow_ipc").add_required_column("id", SqlType::int());
+    Catalog::new(&test.connection)
+        .create_table(&table_def)
+        .expect("Failed to create table");
+
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5]))],
+    )
+    .expect("Failed to build batch");
+
+    let mut buffer = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buffer, &schema).expect("stream writer");
+        writer.write(&batch).expect("write batch");
+        writer.finish().expect("finish stream");
+    }
+
+    let mut inserter =
+        ArrowInserter::new(&test.connection, &table_def).expect("Failed to create inserter");
+    inserter.insert_data(&buffer).expect("insert_data");
+    let rows = inserter.execute().expect("execute");
+    assert_eq!(rows, 5);
+
+    let count = test
+        .execute_scalar_i64("SELECT COUNT(*) FROM arrow_ipc")
+        .expect("count");
+    assert_eq!(count, 5);
+    let sum = test
+        .execute_scalar_i64("SELECT SUM(id) FROM arrow_ipc")
+        .expect("sum");
+    assert_eq!(sum, 15);
+}
+
+/// Serializes one Arrow IPC stream with an `id: Int32` schema and one batch per entry.
+fn int_ipc_stream(batches: &[Vec<i32>]) -> Vec<u8> {
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::ipc::writer::StreamWriter;
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let mut buffer = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buffer, &schema).expect("stream writer");
+        for values in batches {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(values.clone()))],
+            )
+            .expect("Failed to build batch");
+            writer.write(&batch).expect("write batch");
+        }
+        writer.finish().expect("finish stream");
+    }
+    buffer
+}
+
+#[test]
+fn test_arrow_inserter_insert_raw_ipc_stream() {
+    let test = TestConnection::new().expect("Failed to create test connection");
+
+    let table_def = TableDefinition::new("arrow_raw").add_required_column("id", SqlType::int());
+    Catalog::new(&test.connection)
+        .create_table(&table_def)
+        .expect("Failed to create table");
+
+    let buffer = int_ipc_stream(&[vec![1, 2, 3]]);
+    let mut inserter =
+        ArrowInserter::new(&test.connection, &table_def).expect("Failed to create inserter");
+    inserter.insert_raw(&buffer).expect("insert_raw");
+    assert_eq!(inserter.execute().expect("execute"), 3);
+
+    let sum = test
+        .execute_scalar_i64("SELECT SUM(id) FROM arrow_raw")
+        .expect("sum");
+    assert_eq!(sum, 6);
+}
+
+#[test]
+fn test_arrow_inserter_small_flush_threshold_multiple_batches() {
+    let test = TestConnection::new().expect("Failed to create test connection");
+
+    let table_def = TableDefinition::new("arrow_flush").add_required_column("id", SqlType::int());
+    Catalog::new(&test.connection)
+        .create_table(&table_def)
+        .expect("Failed to create table");
+
+    let buffer = int_ipc_stream(&[vec![1, 2], vec![3, 4], vec![5, 6]]);
+    let mut inserter = ArrowInserter::new(&test.connection, &table_def)
+        .expect("Failed to create inserter")
+        .with_flush_threshold(1);
+    inserter.insert_data(&buffer).expect("insert_data");
+    assert_eq!(inserter.execute().expect("execute"), 6);
+
+    let count = test
+        .execute_scalar_i64("SELECT COUNT(*) FROM arrow_flush")
+        .expect("count");
+    assert_eq!(count, 6);
+    let sum = test
+        .execute_scalar_i64("SELECT SUM(id) FROM arrow_flush")
+        .expect("sum");
+    assert_eq!(sum, 21);
+}

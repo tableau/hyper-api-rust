@@ -40,7 +40,7 @@ DELETE, CREATE TABLE).
 Run tests:
 
 ```bash
-cargo test -p sea-query-hyper
+cargo test -p sea-query-hyperdb
 ```
 
 Run the example:

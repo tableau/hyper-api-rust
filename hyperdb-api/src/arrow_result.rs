@@ -387,7 +387,7 @@ pub trait ChunkSource: Send {
     ///
     /// Implementations return whatever transport error the underlying
     /// source produces (typically [`Error::Server`] from a gRPC stream or
-    /// [`Error::Io`] on network failures).
+    /// [`Error::Connection`] on network failures).
     fn next_chunk(&mut self) -> Result<Option<Bytes>>;
 }
 
@@ -723,11 +723,11 @@ impl ArrowRowset {
         }
     }
 
-    /// Returns the total number of rows across all batches.
+    /// Returns the number of rows in the batches the rowset currently holds.
     ///
-    /// For streaming rowsets this reflects only batches decoded **so far** —
-    /// until [`next_chunk`](Self::next_chunk) has pulled everything from the
-    /// source, the total is not yet known.
+    /// For buffered rowsets this is the total row count of the result. For
+    /// streaming rowsets it counts only batches decoded but not yet returned
+    /// by [`next_chunk`](Self::next_chunk), so it is not the result total.
     #[must_use]
     pub fn total_rows(&self) -> usize {
         match &self.inner {
@@ -742,12 +742,12 @@ impl ArrowRowset {
         }
     }
 
-    /// Returns true if there are no rows available **right now**.
+    /// Returns `true` if the rowset has no rows.
     ///
-    /// For streaming rowsets this only reflects the currently-decoded
-    /// batches, not the full result — a streaming rowset that has not been
-    /// iterated will usually report `is_empty() == true` even if the server
-    /// will send more data on `next_chunk`.
+    /// For buffered rowsets this describes the whole result. For streaming
+    /// rowsets it returns `true` only after the source is exhausted and every
+    /// decoded batch has been returned by [`next_chunk`](Self::next_chunk);
+    /// until then it returns `false`, even if the result turns out to be empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         match &self.inner {
@@ -819,14 +819,11 @@ pub(crate) fn arrow_type_to_sql_type(dt: &DataType) -> SqlType {
         DataType::Time32(_) | DataType::Time64(_) => SqlType::Time,
         DataType::Timestamp(_, None) => SqlType::Timestamp,
         DataType::Timestamp(_, Some(_)) => SqlType::TimestampTz,
-        DataType::Decimal128(p, s) => SqlType::Numeric {
-            precision: u32::from(*p),
-            scale: decimal_scale_to_u32(*s),
-        },
-        DataType::Decimal256(p, s) => SqlType::Numeric {
-            precision: u32::from(*p),
-            scale: decimal_scale_to_u32(*s),
-        },
+        // Hyper NUMERIC holds at most 38 digits; a wider (or malformed)
+        // decimal falls back to text like any other unmapped type.
+        DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => {
+            SqlType::try_numeric(u32::from(*p), decimal_scale_to_u32(*s)).unwrap_or(SqlType::Text)
+        }
         DataType::Interval(_) => SqlType::Interval,
         _ => SqlType::Text, // Fallback to text for unknown types
     }

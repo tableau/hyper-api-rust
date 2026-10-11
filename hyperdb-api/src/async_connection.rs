@@ -16,6 +16,7 @@ use crate::error::{Error, Result};
 use crate::names::escape_sql_path;
 use crate::query_stats::{QueryStats, QueryStatsProvider};
 use crate::result::{Row, RowValue};
+use crate::table_definition::TableDefinition;
 
 /// An async connection to a Hyper database.
 ///
@@ -73,7 +74,7 @@ impl AsyncConnection {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Io`] / [`Error::Connection`] if the handshake with
+    /// - Returns [`Error::Connection`] if the handshake with
     ///   the server fails.
     /// - Returns [`Error::Server`] if the `CreateMode` SQL (`CREATE`
     ///   / `DROP` / `ATTACH`) is rejected by the server.
@@ -96,10 +97,16 @@ impl AsyncConnection {
 
     /// Connects with authentication (async).
     ///
+    /// Equivalent to [`AsyncConnectionBuilder`](crate::AsyncConnectionBuilder)
+    /// with `database`, `create_mode`, `user` and `password` set, so the
+    /// endpoint may be TCP, a Unix domain socket or a named pipe. A gRPC
+    /// endpoint is accepted only with [`CreateMode::DoNotCreate`], and
+    /// ignores `user` and `password`.
+    ///
     /// # Errors
     ///
     /// - Returns [`Error::Authentication`] if authentication is rejected.
-    /// - Returns [`Error::Io`] if the endpoint cannot be reached.
+    /// - Returns [`Error::Connection`] if the endpoint cannot be reached.
     /// - Returns [`Error::Server`] if the `CreateMode` SQL is rejected.
     pub async fn connect_with_auth(
         endpoint: &str,
@@ -108,42 +115,33 @@ impl AsyncConnection {
         user: &str,
         password: &str,
     ) -> Result<Self> {
-        let transport = AsyncTransport::connect_tcp_with_auth(endpoint, user, password).await?;
-        let conn = AsyncConnection {
-            transport,
-            database: Some(database.to_string()),
-            stats_provider: Mutex::new(None),
-            pending_stats: Mutex::new(None),
-        };
-
-        conn.handle_creation_mode(database, mode).await?;
-        conn.attach_and_set_path(database).await?;
-
-        Ok(conn)
+        crate::AsyncConnectionBuilder::new(endpoint)
+            .database(database)
+            .create_mode(mode)
+            .user(user)
+            .password(password)
+            .build()
+            .await
     }
 
     /// Connects to a server without attaching any database (async).
     ///
     /// Useful for running `CREATE DATABASE` / `DROP DATABASE` without an
-    /// active attachment.
+    /// active attachment. Equivalent to
+    /// [`AsyncConnectionBuilder::new(endpoint).build()`](crate::AsyncConnectionBuilder),
+    /// so the endpoint may be TCP, gRPC, a Unix domain socket or a named pipe.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] or [`Error::Connection`] if the TCP handshake
-    /// with `endpoint` fails.
+    /// Returns [`Error::Connection`] if the handshake with `endpoint` fails
+    /// or the endpoint cannot be reached.
     pub async fn without_database(endpoint: &str) -> Result<Self> {
-        let transport = AsyncTransport::connect_tcp(endpoint).await?;
-        Ok(AsyncConnection {
-            transport,
-            database: None,
-            stats_provider: Mutex::new(None),
-            pending_stats: Mutex::new(None),
-        })
+        crate::AsyncConnectionBuilder::new(endpoint).build().await
     }
 
     /// Builds an `AsyncConnection` from a pre-existing `AsyncClient` (TCP only).
     #[must_use]
-    pub fn from_async_client(
+    pub(crate) fn from_async_client(
         client: hyperdb_api_core::client::AsyncClient,
         database: Option<String>,
     ) -> Self {
@@ -252,7 +250,7 @@ impl AsyncConnection {
     /// - Returns [`Error::FeatureNotSupported`] on gRPC transports that do not yet
     ///   support write operations.
     /// - Returns [`Error::Server`] if the SQL fails to parse or execute.
-    /// - Returns [`Error::Io`] on transport-level I/O failures.
+    /// - Returns [`Error::Connection`] on transport-level I/O failures.
     pub async fn execute_command(&self, sql: &str) -> Result<u64> {
         let token = self.stats_before_query(sql);
         let result = self.transport.execute_command(sql).await;
@@ -302,7 +300,7 @@ impl AsyncConnection {
     /// # Errors
     ///
     /// - Returns [`Error::Server`] if the SQL is rejected by the server.
-    /// - Returns [`Error::Io`] on transport-level I/O failures while
+    /// - Returns [`Error::Connection`] on transport-level I/O failures while
     ///   opening the stream.
     pub async fn execute_query(&self, query: &str) -> Result<AsyncRowset<'_>> {
         let token = self.stats_before_query(query);
@@ -709,9 +707,11 @@ impl AsyncConnection {
     /// Executes a parameterized query with binary-encoded parameters (async).
     ///
     /// Mirrors the sync [`Connection::query_params`](crate::Connection::query_params);
-    /// see that method for the design rationale. Parameters travel through the
-    /// extended query protocol (Parse/Bind/Execute) in HyperBinary format — no
-    /// SQL escaping, full SQL-injection safety regardless of parameter content.
+    /// see that method for the design rationale and for its known limitation
+    /// with `OR` / `IN` lists over parameters, which applies here too.
+    /// Parameters travel through the extended query protocol
+    /// (Parse/Bind/Execute) in HyperBinary format — no SQL escaping, full
+    /// SQL-injection safety regardless of parameter content.
     ///
     /// # Errors
     ///
@@ -719,7 +719,7 @@ impl AsyncConnection {
     ///   are TCP-only).
     /// - Returns [`Error::Server`] if the server rejects the statement at
     ///   `Parse`, `Bind`, or `Execute` time.
-    /// - Returns [`Error::Io`] on transport-level I/O failures.
+    /// - Returns [`Error::Connection`] on transport-level I/O failures.
     pub async fn query_params(
         &self,
         query: &str,
@@ -753,12 +753,15 @@ impl AsyncConnection {
     /// Executes a parameterized command (INSERT / UPDATE / DELETE) with
     /// binary-encoded parameters via Parse/Bind/Execute (async).
     ///
+    /// Subject to the known limitation with `OR` / `IN` lists over parameters
+    /// described on [`Connection::query_params`](crate::Connection::query_params).
+    ///
     /// # Errors
     ///
     /// - Returns [`Error::FeatureNotSupported`] on gRPC transports.
     /// - Returns [`Error::Server`] if the server rejects the statement at
     ///   `Parse`, `Bind`, or `Execute` time.
-    /// - Returns [`Error::Io`] on transport-level I/O failures.
+    /// - Returns [`Error::Connection`] on transport-level I/O failures.
     pub async fn command_params(
         &self,
         query: &str,
@@ -1008,11 +1011,26 @@ impl AsyncConnection {
         }
     }
 
+    /// Returns true if the connection is encrypted with TLS.
+    ///
+    /// For TCP, true when TLS was negotiated — set with
+    /// [`AsyncConnectionBuilder::tls`](crate::AsyncConnectionBuilder::tls); a
+    /// [`TlsMode::Prefer`](crate::TlsMode::Prefer) connection to a server that
+    /// declined TLS reports false. For gRPC, true for an `https://` endpoint.
+    /// Always false over a Unix domain socket or a named pipe.
+    #[must_use]
+    pub fn is_tls(&self) -> bool {
+        match &self.transport {
+            AsyncTransport::Tcp(tcp) => tcp.client.is_tls(),
+            AsyncTransport::Grpc(grpc) => grpc.config.is_tls(),
+        }
+    }
+
     /// Actively pings the server with `SELECT 1` (async).
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Server`] or [`Error::Io`] if the `SELECT 1`
+    /// Returns [`Error::Server`] or [`Error::Connection`] if the `SELECT 1`
     /// round-trip fails — i.e. the connection is no longer usable.
     pub async fn ping(&self) -> Result<()> {
         self.execute_command("SELECT 1").await?;
@@ -1066,7 +1084,7 @@ impl AsyncConnection {
     ///
     /// - Returns [`Error::FeatureNotSupported`] on gRPC transports — cancellation is not
     ///   yet implemented for gRPC.
-    /// - Returns [`Error::Connection`] or [`Error::Io`] if the cancel-request
+    /// - Returns [`Error::Connection`] if the cancel-request
     ///   connection to the server fails.
     pub async fn cancel(&self) -> Result<()> {
         self.transport.cancel().await
@@ -1111,12 +1129,73 @@ impl AsyncConnection {
         Ok(())
     }
 
-    /// Returns a reference to the underlying async TCP client (`None` for gRPC).
+    /// Streams a pre-encoded `HyperBinary` buffer into `table` with `COPY ... FROM STDIN`.
     ///
-    /// Prefer the high-level `AsyncConnection` methods; this escape hatch
-    /// remains for code that needs direct protocol access (e.g. custom
-    /// COPY loops).
-    pub fn async_tcp_client(&self) -> Option<&hyperdb_api_core::client::AsyncClient> {
+    /// `data` must be one complete `HyperBinary` stream for the table's
+    /// columns, in definition order: exactly one `HyperBinary` header followed
+    /// by the rows. That is the buffer from the **first**
+    /// [`InsertChunk::take`](crate::InsertChunk::take) of a fresh (or
+    /// [`clear`](crate::InsertChunk::clear)ed) chunk. Later `take()` calls on
+    /// the same chunk return rows without a header, and two buffers
+    /// concatenated carry two headers; both are rejected. The buffer is sent
+    /// in 64 MiB slices because `hyperd` rejects COPY packets above ~150 MB.
+    /// Returns the number of rows the server reports as inserted; an empty
+    /// buffer inserts nothing and returns `0`.
+    ///
+    /// Most callers want [`AsyncInserter`](crate::AsyncInserter), which encodes
+    /// rows for you. Use this when the bytes are already encoded.
+    ///
+    /// # Cancel safety
+    ///
+    /// Not cancel-safe. Dropping the returned future before it resolves (for
+    /// example through `tokio::time::timeout` or `select!`) can leave a
+    /// partial message on the wire. The connection then reports itself
+    /// unhealthy and every later call on it fails with
+    /// [`Error::Connection`]; discard it and open a new one. A pooled
+    /// connection in that state is evicted by the default
+    /// [`RecycleStrategy::SelectOne`](crate::pool::RecycleStrategy::SelectOne)
+    /// probe the next time it is checked out.
+    ///
+    /// # Errors
+    ///
+    /// - Returns [`Error::feature_not_supported`] on a gRPC connection, which
+    ///   cannot run COPY.
+    /// - Returns [`Error::invalid_operation`] if `data` does not start with a
+    ///   `HyperBinary` header.
+    /// - Returns an error if the server rejects the COPY or the connection
+    ///   fails while sending.
+    pub async fn copy_in_hyperbinary(&self, table: &TableDefinition, data: &[u8]) -> Result<u64> {
+        // hyperd caps COPY packets at ~150 MB; slice well under that.
+        const MAX_COPY_CHUNK: usize = 64 * 1024 * 1024;
+
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let client = self.async_tcp_client().ok_or_else(|| {
+            Error::feature_not_supported(
+                "copy_in_hyperbinary requires a TCP connection. \
+                 gRPC connections do not support COPY operations.",
+            )
+        })?;
+        if !data.starts_with(hyperdb_api_core::protocol::copy::HYPER_BINARY_HEADER) {
+            return Err(Error::invalid_operation(
+                "copy_in_hyperbinary: data must start with a HyperBinary header \
+                 (use the first InsertChunk::take() of a fresh chunk)",
+            ));
+        }
+        let columns: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
+        let table_name = table.qualified_name();
+
+        let mut writer = client.copy_in(&table_name, &columns).await?;
+        for slice in data.chunks(MAX_COPY_CHUNK) {
+            writer.send_direct(slice).await?;
+            writer.flush_stream().await?;
+        }
+        Ok(writer.finish().await?)
+    }
+
+    /// Returns a reference to the underlying async TCP client (`None` for gRPC).
+    pub(crate) fn async_tcp_client(&self) -> Option<&hyperdb_api_core::client::AsyncClient> {
         self.transport.async_tcp_client()
     }
 
@@ -1150,7 +1229,7 @@ impl AsyncConnection {
     ///   are TCP-only).
     /// - Returns [`Error::Server`] if the server rejects the `Parse`
     ///   message (SQL syntax error, unknown OID).
-    /// - Returns [`Error::Io`] on transport-level I/O failures.
+    /// - Returns [`Error::Connection`] on transport-level I/O failures.
     pub async fn prepare_typed(
         &self,
         query: &str,
@@ -1193,7 +1272,7 @@ impl AsyncConnection {
     /// - Returns [`Error::FeatureNotSupported`] on gRPC transports.
     /// - Returns [`Error::Server`] if the server rejects the `Parse`
     ///   message.
-    /// - Returns [`Error::Io`] on transport-level I/O failures.
+    /// - Returns [`Error::Connection`] on transport-level I/O failures.
     pub async fn prepare_typed_arc(
         self: &Arc<Self>,
         query: &str,

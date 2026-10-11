@@ -3,7 +3,7 @@
 
 //! Dry-run file inspection for the `inspect_file` MCP tool.
 //!
-//! Given a path to a CSV, Parquet, or Arrow IPC file, [`inspect_source`]
+//! Given a path to a CSV, JSON, JSONL, Parquet, or Arrow IPC file, [`inspect_source`]
 //! returns the schema we would use to create a table (using the exact same
 //! inference + full-file numeric widening as [`crate::ingest`]) along with
 //! per-column diagnostics that help an LLM pick a safer schema override
@@ -253,12 +253,15 @@ fn value_preview(v: Option<&Value>) -> String {
         Some(Value::Bool(b)) => b.to_string(),
         Some(other) => other.to_string(),
     };
-    if raw.len() > MAX_LEN {
-        let mut s = raw[..MAX_LEN].to_string();
-        s.push('…');
-        s
-    } else {
-        raw
+    // Truncate by characters: slicing at a byte offset panics when it lands
+    // inside a multi-byte code point.
+    match raw.char_indices().nth(MAX_LEN) {
+        Some((cut, _)) => {
+            let mut s = raw[..cut].to_string();
+            s.push('…');
+            s
+        }
+        None => raw,
     }
 }
 
@@ -396,4 +399,21 @@ fn inspect_arrow_ipc(path: &str, file_size: u64) -> Result<InspectReport, McpErr
         file_size_bytes: file_size,
         sample_rows: Vec::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn value_preview_truncates_on_a_char_boundary() {
+        // 119 ASCII bytes then a 3-byte char straddling the 120-byte cut.
+        let long = format!("{}€€€", "a".repeat(119));
+        let preview = value_preview(Some(&Value::String(long)));
+        assert!(preview.ends_with('…'));
+        assert!(preview.chars().count() <= 121);
+
+        let short = value_preview(Some(&Value::String("héllo".into())));
+        assert_eq!(short, "héllo");
+    }
 }

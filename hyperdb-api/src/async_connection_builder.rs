@@ -14,8 +14,10 @@ use std::time::Duration;
 use crate::async_connection::AsyncConnection;
 use crate::async_transport::AsyncTransport;
 use crate::connection::CreateMode;
+use crate::connection_builder::query_timeout_statement;
 use crate::error::{Error, Result};
 use crate::transport::{TransportType, detect_transport_type};
+use hyperdb_api_core::client::tls::{TlsConfig, TlsMode};
 use hyperdb_api_core::client::{AsyncClient, Config};
 
 /// An async builder for creating database connections.
@@ -50,7 +52,9 @@ pub struct AsyncConnectionBuilder {
     login_timeout: Option<Duration>,
     query_timeout: Option<Duration>,
     application_name: Option<String>,
-    transfer_mode: Option<hyperdb_api_core::client::grpc::TransferMode>,
+    transfer_mode: Option<crate::grpc::TransferMode>,
+    /// TLS settings for TCP connections.
+    tls: TlsConfig,
 }
 
 impl Default for AsyncConnectionBuilder {
@@ -72,11 +76,12 @@ impl AsyncConnectionBuilder {
             query_timeout: None,
             application_name: None,
             transfer_mode: None,
+            tls: TlsConfig::default(),
         }
     }
 
-    #[must_use]
     /// Sets the database path.
+    #[must_use]
     pub fn database(mut self, path: impl AsRef<Path>) -> Self {
         self.database = Some(path.as_ref().to_path_buf());
         self
@@ -89,15 +94,15 @@ impl AsyncConnectionBuilder {
         self
     }
 
-    #[must_use]
     /// Sets the username for authentication.
+    #[must_use]
     pub fn user(mut self, user: impl Into<String>) -> Self {
         self.user = Some(user.into());
         self
     }
 
-    #[must_use]
     /// Sets the password for authentication.
+    #[must_use]
     pub fn password(mut self, password: impl Into<String>) -> Self {
         self.password = Some(password.into());
         self
@@ -111,71 +116,143 @@ impl AsyncConnectionBuilder {
     }
 
     /// Sets the query timeout.
+    ///
+    /// Applied to the session as `hyperd`'s `query_timeout` setting right after
+    /// connecting, so the server cancels any statement on this connection that
+    /// runs longer than `timeout` and reports an error. Sub-millisecond
+    /// precision is rounded up to a whole millisecond.
+    ///
+    /// Applies to TCP, Unix-socket and named-pipe connections. `hyperd`
+    /// clamps the value to its own `query_timeout_max` ceiling. A gRPC
+    /// connection has no equivalent, so [`build`](Self::build) fails with
+    /// [`Error::FeatureNotSupported`] rather than ignoring the setting.
+    ///
+    /// # Errors
+    ///
+    /// [`build`](Self::build) returns an error if `timeout` is zero.
     #[must_use]
     pub fn query_timeout(mut self, timeout: Duration) -> Self {
         self.query_timeout = Some(timeout);
         self
     }
 
-    #[must_use]
     /// Sets the application name sent to the server.
+    #[must_use]
     pub fn application_name(mut self, name: impl Into<String>) -> Self {
         self.application_name = Some(name.into());
         self
     }
 
-    #[must_use]
     /// Convenience method to set user and password at once.
+    #[must_use]
     pub fn auth(mut self, user: impl Into<String>, password: impl Into<String>) -> Self {
         self.user = Some(user.into());
         self.password = Some(password.into());
         self
     }
 
-    #[must_use]
     /// Convenience method to create a new database.
+    #[must_use]
     pub fn create_new_database(mut self, database_path: impl AsRef<Path>) -> Self {
         self.database = Some(database_path.as_ref().to_path_buf());
         self.create_mode = CreateMode::Create;
         self
     }
 
-    #[must_use]
     /// Convenience method to create database if it doesn't exist.
+    #[must_use]
     pub fn create_or_open_database(mut self, database_path: impl AsRef<Path>) -> Self {
         self.database = Some(database_path.as_ref().to_path_buf());
         self.create_mode = CreateMode::CreateIfNotExists;
         self
     }
 
-    #[must_use]
     /// Convenience method to open an existing database.
+    #[must_use]
     pub fn open_database(mut self, database_path: impl AsRef<Path>) -> Self {
         self.database = Some(database_path.as_ref().to_path_buf());
         self.create_mode = CreateMode::DoNotCreate;
         self
     }
 
+    /// Sets the TLS configuration for a TCP connection.
+    ///
+    /// The default is [`TlsMode::Disable`]. A bare [`TlsMode`] converts into a
+    /// [`TlsConfig`]; use [`TlsConfig`] to add a root certificate, a client
+    /// certificate for mutual TLS, or a server-name override. The modes follow
+    /// libpq's `sslmode`:
+    ///
+    /// | Mode | Encrypted | Server certificate checked |
+    /// |------|-----------|----------------------------|
+    /// | [`Disable`](TlsMode::Disable) | never | — |
+    /// | [`Prefer`](TlsMode::Prefer) | if the server offers TLS, else plaintext | chain, only if a root certificate is set |
+    /// | [`Require`](TlsMode::Require) | always | chain, only if a root certificate is set |
+    /// | [`VerifyCa`](TlsMode::VerifyCa) | always | chain, against the root certificate |
+    /// | [`VerifyFull`](TlsMode::VerifyFull) | always | chain and host name |
+    ///
+    /// Over a Unix domain socket or a named pipe, [`TlsMode::Prefer`]
+    /// connects in plaintext and every mode that requires TLS fails
+    /// [`build`](Self::build) with [`Error::FeatureNotSupported`]. A gRPC
+    /// endpoint picks TLS through its `https://` scheme, so any mode other
+    /// than [`TlsMode::Disable`] fails there with
+    /// [`Error::FeatureNotSupported`] too. A query cancel for a TLS session
+    /// is sent over TLS. The TLS handshake must finish within
+    /// [`login_timeout`](Self::login_timeout) (30 seconds by default; zero
+    /// means no limit); the TCP connect itself is not bounded by it.
+    ///
+    /// The `AsyncConnection::connect*` shortcuts and `AsyncConnection::new` always
+    /// connect in plaintext; use this builder for TLS.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use hyperdb_api::{AsyncConnectionBuilder, Result, TlsConfig, TlsMode};
+    ///
+    /// async fn example() -> Result<()> {
+    ///     let conn = AsyncConnectionBuilder::new("hyper.example.com:7483")
+    ///         .database("example.hyper")
+    ///         .tls(TlsConfig::new(TlsMode::VerifyFull).root_cert("ca.pem"))
+    ///         .build()
+    ///         .await?;
+    ///     assert!(conn.is_tls());
+    ///     Ok(())
+    /// }
+    /// ```
+    #[must_use]
+    pub fn tls(mut self, tls: impl Into<TlsConfig>) -> Self {
+        self.tls = tls.into();
+        self
+    }
+
     /// Sets the transfer mode for gRPC connections (ignored for TCP).
     #[must_use]
-    pub fn transfer_mode(mut self, mode: hyperdb_api_core::client::grpc::TransferMode) -> Self {
+    pub fn transfer_mode(mut self, mode: crate::grpc::TransferMode) -> Self {
         self.transfer_mode = Some(mode);
         self
     }
 
     /// Builds and establishes the connection (async).
     ///
-    /// Transport is auto-detected from the endpoint URL:
+    /// Transport is auto-detected from the endpoint, with the same rules as
+    /// [`ConnectionBuilder`](crate::ConnectionBuilder):
     /// - `https://` / `http://` → gRPC
-    /// - `tab.domain://` → Unix domain socket (Unix only)
-    /// - `tab.pipe://` → named pipe (Windows only)
+    /// - `tab.domain://` or an absolute socket path → Unix domain socket (Unix only)
+    /// - `tab.pipe://` or a `\\host\pipe\name` path → named pipe (Windows only)
     /// - otherwise → TCP
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Io`] or [`Error::Connection`] if the transport
-    ///   handshake fails (TCP refused, TLS rejected, named-pipe not
+    /// - Returns [`Error::Config`] if the endpoint cannot be parsed, or if the
+    ///   TLS settings are invalid or a certificate file cannot be read.
+    /// - Returns [`Error::FeatureNotSupported`] for a gRPC endpoint with a
+    ///   [`tls`](Self::tls) mode other than [`TlsMode::Disable`], and for a
+    ///   Unix-socket or named-pipe endpoint whose mode requires TLS.
+    /// - Returns [`Error::Connection`] if the transport
+    ///   handshake fails (TCP refused, named-pipe not
     ///   found, gRPC channel setup failure).
+    /// - Returns [`Error::Tls`] if TLS negotiation or certificate
+    ///   verification fails, and [`Error::Timeout`] if it does not finish
+    ///   within the [`login_timeout`](Self::login_timeout).
     /// - Returns [`Error::Authentication`] if authentication is rejected.
     /// - Returns [`Error::Server`] if the `CreateMode` SQL is rejected
     ///   for a builder that configured a database path.
@@ -210,6 +287,7 @@ impl AsyncConnectionBuilder {
         if let Some(timeout) = self.login_timeout {
             config = config.with_connect_timeout(timeout);
         }
+        config = config.with_tls(self.tls);
 
         let db_path_str = self
             .database
@@ -218,6 +296,10 @@ impl AsyncConnectionBuilder {
 
         let client = AsyncClient::connect(&config).await?;
         let conn = AsyncConnection::from_async_client(client, db_path_str.clone());
+        if let Some(timeout) = self.query_timeout {
+            conn.execute_command(&query_timeout_statement(timeout)?)
+                .await?;
+        }
 
         if let Some(db_path) = db_path_str {
             conn.handle_creation_mode_public(&db_path, self.create_mode)
@@ -253,6 +335,7 @@ impl AsyncConnectionBuilder {
         if let Some(password) = &self.password {
             config = config.with_password(password);
         }
+        config = config.with_tls(self.tls);
 
         let db_path_str = self
             .database
@@ -261,6 +344,10 @@ impl AsyncConnectionBuilder {
 
         let client = AsyncClient::connect_unix(&socket_path, &config).await?;
         let conn = AsyncConnection::from_async_client(client, db_path_str.clone());
+        if let Some(timeout) = self.query_timeout {
+            conn.execute_command(&query_timeout_statement(timeout)?)
+                .await?;
+        }
 
         if let Some(db_path) = db_path_str {
             conn.handle_creation_mode_public(&db_path, self.create_mode)
@@ -296,6 +383,7 @@ impl AsyncConnectionBuilder {
         if let Some(password) = &self.password {
             config = config.with_password(password);
         }
+        config = config.with_tls(self.tls);
 
         let db_path_str = self
             .database
@@ -304,6 +392,10 @@ impl AsyncConnectionBuilder {
 
         let client = AsyncClient::connect_named_pipe(&pipe_path, &config).await?;
         let conn = AsyncConnection::from_async_client(client, db_path_str.clone());
+        if let Some(timeout) = self.query_timeout {
+            conn.execute_command(&query_timeout_statement(timeout)?)
+                .await?;
+        }
 
         if let Some(db_path) = db_path_str {
             conn.handle_creation_mode_public(&db_path, self.create_mode)
@@ -316,6 +408,16 @@ impl AsyncConnectionBuilder {
 
     /// Build a gRPC connection (async).
     async fn build_grpc(self) -> Result<AsyncConnection> {
+        if self.query_timeout.is_some() {
+            return Err(Error::feature_not_supported(
+                "query_timeout is not supported on gRPC connections",
+            ));
+        }
+        if self.tls.mode() != TlsMode::Disable {
+            return Err(Error::feature_not_supported(
+                "tls is not supported on gRPC connections; use an https:// endpoint for TLS",
+            ));
+        }
         if self.create_mode != CreateMode::DoNotCreate {
             return Err(Error::feature_not_supported(
                 "gRPC transport is read-only. Use CreateMode::DoNotCreate for gRPC connections.",

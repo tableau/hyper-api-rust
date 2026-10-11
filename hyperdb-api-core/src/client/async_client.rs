@@ -25,6 +25,7 @@ use super::error::{Error, Result};
 use super::notice::{Notice, NoticeReceiver};
 use super::row::{Row, StreamRow};
 use super::statement::ParamFormat;
+use super::tls::{self, Fallback, Negotiated, TlsConnector};
 
 use crate::protocol::message::Message;
 
@@ -62,24 +63,31 @@ pub struct AsyncClient {
     endpoint: ConnectionEndpoint,
     /// Optional notice receiver callback for server notices/warnings.
     notice_receiver: Option<Arc<NoticeReceiver>>,
+    /// The TLS connector, kept only when TLS was negotiated, so that a cancel
+    /// request for this session goes over TLS too.
+    tls: Option<Arc<TlsConnector>>,
 }
 
 impl std::fmt::Debug for AsyncClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AsyncClient")
             .field("process_id", &self.process_id)
-            .field("secret_key", &self.secret_key)
+            .field("secret_key", &"<redacted>")
             .field("endpoint", &self.endpoint)
             .field(
                 "notice_receiver",
                 &self.notice_receiver.as_ref().map(|_| "<callback>"),
             )
+            .field("tls", &self.tls.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl AsyncClient {
     /// Connects to a Hyper server using the given configuration (async).
+    ///
+    /// Negotiates TLS when [`Config::tls`] asks for it, as
+    /// [`Client::connect`](super::client::Client::connect) does.
     ///
     /// # Example
     ///
@@ -98,8 +106,13 @@ impl AsyncClient {
     ///
     /// # Errors
     ///
+    /// - Returns [`Error::Config`] if the TLS configuration is invalid or a
+    ///   certificate file cannot be read.
     /// - Returns [`Error`] (connection) if the TCP connection cannot be
     ///   established to `config.host():config.port()`.
+    /// - Returns [`Error::Tls`] if TLS negotiation or certificate
+    ///   verification fails, and [`Error::Timeout`] if it does not finish
+    ///   within [`Config::connect_timeout`].
     /// - Propagates any [`Error`] from the startup handshake —
     ///   [`Error`] (auth) for missing/wrong credentials,
     ///   [`Error`] (server) for server-side startup errors, [`Error`] (protocol)
@@ -114,6 +127,10 @@ impl AsyncClient {
             database = config.database().unwrap_or("(none)"),
             "connection-parameters"
         );
+
+        // Built before connecting, so a bad certificate file or option
+        // combination fails without touching the network.
+        let connector = TlsConnector::build(config.tls(), config.host())?;
 
         let endpoint = ConnectionEndpoint::tcp(config.host(), config.port());
         let addr = format!("{}:{}", config.host(), config.port());
@@ -144,7 +161,20 @@ impl AsyncClient {
             sock.set_tcp_keepalive(&keepalive).ok();
         }
 
-        let stream = AsyncStream::tcp(tcp_stream);
+        let (stream, tls) = match connector {
+            None => (AsyncStream::tcp(tcp_stream), None),
+            Some(connector) => {
+                // A zero connect timeout means no limit, as in libpq.
+                let timeout = config.connect_timeout().filter(|t| !t.is_zero());
+                let fallback = Fallback::for_mode(config.tls().mode());
+                match tls::negotiate_async(tcp_stream, &connector, fallback, timeout).await? {
+                    Negotiated::Plain(tcp_stream) => (AsyncStream::tcp(tcp_stream), None),
+                    Negotiated::Tls(tls_stream) => {
+                        (AsyncStream::Tls(Box::new(tls_stream)), Some(connector))
+                    }
+                }
+            }
+        };
         let mut connection = AsyncRawConnection::new(stream);
 
         // Perform startup with authentication
@@ -158,6 +188,7 @@ impl AsyncClient {
         debug!(
             target: "hyperdb_api",
             process_id,
+            tls = tls.is_some(),
             "connection-established"
         );
 
@@ -167,6 +198,7 @@ impl AsyncClient {
             secret_key,
             endpoint,
             notice_receiver: None,
+            tls,
         })
     }
 
@@ -187,6 +219,10 @@ impl AsyncClient {
     ///
     /// # Errors
     ///
+    /// - Returns [`Error::FeatureNotSupported`] if [`Config::tls`] requires
+    ///   TLS, which a Unix domain socket does not carry;
+    ///   [`TlsMode::Prefer`](super::tls::TlsMode::Prefer) connects in
+    ///   plaintext.
     /// - Returns [`Error`] (connection) if the Unix domain socket cannot
     ///   be connected.
     /// - Propagates any error from the startup handshake (see
@@ -198,6 +234,7 @@ impl AsyncClient {
     ) -> Result<Self> {
         use std::path::Path;
 
+        tls::reject_on_ipc(config.tls())?;
         let path = socket_path.as_ref();
         info!(
             target: "hyperdb_api",
@@ -243,6 +280,7 @@ impl AsyncClient {
             secret_key,
             endpoint,
             notice_receiver: None,
+            tls: None,
         })
     }
 
@@ -255,13 +293,18 @@ impl AsyncClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the Named Pipe cannot be opened (e.g., pipe does not
-    /// exist, all instances are busy after the retry window, or permission is
-    /// denied) or if the authentication handshake fails.
+    /// Returns [`Error::FeatureNotSupported`] if [`Config::tls`] requires TLS,
+    /// which a named pipe does not carry
+    /// ([`TlsMode::Prefer`](super::tls::TlsMode::Prefer) connects in
+    /// plaintext). Returns an error if the Named Pipe cannot be opened (e.g.,
+    /// pipe does not exist, all instances are busy after the retry window, or
+    /// permission is denied) or if the authentication handshake fails.
     #[cfg(windows)]
     pub async fn connect_named_pipe(pipe_path: &str, config: &Config) -> Result<Self> {
         use std::time::{Duration, Instant};
         use tokio::net::windows::named_pipe::ClientOptions;
+
+        tls::reject_on_ipc(config.tls())?;
 
         info!(
             target: "hyperdb_api",
@@ -337,6 +380,7 @@ impl AsyncClient {
             secret_key,
             endpoint,
             notice_receiver: None,
+            tls: None,
         })
     }
 
@@ -375,6 +419,13 @@ impl AsyncClient {
         &self.endpoint
     }
 
+    /// Returns true if this connection negotiated TLS; see
+    /// [`Client::is_tls`](super::client::Client::is_tls).
+    #[must_use]
+    pub fn is_tls(&self) -> bool {
+        self.tls.is_some()
+    }
+
     /// Returns the server process ID for this connection.
     #[must_use]
     pub fn process_id(&self) -> i32 {
@@ -390,7 +441,8 @@ impl AsyncClient {
     /// Cancels the currently executing query on this connection (async).
     ///
     /// This method opens a separate connection to send a cancel request.
-    /// For TCP endpoints, it opens a new TCP connection.
+    /// For TCP endpoints, it opens a new TCP connection, negotiating TLS on
+    /// it for a TLS session and never falling back to plaintext.
     /// For Unix domain sockets, it connects to the same socket path.
     ///
     /// # Errors
@@ -398,11 +450,12 @@ impl AsyncClient {
     /// - Returns [`Error`] (connection) if a fresh cancel-side socket
     ///   (TCP / UDS / named-pipe) cannot be opened to
     ///   [`Self::endpoint`].
+    /// - Returns [`Error::Tls`] or [`Error::Timeout`] if this is a TLS
+    ///   session and TLS cannot be negotiated on the cancel-side socket.
     /// - Returns [`Error`] (I/O) if writing the cancel request fails.
     pub async fn cancel(&self) -> Result<()> {
         use crate::protocol::message::frontend;
         use bytes::BytesMut;
-        use tokio::io::AsyncWriteExt;
 
         info!(
             target: "hyperdb_api",
@@ -414,36 +467,18 @@ impl AsyncClient {
 
         match &self.endpoint {
             ConnectionEndpoint::Tcp { host, port } => {
-                let addr = format!("{host}:{port}");
-                let mut stream = TcpStream::connect(&addr).await.map_err(|e| {
-                    warn!(
-                        target: "hyperdb_api",
-                        addr = %endpoint_str,
-                        error = %e,
-                        "query-cancel-connect-failed"
-                    );
-                    Error::connection(format!(
-                        "failed to connect for cancel request to {endpoint_str}: {e}"
-                    ))
-                })?;
-                // Cancel is a 16-byte fire-and-forget — disable Nagle so the
-                // request hits the wire without waiting on a coalesce timer.
-                stream.set_nodelay(true).ok();
-
-                let mut buf = BytesMut::new();
-                frontend::cancel_request(self.process_id, self.secret_key, &mut buf);
-
-                stream.write_all(&buf).await.map_err(|e| {
-                    warn!(
-                        target: "hyperdb_api",
-                        error = %e,
-                        "query-cancel-send-failed"
-                    );
-                    Error::from_io(e)
-                })?;
+                tls::send_cancel_async(
+                    &format!("{host}:{port}"),
+                    self.process_id,
+                    self.secret_key,
+                    self.tls.as_deref(),
+                )
+                .await?;
             }
             #[cfg(unix)]
             ConnectionEndpoint::DomainSocket { directory, name } => {
+                use tokio::io::AsyncWriteExt;
+
                 let socket_path = directory.join(name);
                 let mut stream = UnixStream::connect(&socket_path).await.map_err(|e| {
                     warn!(
@@ -570,7 +605,8 @@ impl AsyncClient {
     /// is usable from [`Drop`] impls (notably
     /// [`AsyncQueryStream::drop`](super::async_stream_query::AsyncQueryStream)).
     ///
-    /// Cancellation opens a short-lived TCP / UDS / Named-Pipe connection,
+    /// Cancellation opens a short-lived TCP / UDS / Named-Pipe connection
+    /// (TLS over TCP for a TLS session),
     /// writes the cancel packet, and drops it — the server recognizes the
     /// (`process_id`, `secret_key`) tuple and signals the long-running query
     /// to abort. No response is expected.
@@ -589,27 +625,12 @@ impl AsyncClient {
 
         match &self.endpoint {
             ConnectionEndpoint::Tcp { host, port } => {
-                let addr = format!("{host}:{port}");
-                let mut stream = std::net::TcpStream::connect(&addr).map_err(|e| {
-                    warn!(
-                        target: "hyperdb_api",
-                        addr = %endpoint_str,
-                        error = %e,
-                        "query-cancel-connect-failed"
-                    );
-                    Error::connection(format!(
-                        "failed to connect for cancel request to {endpoint_str}: {e}"
-                    ))
-                })?;
-                // Cancel is a 16-byte fire-and-forget — disable Nagle so the
-                // request hits the wire without waiting on a coalesce timer.
-                stream.set_nodelay(true).ok();
-
-                let mut buf = BytesMut::with_capacity(16);
-                frontend::cancel_request(self.process_id, self.secret_key, &mut buf);
-
-                stream.write_all(&buf).map_err(Error::from_io)?;
-                stream.flush().map_err(Error::from_io)?;
+                tls::send_cancel_sync(
+                    &format!("{host}:{port}"),
+                    self.process_id,
+                    self.secret_key,
+                    self.tls.as_deref(),
+                )?;
             }
             #[cfg(unix)]
             ConnectionEndpoint::DomainSocket { directory, name } => {

@@ -226,7 +226,10 @@
 //!     let mut client = GrpcClient::connect(config).await?;
 //!
 //!     // Dollar-numbered parameters ($1, $2, ...) - use serde_json::json! for mixed types
-//!     let params = QueryParameters::from_json_value(&serde_json::json!([42, "Alice"]))?;
+//!     let params = QueryParameters::json_positional(&[
+//!         &serde_json::json!(42),
+//!         &serde_json::json!("Alice"),
+//!     ])?;
 //!     let result = client.execute_query_with_params(
 //!         "SELECT * FROM users WHERE id = $1 AND name = $2",
 //!         params,
@@ -236,10 +239,10 @@
 //!     // Named parameters using builder pattern
 //!     let params = QueryParameters::json_named()
 //!         .add("id", &42i64)?
-//!         .add("name", &"Alice")?
+//!         .add("user_name", &"Alice")?
 //!         .build();
 //!     let result = client.execute_query_with_params(
-//!         "SELECT * FROM users WHERE id = :id AND name = :name",
+//!         "SELECT * FROM users WHERE id = :id AND name = :user_name",
 //!         params,
 //!         ParameterStyle::Named,
 //!     ).await?;

@@ -24,8 +24,10 @@
 //! with `Index support is disabled`, and `CHECK` with `check constraints not
 //! implemented yet`. A Hyper table therefore never *has* one of those to lose.
 //! What it can have is `NOT NULL`, `DEFAULT`, `COLLATE`, and the assumed key
-//! forms ([`TableConstraint`](crate::TableConstraint)) — and all five survive
-//! a copy.
+//! forms ([`TableConstraint`](crate::TableConstraint)) — and all five are
+//! reproduced by a copy, except that a `DEFAULT` expression that is not
+//! portable to another database is dropped and listed in
+//! [`CopyTableReport::unpreserved`].
 
 /// Why a piece of the source schema could not be reproduced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,7 +111,7 @@ impl std::fmt::Display for UnpreservedItem {
 /// and what it dropped.
 ///
 /// A copy that returns `Ok` has moved every row. It has **not** necessarily
-/// reproduced every constraint — check [`is_fully_preserved`](Self::is_fully_preserved).
+/// reproduced every constraint and default — check [`is_fully_preserved`](Self::is_fully_preserved).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CopyTableReport {
@@ -130,7 +132,7 @@ pub struct CopyTableReport {
 }
 
 impl CopyTableReport {
-    /// Returns `true` if every constraint on the source was reproduced.
+    /// Returns `true` if every constraint and default on the source was reproduced.
     #[must_use]
     pub fn is_fully_preserved(&self) -> bool {
         self.unpreserved.is_empty()

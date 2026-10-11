@@ -52,6 +52,14 @@ pub struct AsyncRawConnection<S> {
     /// [`Self::is_healthy`] and [`Self::ensure_healthy`] for the
     /// consumer-facing API.
     desynchronized: bool,
+    /// `true` while a write to the stream is in progress. It is set before
+    /// the first `await` of a write and cleared only when the write
+    /// completes, so it is still `true` if the future was dropped mid-write
+    /// (cancellation) or the write failed. In that state a partial frame may
+    /// be on the wire and nothing appended after it can be parsed as a
+    /// message boundary, so the connection is unusable. See
+    /// [`Self::is_healthy`].
+    write_in_flight: bool,
 }
 
 impl<S> AsyncRawConnection<S>
@@ -73,6 +81,7 @@ where
             server_params: HashMap::new(),
             pending_copy_cancel: false,
             desynchronized: false,
+            write_in_flight: false,
         }
     }
 
@@ -81,7 +90,7 @@ where
     /// [`super::connection::RawConnection::is_healthy`] for the full
     /// semantics — this is the async mirror with identical behavior.
     pub fn is_healthy(&self) -> bool {
-        !self.desynchronized
+        !self.desynchronized && !self.write_in_flight
     }
 
     /// Marks this connection as desynchronized.
@@ -101,7 +110,7 @@ where
     /// server request to short-circuit operations on a desynchronized
     /// connection before any bytes hit the wire.
     pub(crate) fn ensure_healthy(&self) -> Result<()> {
-        if self.desynchronized {
+        if !self.is_healthy() {
             return Err(Error::connection(
                 "connection is desynchronized from the server and cannot be reused; \
                  discard it and open a new one",
@@ -144,7 +153,18 @@ where
     /// but NOT flushed (we can't do async I/O from `Drop`). The next async
     /// operation will call [`drain_pending_copy_cancel`](Self::drain_pending_copy_cancel) to flush and drain
     /// the server's `ErrorResponse` + `ReadyForQuery` before proceeding.
+    ///
+    /// If a write was interrupted (the COPY future was dropped or failed
+    /// mid-`write_all`), a partial frame is on the wire and the server would
+    /// read the `CopyFail` bytes as the rest of that frame, so it never sees
+    /// the cancel. The `CopyFail` is not queued then; the connection is marked
+    /// desynchronized instead, so the next operation fails fast rather than
+    /// waiting for a `ReadyForQuery` that cannot arrive.
     pub fn queue_copy_fail(&mut self, reason: &str) {
+        if self.write_in_flight {
+            self.desynchronized = true;
+            return;
+        }
         frontend::copy_fail(reason, &mut self.write_buf);
         self.pending_copy_cancel = true;
     }
@@ -169,25 +189,24 @@ where
         // Flush the queued CopyFail message
         self.flush().await?;
 
-        // Drain messages until the connection is back in ReadyForQuery state
-        loop {
-            let msg = self.read_message().await?;
-            match msg {
-                Message::ReadyForQuery(_) => {
-                    self.pending_copy_cancel = false;
-                    debug!(
-                        target: "hyperdb_api_core::client",
-                        "drained pending COPY cancel — connection restored"
-                    );
-                    return Ok(());
-                }
-                Message::ErrorResponse(_) => {
-                    // Expected — server confirms the cancel
-                }
-                _ => {
-                    // Ignore other messages (e.g., NoticeResponse)
-                }
-            }
+        // Drain messages (the expected ErrorResponse, notices) until the
+        // connection is back in ReadyForQuery state. Bounded: a server that
+        // never answers marks the connection desynchronized instead of
+        // hanging every later operation.
+        if self
+            .drain_until_ready_bounded(super::connection::POST_ERROR_DRAIN_CAP)
+            .await
+        {
+            self.pending_copy_cancel = false;
+            debug!(
+                target: "hyperdb_api_core::client",
+                "drained pending COPY cancel — connection restored"
+            );
+            Ok(())
+        } else {
+            Err(Error::connection(
+                "could not drain the abandoned COPY; connection marked desynchronized",
+            ))
         }
     }
 
@@ -624,9 +643,12 @@ where
     /// the underlying async transport fails.
     pub async fn flush(&mut self) -> Result<()> {
         if !self.write_buf.is_empty() {
+            // Left set if this future is dropped or fails mid-write.
+            self.write_in_flight = true;
             self.stream.write_all(&self.write_buf).await?;
             self.stream.flush().await?;
             self.write_buf.clear();
+            self.write_in_flight = false;
         }
         Ok(())
     }
@@ -731,20 +753,25 @@ where
     /// - Returns [`Error`] (I/O) if flushing buffered bytes or writing
     ///   the header / payload to the async transport fails.
     pub async fn send_copy_data_direct(&mut self, data: &[u8]) -> Result<()> {
-        // First flush any pending buffered data
-        if !self.write_buf.is_empty() {
-            self.stream.write_all(&self.write_buf).await?;
-            self.write_buf.clear();
-        }
-
         // Write CopyData message header + data directly to stream
         // Message format: 'd' (1 byte) + length (4 bytes BigEndian) + data
         let msg_len = u32::try_from(4 + data.len())
             .map_err(|_| Error::protocol("CopyData payload exceeds u32::MAX bytes"))?;
         let len_be = msg_len.to_be_bytes();
         let header = [b'd', len_be[0], len_be[1], len_be[2], len_be[3]];
+
+        // `write_all` is not cancel-safe: if this future is dropped between
+        // the awaits below, a partial frame stays on the wire. The flag is
+        // left set in that case (see `write_in_flight`).
+        self.write_in_flight = true;
+        // First flush any pending buffered data
+        if !self.write_buf.is_empty() {
+            self.stream.write_all(&self.write_buf).await?;
+            self.write_buf.clear();
+        }
         self.stream.write_all(&header).await?;
         self.stream.write_all(data).await?;
+        self.write_in_flight = false;
         Ok(())
     }
 
@@ -772,6 +799,7 @@ where
     /// - Returns [`Error`] (I/O) / [`Error`] (closed) on transport
     ///   read/write failure.
     pub async fn finish_copy(&mut self) -> Result<u64> {
+        self.ensure_healthy()?;
         self.flush().await?;
 
         frontend::copy_done(&mut self.write_buf);
@@ -808,6 +836,7 @@ where
     /// `CopyFail` frame fails, or [`Error`] (closed) if the server
     /// drops the connection before returning `ReadyForQuery`.
     pub async fn cancel_copy(&mut self, reason: &str) -> Result<()> {
+        self.ensure_healthy()?;
         self.flush().await?;
 
         frontend::copy_fail(reason, &mut self.write_buf);
@@ -1152,5 +1181,79 @@ where
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A write future dropped mid-`write_all` (cancellation) must poison the
+    /// connection. The peer end of the duplex pipe is never read, and its
+    /// 8-byte capacity guarantees `write_all` parks after a partial write.
+    #[tokio::test]
+    async fn cancelled_copy_write_marks_connection_unhealthy() {
+        let (client, _peer) = tokio::io::duplex(8);
+        let mut conn = AsyncRawConnection::new(client);
+        assert!(conn.is_healthy());
+
+        let payload = [0u8; 1024];
+        tokio::select! {
+            biased;
+            res = conn.send_copy_data_direct(&payload) => {
+                panic!("write into a full pipe cannot complete: {res:?}");
+            }
+            () = std::future::ready(()) => {}
+        }
+
+        assert!(
+            !conn.is_healthy(),
+            "an interrupted write must poison the connection"
+        );
+        assert!(conn.ensure_healthy().is_err());
+    }
+
+    /// With a partial frame on the wire, a queued `CopyFail` would be read by
+    /// the server as part of that frame and never seen. `queue_copy_fail`
+    /// must not queue it and must leave the connection desynchronized.
+    #[tokio::test]
+    async fn queue_copy_fail_after_interrupted_write_desynchronizes() {
+        let (client, _peer) = tokio::io::duplex(8);
+        let mut conn = AsyncRawConnection::new(client);
+
+        tokio::select! {
+            biased;
+            _ = conn.send_copy_data_direct(&[0u8; 1024]) => unreachable!(),
+            () = std::future::ready(()) => {}
+        }
+        conn.queue_copy_fail("dropped");
+
+        assert!(
+            !conn.pending_copy_cancel,
+            "CopyFail must not follow a partial frame"
+        );
+        assert!(conn.desynchronized);
+    }
+
+    /// A completed write leaves the connection healthy and `queue_copy_fail`
+    /// behaves as before.
+    #[tokio::test]
+    async fn completed_copy_write_stays_healthy() {
+        let (client, mut peer) = tokio::io::duplex(4096);
+        let mut conn = AsyncRawConnection::new(client);
+
+        conn.send_copy_data_direct(b"abc").await.unwrap();
+        assert!(conn.is_healthy());
+
+        conn.queue_copy_fail("abandoned");
+        assert!(conn.pending_copy_cancel);
+        assert!(conn.is_healthy());
+
+        // 'd' + len(7) + payload reached the peer intact.
+        let mut got = [0u8; 8];
+        tokio::io::AsyncReadExt::read_exact(&mut peer, &mut got)
+            .await
+            .unwrap();
+        assert_eq!(&got, &[b'd', 0, 0, 0, 7, b'a', b'b', b'c']);
     }
 }

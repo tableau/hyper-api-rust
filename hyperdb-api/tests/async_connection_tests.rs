@@ -505,3 +505,156 @@ async fn stream_as_params_async() {
 
     conn.close().await.unwrap();
 }
+
+/// `copy_in_hyperbinary` streams a pre-encoded `HyperBinary` buffer into a
+/// table and reports the inserted row count; an empty buffer is a no-op.
+#[tokio::test(flavor = "current_thread")]
+async fn copy_in_hyperbinary_inserts_encoded_rows() {
+    use hyperdb_api::{InsertChunk, SqlType, TableDefinition};
+
+    let (_hyper, conn) = fresh_async_conn("async_copy_in_hyperbinary").await.unwrap();
+    let table_def = TableDefinition::from("copied")
+        .add_required_column("id", SqlType::int())
+        .add_required_column("name", SqlType::text());
+    conn.execute_command("CREATE TABLE copied (id INT NOT NULL, name TEXT NOT NULL)")
+        .await
+        .unwrap();
+
+    let mut chunk = InsertChunk::from_table_definition(&table_def);
+    for (id, name) in [(1, "a"), (2, "b"), (3, "c")] {
+        chunk.add_i32(id).unwrap();
+        chunk.add_str(name).unwrap();
+        chunk.end_row().unwrap();
+    }
+    let buffer = chunk.take().expect("rows were buffered");
+
+    assert_eq!(conn.copy_in_hyperbinary(&table_def, &[]).await.unwrap(), 0);
+    let inserted = conn.copy_in_hyperbinary(&table_def, &buffer).await.unwrap();
+    assert_eq!(inserted, 3);
+
+    let count: i64 = conn
+        .fetch_scalar("SELECT COUNT(*) FROM copied")
+        .await
+        .unwrap();
+    assert_eq!(count, 3);
+}
+
+/// Only the first `InsertChunk::take()` carries the `HyperBinary` header, so
+/// a later buffer is not a complete COPY stream. It is refused up front with
+/// `InvalidOperation` rather than failing mid-COPY on the server.
+#[tokio::test(flavor = "current_thread")]
+async fn copy_in_hyperbinary_rejects_headerless_buffer() {
+    use hyperdb_api::{Error, InsertChunk, SqlType, TableDefinition};
+
+    let (_hyper, conn) = fresh_async_conn("async_copy_in_headerless").await.unwrap();
+    let table_def = TableDefinition::from("headerless").add_required_column("id", SqlType::int());
+    conn.execute_command("CREATE TABLE headerless (id INT NOT NULL)")
+        .await
+        .unwrap();
+
+    let mut chunk = InsertChunk::from_table_definition(&table_def);
+    chunk.add_i32(1).unwrap();
+    chunk.end_row().unwrap();
+    let first = chunk.take().expect("first buffer");
+    chunk.add_i32(2).unwrap();
+    chunk.end_row().unwrap();
+    let second = chunk.take().expect("second buffer");
+
+    let err = conn
+        .copy_in_hyperbinary(&table_def, &second)
+        .await
+        .expect_err("a headerless buffer is not a COPY stream");
+    assert!(
+        matches!(err, Error::InvalidOperation(_)),
+        "expected InvalidOperation, got {err:?}"
+    );
+
+    // The connection is untouched, and the first buffer still works.
+    assert_eq!(
+        conn.copy_in_hyperbinary(&table_def, &first).await.unwrap(),
+        1
+    );
+}
+
+/// A server-side COPY failure surfaces as an error and leaves the connection
+/// usable for the next statement.
+#[tokio::test(flavor = "current_thread")]
+async fn copy_in_hyperbinary_server_error_leaves_connection_usable() {
+    use hyperdb_api::{SqlType, TableDefinition};
+    use hyperdb_api_core::protocol::copy::HYPER_BINARY_HEADER;
+
+    let (_hyper, conn) = fresh_async_conn("async_copy_in_server_error")
+        .await
+        .unwrap();
+    let table_def = TableDefinition::from("broken").add_required_column("id", SqlType::int());
+    conn.execute_command("CREATE TABLE broken (id INT NOT NULL)")
+        .await
+        .unwrap();
+
+    // A valid header followed by 3 bytes: a truncated `INT` row.
+    let mut data = HYPER_BINARY_HEADER.to_vec();
+    data.extend_from_slice(&[0x01; 3]);
+    conn.copy_in_hyperbinary(&table_def, &data)
+        .await
+        .expect_err("a truncated row must be rejected");
+
+    let one: i64 = conn.fetch_scalar("SELECT 1").await.unwrap();
+    assert_eq!(one, 1, "connection must stay usable after a failed COPY");
+}
+
+/// COPY needs the TCP wire protocol; a gRPC connection reports that instead
+/// of attempting it.
+#[tokio::test(flavor = "current_thread")]
+async fn copy_in_hyperbinary_on_grpc_is_feature_not_supported() {
+    use hyperdb_api::{Error, ListenMode, Parameters, SqlType, TableDefinition};
+    use hyperdb_api_core::protocol::copy::HYPER_BINARY_HEADER;
+
+    let mut params = Parameters::new();
+    params.set("log_dir", "test_results");
+    params.set_listen_mode(ListenMode::Grpc { port: 0 });
+    let hyper = HyperProcess::new(None, Some(&params)).unwrap();
+    let url = hyper.grpc_url().expect("gRPC URL");
+    let conn = AsyncConnection::connect(&url, "", CreateMode::DoNotCreate)
+        .await
+        .unwrap();
+
+    let table_def = TableDefinition::from("t").add_required_column("id", SqlType::int());
+    let err = conn
+        .copy_in_hyperbinary(&table_def, HYPER_BINARY_HEADER)
+        .await
+        .expect_err("COPY over gRPC is not supported");
+    assert!(
+        matches!(err, Error::FeatureNotSupported(_)),
+        "expected FeatureNotSupported, got {err:?}"
+    );
+}
+
+/// The string-endpoint constructors reach a Unix domain socket like
+/// `connect` and the builder do, rather than parsing the path as `host:port`.
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn string_constructors_connect_over_a_unix_socket() {
+    use hyperdb_api::TransportMode;
+
+    let mut params = test_hyper_params("async_string_constructors_ipc").unwrap();
+    params.set_transport_mode(TransportMode::Ipc);
+    let hyper = HyperProcess::new(None, Some(&params)).unwrap();
+    let endpoint = hyper.connection_endpoint_string().expect("IPC endpoint");
+    assert!(endpoint.starts_with('/'), "not a socket path: {endpoint}");
+
+    let conn = AsyncConnection::without_database(&endpoint).await.unwrap();
+    let one: i64 = conn.fetch_scalar("SELECT 1").await.unwrap();
+    assert_eq!(one, 1);
+
+    let db = test_result_path("async_string_constructors_ipc", "hyper").unwrap();
+    let conn = AsyncConnection::connect_with_auth(
+        &endpoint,
+        db.to_str().expect("path"),
+        CreateMode::CreateAndReplace,
+        "tableau_internal_user",
+        "unused",
+    )
+    .await
+    .unwrap();
+    assert_eq!(conn.database(), db.to_str());
+}

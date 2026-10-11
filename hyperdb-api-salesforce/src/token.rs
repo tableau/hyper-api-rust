@@ -28,7 +28,7 @@ const DC_JWT_VALIDITY_BUFFER_SECS: i64 = 300;
 /// OAuth Access Token response from Salesforce `/services/oauth2/token`.
 ///
 /// See: <https://help.salesforce.com/s/articleView?id=sf.remoteaccess_oauth_jwt_flow.htm>
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct OAuthTokenResponse {
     /// OAuth Access Token
     pub access_token: String,
@@ -57,6 +57,20 @@ pub struct OAuthTokenResponse {
     pub error_description: Option<String>,
 }
 
+impl std::fmt::Debug for OAuthTokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthTokenResponse")
+            .field("access_token", &"[REDACTED]")
+            .field("instance_url", &self.instance_url)
+            .field("token_type", &self.token_type)
+            .field("scope", &self.scope)
+            .field("issued_at", &self.issued_at)
+            .field("error", &self.error)
+            .field("error_description", &self.error_description)
+            .finish()
+    }
+}
+
 impl OAuthTokenResponse {
     /// Checks if the response contains an error.
     pub fn check_error(&self) -> SalesforceAuthResult<()> {
@@ -79,7 +93,7 @@ impl OAuthTokenResponse {
 ///
 /// Obtained from `/services/oauth2/token`. This token is exchanged for a
 /// DC JWT via `/services/a360/token`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OAuthToken {
     /// OAuth Access Token value
     pub token: String,
@@ -90,6 +104,17 @@ pub struct OAuthToken {
     /// Estimated expiry (Salesforce reports ~2 hours, but server-side
     /// inactivity timeout can invalidate it earlier)
     pub expires_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for OAuthToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthToken")
+            .field("token", &"[REDACTED]")
+            .field("instance_url", &self.instance_url)
+            .field("obtained_at", &self.obtained_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 /// Default OAuth Access Token lifetime in seconds.
@@ -143,7 +168,7 @@ impl OAuthToken {
 /// DC JWT response from `/services/a360/token`.
 ///
 /// See: <https://developer.salesforce.com/docs/atlas.en-us.c360a_api.meta/c360a_api/c360a_getting_started_with_cdp.htm>
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct DataCloudTokenResponse {
     /// DC JWT value
     pub access_token: String,
@@ -166,6 +191,19 @@ pub struct DataCloudTokenResponse {
     /// Error description (present on failure)
     #[serde(default)]
     pub error_description: Option<String>,
+}
+
+impl std::fmt::Debug for DataCloudTokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DataCloudTokenResponse")
+            .field("access_token", &"[REDACTED]")
+            .field("instance_url", &self.instance_url)
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .field("error", &self.error)
+            .field("error_description", &self.error_description)
+            .finish()
+    }
 }
 
 impl DataCloudTokenResponse {
@@ -192,11 +230,12 @@ impl DataCloudTokenResponse {
 /// Sent as the `Authorization: Bearer <jwt>` header with every gRPC call
 /// to the Hyper query engine.
 ///
-/// The DC JWT has a ~2-hour lifetime (`exp` claim), but is proactively
-/// refreshed much earlier (every ~15 minutes by default) so that the
-/// underlying OAuth Access Token is revalidated before Salesforce's
-/// server-side inactivity timeout can invalidate it.
-#[derive(Debug, Clone)]
+/// The DC JWT has a ~2-hour lifetime (`exp` claim).
+/// [`DataCloudTokenProvider`](crate::DataCloudTokenProvider)
+/// refreshes it within 5 minutes of expiry; callers that also want age-based
+/// refresh, as `AuthenticatedGrpcClient` does every ~15 minutes, use
+/// [`Self::needs_refresh`].
+#[derive(Clone)]
 pub struct DataCloudToken {
     /// Token type (e.g., "Bearer")
     token_type: String,
@@ -208,6 +247,18 @@ pub struct DataCloudToken {
     created_at: DateTime<Utc>,
     /// DC JWT expiration time (from `expires_in` in the response)
     expires_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for DataCloudToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DataCloudToken")
+            .field("token_type", &self.token_type)
+            .field("token", &"[REDACTED]")
+            .field("tenant_url", &self.tenant_url)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 impl DataCloudToken {
@@ -414,6 +465,36 @@ fn base64_url_decode(input: &str) -> SalesforceAuthResult<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SECRET: &str = "00Dxx!SUPER-SECRET-TOKEN";
+
+    #[test]
+    fn debug_output_never_contains_token_values() {
+        let oauth_response: OAuthTokenResponse = serde_json::from_str(&format!(
+            r#"{{"access_token":"{SECRET}","instance_url":"https://na1.salesforce.com"}}"#
+        ))
+        .expect("parse");
+        let dbg = format!("{oauth_response:?}");
+        assert!(!dbg.contains(SECRET), "{dbg}");
+        assert!(
+            dbg.contains("na1.salesforce.com"),
+            "non-secret fields stay: {dbg}"
+        );
+
+        let oauth = OAuthToken::from_response(oauth_response).expect("token");
+        assert!(!format!("{oauth:?}").contains(SECRET));
+
+        let dc_response: DataCloudTokenResponse = serde_json::from_str(&format!(
+            r#"{{"access_token":"{SECRET}","instance_url":"tenant.example.com"}}"#
+        ))
+        .expect("parse");
+        assert!(!format!("{dc_response:?}").contains(SECRET));
+
+        let dc = DataCloudToken::from_response(dc_response).expect("token");
+        let dbg = format!("{dc:?}");
+        assert!(!dbg.contains(SECRET), "{dbg}");
+        assert!(dbg.contains("tenant.example.com"), "{dbg}");
+    }
 
     #[test]
     fn test_oauth_access_token_response_error() {

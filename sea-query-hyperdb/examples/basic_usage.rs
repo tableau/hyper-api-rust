@@ -3,7 +3,7 @@
 
 //! Demonstrates building SQL queries with `HyperQueryBuilder`.
 //!
-//! Run with: `cargo run -p sea-query-hyper --example basic_usage`
+//! Run with: `cargo run -p sea-query-hyperdb --example basic_usage`
 
 use sea_query::{ColumnDef, Expr, ExprTrait, Iden, Query, Table};
 use sea_query_hyperdb::HyperQueryBuilder;
@@ -72,13 +72,7 @@ fn main() {
     let create = Table::create()
         .table(Products::Table)
         .if_not_exists()
-        .col(
-            ColumnDef::new(Products::Id)
-                .integer()
-                .not_null()
-                .auto_increment()
-                .primary_key(),
-        )
+        .col(ColumnDef::new(Products::Id).integer().not_null())
         .col(ColumnDef::new(Products::Name).string().not_null())
         .col(ColumnDef::new(Products::Price).double().not_null())
         .col(ColumnDef::new(Products::Category).string())

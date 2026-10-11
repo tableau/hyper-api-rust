@@ -23,14 +23,13 @@
 //!    defines no "already subscribed" error, so this is spec-compliant;
 //!    well-behaved clients subscribe once per URI per session anyway.
 //! 2. Unsubscribing clears *all* entries for the given URI. In multi-client
-//!    setups this would be surprising, but for the stdio + SSE transports
+//!    setups this would be surprising, but for the stdio transport
 //!    typically used with `HyperDB` each process serves at most a handful of
 //!    clients and cross-client URI reuse is rare.
 //! 3. Notify failures (client disconnected) are logged but not pruned.
 //!    Dead peers accumulate until the MCP session tears the registry
-//!    down; a future improvement could prune them from the failing
-//!    detached task, but since notify is a bounded per-tool-call cost
-//!    and sessions are short-lived this hasn't mattered in practice.
+//!    down. Notify is a bounded per-tool-call cost and sessions are
+//!    short-lived, so the accumulation is harmless.
 
 use rmcp::RoleServer;
 use rmcp::model::ResourceUpdatedNotificationParam;
@@ -40,9 +39,9 @@ use std::sync::Mutex;
 
 /// Per-URI registry of subscribed peers with broadcast helpers.
 ///
-/// Cheap to clone (all state is behind an `Arc<Mutex<...>>` externally —
-/// typically `Arc<SubscriptionRegistry>` on the server). Methods take
-/// `&self` because the internal [`Mutex`] provides interior mutability.
+/// Share it via `Arc` (typically `Arc<SubscriptionRegistry>` on the server).
+/// Methods take `&self` because the internal [`Mutex`] provides interior
+/// mutability.
 #[derive(Debug, Default)]
 pub struct SubscriptionRegistry {
     inner: Mutex<HashMap<String, Vec<Peer<RoleServer>>>>,
@@ -88,8 +87,7 @@ impl SubscriptionRegistry {
         guard.keys().cloned().collect()
     }
 
-    /// Drop all subscriptions for every URI. Invoked when the server is
-    /// shutting down or a full workspace reset has happened.
+    /// Drop all subscriptions for every URI.
     pub fn clear(&self) {
         let mut guard = self.lock();
         guard.clear();
@@ -133,15 +131,13 @@ impl SubscriptionRegistry {
     /// subscribed peer (across all URIs). Called when tables are added or
     /// dropped, or saved queries created / deleted.
     ///
-    /// Deduplicates peers across URIs so a client subscribed to three
-    /// URIs only receives one list-changed notification.
+    /// A peer subscribed to N URIs receives N notifications; clients treat
+    /// `list_changed` idempotently.
     pub fn notify_list_changed(&self) {
-        // Collect one peer per Vec entry, then dedupe by identity: two
-        // entries that share the underlying mpsc channel are equivalent
-        // from the client's perspective. Since we can't compare peers,
-        // we simply tolerate the rare duplicate send in multi-URI
-        // subscribers — list_changed handlers on the client side are
-        // idempotent (they trigger a resources/list refresh).
+        // Collect one peer per Vec entry. Peers cannot be compared, so a
+        // multi-URI subscriber receives one notification per entry;
+        // list_changed handlers on the client side are idempotent (they
+        // trigger a resources/list refresh).
         let peers: Vec<Peer<RoleServer>> = {
             let guard = self.lock();
             guard.values().flat_map(|v| v.iter().cloned()).collect()

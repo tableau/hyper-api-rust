@@ -69,7 +69,7 @@ pub struct AsyncArrowInserter<'conn> {
     chunk_count: usize,
     /// Start time for timing the insert operation.
     start_time: Instant,
-    /// Flush threshold in bytes. Data is buffered until this threshold is reached.
+    /// Flush threshold in bytes. Controls how often an explicit flush happens.
     flush_threshold: usize,
     /// Bytes buffered since the last flush.
     buffered_bytes: usize,
@@ -130,7 +130,8 @@ impl<'conn> AsyncArrowInserter<'conn> {
 
     /// Sets a custom flush threshold in bytes.
     ///
-    /// Data is buffered until the threshold is reached, then flushed to the server.
+    /// Data is written to the socket as each chunk is inserted; the threshold
+    /// only controls how often an explicit flush and progress log happen.
     /// Default is 16 MB (matching `HyperBinary` Inserter).
     #[must_use]
     pub fn with_flush_threshold(mut self, threshold: usize) -> Self {
@@ -151,8 +152,8 @@ impl<'conn> AsyncArrowInserter<'conn> {
     ///   subsequent chunks instead).
     /// - Returns [`Error::FeatureNotSupported`] / [`Error::Server`] if the lazy COPY
     ///   session cannot be opened.
-    /// - Returns [`Error::Server`] / [`Error::Io`] if the server rejects
-    ///   the data or the socket write fails.
+    /// - Returns [`Error::Server`] if the server rejects the data, or
+    ///   [`Error::Connection`] if the socket write fails.
     pub async fn insert_data(&mut self, arrow_ipc_data: &[u8]) -> Result<()> {
         if arrow_ipc_data.is_empty() {
             return Ok(());
@@ -198,8 +199,8 @@ impl<'conn> AsyncArrowInserter<'conn> {
     ///
     /// - Returns [`Error::Internal`] if no schema has been sent yet (call
     ///   [`insert_data`](Self::insert_data) first).
-    /// - Returns [`Error::Server`] / [`Error::Io`] if the server rejects
-    ///   the data or the socket write fails.
+    /// - Returns [`Error::Server`] if the server rejects the data, or
+    ///   [`Error::Connection`] if the socket write fails.
     pub async fn insert_record_batches(&mut self, arrow_batch_data: &[u8]) -> Result<()> {
         if arrow_batch_data.is_empty() {
             return Ok(());
@@ -243,8 +244,8 @@ impl<'conn> AsyncArrowInserter<'conn> {
     ///
     /// - Returns [`Error::FeatureNotSupported`] / [`Error::Server`] if the lazy COPY
     ///   session cannot be opened.
-    /// - Returns [`Error::Server`] / [`Error::Io`] if the server rejects
-    ///   the data or the socket write fails.
+    /// - Returns [`Error::Server`] if the server rejects the data, or
+    ///   [`Error::Connection`] if the socket write fails.
     pub async fn insert_raw(&mut self, data: &[u8]) -> Result<()> {
         if data.is_empty() {
             return Ok(());
@@ -272,18 +273,15 @@ impl<'conn> AsyncArrowInserter<'conn> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Server`] or [`Error::Io`] if the `CommandComplete`
+    /// Returns [`Error::Server`] or [`Error::Connection`] if the `CommandComplete`
     /// round-trip fails (server rejected some buffered batch, or the socket
     /// closed mid-flush). If no data was ever written, returns `Ok(0)`.
     pub async fn execute(mut self) -> Result<u64> {
-        if self.writer.is_none() {
+        let Some(writer) = self.writer.take() else {
             return Ok(0);
-        }
-
-        let rows = match self.writer.take() {
-            Some(w) => w.finish().await?,
-            None => 0,
         };
+
+        let rows = writer.finish().await?;
 
         let duration_ms = u64::try_from(self.start_time.elapsed().as_millis()).unwrap_or(u64::MAX);
         info!(
@@ -490,8 +488,8 @@ impl AsyncArrowInserterOwned {
     /// - Returns [`Error::Internal`] if a schema was already sent.
     /// - Returns [`Error::FeatureNotSupported`] / [`Error::Server`] if the lazy COPY
     ///   session cannot be opened.
-    /// - Returns [`Error::Server`] / [`Error::Io`] if the server rejects
-    ///   the data or the socket write fails.
+    /// - Returns [`Error::Server`] if the server rejects the data, or
+    ///   [`Error::Connection`] if the socket write fails.
     pub async fn insert_data(&mut self, arrow_ipc_data: &[u8]) -> Result<()> {
         if arrow_ipc_data.is_empty() {
             return Ok(());
@@ -520,8 +518,8 @@ impl AsyncArrowInserterOwned {
     /// # Errors
     ///
     /// - Returns [`Error::Internal`] if no schema has been sent yet.
-    /// - Returns [`Error::Server`] / [`Error::Io`] if the server rejects
-    ///   the data or the socket write fails.
+    /// - Returns [`Error::Server`] if the server rejects the data, or
+    ///   [`Error::Connection`] if the socket write fails.
     pub async fn insert_record_batches(&mut self, arrow_batch_data: &[u8]) -> Result<()> {
         if arrow_batch_data.is_empty() {
             return Ok(());
@@ -549,8 +547,8 @@ impl AsyncArrowInserterOwned {
     ///
     /// - Returns [`Error::FeatureNotSupported`] / [`Error::Server`] if the lazy COPY
     ///   session cannot be opened.
-    /// - Returns [`Error::Server`] / [`Error::Io`] if the server rejects
-    ///   the data or the socket write fails.
+    /// - Returns [`Error::Server`] if the server rejects the data, or
+    ///   [`Error::Connection`] if the socket write fails.
     pub async fn insert_raw(&mut self, data: &[u8]) -> Result<()> {
         if data.is_empty() {
             return Ok(());
@@ -574,7 +572,7 @@ impl AsyncArrowInserterOwned {
     /// - Returns [`Error::Internal`] with message
     ///   `"No data was inserted before execute()"` if no COPY session was
     ///   ever opened.
-    /// - Returns [`Error::Server`] / [`Error::Io`] if the `CommandComplete`
+    /// - Returns [`Error::Server`] / [`Error::Connection`] if the `CommandComplete`
     ///   round-trip fails.
     pub async fn execute(mut self) -> Result<u64> {
         let elapsed = self.start_time.elapsed();

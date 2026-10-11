@@ -89,6 +89,39 @@ export const enum CreateMode {
   /** Drop and recreate the database. */
   CreateAndReplace = 'CreateAndReplace'
 }
+/**
+ * TLS settings for `ConnectionBuilder.tls()`, with libpq `sslmode`
+ * semantics.
+ */
+export interface TlsOptions {
+  /** `"disable"`, `"prefer"`, `"require"`, `"verify-ca"` or `"verify-full"`. */
+  mode: string
+  /**
+   * PEM file of trusted root certificates. Required by `"verify-ca"` and
+   * `"verify-full"`; with `"prefer"` or `"require"` it turns on chain
+   * verification.
+   */
+  rootCert?: string
+  /** PEM client certificate for mutual TLS. Requires `clientKey`. */
+  clientCert?: string
+  /** PEM private key for `clientCert`. */
+  clientKey?: string
+  /** Host name to verify and send as SNI instead of the endpoint's host. */
+  serverName?: string
+}
+/** Options for starting a `HyperProcess`. */
+export interface HyperProcessOptions {
+  /**
+   * `"tcp"` (the default) or `"ipc"`: a Unix domain socket, or a named
+   * pipe on Windows. TLS needs `"tcp"`.
+   */
+  transport?: string
+  /**
+   * `hyperd` settings, passed through unchanged, for example `ssl_key`
+   * and `ssl_certificate` to serve TLS.
+   */
+  parameters?: Record<string, string>
+}
 /** Information about a single column in a table definition. */
 export interface ColumnInfo {
   /** Column name. */
@@ -312,6 +345,14 @@ export declare class Connection {
   /** Returns true if the connection is alive. */
   get isAlive(): boolean
   /**
+   * Returns true if the session is encrypted with TLS.
+   *
+   * `false` for a plaintext TCP connection, including a
+   * `{ mode: 'prefer' }` connection whose server declined TLS, and for a
+   * Unix domain socket or named pipe.
+   */
+  get isTls(): boolean
+  /**
    * Closes the connection.
    *
    * After calling this, no further operations should be performed on this
@@ -409,6 +450,16 @@ export declare class ConnectionBuilder {
   password(password: string): this
   /** Sets the login timeout in milliseconds. */
   loginTimeout(ms: number): this
+  /**
+   * Sets the TLS options for a TCP connection; the default is
+   * `{ mode: 'disable' }`.
+   *
+   * Over a Unix domain socket or a named pipe, `"prefer"` connects in
+   * plaintext and the modes that require TLS fail `build()`. A gRPC
+   * endpoint picks TLS through its `https://` scheme, so any mode but
+   * `"disable"` fails there too. The options are checked by `build()`.
+   */
+  tls(options: TlsOptions): this
   /** Builds and establishes the connection. */
   build(): Promise<Connection>
 }
@@ -522,10 +573,12 @@ export declare class HyperProcess {
    * path if it's not in the standard location.
    *
    * @param hyperPath - Optional path to the `hyperd` binary.
+   * @param options - Optional transport and `hyperd` settings.
    */
-  constructor(hyperPath?: string | undefined | null)
+  constructor(hyperPath?: string | undefined | null, options?: HyperProcessOptions | undefined | null)
   /**
-   * Returns the server endpoint (e.g., "localhost:7483").
+   * Returns the server endpoint: `host:port` (e.g., "127.0.0.1:7483"),
+   * or with `transport: 'ipc'` the Unix socket path or named pipe.
    *
    * Use this to connect to the server via `Connection.connect()`.
    */

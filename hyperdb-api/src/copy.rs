@@ -36,7 +36,7 @@
 //! fn main() -> Result<()> {
 //!     let conn = Connection::connect("localhost:7483", "test.hyper", CreateMode::DoNotCreate)?;
 //!
-//!     // Import from a file
+//!     // Import from an in-memory byte slice (any `impl Read` works)
 //!     let csv_data = b"1,Alice\n2,Bob\n";
 //!     let rows = conn.import_csv("my_table", &csv_data[..])?;
 //!     println!("Imported {} rows", rows);
@@ -143,8 +143,8 @@ impl CopyOptions {
         self
     }
 
-    #[must_use]
     /// Sets the string used to represent NULL values.
+    #[must_use]
     pub fn with_null(mut self, null_string: impl Into<String>) -> Self {
         self.null_string = Some(null_string.into());
         self
@@ -272,7 +272,7 @@ impl Connection {
     ///   (COPY is TCP-only).
     /// - Returns [`Error::Server`] if the server rejects the
     ///   `COPY (<select_query>) TO STDOUT` statement.
-    /// - Returns [`Error::Io`] if writing to `writer` fails.
+    /// - Returns [`Error::Connection`] if writing to `writer` fails.
     pub fn export_csv(&self, select_query: &str, writer: &mut dyn std::io::Write) -> Result<u64> {
         let opts = CopyOptions::csv().with_header(true);
         self.export_text(select_query, &opts, writer)
@@ -302,7 +302,7 @@ impl Connection {
     ///     // Pipe-separated with custom NULL
     ///     let opts = CopyOptions::csv()
     ///         .with_delimiter(b'|')
-    ///         .with_null("\\N".to_string())
+    ///         .with_null("\\N")
     ///         .with_header(true);
     ///     conn.export_text("SELECT * FROM users", &opts, &mut std::io::stdout())?;
     ///     Ok(())
@@ -311,12 +311,12 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Config`] if `options` fail validation (e.g. an
-    ///   illegal delimiter/quote combination), or
+    /// - Returns [`Error::Config`] if `options` set a QUOTE or ESCAPE
+    ///   character on a text/TSV format, or
     ///   [`Error::FeatureNotSupported`] if the connection is on gRPC.
     /// - Returns [`Error::Server`] if the server rejects the
     ///   `COPY TO STDOUT` statement.
-    /// - Returns [`Error::Io`] if writing to `writer` fails.
+    /// - Returns [`Error::Connection`] if writing to `writer` fails.
     pub fn export_text(
         &self,
         select_query: &str,
@@ -350,7 +350,7 @@ impl Connection {
     /// fn main() -> Result<()> {
     ///     let conn = Connection::connect("localhost:7483", "test.hyper", CreateMode::DoNotCreate)?;
     ///     let csv = conn.export_csv_string("SELECT id, name FROM users")?;
-    ///     println!("{}", csv);
+    ///     println!("{csv}");
     ///     Ok(())
     /// }
     /// ```
@@ -456,7 +456,7 @@ impl Connection {
     ///   [`Error::FeatureNotSupported`] if the connection is on gRPC.
     /// - Returns [`Error::Server`] if the server rejects the
     ///   `COPY <table> FROM STDIN` statement or a row during import.
-    /// - Returns [`Error::Io`] if reading from `reader` fails.
+    /// - Returns [`Error::Connection`] if reading from `reader` fails.
     pub fn import_text(
         &self,
         table_name: &str,

@@ -36,6 +36,11 @@ use super::special::Numeric;
 ///
 /// Each variant corresponds to a Hyper SQL type and has an associated internal OID.
 ///
+/// The enum and its struct variants (`Numeric`, `Varchar`, `Char`) are
+/// `#[non_exhaustive]`: match with a wildcard arm, end field patterns with
+/// `..`, and build values with the constructors (for example
+/// [`SqlType::numeric`]).
+///
 /// # Example
 ///
 /// ```
@@ -48,6 +53,7 @@ use super::special::Numeric;
 /// assert_eq!(numeric_type.to_string(), "NUMERIC(18, 2)");
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum SqlType {
     /// Boolean type.
     Bool,
@@ -59,6 +65,7 @@ pub enum SqlType {
     #[default]
     Int,
     /// Numeric/decimal type with precision and scale.
+    #[non_exhaustive]
     Numeric {
         /// Total number of digits (1-38).
         precision: u32,
@@ -76,11 +83,13 @@ pub enum SqlType {
     /// Variable-length text.
     Text,
     /// Variable-length character string with max length.
+    #[non_exhaustive]
     Varchar {
         /// Maximum length, or None for unlimited.
         max_length: Option<u32>,
     },
     /// Fixed-length character string.
+    #[non_exhaustive]
     Char {
         /// Fixed length.
         length: u32,
@@ -185,6 +194,25 @@ impl SqlType {
             "NUMERIC scale ({scale}) cannot exceed precision ({precision})"
         );
         SqlType::Numeric { precision, scale }
+    }
+
+    /// Creates a Numeric type, or `None` if `precision` is outside
+    /// `1..=38` or `scale` exceeds `precision`.
+    ///
+    /// The non-panicking counterpart of [`SqlType::numeric`], for values that
+    /// come from outside the program (for example an Arrow `Decimal256`
+    /// schema).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use hyperdb_api_core::types::SqlType;
+    /// assert_eq!(SqlType::try_numeric(18, 2), Some(SqlType::numeric(18, 2)));
+    /// assert_eq!(SqlType::try_numeric(76, 2), None);
+    /// ```
+    pub fn try_numeric(precision: u32, scale: u32) -> Option<Self> {
+        (precision >= 1 && precision <= u32::from(Numeric::MAX_PRECISION) && scale <= precision)
+            .then_some(SqlType::Numeric { precision, scale })
     }
 
     /// Creates a Double type.

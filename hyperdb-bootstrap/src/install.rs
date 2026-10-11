@@ -40,7 +40,7 @@ pub enum VersionSource {
 /// Configuration passed to [`install`].
 #[derive(Debug, Clone)]
 pub struct InstallOptions {
-    /// Root directory under which `<version_tag>/` and `current/` are created.
+    /// Root directory under which `<version>/` and `current/` are created.
     pub dest_root: PathBuf,
     /// Which release to resolve. See [`VersionSource`].
     pub version_source: VersionSource,
@@ -125,10 +125,30 @@ pub fn install(opts: InstallOptions) -> Result<InstalledHyperd, Error> {
 }
 
 fn resolve_release(source: &VersionSource) -> Result<PinnedRelease, Error> {
-    match source {
-        VersionSource::Builtin => Ok(PinnedRelease::builtin()),
-        VersionSource::TomlFile(path) => PinnedRelease::from_toml_file(path),
-        VersionSource::Explicit(r) => Ok(r.clone()),
+    let release = match source {
+        VersionSource::Builtin => PinnedRelease::builtin(),
+        VersionSource::TomlFile(path) => PinnedRelease::from_toml_file(path)?,
+        VersionSource::Explicit(r) => r.clone(),
+    };
+    validate_version(&release.version)?;
+    Ok(release)
+}
+
+/// Rejects a `version` that is not safe to use as a directory name under
+/// `dest_root`. [`download_and_extract`] runs `remove_dir_all` on
+/// `dest_root/<version>`, so a TOML or CLI `version` such as `".."` or
+/// `"../../home"` would otherwise delete a directory outside the install root.
+fn validate_version(version: &str) -> Result<(), Error> {
+    let plain = !version.is_empty()
+        && version != "."
+        && version != ".."
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+'));
+    if plain {
+        Ok(())
+    } else {
+        Err(Error::InvalidVersion(version.to_string()))
     }
 }
 
@@ -200,4 +220,58 @@ fn copy_dir_contents(from: &Path, to: &Path) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod version_validation_tests {
+    use super::*;
+
+    fn release(version: &str) -> PinnedRelease {
+        PinnedRelease {
+            version: version.to_string(),
+            wheel_tag: std::collections::HashMap::new(),
+            sha256: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn plain_versions_are_accepted() {
+        for v in ["0.0.26479", "1.2.3-rc.1", "2026_10+build.5"] {
+            assert!(validate_version(v).is_ok(), "{v}");
+        }
+    }
+
+    #[test]
+    fn path_like_versions_are_rejected() {
+        for v in [
+            "", ".", "..", "../x", "a/b", r"a\b", "/abs", "x/../..", "a b",
+        ] {
+            assert!(
+                matches!(validate_version(v), Err(Error::InvalidVersion(_))),
+                "{v:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn install_rejects_an_escaping_version_before_touching_the_filesystem() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let victim = root.path().join("victim");
+        std::fs::create_dir_all(&victim).expect("create victim");
+        std::fs::write(victim.join("keep.txt"), "precious").expect("write");
+
+        let dest_root = root.path().join("install");
+        std::fs::create_dir_all(&dest_root).expect("create dest");
+
+        let err = install(InstallOptions {
+            dest_root,
+            version_source: VersionSource::Explicit(release("../victim")),
+            platform: Some(Platform::LinuxX86_64),
+            force: true,
+        })
+        .expect_err("an escaping version must be rejected");
+
+        assert!(matches!(err, Error::InvalidVersion(_)), "{err}");
+        assert!(victim.join("keep.txt").exists(), "victim dir must survive");
+    }
 }

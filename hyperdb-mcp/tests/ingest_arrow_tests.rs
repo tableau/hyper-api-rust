@@ -1,8 +1,10 @@
 // Copyright (c) 2026, Salesforce, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Tests for Parquet and Arrow IPC file ingest: verifying that data is loaded
-//! with exact schema from file metadata, including nullability handling.
+//! Integration tests for Parquet and Arrow IPC file ingest.
+//!
+//! Covers append, schema overrides, merge, pooled async ingest, decimal
+//! round-trips, `NullType` rejection, and large row counts.
 
 #![expect(
     clippy::cast_possible_wrap,
@@ -350,7 +352,7 @@ fn ingest_parquet_applies_schema_override() {
 }
 
 /// Ingest an Arrow IPC file with 2 rows of INT32 + FLOAT64 data, then query
-/// back to verify the row count and that the exact schema was preserved.
+/// back to verify the row count.
 #[test]
 fn ingest_arrow_ipc() {
     let mut te = TestEngine::new_ephemeral();
@@ -380,7 +382,7 @@ fn ingest_arrow_ipc() {
 /// must round-trip with the correct values over the binary COPY path.
 /// Mirrors the parquet decimal regression test — when the IPC loader still
 /// rendered values as SQL text, a missing Decimal128 branch turned every
-/// cell into NULL. Under the new `ArrowInserter` path, the batch bytes go
+/// cell into NULL. With the `ArrowInserter` path, the batch bytes go
 /// straight through; this test pins that behavior and the schema mapping
 /// that preserves NUMERIC(p, s).
 #[test]

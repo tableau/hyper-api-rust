@@ -10,7 +10,11 @@
   "files": [
     "hyperdb-api-node.darwin-arm64.node",
     "hyperd",
-    "LICENSE-HYPERD"
+    "LICENSE-HYPERD",
+    "THIRD-PARTY-LICENSES.txt",
+    "LICENSE-MIT.txt",
+    "LICENSE-APACHE.txt",
+    "NOTICE"
   ],
   "description": "hyperdb-api-node native binding for macOS ARM64 (Apple Silicon)",
   "license": "MIT OR Apache-2.0",

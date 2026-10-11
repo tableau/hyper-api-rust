@@ -25,7 +25,11 @@ bytes = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 # Arrow for result parsing (used by both TCP and gRPC transports)
-arrow = { version = "59", default-features = false, features = ["ipc"] }
+arrow = { version = "60", default-features = false, features = ["ipc"] }
+# chrono / geo-types appear in the public API and are re-exported from the
+# crate root (see lib.rs); versions track hyperdb-api-core's.
+chrono = { workspace = true }
+geo-types = { workspace = true }
 # SmallVec for memory-efficient collections that are typically small
 smallvec = "1.15"
 # Deadpool - async connection pool.
@@ -64,6 +68,8 @@ futures = "0.3"
 rand = { workspace = true }
 serde = { workspace = true }
 sysinfo = { workspace = true }
+# Certificates for the TLS tests against a real hyperd
+rcgen = "0.14"
 
 # B4 compile-time validation end-to-end integration tests
 [[test]]

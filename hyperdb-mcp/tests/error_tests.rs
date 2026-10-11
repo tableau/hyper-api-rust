@@ -30,13 +30,13 @@ fn error_to_json() {
     assert_eq!(json["message"], "syntax error at position 42");
 }
 
-/// Every transport-disappearance variant the `hyper-client` layer can
+/// Every transport-disappearance variant the `hyperdb_api_core::client` layer can
 /// emit must be recognized as connection-lost so `with_engine` tears
 /// down the engine and reconnects on the next call.
 #[test]
 fn classifies_transport_disappearance_as_connection_lost() {
     // Exact strings drawn from the std / tokio / PG-wire error messages
-    // `hyper-client` forwards when `hyperd` crashes or is killed.
+    // `hyperdb_api_core::client` forwards when `hyperd` crashes or is killed.
     for msg in [
         "Broken pipe (os error 32)",
         "Connection reset by peer",
@@ -55,21 +55,19 @@ fn classifies_transport_disappearance_as_connection_lost() {
 }
 
 /// Wire-protocol desync is a distinct failure mode from transport
-/// disappearance: the socket is still open but `hyper-client` has
+/// disappearance: the socket is still open but `hyperdb_api_core::client` has
 /// marked the connection desynchronized because a bounded drain
 /// exhausted its budget. Subsequent operations fast-fail with a
 /// "desynchronized" message, and the mcp server must treat that the
 /// same way as a transport-lost error — recycle the engine, reconnect
 /// on the next call.
 ///
-/// Regression guard: this was the first concrete mcp-side gap discovered
-/// after the `desynchronized` flag landed in `hyper-client`; without
-/// this match, drain-poisoned connections would stay poisoned until the
-/// process was restarted.
+/// Without this match, drain-poisoned connections would stay poisoned
+/// until the process was restarted.
 #[test]
 fn classifies_desynchronized_wire_as_connection_lost() {
     // The exact message produced by `RawConnection::ensure_healthy` /
-    // `AsyncRawConnection::ensure_healthy` in the `hyper-client` crate.
+    // `AsyncRawConnection::ensure_healthy` in `hyperdb_api_core::client`.
     let desync_msg = "connection is desynchronized from the server and \
                       cannot be reused; discard it and open a new one";
     assert!(

@@ -252,9 +252,9 @@ jobs:
           cargo test --workspace \
             --exclude hyperdb-api-node \
             --exclude hyperdb-bootstrap
-        # hyperdb-api-node needs napi-rs + a Node.js toolchain; it gets
-        # its own workflow when wired up. hyperdb-bootstrap has its own
-        # coverage (next step) and doesn't need hyperd running.
+        # hyperdb-api-node needs napi-rs + a Node.js toolchain; the
+        # node-bindings job builds and smoke-tests it. hyperdb-bootstrap has
+        # its own coverage (next step) and doesn't need hyperd running.
 
       - name: hyperdb-compile-check tests
         # Declares its own [workspace], so the run above cannot see it. Nothing
@@ -385,6 +385,29 @@ jobs:
       - run: cargo install cargo-audit --locked
       - run: cargo audit --deny warnings
 
+  third-party-licenses:
+    # Generates the THIRD-PARTY-LICENSES.txt that npm-build-publish.yml ships
+    # in the npm platform packages, so a dependency under an unaccepted
+    # license (about.toml) fails here rather than in the middle of a release.
+    name: third-party licenses
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          cache-key: about
+          rustflags: ""
+      - run: cargo install cargo-about --locked --features cli --version 0.9.2
+      - name: Generate the notices for both shipped binaries
+        run: |
+          set -euo pipefail
+          for crate in hyperdb-mcp hyperdb-api-node; do
+            cargo about generate --manifest-path "$crate/Cargo.toml" about.hbs \
+              -o "$RUNNER_TEMP/THIRD-PARTY-LICENSES-$crate.txt"
+          done
+
   version-consistency:
     # Ensures version.txt (release-please source of truth) stays in sync
     # with Cargo.toml workspace version. Catches release-please PRs that
@@ -423,9 +446,7 @@ jobs:
             hyperdb-api-node/package.json
             hyperdb-api-node/npm/darwin-arm64/package.json
             hyperdb-api-node/npm/darwin-x64/package.json
-            hyperdb-api-node/npm/linux-arm64-gnu/package.json
             hyperdb-api-node/npm/linux-x64-gnu/package.json
-            hyperdb-api-node/npm/linux-x64-musl/package.json
             hyperdb-api-node/npm/win32-x64-msvc/package.json
           )
           OFFENDERS=()

@@ -560,7 +560,7 @@ cargo test -p hyperdb-api
 cargo test -p hyperdb-api test_name
 
 # Run a specific integration test file
-cargo test -p hyperdb-api --test integration_test
+cargo test -p hyperdb-api --test connection_tests
 ```
 
 ### Test Structure
@@ -576,7 +576,7 @@ hyperdb-api-core/src/types/          # Unit tests (inline with code)
 **Test utilities:**
 
 - `hyperdb-api/tests/common/mod.rs` — shared test helpers
-- `hyperdb-api-core/src/client/test_util.rs` — client test utilities
+- `hyperdb-api-core/tests/common/mod.rs` — client test utilities
 - Both use `HyperProcess::new()` to start temporary `hyperd` servers
 
 Tests create temporary `.hyper` files and clean them up automatically.

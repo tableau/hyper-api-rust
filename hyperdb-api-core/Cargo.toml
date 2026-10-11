@@ -70,7 +70,7 @@ hyperdb-api-salesforce = { path = "../hyperdb-api-salesforce", version = "=1.0.0
 # x-release-please-end
 
 # Arrow parsing for catalog operations (optional, used by authenticated_client)
-arrow = { version = "59.0", optional = true }
+arrow = { version = "60", optional = true }
 
 [lints]
 workspace = true
@@ -82,7 +82,7 @@ tonic-prost-build = { workspace = true }
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util"] }
-arrow = "59.0"
+arrow = "60"
 # For integration tests - we need HyperProcess to start a server
 hyperdb-api = { path = "../hyperdb-api" }
 tempfile = { workspace = true }

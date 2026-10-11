@@ -15,7 +15,7 @@ same tables. The Rust-side specialized benches (`benchmark.rs`,
 `async_parallel_benchmark.rs`) are "dig-deeper" references for
 specific questions.
 
-All benchmarks share the same schema so numbers compare directly:
+`benchmark.rs`, `benchmark_suite.rs`, `async_parallel_benchmark.rs` and the Node.js bench share the same schema so numbers compare directly:
 
 ```sql
 measurements(id INT NOT NULL, sensor_id INT, value DOUBLE, timestamp BIGINT)
@@ -25,15 +25,15 @@ measurements(id INT NOT NULL, sensor_id INT, value DOUBLE, timestamp BIGINT)
 The shared primitives (`ResourceStats`, `HostEnv`, formatting,
 deterministic row generators) live in
 [`hyperdb-api/benches/common.rs`](../hyperdb-api/benches/common.rs) and
-are pulled into each bench via
-`#[path = "common.rs"] mod common;`.
+are pulled into `benchmark.rs`, `benchmark_suite.rs` and
+`async_parallel_benchmark.rs` via `#[path = "common.rs"] mod common;`.
 
 ---
 
 ## Running the benchmark suite
 
 ```sh
-export HYPERD_PATH=/path/to/hyperd
+export HYPERD_PATH="$PWD/.hyperd/current"   # from the workspace root
 
 # Default: 10M rows per workload, 4 parallel workers
 cargo run -p hyperdb-api --release --example benchmark_suite
@@ -48,8 +48,8 @@ BENCH_TRANSPORT=ipc \
 ```
 
 The banner under `Configuration:` prints `Transport: Tcp` or `Transport: Ipc`
-so the saved `benchmark_suite.md` always records which transport produced
-the numbers.
+to stdout only; the saved `benchmark_suite.md` and `.json` do not record it,
+so note the transport next to any table you paste.
 
 The suite prints a live log and, at the end, writes two artifacts
 under `test_results/`:
@@ -74,7 +74,7 @@ under `test_results/`:
 
 Parallel async queries run against the database populated by the
 parallel-Arrow insert (one table per worker), so the full-scan row
-count is *N × rows-per-workload*.
+count is the rows-per-workload total, split across the *N* tables.
 
 ### Other benches (deep-dive)
 
@@ -109,7 +109,7 @@ path), and `executeQueryToArrow` (full Arrow IPC roundtrip).
 cd hyperdb-api-node
 npm install                   # first time only
 npm run build                 # builds hyperdb-api-node.<platform>.node
-HYPERD_PATH=/path/to/hyperd node __test__/benchmark.mjs [ROWS]
+HYPERD_PATH="$PWD/../.hyperd/current" node __test__/benchmark.mjs [ROWS]
 ```
 
 Default is 1M rows. 10M matches the Rust suite's default for
@@ -200,7 +200,7 @@ block from the suite's stdout.
 - **Parallel reads are the standout** — `query.full_scan × 4` reaches roughly **73 M rows/s / 1763 MB/s**, very approximately 2× the single-connection sync scan. Per the note above these are order-of-magnitude figures, so do not read a precise speedup ratio out of them; the single-connection rows are the ones with a tight enough spread to compare.
 - **Parallelism no longer helps Arrow inserts.** Since the `0.0.26479` engine, single-connection `AsyncArrowInserter` (68.9 M rows/s) outruns `AsyncArrowInserter × 4`, so spending connections on an Arrow insert buys nothing on this host.
 - **Sync beats async on single-connection reads.** `query.full_scan` sync runs 31.1 M rows/s against async's 24.9 M rows/s, and `query.filtered` 33.2 vs 26.9 M rows/s. Async wins only once it can use multiple connections, so prefer the sync path for a single streaming consumer and reach for async when you have concurrency to exploit.
-- **Async dominates single-connection *inserts*** — `AsyncArrowInserter` at 68.9 M rows/s versus sync `Inserter` at 25.5 M rows/s, a 2.7× gap. This is the one figure the `0.0.26479` engine bump moved: **+127%** (30.4 → 68.9 M rows/s), reproduced as **+75%** at 10M. Both are medians of 5 interleaved runs whose old and new ranges do not overlap, so the gain survives this workload's wide ±25–35% spread. Sync inserts were unaffected.
+- **Async dominates single-connection *inserts*** — `AsyncArrowInserter` at 68.9 M rows/s versus sync `Inserter` at 25.0 M rows/s, a 2.8× gap. This is the one figure the `0.0.26479` engine bump moved: **+127%** (30.4 → 68.9 M rows/s), reproduced as **+75%** at 10M. Both are medians of 5 interleaved runs whose old and new ranges do not overlap, so the gain survives this workload's wide ±25–35% spread. Sync inserts were unaffected.
 - **Single-connection scans are much faster than the previous entry** (18.8 → 31.1 M rows/s sync full-scan). Note this is *not* a controlled comparison: the prior numbers were taken on a different `hyperd`, rustc 1.94, and macOS 26.4, so the gain cannot be attributed to any single change.
 
 #### Transport A/B — Unix Domain Socket vs TCP loopback
@@ -579,14 +579,14 @@ out differently — worth measuring.
 2. Run the suite:
 
    ```sh
-   HYPERD_PATH=/path/to/hyperd \
+   HYPERD_PATH="$PWD/.hyperd/current" \
      ./target/release/examples/benchmark_suite 100000000 4
    ```
 
 3. Copy-paste:
    - The `Host:` block from stdout into the platform section as the hardware/software block.
    - The `| Workload | … |` markdown table at the end of stdout into the results block.
-4. Commit both the doc update and the JSON artifact (`test_results/benchmark_suite.json`) so future runs can diff against yours.
+4. Commit the doc update, and keep or attach the gitignored `test_results/benchmark_suite.json` so future runs can diff against yours.
 
 ## Tuning
 

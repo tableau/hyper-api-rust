@@ -22,9 +22,9 @@ Seven GitHub Actions workflows live under [`.github/workflows/`](../.github/work
 
 | Workflow | File | Triggers | Purpose |
 |---|---|---|---|
-| `ci` | [ci.yml](../.github/workflows/ci.yml) | `push` to `main`, all PRs, manual | fmt, clippy, full test matrix, `cargo deny`, `cargo audit`, `cargo publish --dry-run` |
+| `ci` | [ci.yml](../.github/workflows/ci.yml) | `push` to `main`, all PRs, manual | fmt, clippy, msrv, doc, full test matrix, Node bindings build, `cargo deny`, `cargo audit`, version consistency, `cargo publish --dry-run` |
 | `release-please` | [release-please.yml](../.github/workflows/release-please.yml) | `push` to `main`, GitHub Release `published`, manual | open/update the release PR with version bumps + CHANGELOG. Does **not** tag: `skip-github-release: true` means the maintainer creates the tag and Release by hand — see [Cutting a release](#cutting-a-release). The `release: published` re-run re-anchors the next `-rc.N` on the just-cut tag (#308) |
-| `release` | [release.yml](../.github/workflows/release.yml) | GitHub Release `published`, manual (`workflow_dispatch` against an existing tag) | re-run tests, publish the 8 Rust crates to crates.io (`hyperdb-api-node` is published separately to npm). **Not** a tag push: that trigger was removed to stop duplicate runs, so pushing a tag alone publishes nothing |
+| `release` | [release.yml](../.github/workflows/release.yml) | GitHub Release `published`, manual (`workflow_dispatch` against an existing tag) | check that CI already passed on the tagged SHA, publish the 8 Rust crates to crates.io (`hyperdb-api-node` is published separately to npm). **Not** a tag push: that trigger was removed to stop duplicate runs, so pushing a tag alone publishes nothing |
 | `npm-build-publish` | [npm-build-publish.yml](../.github/workflows/npm-build-publish.yml) | GitHub Release published, manual | build npm platform packages with bundled hyperd, publish to npm registry |
 | `verify-hyperd-pin` | [verify-hyperd-pin.yml](../.github/workflows/verify-hyperd-pin.yml) | changes to `hyperdb-bootstrap/hyperd-version.toml` or its source, weekly cron, manual | `HEAD` every pinned hyperd release URL to catch Tableau yanks / typos |
 | `verify-release-pr-version` | [verify-release-pr-version.yml](../.github/workflows/verify-release-pr-version.yml) | `pull_request` to `main` | fail the release-please PR if it proposes a version behind `main` (backward-bump guard, #308). Runs on every PR but only acts on the `release-please--branches--*` branch, so non-release PRs report a plain `success` |
@@ -35,11 +35,15 @@ Seven GitHub Actions workflows live under [`.github/workflows/`](../.github/work
 Runs on **every PR** and on **every push to `main`**. Jobs:
 
 - `rustfmt` — `cargo fmt --all --check`.
-- `clippy` — `cargo clippy --workspace --all-targets -- -D warnings` (single runner; lints are platform-independent).
-- `test` — full workspace test matrix on `ubuntu-24.04`, `macos-26`, `windows-2025`.
-- `publish-dry-run` — `cargo publish --dry-run` for each publishable crate so a broken publish manifest is caught before a tag is cut.
+- `clippy (ubuntu-24.04)` and `clippy (windows-2025)` — `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
+- `msrv (1.88)` — `cargo check` of the workspace and `hyperdb-compile-check` at the MSRV floor.
+- `doc` — `cargo doc --no-deps` with `RUSTDOCFLAGS="-D warnings"` for the eight workspace crates (mirrors `make doc`); `hyperdb-compile-check` sits outside the workspace and is not covered.
+- `test (ubuntu-24.04)`, `test (macos-26)`, `test (windows-2025)` — full workspace test matrix.
+- `hyperdb-api-node (build + smoke)` — builds the native addon and runs a smoke test.
+- `publish dry-run` — `cargo publish --dry-run` for `hyperdb-bootstrap` and `sea-query-hyperdb` only; the other crates depend on sibling versions that exist only after the release wave lands, so their dry-run cannot resolve.
 - `cargo-deny` — license and advisory policy enforcement per [`deny.toml`](../deny.toml).
 - `cargo-audit` — RustSec advisories, `--deny warnings`.
+- `version consistency` — `version.txt` matches the Cargo workspace version, and the npm `package.json` files carry no in-source `version` field (`npm-build-publish.yml` injects it at publish time).
 
 In-progress PR CI runs are **cancelled** when a new commit is pushed to
 the PR. Main-branch runs always complete. This is set via the
@@ -53,7 +57,7 @@ is `true`) or via manual `workflow_dispatch` with an explicit tag input
 (for re-runs or emergency releases). Structure:
 
 ```text
-verify          ← full test suite + hyperd URL check, single-platform
+verify          ← polls the CI check-runs on the tagged SHA + hyperd URL check
    │
    └─► publish          ← crates.io publish in dependency order
 ```
@@ -72,9 +76,11 @@ verification step resolves the just-published dep):
    break the optional cycle with `hyperdb-api-core`)
 2. `hyperdb-api-core`
 3. `hyperdb-api`
-4. `hyperdb-mcp`
-5. `hyperdb-bootstrap`
-6. `sea-query-hyperdb`
+4. `hyperdb-compile-check` (outside the workspace; published with `--allow-dirty`)
+5. `hyperdb-api-derive`
+6. `hyperdb-mcp`
+7. `hyperdb-bootstrap`
+8. `sea-query-hyperdb`
 
 `hyperdb-api-node` is **not** on the crates.io list (its `Cargo.toml` has
 `publish = false`) — it ships as npm `hyperdb-api-node` through napi-rs's
@@ -85,7 +91,7 @@ automatically for tags containing `-rc.`, `-alpha.`, or `-beta.` — they
 show up on the Releases page but are not flagged as "Latest release".
 
 **Concurrency:** only one release workflow runs at a time (the `concurrency:
-release` group at the top of the file); a second tag push during a
+release` group at the top of the file); a second release event during a
 release will queue, not clobber.
 
 ### npm-publish (`npm-build-publish.yml`)
@@ -97,8 +103,8 @@ without needing Rust toolchains or manual hyperd setup.
 
 **Triggers:**
 
-- **GitHub Release published** — fires automatically after `release.yml`
-  creates/updates a GitHub Release.
+- **GitHub Release published** — fires on the same `release: published`
+  event as `release.yml`; the two workflows run in parallel.
 - **Manual `workflow_dispatch`** — tag/branch input is optional; leave
   empty to build from the default branch HEAD (useful for testing the
   pipeline without tagging).
@@ -106,9 +112,9 @@ without needing Rust toolchains or manual hyperd setup.
 **Structure:**
 
 ```text
-verify-ci       ← checks that CI passed for this commit (gh api commit status)
+verify-ci       ← checks that CI passed for this commit (gh api check-runs)
    │
-   └─► build-npm (matrix × 4 platforms)
+   └─► build-npm (matrix × 3 platforms)
           build hyperdb-mcp + hyperdb-api-node native binaries
           download hyperd via curl with SHA256 verification
           assemble platform packages (binary + hyperd + LICENSE-HYPERD)
@@ -143,10 +149,10 @@ Intel-Mac users must build from source.
 | `hyperdb-api-node` | Main (napi-rs) | JS bindings + `getHyperdPath()` helper |
 | `hyperdb-api-node-*` | Platform | `.node` addon + `hyperd` + `LICENSE-HYPERD` |
 
-**CI gate:** The `verify-ci` job checks that the combined commit status
-is `success` before building. If CI hasn't passed (e.g., someone
-triggers a manual dispatch on a broken commit), the workflow aborts
-immediately. Note: this does **not** prevent tagging — git tags can be
+**CI gate:** On a `release: published` event the `verify-ci` job polls the
+tagged commit's CI check-runs and aborts the workflow if a required check
+failed. A manual `workflow_dispatch` skips `verify-ci` and builds without
+that gate. Note: this does **not** prevent tagging — git tags can be
 created regardless of CI status. Use GitHub Rulesets (repo Settings →
 Rules) to enforce tag-creation restrictions if needed.
 
@@ -316,7 +322,7 @@ gh release create vX.Y.Z \
 After the tag is created:
 
 1. Watch [`release.yml`](https://github.com/tableau/hyper-api-rust/actions/workflows/release.yml) —
-   it re-runs the verify suite on the tagged SHA, then publishes the
+   it confirms CI already passed on the tagged SHA, then publishes the
    crates to crates.io in dependency order.
 2. Watch [`npm-build-publish.yml`](https://github.com/tableau/hyper-api-rust/actions/workflows/npm-build-publish.yml)
    in parallel.
@@ -727,8 +733,8 @@ The `release` workflow is mostly idempotent but there are two sharp edges:
   `Publish in dependency order` step. Wait for the cooldown printed in the
   error and rerun via Actions → `release` → "Run workflow", entering the
   same tag name in the `tag` input. Already-published crates fail loudly
-  with "already uploaded" and the run will continue past them via the
-  per-crate retry below.
+  with "already exists on" and the publish step skips that crate and
+  continues with the next one.
 
 ### Re-running release.yml against an existing tag
 
@@ -746,7 +752,7 @@ The workflow's regex validator rejects malformed tag names, and
 
 | Secret | Used by | Scope |
 |---|---|---|
-| `RELEASE_PLEASE_TOKEN` | [release-please.yml](../.github/workflows/release-please.yml) | Classic PAT; triggers CI on release-please PRs/tags (see below) |
+| `RELEASE_PLEASE_TOKEN` | [release-please.yml](../.github/workflows/release-please.yml) | Classic PAT; triggers CI on release-please PRs (see below) |
 | `CARGO_REGISTRY_TOKEN` | [release.yml](../.github/workflows/release.yml) `publish` job | `cargo publish` to crates.io |
 | `NPM_TOKEN` | [npm-build-publish.yml](../.github/workflows/npm-build-publish.yml) `publish-npm` job | `npm publish` to npmjs.org |
 | `GITHUB_TOKEN` | Every workflow | Auto-provided by GitHub Actions; used to post releases, download artifacts, verify CI status |
@@ -755,8 +761,7 @@ The workflow's regex validator rejects malformed tag names, and
 
 GitHub Actions suppresses workflow triggers on events created by
 `GITHUB_TOKEN` (anti-recursion protection). Without a PAT, PRs opened
-by release-please don't trigger CI, and tags it pushes don't trigger
-`release.yml` or `npm-build-publish.yml`. The workaround is a PAT
+by release-please don't trigger CI. The workaround is a PAT
 stored as `RELEASE_PLEASE_TOKEN`.
 
 ### Option A: Classic PAT (current setup)

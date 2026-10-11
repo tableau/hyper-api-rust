@@ -22,17 +22,19 @@
 //!
 //! - Write data to a temporary file (e.g. `batch.csv.tmp`), then **rename**
 //!   it to the final name (`batch.csv`). Do not write directly to the target.
-//! - Never replace a data file with a symlink between writing and creating
-//!   the `.ready` sentinel — the watcher resolves symlinks via
-//!   `canonicalize()`, but the window between existence check and open
-//!   cannot be fully eliminated without kernel-level file descriptors.
+//! - Never use a symlink for the data file or the sentinel. The watcher
+//!   checks both with `symlink_metadata()` and skips the pair when either
+//!   is a symlink, but a swap between that check and the open cannot be
+//!   ruled out without kernel-level file descriptors.
 //! - On shared filesystems, ensure the rename is atomic (same mount point).
 //!
 //! Only one table per watched directory is supported; ingest is always in
-//! append mode. File extensions decide the ingest path: `.csv`/`.json` go
-//! through the CSV ingest (JSON-lines not supported today), `.parquet`/`.pq`
-//! through the Parquet ingest, and `.arrow`/`.ipc`/`.feather` through the
-//! Arrow IPC ingest.
+//! append mode. The data file's extension selects the ingest path:
+//! `.parquet`/`.pq` use the Parquet ingest, `.arrow`/`.ipc`/`.feather` the
+//! Arrow IPC ingest, and `.json`/`.jsonl`/`.ndjson` the JSON ingest (arrays
+//! and JSON Lines). Every other extension, `.csv` included, is
+//! content-sniffed: a first non-whitespace byte of `[` or `{` selects JSON,
+//! anything else CSV.
 //!
 //! # Concurrency model
 //!
@@ -320,7 +322,7 @@ impl WatcherRegistry {
                     .and_then(|t| now.duration_since(t).ok())
                     // `Duration::as_millis` is `u128`; saturate to
                     // `u64::MAX` on the absurd-long-duration edge
-                    // instead of silently wrapping (AGENTS.md §9).
+                    // instead of silently wrapping (AGENTS.md reminder 7).
                     .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
                 json!({
                     "directory": h.directory.to_string_lossy(),
@@ -367,7 +369,7 @@ impl Drop for InFlightGuard {
 
 #[expect(
     clippy::needless_pass_by_value,
-    reason = "call-site ergonomics: function consumes logically-owned parameters, refactoring signatures is not worth per-site churn"
+    reason = "engine, attachments, registry, subscriptions, dir and options are only borrowed or Arc-cloned; by-value keeps the single server call site simple"
 )]
 /// Begin watching `dir`. Builds a dedicated connection pool, runs the
 /// initial sweep (sequentially — there's no benefit to parallelism for
@@ -380,17 +382,28 @@ impl Drop for InFlightGuard {
 ///
 /// # Errors
 ///
-/// - Returns [`ErrorCode::FileNotFound`] if `dir` does not exist, is
-///   not a directory, or cannot be canonicalized.
-/// - Returns [`ErrorCode::InternalError`] if the watcher registry
-///   mutex or engine mutex is poisoned, if the engine has not been
-///   initialized, if `start_watching` is not called from a Tokio
-///   runtime, or if the watcher pool / OS file-system watcher cannot
-///   be constructed.
-/// - Returns [`ErrorCode::InternalError`] wrapping the error string
-///   when [`notify::RecommendedWatcher`] setup fails.
-/// - Propagates any error from the initial sweep's per-file ingest
-///   (file read, schema inference, or Hyper `COPY` / `INSERT` errors).
+/// - Returns [`ErrorCode::FileNotFound`] if `dir` does not exist, is not a
+///   directory, or cannot be canonicalized.
+/// - Returns [`ErrorCode::InvalidArgument`] if `target_db` is `persistent`
+///   while the server runs in `--ephemeral-only` mode, or names an alias that
+///   is not attached or is attached read-only.
+/// - Returns [`ErrorCode::InternalError`] if `dir` is already watched, the
+///   watcher registry mutex is poisoned, the engine is not initialized
+///   (including after a poisoned engine mutex is recovered), no `hyperd`
+///   endpoint is available, the call is not made from inside a Tokio runtime,
+///   or the pool, the OS file watcher, or the forwarder thread cannot be
+///   created.
+///
+/// Per-file failures during the initial sweep are not errors: those files
+/// move to `failed/` and are counted in the returned
+/// [`WatcherStats::files_failed`].
+///
+/// # Panics
+///
+/// Panics if called from a `current_thread` Tokio runtime, because the
+/// initial sweep runs under [`tokio::task::block_in_place`]. The
+/// `max_concurrent` conversion cannot panic: `resolved_concurrency` clamps
+/// to [`MAX_CONCURRENT_LIMIT`], which fits in a `u32`.
 pub fn start_watching(
     engine: Arc<Mutex<Option<Engine>>>,
     attachments: Arc<AttachRegistry>,
@@ -452,9 +465,8 @@ pub fn start_watching(
     )?));
 
     let stats = Arc::new(Mutex::new(WatcherStats {
-        // Concurrency is configured by the user via a `u32`-sized field
-        // upstream; saturating is a safe diagnostic.
-        max_concurrent: u32::try_from(concurrency).unwrap_or(u32::MAX),
+        max_concurrent: u32::try_from(concurrency)
+            .expect("resolved_concurrency clamps to MAX_CONCURRENT_LIMIT"),
         ..Default::default()
     }));
     let in_flight = Arc::new(AtomicU32::new(0));

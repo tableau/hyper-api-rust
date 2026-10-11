@@ -7,11 +7,11 @@ The UI is a React SPA (Vite + Tailwind). The API is Express + TypeScript, backed
 ## Prerequisites
 
 - **Node.js** >= 21  
-- **Rust toolchain** (stable) — required to build `hyperdb-api-node` from the workspace when using `file:../../`  
+- **Rust toolchain** (stable) and **`protoc`** — required to build `hyperdb-api-node` from the workspace when using `file:../../`  
 - **`hyperdb-api-node` built** — from the `hyperdb-api-node/` directory:
   - Release: `npm run build` (faster runtime)
   - Debug: `npm run build:debug` (faster compile while iterating on Rust)
-- **`hyperd`** — set the **`HYPERD_PATH`** environment variable to the `hyperd` executable (same as the rest of this repo)
+- **`hyperd`** — run `make download-hyperd` (or `.\build.ps1 download-hyperd`) from the repo root; `HyperProcess` finds `.hyperd/current` by walking up from the working directory. Set an absolute **`HYPERD_PATH`** to override it.
 
 ## Quick start
 
@@ -56,7 +56,6 @@ For a static deployment, run `npm run build`, host `dist/` behind any static fil
 ## System architecture
 
 ```mermaid
-%%{init: {'theme': 'base', 'themeVariables': { 'lineColor': '#93c5fd', 'primaryColor': '#1e293b', 'primaryTextColor': '#e2e8f0', 'primaryBorderColor': '#475569', 'secondaryColor': '#172554', 'tertiaryColor': '#1e293b', 'edgeLabelBackground': '#0f172a', 'clusterBkg': '#0f172a', 'clusterBorder': '#475569' }}}%%
 graph TB
     subgraph Browser["Browser (localhost:5173)"]
         React["React SPA<br/>Vite + TailwindCSS"]
@@ -96,10 +95,10 @@ graph TB
     Proxy -->|"proxy"| Express
     Pool -->|"hyperdb-api-node<br/>Connection, Catalog"| HyperProcess
 
-    style Browser fill:#1e293b,stroke:#475569,color:#e2e8f0
-    style Express fill:#1e293b,stroke:#475569,color:#e2e8f0
-    style HyperProcess fill:#172554,stroke:#60a5fa,color:#93c5fd
-    style Vite fill:#1e293b,stroke:#475569,color:#e2e8f0
+    style Browser fill:none,stroke:#475569
+    style Express fill:none,stroke:#475569
+    style HyperProcess fill:none,stroke:#60a5fa
+    style Vite fill:none,stroke:#475569
 ```
 
 ## Backend: connection pool and query statistics
@@ -114,7 +113,6 @@ If `hyperd.log` is unavailable, stats collection is skipped gracefully; the app 
 ## Request flow: opening a database
 
 ```mermaid
-%%{init: {'theme': 'base', 'themeVariables': { 'lineColor': '#93c5fd', 'signalColor': '#93c5fd', 'actorLineColor': '#93c5fd', 'actorBorder': '#60a5fa', 'actorBkg': '#1e293b', 'actorTextColor': '#e2e8f0', 'loopTextColor': '#cbd5e1', 'noteBkgColor': '#1e3a5f', 'noteTextColor': '#e2e8f0', 'noteBorderColor': '#60a5fa', 'activationBkgColor': '#334155', 'activationBorderColor': '#60a5fa', 'sequenceNumberColor': '#93c5fd' }}}%%
 sequenceDiagram
     participant U as User
     participant R as React app
@@ -146,7 +144,6 @@ sequenceDiagram
 ## Request flow: column detail + Fourier analysis
 
 ```mermaid
-%%{init: {'theme': 'base', 'themeVariables': { 'lineColor': '#93c5fd', 'signalColor': '#93c5fd', 'actorLineColor': '#93c5fd', 'actorBorder': '#60a5fa', 'actorBkg': '#1e293b', 'actorTextColor': '#e2e8f0', 'loopTextColor': '#cbd5e1', 'noteBkgColor': '#1e3a5f', 'noteTextColor': '#e2e8f0', 'noteBorderColor': '#60a5fa', 'activationBkgColor': '#334155', 'activationBorderColor': '#60a5fa', 'sequenceNumberColor': '#93c5fd' }}}%%
 sequenceDiagram
     participant U as User
     participant R as React app
@@ -183,7 +180,6 @@ sequenceDiagram
 ## Request flow: generating a database
 
 ```mermaid
-%%{init: {'theme': 'base', 'themeVariables': { 'lineColor': '#93c5fd', 'signalColor': '#93c5fd', 'actorLineColor': '#93c5fd', 'actorBorder': '#60a5fa', 'actorBkg': '#1e293b', 'actorTextColor': '#e2e8f0', 'loopTextColor': '#cbd5e1', 'noteBkgColor': '#1e3a5f', 'noteTextColor': '#e2e8f0', 'noteBorderColor': '#60a5fa', 'activationBkgColor': '#334155', 'activationBorderColor': '#60a5fa', 'sequenceNumberColor': '#93c5fd' }}}%%
 sequenceDiagram
     participant U as User
     participant R as React app
@@ -202,7 +198,7 @@ sequenceDiagram
         Note over H: Hyper generates rows using random() and math functions
         E->>H: executeQuery(SELECT COUNT(*))
     end
-    E-->>R: {dbPath, results: [{table, rowCount, durationMs}], _queries}
+    E-->>R: {dbPath, results: [{table, rowCount, durationMs}]}
     R-->>U: Success + "Open in Explorer"
     U->>R: Open generated file
     R->>E: POST /api/open {path}
@@ -233,11 +229,13 @@ sequenceDiagram
 
 | Data type | Statistics |
 |-----------|--------------|
-| **All types** | Row count, null count/%, distinct count, cardinality % |
-| **Numeric** (INT, DOUBLE, …) | Min, max, mean, median, std dev, CV%, variance, sum, p10/p25/p75/p90 |
-| **Text** | Min/max/avg length, top values |
-| **Boolean** | True/false counts and percentages |
+| **All types** | Row count, null count/%, distinct count |
+| **Numeric** (INT, DOUBLE, …) | Min, max, mean, std dev, CV% |
+| **Text** | Min/max/avg length, top 5 values |
+| **Boolean** | True/false counts, true % |
 | **Date / timestamp** | Min, max |
+
+Cardinality %, median, variance, sum, and percentiles appear in the column detail view.
 
 ### Numeric column visualizations (column detail)
 
@@ -277,6 +275,7 @@ hyper-explorer/
 │   ├── main.tsx
 │   ├── App.tsx                  # Layout, tabs, pool-driven loading, global drag-drop
 │   ├── api.ts                   # fetch helpers, _queries fan-out, types (incl. QueryStats)
+│   ├── index.css
 │   ├── fourierClient.ts         # Client DFT, reconstruction, R², term selection
 │   └── components/
 │       ├── FileOpener.tsx
@@ -299,24 +298,24 @@ hyper-explorer/
 
 ## API reference
 
-All data routes (except browse/open/close/generate-meta) require the **`db`** query parameter or body field set to the absolute path of the open `.hyper` file.
+All data routes (except browse/open/close/generate-meta/generate) require the **`db`** query parameter or body field set to the absolute path of the open `.hyper` file.
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/api/browse?dir=` | List directories and `.hyper` files (optional `dir`, default home); items include `size`, `lastModified` |
 | `POST` | `/api/open` | Body `{ path }` — schema tree; may include `_queries` |
 | `POST` | `/api/close` | Body `{ path }` — close pooled connections for that path |
-| `GET` | `/api/preview/:schema/:table?db=&limit=&offset=&sortColumn=&sortDir=` | Paginated rows + `totalRowCount`; `limit` capped at **1000**; optional `sortColumn` / `sortDir` (`asc`/`desc`); `_queries` |
+| `GET` | `/api/preview/:schema/:table?db=&limit=&offset=&sortColumn=&sortDir=&withCount=` | Paginated rows; `limit` capped at **1000**; `totalRowCount` is computed only when `withCount=1` (otherwise `null`); optional `sortColumn` / `sortDir` (`asc`/`desc`); `_queries` |
 | `GET` | `/api/stats/:schema/:table?db=` | Per-column statistics; `_queries` |
 | `GET` | `/api/column-detail/:schema/:table/:column?db=` | Detail payload + `_queries` |
-| `POST` | `/api/query` | Body `{ db, sql }` — SELECT → rows + columns; otherwise command; returns `durationMs`, optional `queryStats`, `_queries` |
+| `POST` | `/api/query` | Body `{ db, sql }` — SELECT → rows + columns; otherwise command; returns `durationMs` and optional `queryStats` |
 | `GET` | `/api/generate-meta` | Supported types and distributions |
-| `POST` | `/api/generate` | Body `{ dbPath, tables: [...] }` — create DB; `_queries` |
+| `POST` | `/api/generate` | Body `{ dbPath, tables: [...] }` — deletes any existing file at `dbPath`, then creates the DB; returns `{ dbPath, results }` |
 
 ## Tech stack
 
 - **Backend** — Express 4, TypeScript, **`tsx`** (watch in dev), **`hyperdb-api-node`** (N-API bindings to the Rust Hyper client).
-- **Frontend** — React 18, **Vite 7**, TailwindCSS 3, **`sql-formatter`** (PostgreSQL dialect).
+- **Frontend** — React 18, **Vite 8**, TailwindCSS 3, **`sql-formatter`** (PostgreSQL dialect).
 - **Math** — Radix-2 FFT on the server for spectrum data; client-side DFT / Fourier reconstruction / monotone cubic splines (Fritsch–Carlson).
 - **Concurrency** — `ConnectionPool` + tracked wrappers attach `queryStats` when the log path is known.
 
@@ -325,7 +324,7 @@ All data routes (except browse/open/close/generate-meta) require the **`db`** qu
 The example is self-contained aside from:
 
 - **`hyperdb-api-node`** — `file:../../` in `package.json` (swap for a published package if you ship it).
-- **`hyperd`** — pointed to by **`HYPERD_PATH`**.
+- **`hyperd`** — found via `.hyperd/current` or **`HYPERD_PATH`**.
 
 ## Notes
 

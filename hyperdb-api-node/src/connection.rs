@@ -104,15 +104,10 @@ impl Connection {
         self.inner
             .execute_command(&sql)
             .await
-            .map(|n| {
-                #[expect(
-                    clippy::cast_possible_wrap,
-                    reason = "NAPI BigInt ↔ Hyper u64 bit-pattern reinterpret; JS consumers read the BigInt as an unsigned affected-row count"
-                )]
-                let signed = n as i64;
-                signed
-            })
             .map_err(|e| Error::from_reason(e.to_string()))
+            .and_then(|n| {
+                i64::try_from(n).map_err(|_| Error::from_reason("row count exceeds i64::MAX"))
+            })
     }
 
     /// Executes a SQL query and returns all result rows.
@@ -229,6 +224,16 @@ impl Connection {
         self.inner.database().map(std::string::ToString::to_string)
     }
 
+    /// Returns true if the session is encrypted with TLS.
+    ///
+    /// `false` for a plaintext TCP connection, including a
+    /// `{ mode: 'prefer' }` connection whose server declined TLS, and for a
+    /// Unix domain socket or named pipe.
+    #[napi(getter)]
+    pub fn is_tls(&self) -> bool {
+        self.inner.is_tls()
+    }
+
     /// Returns true if the connection is alive and has not been closed.
     #[napi(getter)]
     pub fn is_alive(&self) -> bool {
@@ -295,6 +300,58 @@ impl Connection {
 }
 
 // =============================================================================
+// TlsOptions
+// =============================================================================
+
+/// TLS settings for [`ConnectionBuilder::tls`], with libpq `sslmode`
+/// semantics.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct TlsOptions {
+    /// `"disable"`, `"prefer"`, `"require"`, `"verify-ca"` or
+    /// `"verify-full"`.
+    pub mode: String,
+    /// PEM file of trusted root certificates. Required by `"verify-ca"` and
+    /// `"verify-full"`; with `"prefer"` or `"require"` it turns on chain
+    /// verification.
+    pub root_cert: Option<String>,
+    /// PEM client certificate for mutual TLS. Requires `clientKey`.
+    pub client_cert: Option<String>,
+    /// PEM private key for `clientCert`.
+    pub client_key: Option<String>,
+    /// Host name to verify and send as SNI instead of the endpoint's host.
+    pub server_name: Option<String>,
+}
+
+impl TryFrom<&TlsOptions> for hyperdb_api::TlsConfig {
+    type Error = Error;
+
+    fn try_from(options: &TlsOptions) -> Result<Self> {
+        let mode: hyperdb_api::TlsMode = options
+            .mode
+            .parse()
+            .map_err(|e: hyperdb_api::ParseTlsModeError| Error::from_reason(e.to_string()))?;
+        let mut tls = hyperdb_api::TlsConfig::new(mode);
+        if let Some(root_cert) = &options.root_cert {
+            tls = tls.root_cert(root_cert);
+        }
+        match (&options.client_cert, &options.client_key) {
+            (Some(cert), Some(key)) => tls = tls.client_cert(cert, key),
+            (None, None) => {}
+            _ => {
+                return Err(Error::from_reason(
+                    "clientCert and clientKey must be set together",
+                ));
+            }
+        }
+        if let Some(server_name) = &options.server_name {
+            tls = tls.server_name(server_name);
+        }
+        Ok(tls)
+    }
+}
+
+// =============================================================================
 // ConnectionBuilder
 // =============================================================================
 
@@ -308,6 +365,7 @@ pub struct ConnectionBuilder {
     user: Option<String>,
     password: Option<String>,
     login_timeout_ms: Option<u32>,
+    tls: Option<TlsOptions>,
 }
 
 #[napi]
@@ -322,6 +380,7 @@ impl ConnectionBuilder {
             user: None,
             password: None,
             login_timeout_ms: None,
+            tls: None,
         }
     }
 
@@ -360,6 +419,19 @@ impl ConnectionBuilder {
         self
     }
 
+    /// Sets the TLS options for a TCP connection; the default is
+    /// `{ mode: 'disable' }`.
+    ///
+    /// Over a Unix domain socket or a named pipe, `"prefer"` connects in
+    /// plaintext and the modes that require TLS fail `build()`. A gRPC
+    /// endpoint picks TLS through its `https://` scheme, so any mode but
+    /// `"disable"` fails there too. The options are checked by `build()`.
+    #[napi]
+    pub fn tls(&mut self, options: TlsOptions) -> &Self {
+        self.tls = Some(options);
+        self
+    }
+
     /// Builds and establishes the connection.
     #[napi]
     pub async fn build(&self) -> Result<Connection> {
@@ -380,6 +452,9 @@ impl ConnectionBuilder {
         }
         if let Some(ms) = self.login_timeout_ms {
             builder = builder.login_timeout(Duration::from_millis(u64::from(ms)));
+        }
+        if let Some(options) = &self.tls {
+            builder = builder.tls(hyperdb_api::TlsConfig::try_from(options)?);
         }
 
         let conn = builder

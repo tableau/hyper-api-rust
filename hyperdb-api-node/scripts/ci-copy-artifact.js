@@ -16,8 +16,6 @@ const TARGET_MAP = {
   'aarch64-apple-darwin':        { npm: 'darwin-arm64',     lib: 'libhyperdb_api_node.dylib' },
   'x86_64-apple-darwin':         { npm: 'darwin-x64',       lib: 'libhyperdb_api_node.dylib' },
   'x86_64-unknown-linux-gnu':    { npm: 'linux-x64-gnu',    lib: 'libhyperdb_api_node.so' },
-  'x86_64-unknown-linux-musl':   { npm: 'linux-x64-musl',   lib: 'libhyperdb_api_node.so' },
-  'aarch64-unknown-linux-gnu':   { npm: 'linux-arm64-gnu',  lib: 'libhyperdb_api_node.so' },
   'x86_64-pc-windows-msvc':      { npm: 'win32-x64-msvc',   lib: 'hyperdb_api_node.dll' },
 };
 

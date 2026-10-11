@@ -37,10 +37,9 @@ pub struct AsyncTransaction<'conn> {
 impl<'conn> AsyncTransaction<'conn> {
     /// Creates a new async transaction by issuing `BEGIN TRANSACTION`.
     pub(crate) async fn new(connection: &'conn mut AsyncConnection) -> Result<Self> {
-        // Use the crate-internal `_raw` family. The matching `pub`
-        // methods on `AsyncConnection` are `#[deprecated]` for
-        // downstream consumers; this guard is the recommended
-        // replacement.
+        // Delegate to the public `*_unguarded` primitive; commit/rollback
+        // consume `self`. Drop cannot roll back (no async Drop), so it only
+        // warns.
         connection.begin_transaction_unguarded().await?;
         Ok(Self {
             connection,

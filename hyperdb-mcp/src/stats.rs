@@ -34,7 +34,7 @@ impl StatsTimer {
     pub fn elapsed_ms(&self) -> u64 {
         // `Duration::as_millis` returns `u128`; `as u64` would
         // silently wrap at ~584 million years, which is absurd in
-        // practice but banned by AGENTS.md §9 (no narrowing integer
+        // practice but banned by AGENTS.md reminder 7 (no narrowing integer
         // casts) because the cast is a latent data-corruption
         // vector if reached. `u64::try_from` with a saturating
         // fallback makes the overflow handling explicit.

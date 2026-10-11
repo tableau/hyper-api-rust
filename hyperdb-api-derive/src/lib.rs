@@ -77,8 +77,8 @@ enum FieldSource {
 ///
 /// # Attributes (field level)
 ///
-/// - `#[hyperdb(primary_key)]` — marks the column as NOT NULL (always true
-///   for non-`Option` fields, but documents intent).
+/// - `#[hyperdb(primary_key)]` — documents intent only; it emits no constraint.
+///   Nullability follows the field type (`Option<T>` is nullable).
 /// - `#[hyperdb(rename = "col")]` — use a different SQL column name.
 #[proc_macro_derive(Table, attributes(hyperdb))]
 pub fn table_derive(input: TokenStream) -> TokenStream {
@@ -123,6 +123,14 @@ pub fn table_derive(input: TokenStream) -> TokenStream {
 /// cache — a `query_as!` can be re-expanded in a process where no derive has
 /// run. Validation therefore skips when the registry is entirely empty, so the
 /// editor does not report errors on code that compiles.
+///
+/// # Known limitation: `OR` / `IN` lists over arguments
+///
+/// Arguments are bound through the `*_as_params` methods, which use
+/// `Connection::query_params`, so the `hyperd` defect documented there applies to `query_as!` and `query_scalar!`: a
+/// single-column filter such as `WHERE id IN ($1, $2)` or
+/// `WHERE id = $1 OR id = $2` fails with SQLSTATE `XX000`. Write
+/// `WHERE id IN (SELECT unnest(ARRAY[$1, $2]))` instead.
 #[proc_macro]
 pub fn query_as(input: TokenStream) -> TokenStream {
     match expand_query_as(&input.into()) {
@@ -248,9 +256,7 @@ fn expand_query_scalar(input: &TokenStream2) -> syn::Result<TokenStream2> {
         let sql_lit: Option<LitStr> = syn::parse2(quote!(#sql_expr)).ok();
         if let Some(sql_lit) = sql_lit {
             let sql_str = sql_lit.value();
-            // Validate SQL structure (syntax + table existence) using a dummy
-            // struct name that won't be in the registry — we only care about
-            // one-column check, not struct-field matching.
+            // Validate syntax, table registration, and that exactly one column is projected.
             match hyperdb_compile_check::validate_scalar_sql(&sql_str) {
                 Ok(()) => {}
                 Err(e) => {

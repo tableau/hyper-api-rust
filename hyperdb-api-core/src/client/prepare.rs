@@ -5,7 +5,7 @@
 //!
 //! # Parameter Encoding
 //!
-//! Use the \[`params!`\] macro for ergonomic parameter encoding:
+//! Use the [`params!`](crate::params) macro for ergonomic parameter encoding:
 //!
 //! ```no_run
 //! # use hyperdb_api_core::{params, client::{Client, Config}};
@@ -29,13 +29,12 @@ use super::row::Row;
 use super::statement::{Column, ParamFormat, bind_format_codes};
 use super::sync_stream::SyncStream;
 // =============================================================================
-// SqlParam trait - Zero-cost parameter encoding
+// SqlParam trait - binary parameter encoding
 // =============================================================================
 
 /// Trait for types that can be encoded as SQL prepared statement parameters.
 ///
-/// This trait enables the \[`params!`\] macro to automatically encode values.
-/// All implementations use `#[inline]` for zero-cost abstraction.
+/// This trait enables the [`params!`](crate::params) macro to automatically encode values.
 pub trait SqlParam {
     /// Encodes the value as binary bytes.
     fn encode(&self) -> Vec<u8>;
@@ -161,7 +160,7 @@ fn generate_statement_name() -> String {
 /// with different parameters efficiently. The statement is prepared once on
 /// the server and can be executed many times with different parameter values.
 ///
-/// For automatic cleanup, use \[`OwnedPreparedStatement`\] via \[`crate::Client::prepare`\].
+/// Usually obtained through [`OwnedPreparedStatement::statement`]; [`Client::prepare`](crate::client::Client::prepare) returns the owned, self-closing wrapper.
 ///
 /// # Example
 ///
@@ -180,9 +179,9 @@ pub struct PreparedStatement {
     name: String,
     /// Original SQL query string.
     query: String,
-    /// Parameter type OIDs (empty if types were inferred by the server).
+    /// Parameter type OIDs from the server's `ParameterDescription`, one per placeholder.
     param_types: Vec<Oid>,
-    /// Result column descriptions (populated after first execution).
+    /// Result column descriptions from the `RowDescription` returned at prepare time (empty for statements without results).
     columns: Vec<Column>,
 }
 
@@ -236,7 +235,7 @@ impl OwnedPreparedStatement {
         self.statement.query()
     }
 
-    /// Returns the parameter types.
+    /// Returns the parameter type OIDs the server reported for this statement.
     #[must_use]
     pub fn param_types(&self) -> &[Oid] {
         self.statement.param_types()
@@ -319,7 +318,9 @@ impl PreparedStatement {
         &self.query
     }
 
-    /// Returns the parameter types.
+    /// Returns the parameter type OIDs the server reported for this statement.
+    ///
+    /// Hyper echoes the OIDs passed to `prepare_typed`, so an unspecified (`0`) OID reads back as `0`.
     #[must_use]
     pub fn param_types(&self) -> &[Oid] {
         &self.param_types
@@ -349,7 +350,7 @@ impl PreparedStatement {
 /// # Errors
 ///
 /// - Returns [`Error`] (connection) if the connection mutex is poisoned.
-/// - Returns [`Error`] (server) if the server rejects the `Parse` request
+/// - Returns [`Error::Query`] if the server rejects the `Parse` request
 ///   (SQL syntax error, unknown parameter OIDs, etc.).
 /// - Returns [`Error`] (I/O) / [`Error`] (closed) on wire-protocol I/O
 ///   failure.
@@ -437,7 +438,7 @@ pub fn prepare(
 /// # Errors
 ///
 /// - Returns [`Error`] (connection) if the connection mutex is poisoned.
-/// - Returns [`Error`] (server) if the server rejects `Bind` / `Execute`
+/// - Returns [`Error::Query`] if the server rejects `Bind` / `Execute`
 ///   (parameter type mismatch, constraint violation, etc.).
 /// - Returns [`Error`] (I/O) / [`Error`] (closed) on wire-protocol I/O
 ///   failure.
@@ -590,7 +591,7 @@ pub fn execute_prepared_no_result_with_formats(
 /// # Errors
 ///
 /// - Returns [`Error`] (connection) if the connection mutex is poisoned.
-/// - Returns [`Error`] (server) if the server reports an `ErrorResponse`
+/// - Returns [`Error::Query`] if the server reports an `ErrorResponse`
 ///   during `Close`/`Sync`.
 /// - Returns [`Error`] (I/O) / [`Error`] (closed) on wire-protocol I/O
 ///   failure.

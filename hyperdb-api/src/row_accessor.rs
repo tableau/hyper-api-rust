@@ -1,7 +1,7 @@
 // Copyright (c) 2026, Salesforce, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! [`RowAccessor`] — name-based column access for [`FromRow`] impls
+//! [`RowAccessor`] — name-based column access for [`FromRow`](crate::FromRow) impls
 //! with cached column-name → index resolution.
 //!
 //! When a typed query is consumed via [`Connection::fetch_one_as`] /

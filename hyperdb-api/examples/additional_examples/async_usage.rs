@@ -11,6 +11,9 @@
 //!
 //! # Running this example
 //!
+//! Requires the pinned `hyperd`: run `make download-hyperd` once, or set an
+//! absolute `HYPERD_PATH`.
+//!
 //! ```bash
 //! cargo run -p hyperdb-api --example async_usage
 //! ```
@@ -351,8 +354,9 @@ fn print_best_practices() {
     println!("2. Use spawn_blocking for synchronous Connection");
     println!("   Wrap all blocking database calls to avoid blocking the executor.\n");
 
-    println!("3. Create Connections inside spawn_blocking");
-    println!("   Connection is not Send/Sync - create it inside the blocking task.\n");
+    println!("3. Give each blocking task its own Connection");
+    println!("   A Connection runs one statement at a time; concurrent tasks need separate");
+    println!("   connections (or a pool::ConnectionPool).\n");
 
     println!("4. Share HyperProcess with Arc");
     println!("   HyperProcess can be wrapped in Arc and shared across tasks.\n");
@@ -364,5 +368,5 @@ fn print_best_practices() {
     println!("   Once data is retrieved, process it with async code (HTTP, file I/O).\n");
 
     println!("7. Consider connection pooling for high load");
-    println!("   See the connection_pool example for deadpool integration.\n");
+    println!("   See the connection_pool example for async connection pooling.\n");
 }

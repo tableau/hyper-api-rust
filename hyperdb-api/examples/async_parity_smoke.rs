@@ -5,7 +5,7 @@
 //!
 //! Exercises the full async surface — connect, DDL, parameterized
 //! DML, streaming reads, struct mapping, transactions — **without**
-//! calling `async_tcp_client()` or importing anything from
+//! reaching for the underlying protocol client or importing anything from
 //! `hyperdb_api_core::client`. If this example compiles and runs clean, the
 //! "async is a first-class equivalent of sync" contract holds.
 

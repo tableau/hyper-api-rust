@@ -3,52 +3,9 @@
 
 //! Query statistics collection for Hyper database queries.
 //!
-//! This module provides a mechanism to capture detailed query performance metrics
-//! from Hyper, including parsing time, compilation time, execution time, memory usage,
-//! storage I/O, and plan cache status.
-//!
-//! # Architecture
-//!
-//! The stats collection is abstracted behind the [`QueryStatsProvider`] trait, allowing
-//! the implementation to be swapped without changing the user-facing API. Currently,
-//! [`LogFileStatsProvider`] parses Hyper's JSON log file (`hyperd.log`) to extract
-//! per-query statistics. If Hyper adds native wire-protocol stats in the future, a new
-//! provider can replace the log-based one transparently.
-//!
-//! # Usage
-//!
-//! ```no_run
-//! use hyperdb_api::{Connection, CreateMode, HyperProcess, Result};
-//! use hyperdb_api::LogFileStatsProvider;
-//!
-//! fn main() -> Result<()> {
-//!     let hyper = HyperProcess::new(None, None)?;
-//!     let mut conn = Connection::new(&hyper, "test.hyper", CreateMode::CreateIfNotExists)?;
-//!
-//!     // Enable stats collection (auto-detect log path from HyperProcess)
-//!     conn.enable_query_stats(LogFileStatsProvider::from_process(&hyper));
-//!
-//!     // Execute a query
-//!     conn.execute_command("CREATE TABLE t (id INT)")?;
-//!
-//!     // Retrieve stats for the last query
-//!     if let Some(stats) = conn.last_query_stats() {
-//!         println!("Total elapsed: {}s", stats.elapsed_s);
-//!         if let Some(ref pre) = stats.pre_execution {
-//!             println!("  Parse: {:?}s, Compile: {:?}s",
-//!                 pre.parsing_time_s, pre.compilation_time_s);
-//!         }
-//!     }
-//!
-//!     Ok(())
-//! }
-//! ```
-//!
-//! # Availability
-//!
-//! - **Local `HyperProcess`**: Full stats available via log file parsing.
-//! - **Remote standalone Hyper**: Not available with the log-based provider (no local log file).
-//!   When Hyper adds native stats support, remote connections will work via a new provider.
+//! Statistics are collected through the [`QueryStatsProvider`] trait.
+//! [`LogFileStatsProvider`], the built-in implementation, parses Hyper's JSON log file
+//! (`hyperd.log`) to extract per-query statistics. See [`QueryStats`] for usage.
 
 use std::any::Any;
 use std::fmt;
@@ -65,12 +22,49 @@ use tracing::{debug, trace};
 
 /// Detailed statistics for a single query execution.
 ///
-/// All time fields are in seconds. Memory fields are in megabytes.
-/// Fields are `Option` because not all queries produce all stats (e.g., a simple
-/// `SET` command won't have execution storage stats).
+/// Covers parsing time, compilation time, execution time, memory usage,
+/// storage I/O, and plan cache status. All time fields are in seconds. Memory
+/// fields are in megabytes. Fields are `Option` because not all queries produce
+/// all stats (e.g., a simple `SET` command won't have execution storage stats).
+///
+/// # Example
+///
+/// ```no_run
+/// use hyperdb_api::{Connection, CreateMode, HyperProcess, Result};
+/// use hyperdb_api::LogFileStatsProvider;
+///
+/// fn main() -> Result<()> {
+///     let hyper = HyperProcess::new(None, None)?;
+///     let mut conn = Connection::new(&hyper, "test.hyper", CreateMode::CreateIfNotExists)?;
+///
+///     // Enable stats collection (auto-detect log path from HyperProcess)
+///     conn.enable_query_stats(LogFileStatsProvider::from_process(&hyper));
+///
+///     // Execute a query
+///     conn.execute_command("CREATE TABLE t (id INT)")?;
+///
+///     // Retrieve stats for the last query
+///     if let Some(stats) = conn.last_query_stats() {
+///         println!("Total elapsed: {}s", stats.elapsed_s);
+///         if let Some(ref pre) = stats.pre_execution {
+///             println!("  Parse: {:?}s, Compile: {:?}s",
+///                 pre.parsing_time_s, pre.compilation_time_s);
+///         }
+///     }
+///
+///     Ok(())
+/// }
+/// ```
+///
+/// # Availability
+///
+/// - **Local `HyperProcess`**: Full stats available via log file parsing.
+/// - **Remote standalone Hyper**: Not available with [`LogFileStatsProvider`], which needs a
+///   readable local log file.
 #[derive(Debug, Clone, Default)]
 pub struct QueryStats {
-    /// Total elapsed wall-clock time for the query (seconds).
+    /// Total elapsed wall-clock time for the query (seconds); `0.0` if the log
+    /// entry has no `elapsed` field.
     pub elapsed_s: f64,
     /// Time spent committing the transaction (seconds).
     pub commit_time_s: Option<f64>,
@@ -142,10 +136,10 @@ pub struct ExecutionStats {
 
 /// Trait for collecting query statistics from a Hyper server.
 ///
-/// Implementations capture stats using different mechanisms (log file parsing,
-/// future native protocol support, etc.). The trait uses an opaque token pattern:
-/// `before_query` is called before execution and returns a token (e.g., a file
-/// offset), which is passed to `after_query` after execution to extract the stats.
+/// Implementations capture stats from a source such as Hyper's log file. The
+/// trait uses an opaque token pattern: `before_query` is called before
+/// execution and returns a token (e.g., a file offset), which is passed to
+/// `after_query` after execution to extract the stats.
 ///
 /// # Thread Safety
 ///
@@ -223,7 +217,8 @@ impl LogFileStatsProvider {
 
     /// Creates a new provider by auto-detecting the log path from a [`HyperProcess`].
     ///
-    /// The log file is expected at `<log_dir>/hyperd.log`.
+    /// The log file is expected at `<log_dir>/hyperd.log`. If the process has no
+    /// log directory, `hyperd.log` in the current directory is used.
     ///
     /// [`HyperProcess`]: crate::HyperProcess
     #[must_use]
@@ -376,13 +371,23 @@ impl QueryStatsProvider for LogFileStatsProvider {
             debug!(
                 target: "hyperdb_api",
                 offset = token.offset,
-                sql_prefix = &sql[..sql.len().min(80)],
+                sql_prefix = log_prefix(sql),
                 "query-stats-not-found"
             );
         }
 
         stats
     }
+}
+
+/// Returns at most the first 80 bytes of `sql` for log output, cut on a
+/// character boundary so multi-byte text cannot cause a slicing panic.
+fn log_prefix(sql: &str) -> &str {
+    let mut end = sql.len().min(80);
+    while !sql.is_char_boundary(end) {
+        end -= 1;
+    }
+    &sql[..end]
 }
 
 // =============================================================================
@@ -620,6 +625,16 @@ fn parse_query_end(v: &Value) -> QueryStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_prefix_never_splits_a_multibyte_char() {
+        // 79 ASCII bytes followed by a 3-byte char straddling the 80-byte cut.
+        let sql = format!("{}€ tail", "a".repeat(79));
+        let prefix = log_prefix(&sql);
+        assert!(prefix.len() <= 80);
+        assert_eq!(prefix, "a".repeat(79));
+        assert_eq!(log_prefix("SELECT 1"), "SELECT 1");
+    }
 
     #[test]
     fn test_normalize_for_matching() {

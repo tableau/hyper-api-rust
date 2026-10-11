@@ -138,7 +138,7 @@ In `hyperdb-api/src/process.rs`:
 
 When connecting via `Connection::new(&HyperProcess, ...)`:
 
-- Uses `connection_endpoint()` if available — UDS on Unix, Named Pipe on Windows
+- Uses the process's connection endpoint if available — UDS on Unix, Named Pipe on Windows
 - Falls back to string endpoint parsing (TCP)
 
 ---

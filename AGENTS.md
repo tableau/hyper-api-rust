@@ -261,8 +261,8 @@ cargo test -p hyperdb-api
 # Run a specific test
 cargo test -p hyperdb-api test_name
 
-# Run tests in a specific file (use module path)
-cargo test -p hyperdb-api --test integration_test
+# Run tests in a specific file (use the file stem)
+cargo test -p hyperdb-api --test connection_tests
 ```
 
 ### Running Examples
@@ -311,7 +311,7 @@ hyperdb-api-core/src/types/     # Unit tests (inline with code)
 **Test utilities:**
 
 - `hyperdb-api/tests/common/mod.rs` - Shared test helpers
-- `hyperdb-api-core/src/client/test_util.rs` - Client test utilities
+- `hyperdb-api-core/tests/common/mod.rs` - Client test utilities
 - Both use `HyperProcess::new()` to start temporary `hyperd` servers
 
 **Pattern:** Tests create temporary `.hyper` files and clean them up automatically. The `make clean-test-files` command removes any leftover test artifacts.
@@ -346,7 +346,7 @@ Query results are **always streaming** to maintain constant memory usage:
 ```rust
 let mut result = conn.execute_query("SELECT * FROM large_table")?;
 
-// Process in chunks (default: 16384 rows per chunk)
+// Process in chunks (TCP: up to 65,536 rows per chunk)
 while let Some(chunk) = result.next_chunk()? {
     for row in &chunk {
         // Process row

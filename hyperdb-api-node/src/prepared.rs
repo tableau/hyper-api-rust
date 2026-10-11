@@ -14,7 +14,7 @@ use crate::result::{RowData, extract_row};
 // PreparedStatement
 // =============================================================================
 
-/// A server-side prepared statement bound to a [`Connection`].
+/// A server-side prepared statement bound to a `Connection`.
 ///
 /// Prepared statements are the supported way to run parameterized
 /// queries: parameter values are sent over the wire in native binary
@@ -22,16 +22,16 @@ use crate::result::{RowData, extract_row};
 ///
 /// ## Type inference
 ///
-/// [`Connection.prepare(sql)`] defers server-side preparation until the
+/// `Connection.prepare(sql)` defers server-side preparation until the
 /// first call to `query`/`execute` because Hyper's Parse message
 /// requires the exact set of parameter OIDs up front. The first call
 /// prepares using the OIDs inferred from the JS parameter values, then
 /// caches the prepared statement for subsequent calls.
 ///
 /// If you later call `query` with *different* types for the same
-/// placeholders (e.g. `[42]` then `[42n]`), the statement re-prepares
+/// placeholders (e.g. `[42]` then `[5_000_000_000n]`, INT then BIGINT; a `bigint` that fits `i32`, such as `42n`, binds as INT like `42`), the statement re-prepares
 /// transparently. For predictable, cache-hot behavior pass explicit
-/// OIDs via [`Connection.prepareTyped(sql, oids)`].
+/// OIDs via `Connection.prepareTyped(sql, oids)`.
 ///
 /// @example
 /// ```js
@@ -211,7 +211,7 @@ impl Connection {
     /// Parameter types are inferred from the JS values passed on the
     /// first call; if those types change between calls the statement
     /// re-prepares transparently. For explicit OID control, use
-    /// [`prepareTyped`](Self::prepare_typed).
+    /// `prepareTyped`.
     #[napi]
     pub fn prepare(&self, sql: String) -> PreparedStatement {
         let param_count = count_placeholders(&sql);
@@ -357,15 +357,10 @@ async fn run_execute(
         .stmt
         .execute(&refs)
         .await
-        .map(|n| {
-            #[expect(
-                clippy::cast_possible_wrap,
-                reason = "NAPI BigInt ↔ Hyper u64 bit-pattern reinterpret; JS consumers read the BigInt as an unsigned affected-row count"
-            )]
-            let signed = n as i64;
-            signed
-        })
         .map_err(|e| Error::from_reason(e.to_string()))
+        .and_then(|n| {
+            i64::try_from(n).map_err(|_| Error::from_reason("row count exceeds i64::MAX"))
+        })
 }
 
 async fn run_fetch_one(

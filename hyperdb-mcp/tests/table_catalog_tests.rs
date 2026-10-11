@@ -6,7 +6,7 @@
 //!
 //! The module-level tests drive the catalog API directly against a fresh
 //! [`Engine`]; the server-level tests verify the lazy bootstrap path and
-//! the `--bare` opt-out by opening the workspace file twice (once through
+//! the read-only no-op by opening the persistent database file twice (once through
 //! a server, then again with a plain `Engine` to inspect the on-disk
 //! state).
 
@@ -16,7 +16,7 @@ use hyperdb_mcp::server::HyperMcpServer;
 use hyperdb_mcp::table_catalog::{self, MetadataFields, TABLE_CATALOG_TABLE};
 use tempfile::TempDir;
 
-/// Build a fresh engine against a temp `.hyper` workspace file. Matches
+/// Build a fresh engine against a temp `.hyper` persistent database file. Matches
 /// the pattern used by `saved_queries_tests::workspace_engine` so the
 /// module interop surface stays consistent.
 /// Uses `new_no_daemon` to avoid interference from any daemon running
@@ -343,8 +343,8 @@ fn delete_for_is_idempotent() {
 // run). Without this, the server or engine may connect to a daemon left over
 // from another test file, causing "database still in use" errors on Windows.
 
-/// Default (non-bare) server: the catalog is created on first engine
-/// use and survives across reopens of the workspace file.
+/// Default server: the catalog is created on first engine
+/// use and survives across reopens of the persistent database file.
 #[test]
 fn default_server_auto_creates_catalog_on_first_engine_use() {
     let dir = TempDir::new().unwrap();
@@ -360,12 +360,12 @@ fn default_server_auto_creates_catalog_on_first_engine_use() {
     let engine = Engine::new_no_daemon(Some(path_str)).unwrap();
     assert!(
         table_exists(&engine, TABLE_CATALOG_TABLE),
-        "_table_catalog must be present in the workspace after a default server has touched it"
+        "_table_catalog must be present in the persistent database after a default server has touched it"
     );
 }
 
 /// Read-only mode must not attempt to create the catalog either — the
-/// first tool call on a pristine workspace shouldn't turn around and
+/// first tool call on a pristine persistent database shouldn't turn around and
 /// issue a `CREATE TABLE`.
 #[test]
 fn read_only_server_does_not_create_catalog() {
@@ -609,8 +609,8 @@ fn set_metadata_data_url_roundtrip() {
 
 /// #195 (as filed): a table created via `execute` on the ephemeral primary
 /// must be stubbed by the post-execute reconcile so `set_metadata` succeeds.
-/// RED before the fix: `set_metadata` returns `TABLE_NOT_FOUND` because
-/// reconcile only ever enumerated the persistent attachment.
+/// Reconcile must enumerate the ephemeral primary as well as the persistent
+/// attachment; otherwise `set_metadata` returns `TABLE_NOT_FOUND`.
 #[test]
 fn set_metadata_finds_execute_created_ephemeral_primary_table() {
     let (engine, _dir) = workspace_engine();
@@ -634,8 +634,8 @@ fn set_metadata_finds_execute_created_ephemeral_primary_table() {
 
 /// The delete-trap: a correctly-stubbed ephemeral-primary table (registered
 /// via the working ingest path, with user prose) must survive an unrelated
-/// later structural `execute`. RED before the fix: the row is silently reaped
-/// because it is absent from the persistent-only live set.
+/// later structural `execute`. The row must not be reaped for being absent
+/// from a persistent-only live set.
 #[test]
 fn reconcile_preserves_ephemeral_primary_metadata_across_unrelated_ddl() {
     let (engine, _dir) = workspace_engine();
@@ -675,9 +675,8 @@ fn reconcile_preserves_ephemeral_primary_metadata_across_unrelated_ddl() {
 }
 
 /// Delete-trap guard: reconciling the shared catalog must not delete
-/// persistent-table rows. Passes on current code (persistent tables are
-/// already enumerated) — it guards against a naive fix that swaps
-/// enumeration to ephemeral-only.
+/// persistent-table rows; enumeration must cover persistent tables, not
+/// only ephemeral ones.
 #[test]
 fn reconcile_does_not_delete_persistent_rows_when_reconciling_shared_catalog() {
     let (engine, _dir) = workspace_engine();
@@ -727,12 +726,10 @@ fn reconcile_reaps_dropped_ephemeral_primary_table() {
     );
 }
 
-/// C1 (deep-review Critical): the rename heuristic must NOT match a
-/// disappeared PERSISTENT row against a new EPHEMERAL table on a coincident
-/// row count — that would migrate persistent prose onto an unrelated scratch
-/// table. RED today (scratch isn't stubbed at all → the `.expect` fails);
-/// RED under a naive union (the false-rename fires → `purpose.is_none()`
-/// fails); GREEN only when rename targets are restricted to persistent origin.
+/// The rename heuristic must NOT match a disappeared PERSISTENT row against a
+/// new EPHEMERAL table on a coincident row count — that would migrate
+/// persistent prose onto an unrelated scratch table. The scratch table must be
+/// stubbed, and rename targets are restricted to persistent origin.
 #[test]
 fn reconcile_does_not_false_rename_persistent_row_onto_new_ephemeral_table() {
     let (engine, _dir) = workspace_engine();

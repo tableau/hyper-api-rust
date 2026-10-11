@@ -37,14 +37,15 @@ use std::collections::HashMap;
 use crate::client::error::{Error, Result};
 use hyperdb_api_salesforce::{DataCloudToken, SharedTokenProvider};
 
+use super::config::TransferMode;
 use super::error::from_grpc_status;
 use super::executor::GrpcQueryExecutor;
 use super::params::{ParameterStyle, QueryParameters};
-use super::proto::hyper_service::query_param::TransferMode;
 use super::proto::{
     AttachedDatabase, CancelQueryParam, HyperServiceClient, OutputFormat, QueryParam,
 };
 use super::result::GrpcQueryResult;
+use crate::protocol::escape::escape_literal;
 
 /// Information about a database table.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,8 +226,8 @@ impl AuthenticatedGrpcClient {
     /// Sets the transfer mode for queries.
     ///
     /// - `Sync`: Wait for complete results (best for small results)
-    /// - `Async`: Stream results as they become available
-    /// - `Adaptive`: Server chooses based on result size (default)
+    /// - `Async`: Returns only the result header; all chunks are fetched with `GetQueryResult`
+    /// - `Adaptive`: Returns the first chunk inline and fetches the rest with `GetQueryResult` (default)
     #[must_use]
     pub fn with_transfer_mode(mut self, mode: TransferMode) -> Self {
         self.transfer_mode = mode;
@@ -398,9 +399,10 @@ impl AuthenticatedGrpcClient {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Authentication`] if the DC JWT cannot be
-    ///   refreshed through the underlying Salesforce token provider
-    ///   (including after the auth-retry budget is exhausted).
+    /// - Returns [`Error::Authentication`] if the proactive DC JWT refresh
+    ///   fails, or [`Error::Config`] / [`Error::Connection`] if the channel
+    ///   cannot be rebuilt. If a refresh triggered by an auth failure fails,
+    ///   the original request error is returned.
     /// - Propagates any error from
     ///   [`GrpcClient::execute_query_with_params_and_options`](super::GrpcClient::execute_query_with_params_and_options) —
     ///   SQL / transport / protocol failures.
@@ -469,8 +471,10 @@ impl AuthenticatedGrpcClient {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Authentication`] if every retry attempt
-    ///   still surfaces an auth error after forcing a token refresh.
+    /// - Returns [`Error::Authentication`] if the proactive DC JWT refresh
+    ///   fails, or [`Error::Config`] / [`Error::Connection`] if the channel
+    ///   cannot be rebuilt. If a refresh triggered by an auth failure fails,
+    ///   the original request error is returned.
     /// - Propagates any other [`Error`] from the underlying gRPC
     ///   executor (SQL errors, transport failures).
     pub async fn execute_query_with_options(
@@ -576,8 +580,11 @@ impl AuthenticatedGrpcClient {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::Other`] if every retry attempt still
-    ///   fails with an auth error after forcing a token refresh.
+    /// - Returns [`Error::Authentication`] if the proactive DC JWT refresh
+    ///   fails, or [`Error::Config`] / [`Error::Connection`] if the channel
+    ///   cannot be rebuilt.
+    /// - Returns the server's auth error if it persists after one forced
+    ///   DC JWT refresh, or if that refresh fails.
     /// - Propagates any error from
     ///   [`GrpcClient::cancel_query`](super::GrpcClient::cancel_query) (transport failure, `tonic::Status`).
     pub async fn cancel_query(&mut self, query_id: &str) -> Result<()> {
@@ -636,7 +643,7 @@ impl AuthenticatedGrpcClient {
     /// Returns a list of schema names from the database.
     ///
     /// This queries the `pg_catalog` to get all user-defined schemas,
-    /// excluding system schemas like '`pg_catalog`', '`pg_temp`', and '`pg_toast`'.
+    /// excluding the `pg_catalog`, `pg_temp`, `pg_toast` and `information_schema` schemas.
     ///
     /// # Example
     ///
@@ -677,7 +684,7 @@ impl AuthenticatedGrpcClient {
     /// Returns a list of table information from the database.
     ///
     /// This queries the `pg_catalog` to get all tables, views, and materialized views,
-    /// excluding system schemas.
+    /// excluding tables in `pg_catalog` and `pg_toast`.
     ///
     /// # Returns
     ///
@@ -819,7 +826,7 @@ impl AuthenticatedGrpcClient {
         );
 
         let result = self.execute_query(&query).await?;
-        Ok(!result.arrow_data().is_empty() && result.arrow_data().len() > 8)
+        arrow_has_rows(&result.arrow_data())
     }
 
     /// Extracts a string column from Arrow IPC data.
@@ -926,15 +933,7 @@ impl AuthenticatedGrpcClient {
         &mut self,
         schema: &str,
     ) -> Result<std::collections::HashMap<String, String>> {
-        let query = format!(
-            r"SELECT c.relname as table_name,
-                      COALESCE(d.description, c.relname) as label
-               FROM pg_catalog.pg_class c
-               LEFT JOIN pg_catalog.pg_description d ON d.objoid = c.oid AND d.objsubid = 0
-               JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
-               WHERE n.nspname = '{schema}' AND c.relkind IN ('r', 'v', 'm')
-               ORDER BY c.relname"
-        );
+        let query = table_labels_query(schema);
 
         let result = self.execute_query(&query).await?;
         parse_label_pairs(&result.arrow_data())
@@ -962,16 +961,7 @@ impl AuthenticatedGrpcClient {
         schema: &str,
         table: &str,
     ) -> Result<std::collections::HashMap<String, String>> {
-        let query = format!(
-            r"SELECT a.attname as column_name,
-                      COALESCE(d.description, a.attname) as label
-               FROM pg_catalog.pg_attribute a
-               LEFT JOIN pg_catalog.pg_description d ON d.objoid = a.attrelid AND d.objsubid = a.attnum
-               JOIN pg_catalog.pg_class c ON a.attrelid = c.oid
-               JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
-               WHERE n.nspname = '{schema}' AND c.relname = '{table}' AND a.attnum > 0 AND NOT a.attisdropped
-               ORDER BY a.attnum"
-        );
+        let query = column_labels_query(schema, table);
 
         let result = self.execute_query(&query).await?;
         parse_label_pairs(&result.arrow_data())
@@ -1252,10 +1242,12 @@ impl AuthenticatedGrpcClient {
     /// Checks if an error is an authentication error that should trigger
     /// a DC JWT refresh and query retry.
     ///
-    /// Only matches gRPC `UNAUTHENTICATED` (code 16) and HTTP 401 errors,
-    /// which are the server-side signals that the DC JWT is no longer valid.
-    /// Broader substring matches (e.g. "token", "expired") are intentionally
-    /// avoided to prevent spurious retries on unrelated errors.
+    /// Returns true for any [`Error::Authentication`] (gRPC `UNAUTHENTICATED` or
+    /// `PERMISSION_DENIED`, SQLSTATE class 28, or a client-side DC JWT failure)
+    /// and for any error whose message contains `unauthenticated`,
+    /// `unauthorized` or `401`. Broader substring matches (e.g. "token",
+    /// "expired") are intentionally avoided to prevent spurious retries on
+    /// unrelated errors.
     fn is_auth_error(error: &Error) -> bool {
         if matches!(error, Error::Authentication(_)) {
             return true;
@@ -1483,6 +1475,62 @@ impl AuthenticatedGrpcClientSync {
     }
 }
 
+/// Builds the catalog query behind [`AuthenticatedGrpcClient::get_table_labels`].
+fn table_labels_query(schema: &str) -> String {
+    let schema = escape_literal(schema);
+    format!(
+        r"SELECT c.relname as table_name,
+                  COALESCE(d.description, c.relname) as label
+           FROM pg_catalog.pg_class c
+           LEFT JOIN pg_catalog.pg_description d ON d.objoid = c.oid AND d.objsubid = 0
+           JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
+           WHERE n.nspname = {schema} AND c.relkind IN ('r', 'v', 'm')
+           ORDER BY c.relname"
+    )
+}
+
+/// Builds the catalog query behind [`AuthenticatedGrpcClient::get_column_labels`].
+fn column_labels_query(schema: &str, table: &str) -> String {
+    let schema = escape_literal(schema);
+    let table = escape_literal(table);
+    format!(
+        r"SELECT a.attname as column_name,
+                  COALESCE(d.description, a.attname) as label
+           FROM pg_catalog.pg_attribute a
+           LEFT JOIN pg_catalog.pg_description d ON d.objoid = a.attrelid AND d.objsubid = a.attnum
+           JOIN pg_catalog.pg_class c ON a.attrelid = c.oid
+           JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
+           WHERE n.nspname = {schema} AND c.relname = {table} AND a.attnum > 0 AND NOT a.attisdropped
+           ORDER BY a.attnum"
+    )
+}
+
+/// Returns whether an Arrow IPC stream contains at least one row.
+///
+/// A zero-row result is still a non-empty IPC stream (schema message plus
+/// end-of-stream marker), so the byte length says nothing about the row count.
+///
+/// # Errors
+///
+/// Returns [`crate::client::Error`] if the stream cannot be opened or a record
+/// batch fails to decode.
+fn arrow_has_rows(arrow_data: &[u8]) -> Result<bool> {
+    if arrow_data.is_empty() {
+        return Ok(false);
+    }
+    let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(arrow_data), None)
+        .map_err(|e| crate::client::Error::other(format!("Failed to parse Arrow data: {e}")))?;
+    for batch in reader {
+        let batch = batch.map_err(|e| {
+            crate::client::Error::other(format!("Failed to decode Arrow record batch: {e}"))
+        })?;
+        if batch.num_rows() > 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Parses an Arrow IPC stream of `(name, label)` text pairs into a map.
 ///
 /// Shared by [`AuthenticatedGrpcClient::get_table_labels`] and
@@ -1579,7 +1627,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
-    use super::parse_label_pairs;
+    use super::{arrow_has_rows, column_labels_query, parse_label_pairs, table_labels_query};
 
     /// Encodes one record batch as an Arrow IPC stream, as the server would.
     fn ipc_stream(batch: &RecordBatch) -> Vec<u8> {
@@ -1711,5 +1759,28 @@ mod tests {
         let labels = parse_label_pairs(&ipc_stream(&batch)).expect("nulls are not an error");
         assert_eq!(labels.len(), 1, "the NULL-name row should be skipped");
         assert_eq!(labels.get("accounts").map(String::as_str), Some("Accounts"));
+    }
+
+    #[test]
+    fn label_queries_escape_single_quotes_in_names() {
+        let evil = "x' OR '1'='1";
+        let tq = table_labels_query(evil);
+        assert!(tq.contains("n.nspname = 'x'' OR ''1''=''1'"), "{tq}");
+        let cq = column_labels_query("public", evil);
+        assert!(cq.contains("c.relname = 'x'' OR ''1''=''1'"), "{cq}");
+        let cq = column_labels_query(evil, "t");
+        assert!(cq.contains("n.nspname = 'x'' OR ''1''=''1'"), "{cq}");
+    }
+
+    #[test]
+    fn arrow_has_rows_distinguishes_empty_result_from_non_empty() {
+        let with_rows = ipc_stream(&two_text_batch(vec!["a"], vec!["A"]));
+        let no_rows = ipc_stream(&two_text_batch(vec![], vec![]));
+        // The zero-row stream still carries a schema message.
+        assert!(no_rows.len() > 8);
+
+        assert!(arrow_has_rows(&with_rows).expect("decode"));
+        assert!(!arrow_has_rows(&no_rows).expect("decode"));
+        assert!(!arrow_has_rows(&[]).expect("decode"));
     }
 }

@@ -5,8 +5,8 @@
 //!
 //! This module provides two pools that share a common configuration surface:
 //!
-//! - [`Pool`] — an async pool built on [`deadpool`], for `async`/`await`
-//!   applications. Created via [`create_pool`].
+//! - [`Pool`] — an async pool for `async`/`await` applications. Created via
+//!   [`create_pool`].
 //! - [`ConnectionPool`] — a synchronous, r2d2-style pool with **no Tokio
 //!   dependency** on its hot path, for blocking applications. Created via
 //!   [`SyncPoolConfig::build`].
@@ -33,7 +33,7 @@
 //!     let pool = create_pool(config)?;
 //!
 //!     // Get a connection from the pool
-//!     let conn = pool.get().await.map_err(|e| hyperdb_api::Error::internal(e.to_string()))?;
+//!     let conn = pool.get().await?;
 //!
 //!     // Use the connection
 //!     conn.execute_command("SELECT 1").await?;
@@ -80,9 +80,12 @@
 //! - **`idle_timeout`** retires connections that have sat idle too long (down to
 //!   `min_idle`, which is kept warm).
 //! - **Timeouts** (`wait_timeout`, `create_timeout`, `recycle_timeout`) bound how
-//!   long an acquire may block. The async pool enforces all three via deadpool's
-//!   Tokio runtime; the sync pool enforces `wait_timeout` natively (see
+//!   long an acquire may block. The async pool enforces all three on the Tokio
+//!   runtime; the sync pool enforces `wait_timeout` natively (see
 //!   [`SyncPoolConfig`] for the create/recycle caveat).
+//! - **TLS** ([`PoolConfig::tls`] / [`SyncPoolConfig::tls`]) applies to every
+//!   connection the pool opens, with the semantics of
+//!   [`ConnectionBuilder::tls`].
 //!
 //! # Lifecycle hooks (async pool only)
 //!
@@ -121,10 +124,10 @@ use deadpool::Runtime;
 use deadpool::managed::{self, Manager, Metrics, RecycleError, RecycleResult, Timeouts};
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::CreateMode;
 use crate::async_connection::AsyncConnection;
 use crate::connection::Connection;
 use crate::error::{Error, Result};
+use crate::{AsyncConnectionBuilder, ConnectionBuilder, CreateMode, TlsConfig};
 
 /// Future returned by pool lifecycle hooks.
 ///
@@ -240,6 +243,8 @@ pub struct PoolConfig {
     pub user: Option<String>,
     /// Optional password for authentication
     pub password: Option<String>,
+    /// TLS for every connection the pool opens (see [`tls`](Self::tls)).
+    pub tls: TlsConfig,
     /// Maximum number of connections in the pool
     pub max_size: usize,
     /// If `false`, skip the per-checkout health probe. Retained for backwards
@@ -251,7 +256,7 @@ pub struct PoolConfig {
     /// [`RecycleStrategy::SelectOne`].
     pub recycle: RecycleStrategy,
     /// Maximum time to wait for a slot to become available on
-    /// [`get`](managed::Pool::get). `None` waits indefinitely (the default).
+    /// [`get`](Pool::get). `None` waits indefinitely (the default).
     pub wait_timeout: Option<Duration>,
     /// Maximum time to wait for a new connection to be created. `None` disables
     /// the cap (the default).
@@ -282,6 +287,7 @@ impl std::fmt::Debug for PoolConfig {
             .field("create_mode", &self.create_mode)
             .field("user", &self.user)
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("tls", &self.tls)
             .field("max_size", &self.max_size)
             .field("health_check", &self.health_check)
             .field("recycle", &self.recycle)
@@ -316,6 +322,7 @@ impl PoolConfig {
             create_mode: CreateMode::DoNotCreate,
             user: None,
             password: None,
+            tls: TlsConfig::default(),
             max_size: 16,
             health_check: true,
             recycle: RecycleStrategy::SelectOne,
@@ -342,6 +349,18 @@ impl PoolConfig {
     pub fn auth(mut self, user: impl Into<String>, password: impl Into<String>) -> Self {
         self.user = Some(user.into());
         self.password = Some(password.into());
+        self
+    }
+
+    /// Sets the TLS configuration for every connection the pool opens.
+    ///
+    /// Same semantics as [`AsyncConnectionBuilder::tls`]; the default is
+    /// [`TlsMode::Disable`](crate::TlsMode::Disable). A mode the endpoint
+    /// cannot honor surfaces from [`Pool::get`], since connections open
+    /// lazily.
+    #[must_use]
+    pub fn tls(mut self, tls: impl Into<TlsConfig>) -> Self {
+        self.tls = tls.into();
         self
     }
 
@@ -461,6 +480,9 @@ impl PoolConfig {
 
 /// Connection pool manager for `AsyncConnection`.
 ///
+/// Crate-private: the pool's public face is [`Pool`] and [`PooledConnection`],
+/// so the `deadpool` types behind them are not part of this crate's API.
+///
 /// The first call to [`Manager::create`] holds an async mutex while attempting
 /// to open a connection with the configured [`CreateMode`]. Concurrent callers
 /// wait for that attempt to finish, then use `CreateMode::DoNotCreate`. If the
@@ -468,7 +490,7 @@ impl PoolConfig {
 /// (for idempotent modes only — `Create` is not retried because a sibling
 /// connection may have already created the database).
 #[derive(Debug)]
-pub struct ConnectionManager {
+pub(crate) struct ConnectionManager {
     config: Arc<PoolConfig>,
     /// Synchronizes the first-connection attempt across concurrent callers.
     /// `Some(())` after the first successful attempt; held while a first
@@ -479,8 +501,7 @@ pub struct ConnectionManager {
 
 impl ConnectionManager {
     /// Creates a new connection manager.
-    #[must_use]
-    pub fn new(config: PoolConfig) -> Self {
+    fn new(config: PoolConfig) -> Self {
         Self {
             config: Arc::new(config),
             init_lock: Arc::new(AsyncMutex::new(false)),
@@ -488,18 +509,14 @@ impl ConnectionManager {
     }
 
     async fn open(&self, mode: CreateMode) -> Result<AsyncConnection> {
+        let mut builder = AsyncConnectionBuilder::new(&self.config.endpoint)
+            .database(&self.config.database)
+            .create_mode(mode)
+            .tls(self.config.tls.clone());
         if let (Some(user), Some(password)) = (&self.config.user, &self.config.password) {
-            AsyncConnection::connect_with_auth(
-                &self.config.endpoint,
-                &self.config.database,
-                mode,
-                user,
-                password,
-            )
-            .await
-        } else {
-            AsyncConnection::connect(&self.config.endpoint, &self.config.database, mode).await
+            builder = builder.user(user).password(password);
         }
+        builder.build().await
     }
 }
 
@@ -597,21 +614,109 @@ impl Manager for ConnectionManager {
 
 /// A pool of async connections to a Hyper database.
 ///
-/// This pool manages a set of reusable connections, automatically creating
-/// new connections when needed and recycling them after use.
-pub type Pool = managed::Pool<ConnectionManager>;
+/// Created by [`create_pool`]. Connections are opened lazily, reused across
+/// checkouts and recycled according to the configured [`RecycleStrategy`].
+/// `Pool` is a cheap handle: clone it to share one pool between tasks.
+#[derive(Clone, Debug)]
+pub struct Pool {
+    inner: managed::Pool<ConnectionManager>,
+}
 
-/// A pooled connection wrapper.
-pub type PooledConnection = managed::Object<ConnectionManager>;
+impl Pool {
+    /// Checks a connection out of the pool, opening one if none is idle and
+    /// the pool is below its maximum size.
+    ///
+    /// The connection returns to the pool when the guard is dropped.
+    ///
+    /// # Errors
+    ///
+    /// - Returns [`Error::Timeout`] if `wait_timeout` or `create_timeout`
+    ///   elapses.
+    /// - Returns [`Error::InvalidOperation`] if the pool has been
+    ///   [closed](Self::close). Retrying cannot succeed.
+    /// - Returns the underlying error if opening a connection fails or an
+    ///   `after_connect` hook rejects it.
+    ///
+    /// A connection that fails, or exceeds `recycle_timeout`, during its
+    /// recycle probe is not reported: the pool discards it and hands out
+    /// another one (opening a new connection if needed).
+    pub async fn get(&self) -> Result<PooledConnection> {
+        match self.inner.get().await {
+            Ok(inner) => Ok(PooledConnection { inner }),
+            Err(managed::PoolError::Backend(e)) => Err(e),
+            Err(e @ managed::PoolError::Timeout(_)) => Err(Error::timeout(e.to_string())),
+            Err(managed::PoolError::Closed) => {
+                Err(Error::invalid_operation("the connection pool is closed"))
+            }
+            Err(e) => Err(Error::internal(e.to_string())),
+        }
+    }
+
+    /// Returns a snapshot of the pool's occupancy.
+    #[must_use]
+    pub fn status(&self) -> PoolStatus {
+        let status = self.inner.status();
+        PoolStatus {
+            idle: status.available,
+            size: status.size,
+            max_size: status.max_size,
+        }
+    }
+
+    /// Closes the pool: idle connections are dropped and further
+    /// [`get`](Self::get) calls fail. Connections already checked out are
+    /// dropped, not returned, when their guards go out of scope.
+    pub fn close(&self) {
+        self.inner.close();
+    }
+
+    /// Returns `true` once [`close`](Self::close) has been called.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+}
+
+/// A connection checked out of an async [`Pool`].
+///
+/// Derefs to [`AsyncConnection`]. Returns to the pool when dropped; the pool
+/// recycles it before the next checkout.
+#[derive(Debug)]
+pub struct PooledConnection {
+    inner: managed::Object<ConnectionManager>,
+}
+
+impl PooledConnection {
+    /// Removes the connection from the pool's management, taking ownership.
+    ///
+    /// The pool slot is freed; the returned connection will not be recycled.
+    #[must_use]
+    pub fn take(self) -> AsyncConnection {
+        managed::Object::take(self.inner)
+    }
+}
+
+impl std::ops::Deref for PooledConnection {
+    type Target = AsyncConnection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for PooledConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
 
 /// Creates a new connection pool from configuration.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Config`] wrapping the `deadpool` builder failure if
-/// the pool cannot be constructed (e.g. invalid `max_size`). Connections
-/// themselves are opened lazily on first use, so endpoint/auth errors
-/// surface from [`Pool::get`](managed::Pool::get), not here.
+/// Returns [`Error::Config`] if the pool cannot be constructed (e.g. invalid
+/// `max_size`). Connections themselves are opened lazily on first use, so
+/// endpoint/auth errors surface from [`Pool::get`], not here.
 pub fn create_pool(config: PoolConfig) -> Result<Pool> {
     let max_size = config.max_size;
     let timeouts = Timeouts {
@@ -623,12 +728,15 @@ pub fn create_pool(config: PoolConfig) -> Result<Pool> {
     // a timeout is actually configured so the zero-config path stays untouched.
     let needs_runtime = config.has_timeout();
     let manager = ConnectionManager::new(config);
-    let mut builder = Pool::builder(manager).max_size(max_size).timeouts(timeouts);
+    let mut builder = managed::Pool::builder(manager)
+        .max_size(max_size)
+        .timeouts(timeouts);
     if needs_runtime {
         builder = builder.runtime(Runtime::Tokio1);
     }
     builder
         .build()
+        .map(|inner| Pool { inner })
         .map_err(|e| Error::config(format!("Failed to create pool: {e}")))
 }
 
@@ -698,6 +806,8 @@ pub struct SyncPoolConfig {
     pub user: Option<String>,
     /// Optional password for authentication.
     pub password: Option<String>,
+    /// TLS for every connection the pool opens (see [`tls`](Self::tls)).
+    pub tls: TlsConfig,
     /// Maximum number of connections in the pool.
     pub max_size: usize,
     /// Per-checkout recycle strategy. Defaults to [`SyncRecycleStrategy::SelectOne`].
@@ -722,6 +832,7 @@ impl std::fmt::Debug for SyncPoolConfig {
             .field("create_mode", &self.create_mode)
             .field("user", &self.user)
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("tls", &self.tls)
             .field("max_size", &self.max_size)
             .field("recycle", &self.recycle)
             .field("wait_timeout", &self.wait_timeout)
@@ -741,6 +852,7 @@ impl SyncPoolConfig {
             create_mode: CreateMode::DoNotCreate,
             user: None,
             password: None,
+            tls: TlsConfig::default(),
             max_size: 16,
             recycle: SyncRecycleStrategy::SelectOne,
             wait_timeout: None,
@@ -762,6 +874,18 @@ impl SyncPoolConfig {
     pub fn auth(mut self, user: impl Into<String>, password: impl Into<String>) -> Self {
         self.user = Some(user.into());
         self.password = Some(password.into());
+        self
+    }
+
+    /// Sets the TLS configuration for every connection the pool opens.
+    ///
+    /// Same semantics as [`ConnectionBuilder::tls`]; the default is
+    /// [`TlsMode::Disable`](crate::TlsMode::Disable). A mode the endpoint
+    /// cannot honor surfaces from [`ConnectionPool::get`], since connections
+    /// open lazily.
+    #[must_use]
+    pub fn tls(mut self, tls: impl Into<TlsConfig>) -> Self {
+        self.tls = tls.into();
         self
     }
 
@@ -863,17 +987,14 @@ impl SyncPoolInner {
         } else {
             CreateMode::DoNotCreate
         };
+        let mut builder = ConnectionBuilder::new(&self.config.endpoint)
+            .database(&self.config.database)
+            .create_mode(mode)
+            .tls(self.config.tls.clone());
         if let (Some(user), Some(password)) = (&self.config.user, &self.config.password) {
-            Connection::connect_with_auth(
-                &self.config.endpoint,
-                &self.config.database,
-                mode,
-                user,
-                password,
-            )
-        } else {
-            Connection::connect(&self.config.endpoint, &self.config.database, mode)
+            builder = builder.user(user).password(password);
         }
+        builder.build()
     }
 
     /// Returns `true` if an idle connection should be retired before reuse.
@@ -1126,14 +1247,20 @@ impl ConnectionPool {
     }
 }
 
-/// A snapshot of [`ConnectionPool`] occupancy.
+/// A snapshot of pool occupancy, returned by [`ConnectionPool::status`] and
+/// [`Pool::status`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PoolStatus {
     /// Number of idle connections currently available.
+    ///
+    /// For the async [`Pool`] this is the number of idle connections not
+    /// already claimed by a task blocked in [`get`](Pool::get), so it can read
+    /// lower than the number physically idle while callers are waiting.
     pub idle: usize,
     /// Total live connections (idle + checked out).
     pub size: usize,
-    /// Configured maximum pool size.
+    /// Configured maximum pool size. The async [`Pool`] reports `0` once it
+    /// has been [closed](Pool::close).
     pub max_size: usize,
 }
 
@@ -1205,6 +1332,7 @@ mod tests {
         let config = PoolConfig::new("localhost:7483", "test.hyper")
             .create_mode(CreateMode::CreateIfNotExists)
             .auth("user", "pass")
+            .tls(crate::TlsMode::Require)
             .max_size(32);
 
         assert_eq!(config.endpoint, "localhost:7483");
@@ -1213,6 +1341,7 @@ mod tests {
         assert_eq!(config.user, Some("user".to_string()));
         assert_eq!(config.password, Some("pass".to_string()));
         assert_eq!(config.max_size, 32);
+        assert_eq!(config.tls.mode(), crate::TlsMode::Require);
     }
 
     #[test]
@@ -1228,6 +1357,7 @@ mod tests {
         assert_eq!(config.max_lifetime, None);
         assert_eq!(config.idle_timeout, None);
         assert_eq!(config.min_idle, None);
+        assert_eq!(config.tls, TlsConfig::default());
         assert!(!config.has_timeout());
     }
 
@@ -1276,6 +1406,7 @@ mod tests {
         assert_eq!(config.max_lifetime, None);
         assert_eq!(config.idle_timeout, None);
         assert_eq!(config.min_idle, None);
+        assert_eq!(config.tls, TlsConfig::default());
 
         let password: String = {
             use rand::RngExt;
@@ -1286,12 +1417,14 @@ mod tests {
             .create_mode(CreateMode::CreateIfNotExists)
             .auth("u", password)
             .max_size(4)
+            .tls(crate::TlsMode::VerifyFull)
             .recycle(SyncRecycleStrategy::Ping)
             .wait_timeout(Some(Duration::from_millis(500)))
             .max_lifetime(Some(Duration::from_secs(10)))
             .idle_timeout(Some(Duration::from_secs(5)))
             .min_idle(Some(1));
         assert_eq!(tuned.max_size, 4);
+        assert_eq!(tuned.tls.mode(), crate::TlsMode::VerifyFull);
         assert!(matches!(tuned.recycle, SyncRecycleStrategy::Ping));
         assert_eq!(tuned.user, Some("u".to_string()));
         assert_eq!(tuned.wait_timeout, Some(Duration::from_millis(500)));

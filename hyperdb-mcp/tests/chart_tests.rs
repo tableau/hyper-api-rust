@@ -12,6 +12,7 @@ use hyperdb_mcp::chart::{
 };
 use hyperdb_mcp::error::ErrorCode;
 use serde_json::json;
+use std::path::Path;
 
 fn bar_opts() -> ChartOptions {
     ChartOptions {
@@ -773,7 +774,7 @@ fn disposition_inline_only() {
 /// `inline=true` + `output_path` → both.
 #[test]
 fn disposition_inline_and_write() {
-    let d = resolve_chart_disposition(true, Some("/tmp/x.png"), ChartFormat::Png);
+    let d = resolve_chart_disposition(true, Some(Path::new("/tmp/x.png")), ChartFormat::Png);
     assert!(matches!(d, ChartDisposition::WriteAndInline { .. }));
     assert!(d.wants_inline());
     assert_eq!(d.path().unwrap(), std::path::Path::new("/tmp/x.png"));
@@ -782,7 +783,7 @@ fn disposition_inline_and_write() {
 /// `inline=false` + `output_path` → write only.
 #[test]
 fn disposition_write_only_explicit_path() {
-    let d = resolve_chart_disposition(false, Some("/tmp/x.svg"), ChartFormat::Svg);
+    let d = resolve_chart_disposition(false, Some(Path::new("/tmp/x.svg")), ChartFormat::Svg);
     assert!(matches!(d, ChartDisposition::WriteOnly { .. }));
     assert!(!d.wants_inline());
     assert_eq!(d.path().unwrap(), std::path::Path::new("/tmp/x.svg"));

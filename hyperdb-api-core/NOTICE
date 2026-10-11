@@ -1,0 +1,88 @@
+================================================================================
+Third-Party Attributions for hyperdb-api-rust
+================================================================================
+
+This NOTICE file lists third-party software whose code, copyright notices, or
+license texts are required to be reproduced when redistributing this project.
+This project's own copyright and license terms live in LICENSE-MIT.txt and
+LICENSE-APACHE.txt at the repo root.
+
+Each section below names the upstream project, the files in this repository
+where adapted code lives, and reproduces the upstream copyright and license
+notice as required by the upstream license terms.
+
+--------------------------------------------------------------------------------
+sfackler/rust-postgres (postgres-protocol, tokio-postgres, postgres-types)
+--------------------------------------------------------------------------------
+
+Source:  https://github.com/sfackler/rust-postgres
+License: MIT OR Apache-2.0 (this project includes the MIT terms below)
+
+Portions of the following files in this repository were adapted from
+sfackler/rust-postgres. Per-file source-level credits with the specific
+patterns adapted are in each file's module-level doc comment.
+
+  - hyperdb-api-core/src/client/auth.rs
+      Adapted from postgres-protocol/src/authentication/sasl.rs:
+      SCRAM-SHA-256 client implementation. Hyper-specific additions on top.
+
+  - hyperdb-api-core/src/protocol/message/backend.rs
+      Adapted from postgres-protocol/src/message/backend.rs: message-tag
+      constants, Header struct, and framing logic. Hyper-specific
+      additions on top.
+
+  - hyperdb-api-core/src/protocol/message/frontend.rs
+      Adapted from postgres-protocol/src/message/frontend.rs:
+      startup-message framing and message-length helpers. Hyper-specific
+      additions on top.
+
+  - hyperdb-api-core/src/types/oid.rs
+      Adapted from postgres-types: the Oid newtype and constants-module
+      pattern. Hyper-specific OIDs added on top.
+
+  - hyperdb-api-core/src/client/row.rs
+      Adapted from tokio-postgres: the Row / StreamRow / BatchRow type
+      decomposition and pre-computed-offset random-access pattern.
+      Hyper-specific additions on top.
+
+The MIT License (MIT)
+
+Copyright (c) 2016 Steven Fackler
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+Other Inspirational Sources
+================================================================================
+
+The following crates informed API patterns in this repository. No code,
+comments, or fingerprintable variable names from these projects appear in
+this repository; the influence is at the level of public-API shape and idiom
+choices. They are listed here for developer-facing transparency.
+
+  - SQLx       https://github.com/launchbadge/sqlx        (MIT or Apache-2.0)
+      Inspired the fetch_one() / fetch_optional() / fetch_all() /
+      fetch_scalar() convenience-method shape on Connection and Transaction.
+
+  - Diesel     https://diesel.rs/                         (MIT or Apache-2.0)
+      Informed builder-pattern ergonomics in TableDefinition and the
+      ConnectionBuilder family.
+
+  - SeaORM     https://www.sea-ql.org/SeaORM/             (MIT or Apache-2.0)
+      Informed modern Rust async patterns for database operations.

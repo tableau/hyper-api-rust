@@ -41,7 +41,6 @@ where
 /// Test SMALLINT round-trip.
 ///
 /// This test verifies that SMALLINT values round-trip correctly through insert/query.
-/// The text/binary format detection uses protocol metadata from `RowDescription`.
 #[test]
 fn test_roundtrip_smallint() {
     let test = TestConnection::new().expect("Failed to create test connection");
@@ -342,10 +341,11 @@ fn test_roundtrip_varchar() {
     test.execute_command("CREATE TABLE rt_varchar (val VARCHAR(100))")
         .expect("Failed to create table");
 
+    let max_length_value = "x".repeat(100);
     let test_values: Vec<Option<&str>> = vec![
         Some(""),
         Some("short"),
-        Some("exactly one hundred chars - padded to make it longer for testing purposes!!!!!"),
+        Some(max_length_value.as_str()),
         None,
     ];
 
@@ -409,7 +409,8 @@ fn test_roundtrip_date() {
     }
     inserter.execute().expect("Failed to execute");
 
-    // Query and verify using raw string comparison (since we might not have Date parsing)
+    // Query and verify using raw string comparison, which checks the server's
+    // rendering independently of the client-side decoder
     let result = test
         .connection
         .execute_query("SELECT val::TEXT FROM rt_date")
@@ -448,12 +449,13 @@ fn test_roundtrip_numeric_small() {
         .expect("Failed to get table definition");
 
     let test_values: Vec<Option<Numeric>> = vec![
-        Some(Numeric::new(0, 2)),        // 0.00
-        Some(Numeric::new(100, 2)),      // 1.00
-        Some(Numeric::new(-100, 2)),     // -1.00
-        Some(Numeric::new(12345, 2)),    // 123.45
-        Some(Numeric::new(-12345, 2)),   // -123.45
-        Some(Numeric::new(99999999, 2)), // 999999.99 (near max for precision 10)
+        Some(Numeric::new(0, 2)),             // 0.00
+        Some(Numeric::new(100, 2)),           // 1.00
+        Some(Numeric::new(-100, 2)),          // -1.00
+        Some(Numeric::new(12345, 2)),         // 123.45
+        Some(Numeric::new(-12345, 2)),        // -123.45
+        Some(Numeric::new(99999999, 2)),      // 999999.99
+        Some(Numeric::new(9_999_999_999, 2)), // 99999999.99 (max for precision 10)
         None,
     ];
 
@@ -477,6 +479,7 @@ fn test_roundtrip_numeric_small() {
         Some("123.45".to_string()),
         Some("-123.45".to_string()),
         Some("999999.99".to_string()),
+        Some("99999999.99".to_string()),
         None,
     ];
 
@@ -488,6 +491,80 @@ fn test_roundtrip_numeric_small() {
     );
 }
 
+/// A `Numeric` whose scale differs from the column's must be rescaled to the
+/// column's scale, not written as a raw unscaled value.
+/// Regression: `add_numeric` ignored the value's scale, so `1234.5` inserted
+/// into `NUMERIC(10, 2)` was stored as `12.35`/`123.45` (magnitude corruption).
+#[test]
+fn test_roundtrip_numeric_scale_mismatch() {
+    let test = TestConnection::new().expect("Failed to create test connection");
+
+    // One small (i64) and one big (128-bit) storage column.
+    test.execute_command(
+        "CREATE TABLE rt_numeric_rescale (small NUMERIC(10, 2), big NUMERIC(30, 4))",
+    )
+    .expect("Failed to create table");
+    let table_def = Catalog::new(&test.connection)
+        .get_table_definition("rt_numeric_rescale")
+        .expect("Failed to get table definition");
+
+    let rows: Vec<(Numeric, Numeric)> = vec![
+        (Numeric::new(12345, 1), Numeric::new(12345, 1)), // 1234.5 -> scale up
+        (Numeric::new(5, 0), Numeric::new(5, 0)),         // 5 -> scale up
+        (Numeric::new(12_300, 4), Numeric::new(1_234_500, 6)), // trailing zeros -> scale down, exact
+        (Numeric::new(-25, 1), Numeric::new(-25, 1)),          // -2.5
+    ];
+
+    let mut inserter =
+        Inserter::new(&test.connection, &table_def).expect("Failed to create inserter");
+    for (small, big) in &rows {
+        inserter
+            .add_row(&[&Some(*small), &Some(*big)])
+            .expect("Failed to add row");
+    }
+    inserter.execute().expect("Failed to execute");
+
+    let result = test
+        .connection
+        .execute_query("SELECT small::TEXT, big::TEXT FROM rt_numeric_rescale")
+        .expect("Failed to query");
+    let returned: Vec<(Option<String>, Option<String>)> =
+        collect_rows(result, |row| (row.get(0), row.get(1)));
+    let want = [
+        ("1234.50", "1234.5000"),
+        ("5.00", "5.0000"),
+        ("1.23", "1.2345"),
+        ("-2.50", "-2.5000"),
+    ];
+    for ((got_s, got_b), (want_s, want_b)) in returned.iter().zip(want) {
+        assert_eq!(got_s.as_deref(), Some(want_s));
+        assert_eq!(got_b.as_deref(), Some(want_b));
+    }
+    assert_eq!(returned.len(), want.len());
+}
+
+/// A `Numeric` that cannot be represented at the column's scale without
+/// losing digits must be rejected, not silently truncated.
+#[test]
+fn test_roundtrip_numeric_scale_mismatch_lossy_rejected() {
+    let test = TestConnection::new().expect("Failed to create test connection");
+    test.execute_command("CREATE TABLE rt_numeric_lossy (v NUMERIC(10, 2))")
+        .expect("Failed to create table");
+    let table_def = Catalog::new(&test.connection)
+        .get_table_definition("rt_numeric_lossy")
+        .expect("Failed to get table definition");
+
+    let mut inserter =
+        Inserter::new(&test.connection, &table_def).expect("Failed to create inserter");
+    let err = inserter
+        .add_row(&[&Some(Numeric::new(12_345, 3))]) // 12.345 has 3 decimals, column holds 2
+        .expect_err("lossy rescale must be rejected");
+    assert!(
+        err.to_string().contains("scale"),
+        "error should explain the scale problem, got: {err}"
+    );
+}
+
 // =============================================================================
 // Binary Data Round-Trip Tests
 // =============================================================================
@@ -495,8 +572,7 @@ fn test_roundtrip_numeric_small() {
 /// Test BYTEA round-trip.
 ///
 /// This test verifies that BYTEA values round-trip correctly through insert/query.
-/// `PostgreSQL` text format uses hex escape format (`\xHEXDIGITS`) which is automatically
-/// decoded by the client.
+/// BYTEA is returned as raw bytes in `HyperBinary`; `get::<Vec<u8>>` yields them unchanged.
 #[test]
 fn test_roundtrip_bytea() {
     let test = TestConnection::new().expect("Failed to create test connection");

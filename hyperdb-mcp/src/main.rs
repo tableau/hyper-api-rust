@@ -17,8 +17,9 @@
 //! 2. **`<log_dir>/hyperdb-mcp.log`** — append-only file, same log filter.
 //!    The path is reported in the `status` tool's `logs.client_log` field.
 //!
-//! Both `hyperd` and the client write to the same `log_dir` (see
-//! [`hyperdb_mcp::engine::resolve_log_dir`]). Check the `status` tool for
+//! With a private `hyperd`, both it and the client write to the same `log_dir`
+//! (see [`hyperdb_mcp::engine::resolve_log_dir`]); the shared daemon's `hyperd`
+//! logs under the daemon state directory instead. Check the `status` tool for
 //! the exact paths.
 
 use clap::{Parser, Subcommand};
@@ -33,7 +34,7 @@ use hyperdb_mcp::server::HyperMcpServer;
 use rmcp::ServiceExt;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
-// Both MCP_VERSION and HYPERDB_GIT_HASH are env! string literals, so this
+// Both CARGO_PKG_VERSION and HYPERDB_GIT_HASH are env! string literals, so this
 // concat! resolves at compile time into a single &'static str — exactly
 // what clap wants for the `version = ...` attribute.
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), ".r", env!("HYPERDB_GIT_HASH"));
@@ -126,22 +127,12 @@ enum Commands {
         json: bool,
     },
 
-    /// Run a foreground daemon managing shared hyperd. Auto-spawn scans before
-    /// launching; foreground startup binds its configured/base port exactly.
+    /// Run a foreground daemon managing shared hyperd. One daemon runs per
+    /// state directory (`~/.hyperdb`, or `HYPERDB_STATE_DIR`); it listens on a
+    /// per-user Unix socket or named pipe there, not on a TCP port.
     Daemon {
         #[command(subcommand)]
         action: Option<DaemonAction>,
-
-        /// Exact TCP health/lock port for foreground startup. Without `--port`,
-        /// the foreground daemon binds the configured/base port exactly
-        /// (`HYPERDB_DAEMON_PORT` when valid, otherwise 7485) and does not scan.
-        /// Auto-spawn performs bounded discovery from its configured base before
-        /// launching. For stop/status, omitting the port uses discovery plus
-        /// scanning. Must be 1-65535: port 0 asks the OS for an *ephemeral*
-        /// port, which contradicts the exact bind promised here and leaves a
-        /// daemon on a port no client's scan can ever find.
-        #[arg(long, global = true, value_parser = clap::value_parser!(u16).range(1..))]
-        port: Option<u16>,
 
         /// Idle timeout in seconds before the daemon shuts down
         #[arg(long)]
@@ -166,29 +157,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Doctor { json }) => run_doctor_mode(&cli, json),
         Some(Commands::Daemon {
             action: Some(DaemonAction::Stop),
-            port,
             ..
         }) => {
-            daemon_stop(port);
+            daemon_stop();
             Ok(())
         }
         Some(Commands::Daemon {
             action: Some(DaemonAction::Status),
-            port,
             ..
         }) => {
-            daemon_status(port);
+            daemon_status();
             Ok(())
         }
         Some(Commands::Daemon {
             action: None,
-            port,
             idle_timeout,
-        }) => {
-            // Resolve the effective port for daemon startup
-            let effective_port = port.unwrap_or_else(|| discovery::resolve_port_scan().base);
-            run_daemon_mode(effective_port, idle_timeout).await
-        }
+        }) => run_daemon_mode(idle_timeout).await,
         None => run_mcp_mode(cli).await,
     }
 }
@@ -213,15 +197,16 @@ fn run_doctor_mode(cli: &Cli, json: bool) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-async fn run_daemon_mode(
-    port: u16,
-    idle_timeout: Option<u64>,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_daemon_mode(idle_timeout: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
     // Daemon logs go to ~/.hyperdb/logs/. They record the hyperd endpoint, so
     // both the state directory and the log directory inside it are restricted
     // to the owning user, as `daemon.json` is.
     let state_dir = discovery::state_dir()?;
     daemon::state_perms::ensure_owner_only_dir(&state_dir)?;
+    // Before anything is written into it: an untrusted directory (someone
+    // else's, or writable by others) gets no log file and no logs directory.
+    // Logging is not up yet, so the error reaches the caller's stderr.
+    daemon::state_perms::verify_state_dir_trusted(&state_dir)?;
     let log_dir = state_dir.join("logs");
     daemon::state_perms::ensure_owner_only_dir(&log_dir)?;
 
@@ -237,8 +222,14 @@ async fn run_daemon_mode(
         .with(fmt::layer().with_writer(file_writer).with_ansi(false))
         .init();
 
-    let config = DaemonConfig::from_args(port, idle_timeout);
-    daemon::run::run_daemon(config).await
+    let config = DaemonConfig::from_args(idle_timeout);
+    let result = daemon::run::run_daemon(config).await;
+    // A spawned daemon's stderr is /dev/null, so the log file is the only place
+    // a failed start (lock, pre-flight, hyperd) can be read afterwards.
+    if let Err(error) = &result {
+        tracing::error!(%error, "daemon exited with an error");
+    }
+    result
 }
 
 async fn run_mcp_mode(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
@@ -302,57 +293,125 @@ async fn run_mcp_mode(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn daemon_stop(port: Option<u16>) {
-    let target_port = match port {
-        Some(p) => p,
-        None => {
-            // No explicit port — discover the running daemon
-            if let Some(info) = discovery::find_running_daemon() {
-                info.health_port
-            } else {
-                eprintln!("No daemon is currently running.");
-                std::process::exit(1);
-            }
-        }
-    };
+/// Find the running daemon and the endpoint to reach it on, or exit 1.
+///
+/// The record in `daemon.json` is the normal locator. A live daemon whose
+/// record is missing or unusable is still found through the daemon lock: when
+/// it is held, the daemon's well-known socket (Unix) is probed with an
+/// identified `PING`.
+fn running_daemon_endpoint() -> daemon::control::HealthEndpoint {
+    use daemon::control::HealthEndpoint;
 
-    match health::send_command(target_port, "STOP") {
+    let Ok(dir) = discovery::state_dir() else {
+        eprintln!("No daemon is currently running.");
+        std::process::exit(1);
+    };
+    // The lock-based daemon is not running; a pre-1.0 one holds no lock, so
+    // say so when its record is there.
+    let no_daemon = || -> ! {
+        match discovery::legacy_daemon_hint(&dir) {
+            Some(hint) => eprintln!("No daemon is currently running. {hint}"),
+            None => eprintln!("No daemon is currently running."),
+        }
+        std::process::exit(1);
+    };
+    if let Some(info) = discovery::discover_in(&dir)
+        && let Some(endpoint) = HealthEndpoint::from_record(&info.health_endpoint, &dir)
+    {
+        return endpoint;
+    }
+
+    match daemon::state_perms::verify_state_dir_trusted(&dir) {
+        Ok(()) => {}
+        // No state directory at all: nothing has ever run here.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => no_daemon(),
+        Err(e) => {
+            eprintln!("The daemon state directory cannot be trusted: {e}");
+            std::process::exit(1);
+        }
+    }
+    match daemon::lock::DaemonLock::is_held(&dir) {
+        Ok(false) => no_daemon(),
+        Ok(true) => {}
+        Err(e) => {
+            eprintln!("Cannot check the daemon lock in {}: {e}", dir.display());
+            std::process::exit(1);
+        }
+    }
+    // The lock is held, so a daemon is running or starting. A Windows pipe
+    // name is random per daemon and only the record carries it, so only Unix
+    // can probe the fixed socket path.
+    #[cfg(unix)]
+    if let Ok(endpoint) = HealthEndpoint::for_new_daemon(&dir)
+        && health::ping_identified(
+            &endpoint,
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_millis(500),
+        )
+        .is_some()
+    {
+        return endpoint;
+    }
+    eprintln!(
+        "The daemon lock is held but no usable record was found, and nothing answered on the \
+         health channel in {}. A daemon may still be starting; try again shortly.",
+        dir.display()
+    );
+    std::process::exit(1);
+}
+
+fn daemon_stop() {
+    let endpoint = running_daemon_endpoint();
+    match health::send_command(&endpoint, "STOP") {
         Ok(response) => {
             println!("Daemon responded: {}", response.trim());
         }
         Err(e) => {
-            eprintln!("No daemon running on port {target_port} (or cannot connect): {e}");
+            eprintln!("No daemon running at {endpoint} (or cannot connect): {e}");
+            std::process::exit(1);
+        }
+    }
+    // Success means the daemon is gone, not merely that it acknowledged: it
+    // releases the lock only after `hyperd` has exited.
+    let dir = match discovery::state_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!(
+                "The daemon acknowledged STOP, but its state directory cannot be resolved to confirm it exited: {e}"
+            );
+            std::process::exit(1);
+        }
+    };
+    match daemon::spawn::wait_for_lock_release(&dir, daemon::spawn::STOP_WAIT) {
+        Ok(()) => println!("Daemon stopped."),
+        Err(e) => {
+            eprintln!("The daemon acknowledged STOP but did not exit: {e}");
             std::process::exit(1);
         }
     }
 }
 
-fn daemon_status(port: Option<u16>) {
-    let info = if let Some(port) = port {
-        match health::send_command(port, "STATUS") {
-            Ok(response) => match serde_json::from_str::<discovery::DaemonInfo>(response.trim()) {
-                Ok(info) => info,
-                Err(e) => {
-                    eprintln!("Daemon on port {port} returned invalid status: {e}");
-                    std::process::exit(1);
-                }
-            },
+fn daemon_status() {
+    let endpoint = running_daemon_endpoint();
+    // Ask the daemon itself, so the report is its own view of its endpoints.
+    let info = match health::send_command(&endpoint, "STATUS") {
+        Ok(response) => match serde_json::from_str::<discovery::DaemonInfo>(response.trim()) {
+            Ok(info) => info,
             Err(e) => {
-                eprintln!("No daemon running on port {port} (or cannot connect): {e}");
+                eprintln!("Daemon at {endpoint} returned invalid status: {e}");
                 std::process::exit(1);
             }
+        },
+        Err(e) => {
+            eprintln!("No daemon running at {endpoint} (or cannot connect): {e}");
+            std::process::exit(1);
         }
-    } else if let Some(info) = discovery::find_running_daemon() {
-        info
-    } else {
-        eprintln!("No daemon is currently running.");
-        std::process::exit(1);
     };
 
     println!("Daemon is running:");
     println!("  PID:            {}", info.pid);
     println!("  Hyperd endpoint: {}", info.hyperd_endpoint);
-    println!("  Health port:    {}", info.health_port);
+    println!("  Health endpoint: {}", info.health_endpoint);
     println!("  Started:        {}", info.started_at);
     println!("  Version:        {}", info.version);
 }

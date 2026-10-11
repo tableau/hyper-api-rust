@@ -5,6 +5,9 @@
 
 use std::time::Duration;
 
+use super::error::Error;
+use super::tls::TlsConfig;
+
 /// Configuration for a Hyper database connection.
 ///
 /// Use the builder pattern to construct a configuration:
@@ -36,7 +39,22 @@ pub struct Config {
     connect_timeout: Option<Duration>,
     application_name: Option<String>,
     options: Vec<(String, String)>,
+    tls: TlsConfig,
 }
+
+/// libpq connection-string keys that configure TLS. [`Config`]'s `FromStr`
+/// rejects them instead of forwarding them to the server as startup options,
+/// where they would be silently ignored.
+const LIBPQ_TLS_KEYS: &[&str] = &[
+    "sslmode",
+    "sslrootcert",
+    "sslcert",
+    "sslkey",
+    "sslpassword",
+    "sslcrl",
+    "sslsni",
+    "sslnegotiation",
+];
 
 impl Config {
     /// Creates a new configuration with default settings.
@@ -54,6 +72,7 @@ impl Config {
             application_name: None,
             // Set HyperBinary format by default for optimal performance
             options: vec![("result_format_code".to_string(), "HyperBinary".to_string())],
+            tls: TlsConfig::default(),
         }
     }
 
@@ -105,6 +124,17 @@ impl Config {
         self
     }
 
+    /// Sets the TLS configuration; the default is
+    /// [`TlsMode::Disable`](super::tls::TlsMode::Disable).
+    ///
+    /// Applies to TCP connections only. Over a Unix domain socket or a named
+    /// pipe, [`TlsMode::Prefer`](super::tls::TlsMode::Prefer) connects in
+    /// plaintext and every mode that requires TLS is rejected.
+    pub fn with_tls(mut self, tls: impl Into<TlsConfig>) -> Self {
+        self.tls = tls.into();
+        self
+    }
+
     /// Returns the host.
     #[must_use]
     pub fn host(&self) -> &str {
@@ -139,6 +169,12 @@ impl Config {
     #[must_use]
     pub fn connect_timeout(&self) -> Option<Duration> {
         self.connect_timeout
+    }
+
+    /// Returns the TLS configuration.
+    #[must_use]
+    pub fn tls(&self) -> &TlsConfig {
+        &self.tls
     }
 
     /// Returns the application name.
@@ -180,11 +216,15 @@ impl Config {
 }
 
 impl std::str::FromStr for Config {
-    type Err = String;
+    type Err = Error;
 
     /// Parses a connection string into a Config.
     ///
     /// Format: `host:port/database?user=xxx&password=xxx`
+    ///
+    /// The libpq TLS keys (`sslmode`, `sslrootcert`, `sslcert`, `sslkey`, ...)
+    /// are rejected with [`Error::Config`]; configure TLS with
+    /// [`Config::with_tls`] instead.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut config = Config::new();
 
@@ -197,7 +237,9 @@ impl std::str::FromStr for Config {
 
         if let Some(idx) = addr.rfind(':') {
             config.host = addr[..idx].to_string();
-            config.port = addr[idx + 1..].parse().map_err(|_| "invalid port number")?;
+            config.port = addr[idx + 1..]
+                .parse()
+                .map_err(|_| Error::config("invalid port number"))?;
         } else {
             config.host = addr.to_string();
         }
@@ -218,8 +260,14 @@ impl std::str::FromStr for Config {
             if param.is_empty() {
                 continue;
             }
+            let name = param.split_once('=').map_or(param, |(name, _)| name);
+            if LIBPQ_TLS_KEYS.contains(&name) {
+                return Err(Error::config(format!(
+                    "TLS options are not accepted in the connection string (found `{name}`); \
+                     use Config::with_tls (ConnectionBuilder::tls in hyperdb-api)"
+                )));
+            }
             if let Some(idx) = param.find('=') {
-                let name = &param[..idx];
                 let value = &param[idx + 1..];
                 match name {
                     "user" => config.user = Some(value.to_string()),
@@ -251,6 +299,25 @@ mod tests {
         assert_eq!(config.port, 7483);
         assert_eq!(config.database, Some("mydb".to_string()));
         assert_eq!(config.user, Some("test".to_string()));
+    }
+
+    #[test]
+    fn test_config_from_str_rejects_libpq_tls_keys() {
+        for key in LIBPQ_TLS_KEYS {
+            let err = format!("h:1/db?{key}=x")
+                .parse::<Config>()
+                .expect_err("TLS key must be rejected");
+            assert!(matches!(err, Error::Config(_)), "{key}: got {err:?}");
+            assert!(err.to_string().contains("Config::with_tls"), "got {err}");
+        }
+        let err = "h:1/db?sslmode=require".parse::<Config>().unwrap_err();
+        assert!(err.to_string().contains("sslmode"), "got {err}");
+        // A bare key with no `=` is rejected too, not silently dropped.
+        let err = "h:1/db?user=u&sslmode".parse::<Config>().unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "got {err:?}");
+
+        let err = "h:notaport/db".parse::<Config>().unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "got {err:?}");
     }
 
     /// Mirrors the `///` example on `Config` so the builder chain is still

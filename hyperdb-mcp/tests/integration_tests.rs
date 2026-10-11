@@ -79,6 +79,7 @@ fn full_pipeline_csv_ingest_and_export() {
         path: export_path_str.into(),
         format: "csv".into(),
         overwrite: true,
+        protected_paths: Vec::new(),
         format_options: None,
         source_db: None,
     };

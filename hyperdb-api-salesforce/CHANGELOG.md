@@ -7,15 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- **Secrets no longer appear in `Debug` output or debug logs.**
+  `SalesforceAuthConfig` printed `client_secret`, and `OAuthTokenResponse`,
+  `OAuthToken`, `DataCloudTokenResponse` and `DataCloudToken` printed their
+  access-token values; all five now redact them. The token provider also no
+  longer logs the raw OAuth and DC JWT response bodies at `debug` level (it
+  logs their size instead).
+
 ## [1.0.0-rc.3] - 2026-09-07
+
+These changes first shipped in 1.0.0-rc.1.
 
 ### Changed
 
-- **BREAKING:** the `arrow` dependency moved from **58** to **59**, matching
-  `hyperdb-api`. Arrow IPC types cross this crate's API surface, so consumers
-  must move in lockstep.
+- The `arrow` dev-dependency (used only by the example) moved from **58** to **59**, matching
+  `hyperdb-api`. This does not affect consumers.
 
-- **BREAKING:** the minimum supported Rust version is now **1.88**, up from
+- The minimum supported Rust version is now **1.88**, up from
   1.81, and the crate is compiled with **edition 2024**. 1.88 is the version
   Red Hat Enterprise Linux 9.7 ships as `rust-toolset`.
 - **BREAKING:** the TLS crypto provider is now **ring** rather than AWS-LC.

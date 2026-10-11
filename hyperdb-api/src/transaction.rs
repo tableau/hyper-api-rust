@@ -36,9 +36,8 @@ pub struct Transaction<'conn> {
 impl<'conn> Transaction<'conn> {
     /// Creates a new transaction by issuing `BEGIN TRANSACTION`.
     pub(crate) fn new(connection: &'conn mut Connection) -> Result<Self> {
-        // Use the crate-internal `_raw` family. The matching `pub`
-        // methods on `Connection` are `#[deprecated]` for downstream
-        // consumers; this guard is the recommended replacement.
+        // Delegate to the public `*_unguarded` primitive; the guard adds the
+        // pairing guarantee (commit/rollback consume `self`, drop rolls back).
         connection.begin_transaction_unguarded()?;
         Ok(Self {
             connection,

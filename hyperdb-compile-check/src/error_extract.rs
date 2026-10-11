@@ -3,9 +3,9 @@
 
 //! SQLSTATE-based Hyper error classification.
 //!
-//! Phase 0 spike S5 confirmed that Hyper returns PostgreSQL SQLSTATE codes as a
-//! structured field on `Error::Server`. We branch on the **stable code**, not
-//! fragile message text, so Hyper message wording changes don't break us.
+//! Hyper reports PostgreSQL SQLSTATE codes as a structured field on
+//! `Error::Server`. Classification branches on the **stable code**, not
+//! fragile message text, so Hyper message wording changes don't break it.
 //!
 //! Relevant codes:
 //! - `42P01` — undefined_table  → extract the table name and seed-and-retry
@@ -46,8 +46,8 @@ pub fn classify(err: &Error) -> ErrorClass {
 /// Extract a double-quoted or single-quoted identifier from a Hyper error
 /// message, with a fallback to the full message.
 ///
-/// Phase 0 output for 42P01: `ERROR: table "ghosts" does not exist (42P01)`
-/// Phase 0 output for 42703: `ERROR: unknown column 'ema1l' (42703)`
+/// Hyper formats 42P01 as `ERROR: table "ghosts" does not exist (42P01)` and
+/// 42703 as `ERROR: unknown column 'ema1l' (42703)`.
 fn extract_quoted_identifier(message: &str, _kind: &str) -> String {
     // Try double-quoted first ("ghosts"), then single-quoted ('ema1l').
     if let Some(name) = extract_between(message, '"', '"') {

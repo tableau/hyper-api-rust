@@ -83,8 +83,11 @@ impl<'conn> AsyncPreparedStatement<'conn> {
     /// - Returns [`Error::FeatureNotSupported`] on gRPC transport.
     /// - Returns [`Error::Server`] if the server rejects `Bind` or
     ///   `Execute`.
-    /// - Returns [`Error::Io`] on transport-level I/O failures.
-    pub async fn query(&self, params: &[&dyn ToSqlParam]) -> Result<AsyncRowset<'conn>> {
+    /// - Returns [`Error::Connection`] on transport-level I/O failures.
+    pub async fn query<'stmt>(
+        &'stmt self,
+        params: &[&dyn ToSqlParam],
+    ) -> Result<AsyncRowset<'stmt>> {
         let (encoded, formats) = encode_params(params);
         let client = async_tcp_client(self.connection)?;
         let stream = client
@@ -106,7 +109,7 @@ impl<'conn> AsyncPreparedStatement<'conn> {
     /// - Returns [`Error::FeatureNotSupported`] on gRPC transport.
     /// - Returns [`Error::Server`] if the server rejects `Bind` or
     ///   `Execute`.
-    /// - Returns [`Error::Io`] on transport-level I/O failures.
+    /// - Returns [`Error::Connection`] on transport-level I/O failures.
     pub async fn execute(&self, params: &[&dyn ToSqlParam]) -> Result<u64> {
         let (encoded, formats) = encode_params(params);
         let client = async_tcp_client(self.connection)?;
@@ -259,7 +262,7 @@ impl AsyncPreparedStatementOwned {
     /// - Returns [`Error::FeatureNotSupported`] on gRPC transport.
     /// - Returns [`Error::Server`] if the server rejects `Bind` or
     ///   `Execute`, or raises a runtime error while streaming.
-    /// - Returns [`Error::Io`] on transport-level I/O failures.
+    /// - Returns [`Error::Connection`] on transport-level I/O failures.
     pub async fn fetch_all(&self, params: &[&dyn ToSqlParam]) -> Result<Vec<Row>> {
         let (encoded, formats) = encode_params(params);
         let client = async_tcp_client_arc(&self.connection)?;
@@ -282,7 +285,7 @@ impl AsyncPreparedStatementOwned {
     /// - Returns [`Error::FeatureNotSupported`] on gRPC transport.
     /// - Returns [`Error::Server`] if the server rejects `Bind` or
     ///   `Execute`.
-    /// - Returns [`Error::Io`] on transport-level I/O failures.
+    /// - Returns [`Error::Connection`] on transport-level I/O failures.
     pub async fn execute(&self, params: &[&dyn ToSqlParam]) -> Result<u64> {
         let (encoded, formats) = encode_params(params);
         let client = async_tcp_client_arc(&self.connection)?;

@@ -10,11 +10,9 @@ name: release
 #   - a manual workflow_dispatch with an explicit existing tag (for
 #     re-runs or emergency releases).
 #
-# Note: the `push: tags:` trigger was removed because release-please
-# now uses a PAT (RELEASE_PLEASE_TOKEN) that fires both `release:
-# published` AND `push: tags:` events. Keeping both caused duplicate
-# runs. For emergency releases that bypass release-please, use
-# workflow_dispatch.
+# There is no `push: tags:` trigger: pushing a tag alone publishes
+# nothing. Use workflow_dispatch for re-runs or for emergency releases
+# that bypass release-please.
 #
 # Stable tags (v0.1.0) mark the GitHub release as latest; pre-release
 # tags (v0.1.0-rc.1) mark it as prerelease so it doesn't show as
@@ -60,16 +58,18 @@ jobs:
           ref: ${{ github.event.inputs.tag || github.event.release.tag_name || github.ref }}
 
       - name: Wait for CI to pass
-        # The full test matrix already ran on the merge commit before
-        # release-please tagged it. Re-running it here was ~20 minutes
-        # of redundant CI per release. Instead, poll the check-runs
+        # The full test matrix already ran on the release-PR merge
+        # commit, and re-running it here would cost ~20 minutes of
+        # redundant CI per release. Instead, poll the check-runs
         # API for the tag's SHA and verify all required checks are
         # green. Mirrors the verify-ci pattern in npm-build-publish.yml.
         #
         # Risk: a maintainer who runs workflow_dispatch with a tag on
         # a SHA that never had CI would skip all test coverage. Guard
-        # against that by requiring TOTAL > 0 — if no required check
-        # ever ran on this SHA, abort.
+        # against that by requiring every name in REQUIRED_JSON to be
+        # present and completed — if a required check never ran on
+        # this SHA (or was renamed), the gate times out instead of
+        # passing.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -85,16 +85,21 @@ jobs:
           # them through bash → jq → Oniguruma was fragile and broke
           # silently on the v0.2.2 release. Exact-string match avoids
           # the whole class of regex-escaping bugs.
+          # These names must match the `name:` of the ci.yml jobs; the
+          # msrv entry embeds the MSRV, so it changes whenever ci.yml does.
           REQUIRED_JSON='[
-            "rustfmt","clippy","cargo-audit","cargo-deny",
+            "rustfmt","clippy (ubuntu-24.04)","clippy (windows-2025)",
+            "msrv (1.88)","doc","cargo-audit","cargo-deny",
             "version consistency","publish dry-run",
             "test (ubuntu-24.04)","test (macos-26)","test (windows-2025)",
             "hyperdb-api-node (build + smoke)"
           ]'
+          EXPECTED=$(echo "$REQUIRED_JSON" | jq 'length')
           for i in $(seq 1 "$MAX_ATTEMPTS"); do
             RUNS=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" \
               --jq "[.check_runs[] | select(.name as \$n | $REQUIRED_JSON | index(\$n))]")
             TOTAL=$(echo "$RUNS" | jq 'length')
+            PRESENT=$(echo "$RUNS" | jq '[.[].name] | unique | length')
             COMPLETED=$(echo "$RUNS" | jq '[.[] | select(.status=="completed")] | length')
             FAILED=$(echo "$RUNS" | jq '[.[] | select(.status=="completed" and (.conclusion!="success" and .conclusion!="skipped" and .conclusion!="neutral"))] | length')
             echo "Attempt $i/$MAX_ATTEMPTS: total=$TOTAL completed=$COMPLETED failed=$FAILED"
@@ -103,7 +108,7 @@ jobs:
               echo "$RUNS" | jq -r '.[] | select(.status=="completed" and (.conclusion!="success" and .conclusion!="skipped" and .conclusion!="neutral")) | "  - \(.name): \(.conclusion)"'
               exit 1
             fi
-            if [[ "$TOTAL" -gt 0 && "$COMPLETED" == "$TOTAL" ]]; then
+            if [[ "$PRESENT" == "$EXPECTED" && "$COMPLETED" == "$TOTAL" ]]; then
               echo "CI passed ($TOTAL required check-runs completed successfully)."
               exit 0
             fi

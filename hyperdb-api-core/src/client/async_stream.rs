@@ -4,8 +4,8 @@
 //! Async stream abstraction for multiple transport types.
 //!
 //! This module provides [`AsyncStream`], an enum that can hold different
-//! async stream types (TCP, Unix Domain Socket) while implementing the
-//! necessary async I/O traits.
+//! async stream types (TCP, TLS over TCP, Unix Domain Socket, named pipe)
+//! while implementing the necessary async I/O traits.
 
 use std::io;
 use std::pin::Pin;
@@ -13,6 +13,7 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+use tokio_rustls::client::TlsStream;
 
 #[cfg(unix)]
 use tokio::net::UnixStream;
@@ -20,15 +21,18 @@ use tokio::net::UnixStream;
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::NamedPipeClient;
 
-/// An async stream that can be either TCP or Unix Domain Socket.
+/// An async stream over TCP, TLS over TCP, a Unix Domain Socket or a named pipe.
 ///
 /// This enum provides a unified interface for different transport mechanisms,
-/// allowing [`AsyncClient`](crate::client::AsyncClient) to work with both TCP and
-/// Unix Domain Sockets transparently.
+/// allowing [`AsyncClient`](crate::client::AsyncClient) to work with all of
+/// them transparently.
 #[derive(Debug)]
 pub enum AsyncStream {
     /// TCP stream for network connections.
     Tcp(TcpStream),
+
+    /// TLS-encrypted TCP stream, after a successful `SSLRequest` handshake.
+    Tls(Box<TlsStream<TcpStream>>),
 
     /// Unix Domain Socket stream for local IPC (Unix only).
     #[cfg(unix)]
@@ -51,9 +55,14 @@ impl AsyncStream {
         AsyncStream::Unix(stream)
     }
 
-    /// Returns true if this is a TCP stream.
+    /// Returns true if this is a TCP stream, encrypted or not.
     pub fn is_tcp(&self) -> bool {
-        matches!(self, AsyncStream::Tcp(_))
+        matches!(self, AsyncStream::Tcp(_) | AsyncStream::Tls(_))
+    }
+
+    /// Returns true if this is a TLS-encrypted TCP stream.
+    pub fn is_tls(&self) -> bool {
+        matches!(self, AsyncStream::Tls(_))
     }
 
     /// Returns true if this is a Unix Domain Socket stream.
@@ -85,6 +94,7 @@ impl AsyncStream {
     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
         match self {
             AsyncStream::Tcp(stream) => stream.set_nodelay(nodelay),
+            AsyncStream::Tls(stream) => stream.get_ref().0.set_nodelay(nodelay),
             #[cfg(unix)]
             AsyncStream::Unix(_) => Ok(()), // No-op for Unix sockets
             #[cfg(windows)]
@@ -96,6 +106,11 @@ impl AsyncStream {
     pub fn local_addr_string(&self) -> String {
         match self {
             AsyncStream::Tcp(stream) => stream
+                .local_addr()
+                .map_or_else(|_| "unknown".to_string(), |a| a.to_string()),
+            AsyncStream::Tls(stream) => stream
+                .get_ref()
+                .0
                 .local_addr()
                 .map_or_else(|_| "unknown".to_string(), |a| a.to_string()),
             #[cfg(unix)]
@@ -113,6 +128,11 @@ impl AsyncStream {
     pub fn peer_addr_string(&self) -> String {
         match self {
             AsyncStream::Tcp(stream) => stream
+                .peer_addr()
+                .map_or_else(|_| "unknown".to_string(), |a| a.to_string()),
+            AsyncStream::Tls(stream) => stream
+                .get_ref()
+                .0
                 .peer_addr()
                 .map_or_else(|_| "unknown".to_string(), |a| a.to_string()),
             #[cfg(unix)]
@@ -135,6 +155,16 @@ impl AsyncRead for AsyncStream {
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
             AsyncStream::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
+            // rustls reports a peer that closes the socket without a
+            // `close_notify` alert as `UnexpectedEof`. Report it as EOF, as
+            // the plaintext stream would: the wire protocol is length-framed,
+            // so a truncated message is still caught by the reader.
+            AsyncStream::Tls(stream) => match Pin::new(stream.as_mut()).poll_read(cx, buf) {
+                Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                    Poll::Ready(Ok(()))
+                }
+                other => other,
+            },
             #[cfg(unix)]
             AsyncStream::Unix(stream) => Pin::new(stream).poll_read(cx, buf),
             #[cfg(windows)]
@@ -151,6 +181,7 @@ impl AsyncWrite for AsyncStream {
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
             AsyncStream::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
+            AsyncStream::Tls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
             #[cfg(unix)]
             AsyncStream::Unix(stream) => Pin::new(stream).poll_write(cx, buf),
             #[cfg(windows)]
@@ -161,6 +192,7 @@ impl AsyncWrite for AsyncStream {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             AsyncStream::Tcp(stream) => Pin::new(stream).poll_flush(cx),
+            AsyncStream::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
             #[cfg(unix)]
             AsyncStream::Unix(stream) => Pin::new(stream).poll_flush(cx),
             #[cfg(windows)]
@@ -171,6 +203,7 @@ impl AsyncWrite for AsyncStream {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             AsyncStream::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
+            AsyncStream::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
             #[cfg(unix)]
             AsyncStream::Unix(stream) => Pin::new(stream).poll_shutdown(cx),
             #[cfg(windows)]
@@ -185,6 +218,7 @@ impl AsyncWrite for AsyncStream {
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
             AsyncStream::Tcp(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+            AsyncStream::Tls(stream) => Pin::new(stream.as_mut()).poll_write_vectored(cx, bufs),
             #[cfg(unix)]
             AsyncStream::Unix(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
             #[cfg(windows)]
@@ -195,6 +229,7 @@ impl AsyncWrite for AsyncStream {
     fn is_write_vectored(&self) -> bool {
         match self {
             AsyncStream::Tcp(stream) => stream.is_write_vectored(),
+            AsyncStream::Tls(stream) => stream.is_write_vectored(),
             #[cfg(unix)]
             AsyncStream::Unix(stream) => stream.is_write_vectored(),
             #[cfg(windows)]

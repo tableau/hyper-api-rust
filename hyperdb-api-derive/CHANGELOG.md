@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `derive(Table)` now double-quotes the table and column names in `CREATE_SQL`,
+  so structs named or fields called after reserved words (`Order`, `User`,
+  `order`) produce valid DDL. `CREATE_SQL` text changes accordingly.
+
+- **`query_as!` and `query_scalar!` now bind their `$N` arguments.** They were
+  accepted and silently discarded. Each argument must implement
+  `hyperdb_api::ToSqlParam`; the macros now generate code that requires it.
+
 ## [1.0.0-rc.3] - 2026-09-07
 
 ### Changed

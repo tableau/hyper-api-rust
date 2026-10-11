@@ -50,8 +50,8 @@ use tracing::{debug, trace, warn};
 
 use crate::client::error::{Error, Result};
 
+use super::config::TransferMode;
 use super::error::from_grpc_status;
-use super::proto::hyper_service::query_param::TransferMode;
 use super::proto::hyper_service::query_result::Result as QueryResultPayload;
 use super::proto::hyper_service::query_status::CompletionStatus;
 use super::proto::{
@@ -277,7 +277,7 @@ where
                 //     chunks 1..N still need to be fetched for ADAPTIVE
                 //     (and 0..N for ASYNC).
                 match self.transfer_mode {
-                    TransferMode::Sync | TransferMode::Unspecified => {
+                    TransferMode::Sync => {
                         debug!(
                             query_id = ?self.query_id,
                             "ExecuteQuery stream closed; SYNC mode complete",

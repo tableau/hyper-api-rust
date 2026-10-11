@@ -8,6 +8,7 @@ use crate::connection::{Connection, CreateMode};
 use crate::error::{Error, Result};
 use crate::transport::{Transport, TransportType, detect_transport_type};
 use hyperdb_api_core::client::Config;
+use hyperdb_api_core::client::tls::{TlsConfig, TlsMode};
 
 /// A builder for creating database connections.
 ///
@@ -17,8 +18,10 @@ use hyperdb_api_core::client::Config;
 /// # Transport Auto-Detection
 ///
 /// The transport is automatically detected from the endpoint URL:
-/// - `https://` or `http://` → gRPC transport (read-only)
-/// - Otherwise → TCP transport (e.g., `localhost:7483`)
+/// - `https://` or `http://` → gRPC (read-only)
+/// - `tab.domain://...` or an absolute socket path → Unix domain socket (Unix only)
+/// - `tab.pipe://...` or a `\\host\pipe\name` path → named pipe (Windows only)
+/// - otherwise `host:port` → TCP (e.g., `localhost:7483`)
 ///
 /// # Example
 ///
@@ -55,12 +58,14 @@ pub struct ConnectionBuilder {
     user: Option<String>,
     password: Option<String>,
     login_timeout: Option<Duration>,
-    /// Query timeout — cancel queries that exceed this duration.
+    /// Per-query timeout, sent to the server as the `query_timeout` setting.
     query_timeout: Option<Duration>,
     /// Application name sent to the server during connection startup.
     application_name: Option<String>,
     /// Transfer mode for gRPC connections (ignored for TCP)
-    transfer_mode: Option<hyperdb_api_core::client::grpc::TransferMode>,
+    transfer_mode: Option<crate::grpc::TransferMode>,
+    /// TLS settings for TCP connections.
+    tls: TlsConfig,
 }
 
 impl Default for ConnectionBuilder {
@@ -69,12 +74,25 @@ impl Default for ConnectionBuilder {
     }
 }
 
+/// Renders the `SET` statement that applies `timeout` as the session's
+/// `query_timeout` (whole milliseconds, rounded up).
+///
+/// `hyperd` ignores `query_timeout` as a startup parameter, so it has to be
+/// set on the established session.
+pub(crate) fn query_timeout_statement(timeout: Duration) -> Result<String> {
+    if timeout.is_zero() {
+        return Err(Error::config("query_timeout must be greater than zero"));
+    }
+    let millis = timeout.as_nanos().div_ceil(1_000_000);
+    Ok(format!("SET query_timeout = '{millis}ms'"))
+}
+
 impl ConnectionBuilder {
     /// Creates a new builder for the given endpoint.
     ///
     /// # Arguments
     ///
-    /// * `endpoint` - The server endpoint (host:port).
+    /// * `endpoint` - The server endpoint; see [`ConnectionBuilder`] for the accepted forms.
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
@@ -86,11 +104,12 @@ impl ConnectionBuilder {
             query_timeout: None,
             application_name: None,
             transfer_mode: None, // Use default (Adaptive)
+            tls: TlsConfig::default(),
         }
     }
 
-    #[must_use]
     /// Sets the database path.
+    #[must_use]
     pub fn database(mut self, path: impl AsRef<Path>) -> Self {
         self.database = Some(path.as_ref().to_path_buf());
         self
@@ -105,23 +124,23 @@ impl ConnectionBuilder {
         self
     }
 
-    #[must_use]
     /// Sets the username for authentication.
     ///
     /// Default is "`tableau_internal_user`".
+    #[must_use]
     pub fn user(mut self, user: impl Into<String>) -> Self {
         self.user = Some(user.into());
         self
     }
 
-    #[must_use]
     /// Sets the password for authentication.
+    #[must_use]
     pub fn password(mut self, password: impl Into<String>) -> Self {
         self.password = Some(password.into());
         self
     }
 
-    /// Sets the login timeout.
+    /// Sets the login timeout (TCP connections only).
     #[must_use]
     pub fn login_timeout(mut self, timeout: Duration) -> Self {
         self.login_timeout = Some(timeout);
@@ -130,52 +149,112 @@ impl ConnectionBuilder {
 
     /// Sets the query timeout.
     ///
-    /// Queries that exceed this duration will be cancelled automatically.
-    /// Default is no timeout (queries run until completion).
+    /// Applied to the session as `hyperd`'s `query_timeout` setting right after
+    /// connecting, so the server cancels any statement on this connection that
+    /// runs longer than `timeout` and reports an error. Sub-millisecond
+    /// precision is rounded up to a whole millisecond.
+    ///
+    /// Applies to TCP, Unix-socket and named-pipe connections. `hyperd`
+    /// clamps the value to its own `query_timeout_max` ceiling. A gRPC
+    /// connection has no equivalent, so [`build`](Self::build) fails with
+    /// [`Error::FeatureNotSupported`] rather than ignoring the setting.
+    ///
+    /// # Errors
+    ///
+    /// [`build`](Self::build) returns an error if `timeout` is zero.
     #[must_use]
     pub fn query_timeout(mut self, timeout: Duration) -> Self {
         self.query_timeout = Some(timeout);
         self
     }
 
-    #[must_use]
     /// Sets the application name sent to the server.
     ///
-    /// This appears in server logs and can be used for monitoring.
+    /// This appears in server logs and can be used for monitoring. It applies
+    /// to TCP connections only.
+    #[must_use]
     pub fn application_name(mut self, name: impl Into<String>) -> Self {
         self.application_name = Some(name.into());
         self
     }
 
-    #[must_use]
     /// Convenience method to set user and password at once.
+    #[must_use]
     pub fn auth(mut self, user: impl Into<String>, password: impl Into<String>) -> Self {
         self.user = Some(user.into());
         self.password = Some(password.into());
         self
     }
 
-    #[must_use]
     /// Convenience method to create a new database.
+    #[must_use]
     pub fn create_new_database(mut self, database_path: impl AsRef<Path>) -> Self {
         self.database = Some(database_path.as_ref().to_path_buf());
         self.create_mode = CreateMode::Create;
         self
     }
 
-    #[must_use]
     /// Convenience method to create database if it doesn't exist.
+    #[must_use]
     pub fn create_or_open_database(mut self, database_path: impl AsRef<Path>) -> Self {
         self.database = Some(database_path.as_ref().to_path_buf());
         self.create_mode = CreateMode::CreateIfNotExists;
         self
     }
 
-    #[must_use]
     /// Convenience method to open an existing database.
+    #[must_use]
     pub fn open_database(mut self, database_path: impl AsRef<Path>) -> Self {
         self.database = Some(database_path.as_ref().to_path_buf());
         self.create_mode = CreateMode::DoNotCreate;
+        self
+    }
+
+    /// Sets the TLS configuration for a TCP connection.
+    ///
+    /// The default is [`TlsMode::Disable`]. A bare [`TlsMode`] converts into a
+    /// [`TlsConfig`]; use [`TlsConfig`] to add a root certificate, a client
+    /// certificate for mutual TLS, or a server-name override. The modes follow
+    /// libpq's `sslmode`:
+    ///
+    /// | Mode | Encrypted | Server certificate checked |
+    /// |------|-----------|----------------------------|
+    /// | [`Disable`](TlsMode::Disable) | never | — |
+    /// | [`Prefer`](TlsMode::Prefer) | if the server offers TLS, else plaintext | chain, only if a root certificate is set |
+    /// | [`Require`](TlsMode::Require) | always | chain, only if a root certificate is set |
+    /// | [`VerifyCa`](TlsMode::VerifyCa) | always | chain, against the root certificate |
+    /// | [`VerifyFull`](TlsMode::VerifyFull) | always | chain and host name |
+    ///
+    /// Over a Unix domain socket or a named pipe, [`TlsMode::Prefer`]
+    /// connects in plaintext and every mode that requires TLS fails
+    /// [`build`](Self::build) with [`Error::FeatureNotSupported`]. A gRPC
+    /// endpoint picks TLS through its `https://` scheme, so any mode other
+    /// than [`TlsMode::Disable`] fails there with
+    /// [`Error::FeatureNotSupported`] too. A query cancel for a TLS session
+    /// is sent over TLS. The TLS handshake must finish within
+    /// [`login_timeout`](Self::login_timeout) (30 seconds by default; zero
+    /// means no limit); the TCP connect itself is not bounded by it.
+    ///
+    /// The `Connection::connect*` shortcuts and `Connection::new` always
+    /// connect in plaintext; use this builder for TLS.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use hyperdb_api::{ConnectionBuilder, Result, TlsConfig, TlsMode};
+    ///
+    /// fn main() -> Result<()> {
+    ///     let conn = ConnectionBuilder::new("hyper.example.com:7483")
+    ///         .database("example.hyper")
+    ///         .tls(TlsConfig::new(TlsMode::VerifyFull).root_cert("ca.pem"))
+    ///         .build()?;
+    ///     assert!(conn.is_tls());
+    ///     Ok(())
+    /// }
+    /// ```
+    #[must_use]
+    pub fn tls(mut self, tls: impl Into<TlsConfig>) -> Self {
+        self.tls = tls.into();
         self
     }
 
@@ -202,7 +281,7 @@ impl ConnectionBuilder {
     /// }
     /// ```
     #[must_use]
-    pub fn transfer_mode(mut self, mode: hyperdb_api_core::client::grpc::TransferMode) -> Self {
+    pub fn transfer_mode(mut self, mode: crate::grpc::TransferMode) -> Self {
         self.transfer_mode = Some(mode);
         self
     }
@@ -210,12 +289,24 @@ impl ConnectionBuilder {
     /// Builds and establishes the connection.
     ///
     /// The transport is automatically detected from the endpoint URL:
-    /// - `https://` or `http://` → gRPC transport
-    /// - Otherwise → TCP transport
+    /// - `https://` or `http://` → gRPC (read-only)
+    /// - `tab.domain://...` or an absolute socket path → Unix domain socket (Unix only)
+    /// - `tab.pipe://...` or a `\\host\pipe\name` path → named pipe (Windows only)
+    /// - otherwise `host:port` → TCP
+    ///
+    /// `application_name` and `login_timeout` apply to TCP connections only.
     ///
     /// # Errors
     ///
-    /// Returns an error if the connection fails or if database creation fails.
+    /// - Returns [`Error::Config`] if the endpoint cannot be parsed, or if the
+    ///   TLS settings are invalid or a certificate file cannot be read.
+    /// - Returns [`Error::FeatureNotSupported`] for a gRPC endpoint with a create mode other than [`CreateMode::DoNotCreate`],
+    ///   or with a [`tls`](Self::tls) mode other than [`TlsMode::Disable`], and for a Unix-socket or named-pipe endpoint
+    ///   whose [`tls`](Self::tls) mode requires TLS.
+    /// - Returns [`Error::Connection`] or [`Error::Timeout`] if the transport handshake fails.
+    /// - Returns [`Error::Tls`] if TLS negotiation or certificate verification fails.
+    /// - Returns [`Error::Authentication`] if authentication is rejected.
+    /// - Returns [`Error::Server`] or [`Error::Internal`] if the database creation or attach SQL fails.
     pub fn build(self) -> Result<Connection> {
         let transport_type = detect_transport_type(&self.endpoint);
 
@@ -251,6 +342,7 @@ impl ConnectionBuilder {
         if let Some(timeout) = self.login_timeout {
             config = config.with_connect_timeout(timeout);
         }
+        config = config.with_tls(self.tls);
 
         let db_path_str = self
             .database
@@ -260,6 +352,9 @@ impl ConnectionBuilder {
         let client = hyperdb_api_core::client::Client::connect(&config)?;
 
         let conn = Connection::from_client(client, db_path_str.clone());
+        if let Some(timeout) = self.query_timeout {
+            conn.execute_command(&query_timeout_statement(timeout)?)?;
+        }
 
         // Handle database creation (TCP only - gRPC is read-only)
         if let Some(db_path) = db_path_str {
@@ -300,6 +395,7 @@ impl ConnectionBuilder {
         if let Some(password) = &self.password {
             config = config.with_password(password);
         }
+        config = config.with_tls(self.tls);
 
         let db_path_str = self
             .database
@@ -310,6 +406,9 @@ impl ConnectionBuilder {
         let client = hyperdb_api_core::client::Client::connect_unix(&socket_path, &config)?;
 
         let conn = Connection::from_client(client, db_path_str.clone());
+        if let Some(timeout) = self.query_timeout {
+            conn.execute_command(&query_timeout_statement(timeout)?)?;
+        }
 
         // Handle database creation
         if let Some(db_path) = db_path_str {
@@ -350,6 +449,7 @@ impl ConnectionBuilder {
         if let Some(password) = &self.password {
             config = config.with_password(password);
         }
+        config = config.with_tls(self.tls);
 
         let db_path_str = self
             .database
@@ -360,6 +460,9 @@ impl ConnectionBuilder {
         let client = hyperdb_api_core::client::Client::connect_named_pipe(&pipe_path, &config)?;
 
         let conn = Connection::from_client(client, db_path_str.clone());
+        if let Some(timeout) = self.query_timeout {
+            conn.execute_command(&query_timeout_statement(timeout)?)?;
+        }
 
         // Handle database creation
         if let Some(db_path) = db_path_str {
@@ -372,6 +475,17 @@ impl ConnectionBuilder {
 
     /// Build a gRPC connection.
     fn build_grpc(self) -> Result<Connection> {
+        if self.query_timeout.is_some() {
+            return Err(Error::feature_not_supported(
+                "query_timeout is not supported on gRPC connections",
+            ));
+        }
+        if self.tls.mode() != TlsMode::Disable {
+            return Err(Error::feature_not_supported(
+                "tls is not supported on gRPC connections; use an https:// endpoint for TLS",
+            ));
+        }
+
         // Validate create_mode - gRPC is read-only
         if self.create_mode != CreateMode::DoNotCreate {
             return Err(Error::feature_not_supported(

@@ -85,15 +85,10 @@ impl ArrowInserter {
         let ins = guard.take().ok_or_else(already_executed)?;
         ins.execute()
             .await
-            .map(|n| {
-                #[expect(
-                    clippy::cast_possible_wrap,
-                    reason = "NAPI BigInt ↔ Hyper u64 bit-pattern reinterpret; JS consumers read the BigInt as an unsigned inserted-row count"
-                )]
-                let signed = n as i64;
-                signed
-            })
             .map_err(|e| Error::from_reason(e.to_string()))
+            .and_then(|n| {
+                i64::try_from(n).map_err(|_| Error::from_reason("row count exceeds i64::MAX"))
+            })
     }
 
     /// Cancels the COPY stream without committing any rows.

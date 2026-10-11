@@ -50,8 +50,7 @@ fn test_interval_param() {
     let interval = Interval::new(2, 5, 0); // 2 months, 5 days, 0 microseconds
     // CAST the bound interval param to text so we can assert the VALUE, not
     // just non-null — this proves the [us BE][days BE][months BE] encoding
-    // was interpreted correctly (Interval doesn't yet implement RowValue, so
-    // we can't read it back as a typed Interval).
+    // was interpreted correctly.
     let result = test
         .connection
         .query_params(
@@ -639,4 +638,42 @@ fn test_untyped_prepare_rejects_parameters() {
         err.to_string().contains("42601"),
         "expected 42601 unexpected-parameter error, got: {err}"
     );
+}
+
+/// Date, Timestamp and OffsetTimestamp parameters must round-trip: the
+/// bound value must be read back by the server as the same instant.
+/// Regression: they were encoded with the absolute Julian epoch instead of
+/// the PostgreSQL 2000-01-01 epoch, so the server stored them ~6,700 years off.
+#[test]
+fn test_date_time_params_round_trip() {
+    use hyperdb_api::{Date, OffsetTimestamp, Time, Timestamp};
+
+    let test = TestConnection::new().expect("Failed to create test connection");
+
+    let date = Date::new(2024, 1, 15);
+    let timestamp = Timestamp::new(Date::new(2024, 1, 15), Time::new(13, 45, 30, 123_456));
+    let offset_ts = OffsetTimestamp::new(timestamp, 0);
+
+    let result = test
+        .connection
+        .query_params(
+            "SELECT CAST($1 AS text), CAST($2 AS text), \
+                    $3 = TIMESTAMPTZ '2024-01-15 13:45:30.123456+00'",
+            &[
+                &date as &dyn ToSqlParam,
+                &timestamp as &dyn ToSqlParam,
+                &offset_ts as &dyn ToSqlParam,
+            ],
+        )
+        .expect("query_params failed");
+    let rows = result.collect_rows().expect("collect_rows failed");
+    assert_eq!(rows.len(), 1);
+
+    let d: Option<String> = rows[0].get(0);
+    let ts: Option<String> = rows[0].get(1);
+    // TIMESTAMPTZ text renders in the session time zone, so compare the instant.
+    let same_instant: Option<bool> = rows[0].get(2);
+    assert_eq!(d.as_deref(), Some("2024-01-15"));
+    assert_eq!(ts.as_deref(), Some("2024-01-15 13:45:30.123456"));
+    assert_eq!(same_instant, Some(true), "timestamptz instant mismatch");
 }

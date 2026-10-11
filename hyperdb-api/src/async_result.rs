@@ -179,7 +179,7 @@ impl<'conn> AsyncRowset<'conn> {
     ///
     /// - Returns [`crate::Error::Server`] if the server sends an `ErrorResponse`
     ///   while streaming the result set.
-    /// - Returns [`crate::Error::Io`] on transport-level I/O failures.
+    /// - Returns [`crate::Error::Connection`] on transport-level I/O failures.
     /// - Returns [`crate::Error::Conversion`] if an Arrow IPC chunk cannot be decoded.
     pub async fn next_chunk(&mut self) -> Result<Option<Vec<Row>>> {
         enum TransportChunk {

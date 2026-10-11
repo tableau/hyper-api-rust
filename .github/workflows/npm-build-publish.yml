@@ -1,8 +1,9 @@
 name: npm-build-publish
 
 # Builds hyperdb-mcp and hyperdb-api-node npm packages with bundled
-# hyperd binaries. Triggered after a successful release workflow creates
-# a GitHub release, or manually via workflow_dispatch.
+# hyperd binaries. Triggered by the hand-created GitHub Release
+# (`release: published`, in parallel with release.yml), or manually via
+# workflow_dispatch.
 
 on:
   workflow_dispatch:
@@ -58,17 +59,23 @@ jobs:
           # them through bash → jq → Oniguruma was fragile and broke
           # silently on the v0.2.2 release. Exact-string match avoids
           # the whole class of regex-escaping bugs.
+          # These names must match the `name:` of the ci.yml jobs; the
+          # msrv entry embeds the MSRV, so it changes whenever ci.yml does.
+          # Every name must be present: a renamed or missing job makes the
+          # gate time out instead of silently lowering the count.
           REQUIRED_JSON='[
             "rustfmt","clippy (ubuntu-24.04)","clippy (windows-2025)",
-            "cargo-audit","cargo-deny",
+            "msrv (1.88)","doc","cargo-audit","cargo-deny",
             "version consistency","publish dry-run",
             "test (ubuntu-24.04)","test (macos-26)","test (windows-2025)",
             "hyperdb-api-node (build + smoke)"
           ]'
+          EXPECTED=$(echo "$REQUIRED_JSON" | jq 'length')
           for i in $(seq 1 "$MAX_ATTEMPTS"); do
             RUNS=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" \
               --jq "[.check_runs[] | select(.name as \$n | $REQUIRED_JSON | index(\$n))]")
             TOTAL=$(echo "$RUNS" | jq 'length')
+            PRESENT=$(echo "$RUNS" | jq '[.[].name] | unique | length')
             COMPLETED=$(echo "$RUNS" | jq '[.[] | select(.status=="completed")] | length')
             FAILED=$(echo "$RUNS" | jq '[.[] | select(.status=="completed" and (.conclusion!="success" and .conclusion!="skipped" and .conclusion!="neutral"))] | length')
             echo "Attempt $i/$MAX_ATTEMPTS: total=$TOTAL completed=$COMPLETED failed=$FAILED"
@@ -77,7 +84,7 @@ jobs:
               echo "$RUNS" | jq -r '.[] | select(.status=="completed" and (.conclusion!="success" and .conclusion!="skipped" and .conclusion!="neutral")) | "  - \(.name): \(.conclusion)"'
               exit 1
             fi
-            if [[ "$TOTAL" -gt 0 && "$COMPLETED" == "$TOTAL" ]]; then
+            if [[ "$PRESENT" == "$EXPECTED" && "$COMPLETED" == "$TOTAL" ]]; then
               echo "CI passed ($TOTAL required check-runs completed successfully)."
               exit 0
             fi
@@ -169,6 +176,9 @@ jobs:
           MACOSX_DEPLOYMENT_TARGET: "13.0"
         run: cargo build --release --target "$TARGET" -p hyperdb-api-node
 
+      - name: Install cargo-about
+        run: cargo install cargo-about --locked --features cli --version 0.9.2
+
       - name: Download and verify hyperd
         env:
           SLUG: ${{ matrix.hyperd-slug }}
@@ -255,6 +265,8 @@ jobs:
             cp "$f" "$DEST/"
           done
           cp LICENSE-HYPERD "$DEST/"
+          cargo about generate --manifest-path hyperdb-mcp/Cargo.toml about.hbs \
+            -o "$DEST/THIRD-PARTY-LICENSES.txt"
           chmod +x "$DEST/hyperdb-mcp${EXE}" "$DEST/${HYPERD_BIN}" 2>/dev/null || true
           echo "Contents of $DEST:"
           ls -la "$DEST/"
@@ -280,6 +292,8 @@ jobs:
             cp "$f" "$DEST/"
           done
           cp LICENSE-HYPERD "$DEST/"
+          cargo about generate --manifest-path hyperdb-api-node/Cargo.toml about.hbs \
+            -o "$DEST/THIRD-PARTY-LICENSES.txt"
           chmod +x "$DEST/${HYPERD_BIN}" 2>/dev/null || true
           echo "Contents of $DEST:"
           ls -la "$DEST/"
@@ -330,6 +344,19 @@ jobs:
 
       - name: Copy README into hyperdb-mcp npm publish directory
         run: cp hyperdb-mcp/README.md hyperdb-mcp/npm/README.md
+
+      - name: Copy license files into every published npm package directory
+        # npm auto-includes only files named LICENSE / LICENCE, so the
+        # hyphenated names are listed in each package.json `files` array and
+        # copied in here, the same way as the README above. The platform
+        # list must match PLATFORMS in the version-injection step below.
+        run: |
+          set -euo pipefail
+          for d in hyperdb-mcp/npm hyperdb-api-node \
+              hyperdb-mcp/npm/{darwin-arm64,linux-x64-gnu,win32-x64-msvc} \
+              hyperdb-api-node/npm/{darwin-arm64,linux-x64-gnu,win32-x64-msvc}; do
+            cp LICENSE-MIT.txt LICENSE-APACHE.txt NOTICE "$d/"
+          done
 
       - name: Resolve version and dist-tag from event
         id: version

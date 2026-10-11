@@ -44,24 +44,20 @@ The OAuth Access Token and DC JWT are cached independently in
   rotation that would invalidate tokens held by other connections sharing the
   same refresh token.
 
-- **DC JWT** (~2-hour hard expiry): Refreshed proactively via `needs_refresh()`,
-  which checks two conditions:
-  1. **Expiry threshold** -- fewer than 300 seconds (5 minutes) remaining
-  2. **Max age** -- older than 900 seconds (15 minutes)
-
-  The max-age check ensures the underlying OAuth Access Token is revalidated
-  regularly, catching server-side inactivity timeouts before the DC JWT's own
-  hard expiry.
-
-These constants live in `token.rs` (`DC_JWT_VALIDITY_BUFFER_SECS`) and are
-passed as parameters to `needs_refresh()` by the caller.
+- **DC JWT** (~2-hour hard expiry): the provider refreshes it when `is_valid()`
+  fails, meaning fewer than `DC_JWT_VALIDITY_BUFFER_SECS` (300 s) remain. The
+  stricter `needs_refresh(threshold, max_age)` check (expiry threshold *or* age
+  over 900 s) is applied by `AuthenticatedGrpcClient` in `hyperdb-api-core`,
+  which owns those constants (`DEFAULT_DC_JWT_EXPIRY_THRESHOLD_SECS`,
+  `DEFAULT_DC_JWT_MAX_AGE_SECS`).
 
 ---
 
 ## Testing
 
-Unit tests cover token parsing, validity checks, JWT assertion generation, and
-configuration validation:
+Unit tests cover token parsing, validity checks, and JWT assertion generation.
+`tests/crypto_provider_tests.rs` guards the `rustls-no-provider` choice by
+constructing a provider (no network or credentials needed):
 
 ```bash
 cargo test -p hyperdb-api-salesforce

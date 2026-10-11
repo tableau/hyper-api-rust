@@ -6,7 +6,7 @@
 [advisories]
 ignore = [
     # `rsa` Marvin Attack — no constant-time fix yet. Used only for outbound
-    # JWT signing in `hyperapi-salesforce`, where timing sidechannels are not
+    # JWT signing in `hyperdb-api-salesforce`, where timing sidechannels are not
     # observable to a remote attacker. Threat model does not apply.
     "RUSTSEC-2023-0071",
     # `ttf-parser` unmaintained (RUSTSEC-2026-0192, informational). Transitive via

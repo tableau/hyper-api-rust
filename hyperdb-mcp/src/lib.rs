@@ -33,6 +33,8 @@
 //!
 //! The crate is layered bottom-up:
 //!
+//! - `daemon` — Single-instance daemon that shares one `hyperd` across MCP clients (discovery, spawn, health listener).
+//! - `paths` — Platform-standard default path for the persistent database.
 //! - `error` — Structured error codes with recovery suggestions for LLM self-correction.
 //! - `attach` — Registry of additional `.hyper` databases attached to the primary
 //!   workspace for cross-database JOINs and `copy_query`. Replays attachments
@@ -44,17 +46,19 @@
 //!   query execution across the local database and optional persistent database.
 //! - `ingest` — Loads inline JSON (row-by-row INSERT) and CSV (`COPY FROM`) into Hyper.
 //! - `ingest_arrow` — Loads Parquet and Arrow IPC files via the Arrow crate.
+//! - `lakehouse` — Loads Apache Iceberg tables via hyperd's native `external(..., format => 'iceberg')` scan.
 //! - `inspect` — Dry-run file inspection powering the `inspect_file` MCP tool.
-//! - `export` — Writes query results to CSV, Parquet, Arrow IPC, or `.hyper` files.
+//! - `export` — Writes query results to CSV, Parquet, Arrow IPC, Iceberg, or `.hyper` files.
 //! - `chart` — Renders SQL query results as PNG/SVG charts via the `plotters` crate.
 //! - `saved_queries` — Named read-only SQL queries exposed via tools and `hyper://queries/...` resources.
 //! - `subscriptions` — Per-URI registry of MCP clients that asked for resource-update notifications.
 //! - `table_catalog` — User-visible catalog of data tables (`_table_catalog`) tracking
-//!   source, purpose, and load history so workspaces are self-documenting. Disabled by `--bare`.
+//!   source, purpose, and load history so workspaces are self-documenting.
 //! - `version` — Compile-time-captured version strings for the MCP crate and the underlying `hyperdb-api`, with a git-hash suffix.
 //! - `readme` — Static LLM-facing README returned by the `get_readme` tool.
 //! - `watcher` — Monitors directories for incremental ingest via a `.ready` sentinel protocol.
 //! - `server` — MCP tool definitions and the `rmcp` server handler that ties everything together.
+//! - `diagnostics` — Installation and launcher identity, and the `doctor` report.
 
 // Every module below is `#[doc(hidden)]`: reachable so the binary, the
 // integration tests, and the examples compile, but excluded from the published
@@ -74,6 +78,7 @@ pub mod engine;
 pub mod error;
 #[doc(hidden)]
 pub mod export;
+mod file_identity;
 #[doc(hidden)]
 pub mod ingest;
 #[doc(hidden)]
@@ -92,6 +97,7 @@ pub mod saved_queries;
 pub mod schema;
 #[doc(hidden)]
 pub mod server;
+mod sql_classify;
 #[doc(hidden)]
 pub mod stats;
 #[doc(hidden)]

@@ -58,7 +58,13 @@ use std::path::{Path, PathBuf};
 /// Any canonicalize failure falls back to the original path — the
 /// common case (absolute, existing file on any platform) still works.
 fn canonicalize_for_copy(path: &Path) -> PathBuf {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    path_for_hyperd(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
+}
+
+/// Steps 1 and 2 of [`canonicalize_for_copy`] for a path that is already
+/// canonical: on Windows, strip the extended-length prefix and use forward
+/// slashes. Any other path is returned unchanged.
+pub(crate) fn path_for_hyperd(canonical: PathBuf) -> PathBuf {
     #[cfg(windows)]
     {
         if let Some(s) = canonical.to_str() {
@@ -578,7 +584,7 @@ where
 /// whatever the Rust inferrer emitted (`"INT"`, `"DOUBLE
 /// PRECISION"`, `"NUMERIC(15, 2)"`). Comparing through
 /// [`crate::schema::map_hyper_type`] collapses all known aliases
-/// into a single [`SqlType`].
+/// into a single [`hyperdb_api::SqlType`].
 ///
 /// If *either* side fails to parse (returns `None`), we err on the
 /// side of permissive: treat the pair as compatible and let Hyper

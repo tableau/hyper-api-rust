@@ -9,16 +9,17 @@
 //!
 //! # Architecture
 //!
-//! This is a layered API built from four crates:
-//! - `hyper-types` — Type definitions with `LittleEndian` encoding
-//! - `hyper-protocol` — Wire protocol with `HyperBinary` COPY support
-//! - `hyper-client` — Sync/async TCP and gRPC clients
-//! - `hyperdb-api` — High-level API (this crate)
+//! This crate is the user-facing layer over `hyperdb-api-core`, an internal
+//! implementation crate (not a public API) with three modules: `types`
+//! (`LittleEndian` encoding), `protocol` (wire protocol, `HyperBinary` COPY)
+//! and `client` (sync/async TCP, UDS, named-pipe and gRPC clients).
 //!
 //! Optional companion crates:
 //! - `sea-query-hyperdb` — `HyperDB` SQL dialect backend for `sea-query`
 //! - `hyperdb-api-salesforce` — Salesforce Data Cloud OAuth authentication
-//! - `hyperdb-api-derive` — Proc-macro `#[derive(FromRow)]` (re-exported by this crate)
+//! - `hyperdb-api-derive` — `#[derive(FromRow)]`, `#[derive(Table)]`,
+//!   `query_as!` and `query_scalar!`; add it as a direct dependency (it is not
+//!   re-exported here)
 //!
 //! # Quick Start
 //!
@@ -37,7 +38,7 @@
 //!         for row in &chunk {
 //!             let id: Option<i32> = row.get(0);
 //!             let name: Option<String> = row.get(1);
-//!             println!("id: {:?}, name: {:?}", id, name);
+//!             println!("id: {id:?}, name: {name:?}");
 //!         }
 //!     }
 //!     Ok(())
@@ -54,7 +55,6 @@
 //! ```text
 //! Connection (owns underlying client)
 //! ├── Inserter<'conn>
-//! │   └── CopyInWriter<'conn>
 //! ├── Catalog<'conn>
 //! ├── KvStore<'conn>
 //! ├── Rowset<'conn>
@@ -63,7 +63,8 @@
 //!
 //! This is a **simple hierarchical design**, not a complex lifetime web:
 //! - **Single root owner**: `Connection` owns the underlying client
-//! - **Simple borrows**: All dependent types borrow `&'conn Connection`
+//! - **Simple borrows**: Dependent types borrow the `Connection`; a
+//!   [`Transaction`] borrows it exclusively
 //! - **No circular references**: `Inserter` doesn't reference `Catalog`, etc.
 //! - **Single lifetime parameter**: Just one `'conn` — no multi-lifetime bounds
 //!
@@ -71,11 +72,13 @@
 //! while any dependent type holds a reference to it:
 //!
 //! ```compile_fail
-//! # use hyperdb_api::{Connection, Inserter, CreateMode};
+//! # use hyperdb_api::{Connection, Inserter, CreateMode, SqlType, TableDefinition};
 //! # fn example() -> hyperdb_api::Result<()> {
 //! let conn = Connection::connect("localhost:7483", "test.hyper", CreateMode::CreateIfNotExists)?;
-//! let inserter = Inserter::new(&conn, /* ... */)?;
-//! drop(conn);  // ERROR: cannot move `conn` because it is borrowed by `inserter`
+//! let def = TableDefinition::new("t").add_required_column("a", SqlType::int());
+//! let mut inserter = Inserter::new(&conn, &def)?;
+//! drop(conn);  // ERROR: cannot move out of `conn` because it is borrowed
+//! inserter.execute()?;
 //! # Ok(())
 //! # }
 //! ```
@@ -94,9 +97,8 @@
 //! # }
 //! ```
 //!
-//! The `execute(self)` method on [`Inserter`] takes ownership (`self`), which
-//! automatically ends the borrow when the insert completes — no manual cleanup
-//! needed.
+//! [`Inserter::execute`] takes `&mut self`; the borrow of the [`Connection`]
+//! ends when the [`Inserter`] is dropped.
 //!
 //! # Key Types
 //!
@@ -112,7 +114,7 @@
 //! # Public Modules
 //!
 //! - [`copy`] — CSV/text export and import via COPY protocol
-//! - [`pool`] — Async connection pooling (deadpool-based)
+//! - [`pool`] — Async connection pooling
 //! - [`grpc`] — gRPC transport types for Arrow IPC queries
 //!
 //! # Bulk Data Loading
@@ -153,10 +155,10 @@
 #![warn(clippy::must_use_candidate)]
 
 mod arrow_inserter;
-/// Semantic version of this crate, resolved at compile time from
-/// `Cargo.toml`. Used by downstream tools (notably `hyperdb-mcp`) to
-/// surface the library version in their own status output without
-/// duplicating the version string.
+/// Semantic version of this crate, resolved at compile time from `Cargo.toml`.
+///
+/// Used by downstream tools (notably `hyperdb-mcp`) to surface the library
+/// version in their own status output without duplicating the version string.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 mod arrow_reader;
@@ -199,6 +201,13 @@ mod grpc_connection;
 #[cfg(kani)]
 mod proofs;
 
+// Third-party crates whose types appear in this crate's public API. Re-exported
+// so callers use exactly the version we are built against; a major bump of any
+// of them is a `hyperdb-api` major (see README, "Semver and re-exported crates").
+pub use arrow;
+pub use chrono;
+pub use geo_types;
+
 pub use arrow_inserter::ArrowInserter;
 pub use arrow_reader::ArrowReader;
 pub use arrow_result::{
@@ -211,16 +220,18 @@ pub use async_inserter::AsyncInserter;
 pub use async_kv_store::AsyncKvStore;
 pub use async_prepared::{AsyncPreparedStatement, AsyncPreparedStatementOwned};
 pub use async_result::AsyncRowset;
+pub use async_transaction::AsyncTransaction;
 pub use catalog::Catalog;
 pub use connection::{Connection, CreateMode, ScalarValue};
 pub use connection_builder::ConnectionBuilder;
 pub use error::{ColumnErrorKind, Error, Result};
 pub use params::{ParamFormat, ToSqlParam};
 pub use prepared::PreparedStatement;
+// TLS settings for TCP connections (`ConnectionBuilder::tls` and friends).
+pub use hyperdb_api_core::client::tls::{ParseTlsModeError, TlsConfig, TlsMode};
 // Re-export Notice for callback registrants. `hyperdb-api-core`'s
 // `client::Error` is intentionally NOT re-exported — callers match
 // directly on the flat `Error` enum this crate defines.
-pub use async_transaction::AsyncTransaction;
 pub use hyperdb_api_core::client::{Notice, NoticeReceiver};
 pub use inserter::{ChunkSender, ColumnMapping, InsertChunk, Inserter, IntoValue, MappedInserter};
 pub use kv_store::{BatchGuardOutcome, BatchSetOutcome, KvStore, SetOutcome};
@@ -249,10 +260,10 @@ pub use hyperdb_api_core::types::{
     Timestamp, Type,
 };
 
-/// Re-export of `GeoError` from hyperdb-api-core::types.
+/// Error type for geography conversions (WKT parsing, WKB encoding and decoding).
 pub use hyperdb_api_core::types::GeoError;
 
-/// Re-export of the PostgreSQL OID constants. Access as `hyperdb_api::oids::INT4` etc.
+/// Re-export of the PostgreSQL OID constants, e.g. `hyperdb_api::oids::INT`.
 pub use hyperdb_api_core::types::oids;
 
 // Re-export gRPC types (always available)
@@ -276,10 +287,12 @@ pub mod grpc {
     // Re-export connection types from grpc_connection module
     pub use crate::grpc_connection::{GrpcConnection, GrpcConnectionAsync};
 
-    // Re-export types from hyperdb_api_core::client::grpc
+    // Configuration and result types. The raw core clients (`GrpcClient`,
+    // `GrpcClientSync`) and `GrpcError` are deliberately not re-exported: they
+    // would put tonic and prost types into this crate's public API. Errors
+    // surface as `hyperdb_api::Error`.
     pub use hyperdb_api_core::client::grpc::{
-        GrpcClient, GrpcClientSync, GrpcConfig, GrpcError, GrpcQueryResult, GrpcResultChunk,
-        TransferMode,
+        GrpcColumnInfo, GrpcConfig, GrpcQueryResult, GrpcResultChunk, TransferMode,
     };
 }
 

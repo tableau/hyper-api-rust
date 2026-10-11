@@ -25,26 +25,24 @@ pub struct CompileTimeDb {
 //
 // The `parking_lot::Mutex` is what makes this safe: it ensures only one
 // proc-macro expansion thread touches the connection at a time. Each `query_as!`
-// site locks, runs one dry-run (~7ms), unlocks. They serialize on the one
+// site locks, runs one dry-run, unlocks. They serialize on the one
 // connection rather than each getting their own (a connection-pool approach
-// would work too but adds startup cost for negligible gain at v1 scale).
+// would work too but adds startup cost for negligible gain).
 //
 // Neither `HyperProcess` nor `Connection` is `Send`/`Sync` in the public API.
 // We implement both here because `OnceLock<T>` requires `T: Send + Sync`.
 // The `Mutex` upholds the invariant that only one thread ever accesses the
 // fields — making the `Send`/`Sync` impls sound.
 //
-// REVISIT: if `HyperProcess`/`Connection` are made `Send` upstream, remove
-// these impls and let the compiler derive them.
+// If `HyperProcess`/`Connection` become `Send` upstream, these impls can be
+// removed and derived by the compiler.
 //
 // # Why `parking_lot::Mutex` instead of `std::sync::Mutex`
 //
-// Proc-macros routinely call `panic!` to emit a `compile_error!`. A
-// `std::sync::Mutex` poisons on the first panic, causing every subsequent
-// macro invocation in the same crate to receive `PoisonError` regardless of
-// whether they have anything to do with the failing site. `parking_lot::Mutex`
-// never poisons — lock acquisition always succeeds after the panicking thread
-// releases the lock, so a bad `query_as!` site doesn't cascade.
+// A panic inside a dry-run must not poison the lock for every later macro
+// invocation; `parking_lot::Mutex` never poisons, so lock acquisition always
+// succeeds after the panicking thread releases the lock and a bad `query_as!`
+// site doesn't cascade.
 
 // SAFETY: `OnceLock` requires `Send`; safe because the `Mutex` guarantees
 // exclusive access — `CompileTimeDb` is never touched without holding the lock.
@@ -101,9 +99,10 @@ impl CompileTimeDb {
         let db_path = log_dir.path().join("compile_check.hyper");
         let conn = Connection::new(&process, &db_path, CreateMode::CreateAndReplace)?;
 
-        // Keep `log_dir` alive as long as the process — drop it with the struct.
-        // We leak the TempDir intentionally: `CompileTimeDb` is `'static` (stored
-        // in a static); the OS will clean up the temp dir on process exit.
+        // `CompileTimeDb` lives in a `static` and is never dropped, so the
+        // directory (hyperd logs plus the scratch database) outlives the process
+        // and is left to the system's temp-file reaper. Forgetting the `TempDir`
+        // keeps it from being removed while hyperd is still using it.
         std::mem::forget(log_dir);
 
         Ok(Self {

@@ -247,9 +247,10 @@ impl GrpcResultChunk {
 #[derive(Debug)]
 pub struct GrpcColumnInfo<'a> {
     /// Column name
-    pub name: &'a str,
-    /// SQL type information
-    pub sql_type: Option<SqlType>,
+    pub(crate) name: &'a str,
+    /// SQL type information (the generated protobuf message, so it is not
+    /// part of the public API; see [`Self::type_name`])
+    pub(crate) sql_type: Option<SqlType>,
 }
 
 impl GrpcColumnInfo<'_> {

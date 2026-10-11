@@ -14,10 +14,10 @@ use tracing::{debug, info, warn};
 use crate::client::error::{Error, Result};
 
 use super::config::GrpcConfig;
+use super::config::TransferMode;
 use super::error::from_grpc_status;
 use super::executor::{GrpcChunkStream, GrpcQueryExecutor};
 use super::params::{ParameterStyle, QueryParameters};
-use super::proto::hyper_service::query_param::TransferMode;
 use super::proto::{
     AttachedDatabase, CancelQueryParam, HyperServiceClient, OutputFormat, QueryParam,
 };
@@ -220,8 +220,11 @@ impl GrpcClient {
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// # let config = GrpcConfig::new("http://localhost:7484");
     /// # let mut client = GrpcClient::connect(config).await?;
-    /// // Dollar-numbered parameters (mixed types use from_json_value)
-    /// let params = QueryParameters::from_json_value(&serde_json::json!([42, "Alice"]))?;
+    /// // Dollar-numbered parameters (mixed types use serde_json::json!)
+    /// let params = QueryParameters::json_positional(&[
+    ///     &serde_json::json!(42),
+    ///     &serde_json::json!("Alice"),
+    /// ])?;
     /// let result = client.execute_query_with_params(
     ///     "SELECT * FROM users WHERE id = $1 AND name = $2",
     ///     params,
@@ -552,7 +555,7 @@ impl GrpcClient {
     /// # When do you have a `query_id`?
     ///
     /// The server assigns a `query_id` for queries started in
-    /// [`TransferMode::Async`](super::proto::hyper_service::query_param::TransferMode)
+    /// [`TransferMode::Async`]
     /// (long-running queries that the client polls). Grab it from
     /// [`GrpcQueryResult::query_id`](super::result::GrpcQueryResult::query_id)
     /// after `execute_query_with_options(..., TransferMode::Async)` returns.

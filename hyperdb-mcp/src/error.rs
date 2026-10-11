@@ -39,7 +39,7 @@ pub enum ErrorCode {
     /// The connection to `hyperd` was lost (crash, broken pipe, EOF) or
     /// the wire protocol fell out of sync (a bounded drain exhausted
     /// without reaching `ReadyForQuery`, surfacing as a
-    /// `"desynchronized"` error message from the `hyper-client` layer).
+    /// `"desynchronized"` error message from the `hyperdb_api_core::client` layer).
     /// Either way, the connection is unusable and the MCP server will
     /// automatically tear down the [`crate::engine::Engine`] and
     /// reconnect on the next call.
@@ -289,7 +289,7 @@ impl From<hyperdb_api::Error> for McpError {
 ///    `PostgreSQL` client produces when `hyperd` crashes or is killed
 ///    mid-transaction.
 ///
-/// 2. **Wire-protocol desync** — the `hyper-client` layer marks a
+/// 2. **Wire-protocol desync** — the `hyperdb_api_core::client` layer marks a
 ///    connection `desynchronized` when its bounded drain exhausts the
 ///    `POST_ERROR_DRAIN_CAP` budget without reaching `ReadyForQuery` or
 ///    hits an I/O error mid-drain. Subsequent operations on that

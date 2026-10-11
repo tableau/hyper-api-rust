@@ -33,7 +33,7 @@ use crate::engine::Engine;
 use crate::error::{ErrorCode, McpError};
 use hyperdb_api::escape_sql_path;
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
@@ -134,7 +134,8 @@ pub enum AttachSource {
         /// Canonical absolute path to the `.hyper` file.
         path: PathBuf,
     },
-    // Future: Tcp  { endpoint: String, auth: Option<TcpAuth> },
+    // Future: Tcp  { endpoint: String, auth: Option<TcpAuth>, tls: TlsConfig },
+    //   (`hyperdb_api::TlsConfig`, passed to the builder's `tls()`)
     // Future: Grpc { endpoint: String, auth: Option<GrpcAuth> }, // writable always false
 }
 
@@ -711,12 +712,15 @@ pub fn validate_input_path(path: &str, kind: &str) -> Result<PathBuf, McpError> 
 /// Validate a user-supplied output path that may not yet exist.
 ///
 /// Must be absolute. If the file exists, behaves like [`validate_input_path`].
-/// Otherwise the parent directory must exist and canonicalize cleanly.
+/// Otherwise missing parent directories are created, and the result is the
+/// canonical parent joined with the file name. Write to the returned path,
+/// not to `path`.
 ///
 /// # Errors
 ///
 /// Same shape as [`validate_input_path`]; additionally returns
-/// [`ErrorCode::InvalidArgument`] if the path has no parent or no file-name.
+/// [`ErrorCode::InvalidArgument`] if the path has no parent or no file-name,
+/// and [`ErrorCode::InternalError`] if a parent directory cannot be created.
 pub fn validate_output_path(path: &str, kind: &str) -> Result<PathBuf, McpError> {
     let pb = PathBuf::from(path);
     if !pb.is_absolute() {
@@ -764,6 +768,63 @@ pub fn validate_output_path(path: &str, kind: &str) -> Result<PathBuf, McpError>
         ));
     }
     Ok(canonical_parent.join(file_name))
+}
+
+/// Refuse to write to `dest` when it is one of the `protected` files the
+/// session has open (its persistent and ephemeral databases and every
+/// attached file), whatever path reaches it, or a directory holding one:
+/// replacing the directory would take the file with it.
+///
+/// A `dest` that does not exist is not one of them, and a protected path
+/// that no longer exists protects nothing.
+///
+/// # Errors
+///
+/// - Returns [`ErrorCode::InvalidArgument`] if `dest` is the same file as a
+///   protected one, or a directory containing one.
+/// - Returns [`ErrorCode::InternalError`] if the identity of `dest` or of a
+///   protected file cannot be read for a reason other than its absence.
+pub fn refuse_protected_destination(
+    dest: &Path,
+    protected: &[PathBuf],
+    kind: &str,
+) -> Result<(), McpError> {
+    let unidentified = |path: &Path, e: std::io::Error| {
+        McpError::new(
+            ErrorCode::InternalError,
+            format!("Cannot identify {kind} path '{}': {e}", path.display()),
+        )
+    };
+    let dest_id = match crate::file_identity::FileId::of(dest) {
+        Ok(id) => id,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(unidentified(dest, e)),
+    };
+    let dest_dir = dest.canonicalize().ok().filter(|d| d.is_dir());
+    for path in protected {
+        let same = match crate::file_identity::FileId::of(path) {
+            Ok(id) => id == dest_id,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(unidentified(path, e)),
+        };
+        let inside = dest_dir
+            .as_ref()
+            .is_some_and(|dir| path.canonicalize().is_ok_and(|p| p.starts_with(dir)));
+        if same || inside {
+            let what = if same { "is" } else { "contains" };
+            return Err(McpError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "Refusing to write {kind} to '{}': it {what} a database this session has open",
+                    dest.display()
+                ),
+            )
+            .with_suggestion(
+                "Choose a path that is not the persistent database or an attached file.",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Validate a `LocalFile` path. Must be absolute, must exist, must

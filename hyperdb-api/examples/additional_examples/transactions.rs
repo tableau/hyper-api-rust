@@ -11,20 +11,16 @@
 //! - Multi-table reconnect semantics: only committed cross-table data is visible after reconnect
 //! - Auto-rollback safety net when the guard is dropped without commit
 //! - DDL inside transactions and known restrictions
-//! - Legacy raw transaction methods (`begin_transaction`, `commit`,
-//!   `rollback`) — included for completeness only; deprecated and
-//!   slated for removal. New code should use the RAII guard.
+//! - Unguarded transaction control (`begin_transaction_unguarded`,
+//!   `commit_unguarded`, `rollback_unguarded`) for code that cannot take
+//!   the guard's `&mut` borrow, such as a helper holding `&Connection`.
+//!   Prefer the RAII guard everywhere else: you must pair every unguarded
+//!   `BEGIN` with a commit or rollback yourself, on every path.
 //!
-//!   cargo run -p hyperdb-api --example transactions
-
-// The `example_raw_transaction` and `example_raw_error_recovery`
-// helpers below intentionally exercise the deprecated raw transaction
-// API for documentation purposes. New code should use the RAII guard
-// shown in `example_transaction_guard` instead.
-#![allow(
-    deprecated,
-    reason = "example intentionally demonstrates the deprecated raw transaction API alongside the RAII guard"
-)]
+//! Run with: `cargo run -p hyperdb-api --example transactions`
+//!
+//! Requires the pinned `hyperd`: run `make download-hyperd` once, or set an
+//! absolute `HYPERD_PATH`.
 
 use hyperdb_api::{
     Catalog, Connection, CreateMode, HyperProcess, Parameters, Result, SqlType, TableDefinition,
@@ -42,7 +38,7 @@ fn main() -> Result<()> {
     let mut connection = Connection::new(&hyper, db_path, CreateMode::CreateAndReplace)?;
     println!("Created database: {db_path}\n");
 
-    // Example 1: Raw transaction methods
+    // Example 1: Unguarded transaction control
     example_raw_transaction(&connection)?;
 
     // Example 2: RAII Transaction guard
@@ -58,16 +54,13 @@ fn main() -> Result<()> {
     example_multi_table_rollback(&mut connection)?;
 
     // Example 6: Multi-table reconnect semantics
-    example_multi_table_reconnect(&hyper, db_path)?;
-    // Reconnect after the previous example closed the connection
-    let mut connection = Connection::new(&hyper, db_path, CreateMode::DoNotCreate)?;
+    example_multi_table_reconnect(&hyper)?;
 
     // Example 7: Auto-rollback on drop (the safety net)
     example_auto_rollback_on_drop(&mut connection)?;
 
     // Example 8: DDL in transactions and known restrictions
-    // (Last because the DDL-after-DML error leaves the connection in a state
-    // where subsequent queries may not work reliably.)
+    // (Last because it deliberately triggers a server error inside a transaction.)
     example_ddl_in_transactions(&mut connection)?;
 
     println!("\nAll transaction examples completed successfully!");
@@ -108,10 +101,10 @@ fn print_table(connection: &Connection, table_name: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Example 1: Raw transaction methods (begin / commit / rollback)
+// Example 1: Unguarded transaction control (&self helpers)
 // ---------------------------------------------------------------------------
 fn example_raw_transaction(connection: &Connection) -> Result<()> {
-    println!("=== Example 1: Raw Transaction Methods ===");
+    println!("=== Example 1: Unguarded Transaction Control ===");
 
     create_accounts_table(connection, "raw_txn")?;
 
@@ -332,7 +325,7 @@ fn example_multi_table_rollback(connection: &mut Connection) -> Result<()> {
 // connection. This demonstrates the atomicity/isolation guarantees across
 // reconnects on the same `HyperProcess`.
 // ---------------------------------------------------------------------------
-fn example_multi_table_reconnect(hyper: &HyperProcess, _db_path: &str) -> Result<()> {
+fn example_multi_table_reconnect(hyper: &HyperProcess) -> Result<()> {
     println!("=== Example 6: Multi-Table Reconnect Semantics ===");
 
     // Use a fresh database for this example

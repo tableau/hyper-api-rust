@@ -5,7 +5,59 @@
 
 use std::marker::PhantomData;
 
+use crate::params::{ParamFormat, ToSqlParam};
 use crate::{Connection, FromRow, Result, RowValue};
+use hyperdb_api_core::types::Oid;
+
+/// A bind argument encoded eagerly so the query object owns it.
+///
+/// `QueryAs` / `QueryScalar` are built from borrowed macro arguments but
+/// executed later, so the arguments are captured as their wire encoding
+/// rather than as borrows.
+#[derive(Debug)]
+struct BoundParam {
+    bytes: Option<Vec<u8>>,
+    format: ParamFormat,
+    oid: Oid,
+    literal: String,
+}
+
+impl BoundParam {
+    fn capture(p: &dyn ToSqlParam) -> Self {
+        Self {
+            bytes: p.encode_param(),
+            format: p.param_format(),
+            oid: p.sql_oid(),
+            literal: p.to_sql_literal(),
+        }
+    }
+}
+
+impl ToSqlParam for BoundParam {
+    fn encode_param(&self) -> Option<Vec<u8>> {
+        self.bytes.clone()
+    }
+
+    fn param_format(&self) -> ParamFormat {
+        self.format
+    }
+
+    fn sql_oid(&self) -> Oid {
+        self.oid
+    }
+
+    fn to_sql_literal(&self) -> String {
+        self.literal.clone()
+    }
+}
+
+fn capture_all(params: &[&dyn ToSqlParam]) -> Vec<BoundParam> {
+    params.iter().map(|p| BoundParam::capture(*p)).collect()
+}
+
+fn as_refs(params: &[BoundParam]) -> Vec<&dyn ToSqlParam> {
+    params.iter().map(|p| p as &dyn ToSqlParam).collect()
+}
 
 /// A compiled, type-safe query. Created by the `query_as!` macro.
 ///
@@ -14,18 +66,7 @@ use crate::{Connection, FromRow, Result, RowValue};
 #[derive(Debug)]
 pub struct QueryAs<T> {
     sql: String,
-    // Bind parameters are stored as formatted strings for now — the macro
-    // accepts `$N` args and validates the SQL, but binding is not yet wired
-    // (the `fetch_*` methods below forward to the NON-param `fetch_*_as`).
-    //
-    // To finish this: change `params` to hold `ToSqlParam` values and route
-    // through `Connection::fetch_*_as_params` (added in issue #137 — the
-    // parameterized FromRow methods are exactly the primitive this needs).
-    #[allow(
-        dead_code,
-        reason = "typed parameter binding not yet wired — see issue #137"
-    )]
-    params: Vec<String>,
+    params: Vec<BoundParam>,
     _phantom: PhantomData<fn() -> T>,
 }
 
@@ -33,13 +74,12 @@ impl<T: FromRow> QueryAs<T> {
     /// Construct a new `QueryAs`. Called by the `query_as!` macro; not intended
     /// for direct use.
     ///
-    /// `params` accepts `&dyn std::fmt::Debug` so the macro can pass any bind
-    /// arguments through — typed binding via `ToSqlParam` is not yet wired
-    /// (see the `TODO(#137)` on `fetch_all` below).
-    pub fn new(sql: &str, params: &[&dyn std::fmt::Debug]) -> Self {
+    /// `params` are the `$1`, `$2`, … bind arguments. Each is encoded
+    /// immediately and bound by the server at execution time.
+    pub fn new(sql: &str, params: &[&dyn ToSqlParam]) -> Self {
         Self {
             sql: sql.to_owned(),
-            params: params.iter().map(|p| format!("{p:?}")).collect(),
+            params: capture_all(params),
             _phantom: PhantomData,
         }
     }
@@ -51,9 +91,7 @@ impl<T: FromRow> QueryAs<T> {
     /// Returns a `hyperdb_api::Error` on connection failure, SQL error, or
     /// row-mapping failure.
     pub fn fetch_all(self, conn: &Connection) -> Result<Vec<T>> {
-        // TODO(#137): forward to `conn.fetch_all_as_params(&self.sql, &params)`
-        // once `params` holds `ToSqlParam` values, to actually bind `$N` args.
-        conn.fetch_all_as(&self.sql)
+        self.fetch_rows(conn)
     }
 
     /// Execute the query and return exactly one row.
@@ -63,7 +101,11 @@ impl<T: FromRow> QueryAs<T> {
     /// Returns `Error::Conversion` if the query returns zero rows.
     /// Returns a `hyperdb_api::Error` on connection or SQL failure.
     pub fn fetch_one(self, conn: &Connection) -> Result<T> {
-        conn.fetch_one_as(&self.sql)
+        if self.params.is_empty() {
+            conn.fetch_one_as(&self.sql)
+        } else {
+            conn.fetch_one_as_params(&self.sql, &as_refs(&self.params))
+        }
     }
 
     /// Execute the query and return `Some(row)` for the first row, or `None`
@@ -73,8 +115,16 @@ impl<T: FromRow> QueryAs<T> {
     ///
     /// Returns a `hyperdb_api::Error` on connection or SQL failure.
     pub fn fetch_optional(self, conn: &Connection) -> Result<Option<T>> {
-        let rows = conn.fetch_all_as::<T>(&self.sql)?;
-        Ok(rows.into_iter().next())
+        Ok(self.fetch_rows(conn)?.into_iter().next())
+    }
+
+    /// Runs the query, binding `$N` arguments when there are any.
+    fn fetch_rows(&self, conn: &Connection) -> Result<Vec<T>> {
+        if self.params.is_empty() {
+            conn.fetch_all_as(&self.sql)
+        } else {
+            conn.fetch_all_as_params(&self.sql, &as_refs(&self.params))
+        }
     }
 }
 
@@ -92,23 +142,18 @@ impl<T: FromRow> QueryAs<T> {
 #[derive(Debug)]
 pub struct QueryScalar<T> {
     sql: String,
-    // Same gap as `QueryAs::params` — the macro validates the SQL and
-    // accepts args, but binding isn't wired yet. Route through
-    // `fetch_scalar_params` (or equivalent) once it exists.
-    #[allow(
-        dead_code,
-        reason = "typed parameter binding not yet wired — see issue #137"
-    )]
-    params: Vec<String>,
+    params: Vec<BoundParam>,
     _phantom: PhantomData<fn() -> T>,
 }
 
 impl<T: RowValue> QueryScalar<T> {
     /// Construct a new `QueryScalar`. Called by the `query_scalar!` macro.
-    pub fn new(sql: &str, params: &[&dyn std::fmt::Debug]) -> Self {
+    ///
+    /// `params` are the `$1`, `$2`, … bind arguments, encoded immediately.
+    pub fn new(sql: &str, params: &[&dyn ToSqlParam]) -> Self {
         Self {
             sql: sql.to_owned(),
-            params: params.iter().map(|p| format!("{p:?}")).collect(),
+            params: capture_all(params),
             _phantom: PhantomData,
         }
     }
@@ -120,7 +165,7 @@ impl<T: RowValue> QueryScalar<T> {
     /// Returns a `hyperdb_api::Error` on connection failure, SQL error, or
     /// type conversion failure.
     pub fn fetch_all(self, conn: &Connection) -> Result<Vec<T>> {
-        conn.fetch_all_as::<ScalarRow<T>>(&self.sql)
+        self.fetch_rows(conn)
             .map(|rows| rows.into_iter().map(|r| r.0).collect())
     }
 
@@ -130,7 +175,7 @@ impl<T: RowValue> QueryScalar<T> {
     ///
     /// Returns `Error::Conversion` if the query returns zero rows.
     pub fn fetch_one(self, conn: &Connection) -> Result<T> {
-        let rows = conn.fetch_all_as::<ScalarRow<T>>(&self.sql)?;
+        let rows = self.fetch_rows(conn)?;
         rows.into_iter()
             .next()
             .map(|r| r.0)
@@ -143,8 +188,17 @@ impl<T: RowValue> QueryScalar<T> {
     ///
     /// Returns a `hyperdb_api::Error` on connection or SQL failure.
     pub fn fetch_optional(self, conn: &Connection) -> Result<Option<T>> {
-        let rows = conn.fetch_all_as::<ScalarRow<T>>(&self.sql)?;
+        let rows = self.fetch_rows(conn)?;
         Ok(rows.into_iter().next().map(|r| r.0))
+    }
+
+    /// Runs the query, binding `$N` arguments when there are any.
+    fn fetch_rows(&self, conn: &Connection) -> Result<Vec<ScalarRow<T>>> {
+        if self.params.is_empty() {
+            conn.fetch_all_as(&self.sql)
+        } else {
+            conn.fetch_all_as_params(&self.sql, &as_refs(&self.params))
+        }
     }
 }
 

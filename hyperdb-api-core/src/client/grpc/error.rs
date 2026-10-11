@@ -4,7 +4,7 @@
 //! gRPC-specific error types.
 //!
 //! This module handles conversion from gRPC status codes and Hyper's structured
-//! error details to the common [`crate::Error`] type.
+//! error details to the common [`crate::client::Error`] type.
 
 use std::fmt;
 

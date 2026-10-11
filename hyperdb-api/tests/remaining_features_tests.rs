@@ -15,7 +15,6 @@ mod common;
 use common::TestConnection;
 
 use hyperdb_api::{Catalog, FromRow, ServerVersion};
-// The derive macro is no longer re-exported from hyperdb_api; import directly.
 use hyperdb_api_derive::FromRow;
 
 // =============================================================================
@@ -308,12 +307,6 @@ fn test_fetch_all_as() {
     assert_eq!(users[2].name, "Carol");
 }
 
-// `test_from_row_tuple` was removed in v0.3.0 along with the blanket
-// `(Option<A>,)` … `(Option<A>, Option<B>, Option<C>, Option<D>)`
-// `FromRow` impls. For ad-hoc tuple-shaped destructuring, callers
-// should now use `Row::get(idx)` directly on each row, or define a
-// struct with `#[derive(FromRow)]`.
-
 // =============================================================================
 // #17 cont: #[derive(FromRow)] parity with hand-written impl
 // =============================================================================
@@ -466,7 +459,7 @@ fn test_derive_from_row_missing_column_errors() {
         .expect_err("expected missing-column error");
 
     match err {
-        Error::Column { name, kind } => {
+        Error::Column { name, kind, .. } => {
             assert_eq!(name, "not_in_query");
             assert!(
                 matches!(kind, ColumnErrorKind::Missing),
@@ -541,8 +534,9 @@ fn test_stream_as_multi_chunk() {
         .collect::<hyperdb_api::Result<Vec<_>>>()
         .expect("collect");
 
-    let last = usize::try_from(ROWS).expect("row count fits usize") - 1;
-    assert_eq!(users.len(), ROWS as usize);
+    let rows = usize::try_from(ROWS).expect("row count fits usize");
+    let last = rows - 1;
+    assert_eq!(users.len(), rows);
     assert_eq!(users[0].id, 1);
     assert_eq!(users[0].name, "name1");
     assert!((users[0].score - 1.0).abs() < 0.001);

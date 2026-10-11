@@ -11,9 +11,9 @@ name: release-please
 # anchor on the freshly created tag and correct the next release PR (see #308).
 #
 # Uses a fine-grained PAT (RELEASE_PLEASE_TOKEN) instead of the default
-# GITHUB_TOKEN so that PRs and tags created by this workflow trigger
-# downstream CI and publish workflows. With GITHUB_TOKEN, GitHub
-# suppresses workflow triggers on events it creates (anti-recursion).
+# GITHUB_TOKEN so that PRs created by this workflow trigger downstream
+# CI. With GITHUB_TOKEN, GitHub suppresses workflow triggers on events
+# it creates (anti-recursion).
 #
 # After release-please opens or updates the release PR, a follow-up
 # step reconciles Cargo.lock against the bumped Cargo.toml and pushes

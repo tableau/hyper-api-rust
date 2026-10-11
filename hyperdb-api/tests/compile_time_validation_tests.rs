@@ -20,7 +20,7 @@ mod common;
 use common::TestConnection;
 
 use hyperdb_api::Table;
-use hyperdb_api_derive::{FromRow, Table, query_as};
+use hyperdb_api_derive::{FromRow, Table, query_as, query_scalar};
 
 // ---------------------------------------------------------------------------
 // Test structs — derive(Table) registers them at compile time when
@@ -55,21 +55,21 @@ fn table_derive_creates_correct_sql() {
         "CREATE_SQL must contain table name"
     );
     assert!(
-        CtUser::CREATE_SQL.contains("id BIGINT"),
+        CtUser::CREATE_SQL.contains("\"id\" BIGINT"),
         "i64 maps to BIGINT"
     );
     assert!(
-        CtUser::CREATE_SQL.contains("name TEXT"),
+        CtUser::CREATE_SQL.contains("\"name\" TEXT"),
         "String maps to TEXT"
     );
     // score is Option<f64> → nullable DOUBLE PRECISION
     assert!(
-        CtUser::CREATE_SQL.contains("score DOUBLE PRECISION"),
+        CtUser::CREATE_SQL.contains("\"score\" DOUBLE PRECISION"),
         "f64 maps to DOUBLE PRECISION"
     );
     // Option<T> → no NOT NULL constraint
     assert!(
-        !CtUser::CREATE_SQL.contains("score DOUBLE PRECISION NOT NULL"),
+        !CtUser::CREATE_SQL.contains("\"score\" DOUBLE PRECISION NOT NULL"),
         "Option<f64> must not have NOT NULL"
     );
     assert_eq!(CtUser::NAME, "ct_users");
@@ -175,4 +175,79 @@ fn query_as_join_two_registered_tables() {
 
     assert_eq!(users.len(), 1);
     assert_eq!(users[0].name, "Eve");
+}
+
+// ---------------------------------------------------------------------------
+// Bind arguments
+// ---------------------------------------------------------------------------
+
+/// `$N` arguments given to `query_as!` are bound, not dropped.
+#[test]
+fn query_as_binds_arguments() {
+    let test = TestConnection::new().expect("TestConnection");
+    test.execute_command(CtUser::CREATE_SQL)
+        .expect("create ct_users");
+    test.execute_command(
+        "INSERT INTO ct_users VALUES (1, 'Alice', 95.5), (2, 'Bob', 10.0), (3, 'Cy', NULL)",
+    )
+    .expect("insert");
+
+    let name = String::from("Bob");
+    let users: Vec<CtUser> = query_as!(
+        CtUser,
+        "SELECT id, name, score FROM ct_users WHERE name = $1 AND id >= $2",
+        name,
+        1_i64
+    )
+    .fetch_all(&test.connection)
+    .expect("fetch_all with binds");
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].name, "Bob");
+
+    let one: CtUser = query_as!(
+        CtUser,
+        "SELECT id, name, score FROM ct_users WHERE id = $1",
+        3_i64
+    )
+    .fetch_one(&test.connection)
+    .expect("fetch_one with binds");
+    assert_eq!(one.name, "Cy");
+
+    let none: Option<CtUser> = query_as!(
+        CtUser,
+        "SELECT id, name, score FROM ct_users WHERE id = $1",
+        99_i64
+    )
+    .fetch_optional(&test.connection)
+    .expect("fetch_optional with binds");
+    assert!(none.is_none());
+}
+
+/// `$N` arguments given to `query_scalar!` are bound, not dropped.
+#[test]
+fn query_scalar_binds_arguments() {
+    let test = TestConnection::new().expect("TestConnection");
+    test.execute_command(CtUser::CREATE_SQL)
+        .expect("create ct_users");
+    test.execute_command("INSERT INTO ct_users VALUES (1, 'Alice', 95.5), (2, 'Bob', 10.0)")
+        .expect("insert");
+
+    let n: i64 = query_scalar!(
+        i64,
+        "SELECT COUNT(*) FROM ct_users WHERE score > $1",
+        50.0_f64
+    )
+    .fetch_one(&test.connection)
+    .expect("scalar with bind");
+    assert_eq!(n, 1);
+
+    let names: Vec<String> = query_scalar!(
+        String,
+        "SELECT name FROM ct_users WHERE id >= $1 AND id <= $2 ORDER BY id",
+        1_i64,
+        2_i64
+    )
+    .fetch_all(&test.connection)
+    .expect("scalar fetch_all with binds");
+    assert_eq!(names, ["Alice", "Bob"]);
 }

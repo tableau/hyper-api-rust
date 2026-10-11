@@ -59,7 +59,9 @@ fn avg_integer_schema_has_precision_16_scale_6() {
     assert_eq!(schema.column_count(), 1);
     let col = schema.column(0);
     match col.sql_type() {
-        SqlType::Numeric { precision, scale } => {
+        SqlType::Numeric {
+            precision, scale, ..
+        } => {
             assert_eq!(
                 precision, 16,
                 "AVG(INTEGER) precision should be 16 per Hyper's \
@@ -96,7 +98,9 @@ fn avg_bigint_schema_has_precision_25_scale_6() {
     let schema = result.schema().expect("schema after first chunk");
     let col = schema.column(0);
     match col.sql_type() {
-        SqlType::Numeric { precision, scale } => {
+        SqlType::Numeric {
+            precision, scale, ..
+        } => {
             assert_eq!(precision, 25, "AVG(BIGINT) precision should be 25");
             assert_eq!(scale, 6, "AVG(BIGINT) scale should be 6");
         }
@@ -149,7 +153,9 @@ fn avg_integer_via_row_get_numeric() {
 
     // And row.sql_type() exposes the column's SqlType from the schema.
     match row.sql_type(0) {
-        Some(SqlType::Numeric { precision, scale }) => {
+        Some(SqlType::Numeric {
+            precision, scale, ..
+        }) => {
             assert_eq!(precision, 16);
             assert_eq!(scale, 6);
         }
@@ -225,7 +231,9 @@ fn explicit_numeric_column_preserves_precision_and_scale() {
     let _ = result.next_chunk().unwrap();
     let schema = result.schema().expect("schema");
     match schema.column(0).sql_type() {
-        SqlType::Numeric { precision, scale } => {
+        SqlType::Numeric {
+            precision, scale, ..
+        } => {
             assert_eq!(precision, 10);
             assert_eq!(scale, 2);
         }

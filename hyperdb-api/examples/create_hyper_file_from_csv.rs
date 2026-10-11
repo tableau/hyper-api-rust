@@ -71,8 +71,8 @@ fn run_create_hyper_file_from_csv() -> Result<()> {
             // Also be aware that the `header` option is used in this example:
             // It treats the first line of the csv file as a header and does not import it.
             //
-            // The parameters of the COPY command are documented in the Tableau Hyper SQL documentation
-            // (https://tableau.github.io/hyper-db/docs/sql/command/copy_from).
+            // The parameters of the COPY command are documented in the Data Cloud SQL reference (the SQL dialect Hyper uses)
+            // (https://developer.salesforce.com/docs/data/data-cloud-query-guide/references/dc-sql-reference/copy-from.html).
             println!(
                 "Issuing the SQL COPY command to load the csv file into the table. Since the first line"
             );

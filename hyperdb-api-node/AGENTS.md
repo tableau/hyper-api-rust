@@ -34,14 +34,14 @@ For documentation conventions specific to JavaScript/TypeScript, see the [Docume
 | `src/lib.rs` | Rust module declarations |
 | `src/connection.rs` | napi-rs `Connection`, `ConnectionBuilder` |
 | `src/process.rs` | napi-rs `HyperProcess` |
-| `src/inserter.rs` | napi-rs `Inserter` |
+| `src/inserter.rs` | napi-rs `RowInserter` |
 | `src/catalog.rs` | napi-rs `Catalog` |
 | `src/result.rs` | napi-rs `RowData`, `ResultColumnInfo` |
 | `src/query_stream.rs` | napi-rs `QueryStream` |
 | `src/columnar.rs` | napi-rs `ColumnarStream`, `ColumnarChunk` |
 | `src/types.rs` | napi-rs `SqlType`, `TableDefinition`, `CreateMode` |
 | `src/query_stats.rs` | Query statistics |
-| `index.js` | Native binding loader + JS extensions (tagged templates, parameterized queries, event hooks, `Symbol.asyncDispose`, `toJSON`) |
+| `index.js` | Native binding loader + JS extensions (tagged templates, `Symbol.asyncDispose`, async iteration) |
 | `index.d.ts` | Hand-written TypeScript declarations (full IntelliSense) |
 | `pool.mjs` | `ConnectionPool` — pure JS connection pooling |
 | `arrow.mjs` | Arrow convenience helpers (`tableFromQuery`, `insertFromTable`, etc.) |
@@ -50,7 +50,7 @@ For documentation conventions specific to JavaScript/TypeScript, see the [Docume
 
 ## Build and Test Commands
 
-**Prerequisites:** Rust toolchain, Node.js >= 21, `HYPERD_PATH` set.
+**Prerequisites:** Rust toolchain, `protoc` (needed by the `hyperdb-api-core` build script), Node.js >= 21, and `hyperd` (run `make download-hyperd` from the repo root; `HyperProcess` finds `.hyperd/current` by walking up, or set an absolute `HYPERD_PATH`).
 
 ```bash
 cd hyperdb-api-node
@@ -64,7 +64,7 @@ npm run build:debug
 # Build native addon (release — slow compile, fast runtime)
 npm run build
 
-# Run smoke tests
+# Run the smoke and TLS tests
 npm test
 
 # Run benchmarks (build release first!)
@@ -81,20 +81,17 @@ npm run build && npm run benchmark
 ### Rust ↔ JS Bridge
 
 - Each Rust struct in `src/*.rs` uses `#[napi]` attribute macros to expose constructors, methods, and properties to JS.
-- **Sync Rust → Async JS:** Blocking Rust methods are wrapped with `tokio::task::spawn_blocking` and return `Promise` to JavaScript.
-- **Thread safety:** Connections are wrapped in `Arc<Mutex<...>>` for safe concurrent access from the JS event loop.
+- **Async Rust → Async JS:** Each `#[napi] async fn` awaits the matching `hyperdb_api::AsyncConnection` method on the napi tokio runtime and returns a `Promise`; `tokio::task::spawn_blocking` is reserved for CPU-heavy work.
+- **Shared connection:** `Connection` holds an `Arc<hyperdb_api::AsyncConnection>`, so concurrent calls share it without a JS-side lock.
 
 ### JS Extensions in `index.js`
 
 The native binding loader (`index.js`) is **not just a loader** — it adds significant functionality on top of the napi-rs exports:
 
-- **Parameterized queries** (`executeQueryParams`, `executeCommandParams`) — `$1`/`$2` placeholder substitution via `escapeParam()`
-- **Tagged template literals** (`conn.sql\`...\``,`conn.command\`...\``) — safe SQL interpolation
-- **Query event hooks** (`conn.on('query', ...)`) — wraps `executeQuery`/`executeCommand` with timing
+- **Tagged template literals** (`conn.sql` and `conn.command`) — `${value}` placeholders are rewritten to `$n` parameters of a prepared statement
+- **`conn.sqlTyped`, `conn.queryObjects()`, `conn.transaction()`** — keyed plain-object rows and a BEGIN/COMMIT/ROLLBACK helper
 - **`Symbol.asyncDispose` / `Symbol.dispose`** — resource management for `await using`
-- **`RowData.toJSON()`** — serialization with optional column names
 - **`QueryStream[Symbol.asyncIterator]`** — `for await (const row of stream)` support
-- **`createExtractTable()`** — Tableau Extract schema helper
 
 When modifying connection behavior, check both `src/connection.rs` (Rust) and `index.js` (JS wrappers).
 
@@ -113,9 +110,10 @@ When modifying connection behavior, check both `src/connection.rs` (Rust) and `i
 
 ## Testing
 
-- **Smoke tests:** `__test__/smoke.mjs` — covers all major features (connection, queries, inserts, streams, pool, tagged templates, BigInt, dates, JSON, event hooks)
+- **Smoke tests:** `__test__/smoke.mjs` — covers all major features (connection, queries, inserts, streams, pool, tagged templates, BigInt, dates, JSON)
+- **TLS tests:** `__test__/tls.mjs` — `ConnectionBuilder.tls()`, `ConnectionPool`'s `tls` option and `HyperProcess` options against an `ssl_force` server, plus TLS modes over an IPC socket; certificates come from the `openssl` CLI, and the test skips without it. Its certificates and database live in a temporary directory it removes
 - **Benchmarks:** `__test__/benchmark.mjs` — insert and query performance with configurable row counts
-- Tests require `HYPERD_PATH` to be set
+- Tests need `hyperd`: run `make download-hyperd` (found via `.hyperd/current`), or set an absolute `HYPERD_PATH`
 - Test artifacts go into `test_results/` (gitignored)
 
 ## npm Publishing
@@ -126,13 +124,11 @@ Uses napi-rs platform packages for cross-platform prebuilt binaries:
 |----------|---------|
 | macOS ARM64 | `hyperdb-api-node-darwin-arm64` |
 | Linux x64 (glibc) | `hyperdb-api-node-linux-x64-gnu` |
-| Linux x64 (musl) | `hyperdb-api-node-linux-x64-musl` |
-| Linux ARM64 | `hyperdb-api-node-linux-arm64-gnu` |
 | Windows x64 | `hyperdb-api-node-win32-x64-msvc` |
 
-macOS x64 (Intel) is currently disabled — `macos-13` GHA runners are unreliable.
+Only these three platforms are published; macOS x64 (Intel), Linux x64 (musl) and Linux ARM64 have no prebuilt package.
 
-CI builds all enabled platforms on push. Publishing is driven by release-please.
+On every PR and push, `ci.yml` builds the Linux debug addon and runs `npm test`, the smoke and TLS tests (the `hyperdb-api-node (build + smoke)` job). The per-platform release builds run in `npm-build-publish.yml`, which the hand-created GitHub Release triggers; release-please only prepares the version bump and changelog in the release PR.
 
 ## Common Development Scenarios
 
@@ -154,7 +150,7 @@ CI builds all enabled platforms on push. Publishing is driven by release-please.
 ### Modifying Type Mappings
 
 - **Rust → JS:** Reading conversions are in `src/result.rs` (`RowData` getters)
-- **JS → Rust:** Writing conversions are in `src/inserter.rs` and `index.js` (`escapeParam`)
+- **JS → Rust:** Writing conversions are in `src/inserter.rs` and `index.js` (`toPreparedParam`)
 - Update the type mapping tables in `README.md` if you change behavior
 
 ## Documentation Conventions
@@ -176,8 +172,9 @@ Follow the [Documentation Style Guide](DOCUMENTATION_STYLE.md) for JSDoc convent
 ## Codebase-Specific Reminders
 
 1. **`index.d.ts` is hand-written** — always update it when changing the API surface
-2. **`index.js` is more than a loader** — it contains significant logic (params, templates, events, disposal)
+2. **`index.js` is more than a loader** — it contains significant logic (templates, disposal, async iteration)
 3. **Build release for benchmarks** — `npm run build:debug` produces binaries 10x+ slower
 4. **`apache-arrow` is an optional peer dependency** — `arrow.mjs` gracefully handles its absence
 5. **Tests use `.mjs` (ESM)** — use `import`/`export`, not `require` in test files
 6. **CJS entry point** — `index.js` uses CommonJS (`require`/`module.exports`) for maximum compatibility
+7. **Update `hyperdb-api-node/CHANGELOG.md`** under `## [Unreleased]` for user-visible API changes (see root [AGENTS.md](../AGENTS.md) reminder 8)

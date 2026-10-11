@@ -33,7 +33,7 @@ workspace = true
 [dev-dependencies]
 rand = { workspace = true }
 hyperdb-api-core = { path = "../hyperdb-api-core", features = ["salesforce-auth"] }
-arrow = { version = "59.0", default-features = false, features = ["ipc"] }
+arrow = { version = "60", default-features = false, features = ["ipc"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["full"] }
 

@@ -11,20 +11,14 @@
 //! |------|--------|----------|
 //! | **Exact** | Arrow IPC, Parquet | Types read from file metadata — zero guessing. |
 //! | **Structural** | JSON | Full scan of all objects. Per-column type widening (see below). |
-//! | **Heuristic** | CSV | Header row for names, first 1 000 rows sampled for types. Ambiguous → TEXT. |
+//! | **Heuristic** | CSV | Header row for names, first 1 000 rows sampled for types. Ambiguous → TEXT. A second full-file pass promotes INT → BIGINT → NUMERIC(38,0) on out-of-range values and INT/BIGINT → DOUBLE PRECISION on decimals. |
 //!
 //! All tiers can be bypassed with an explicit `schema` override from the caller.
 //!
 //! # Type Widening Rules (Structural / Heuristic Tiers)
 //!
-//! When a JSON or CSV column contains mixed types across rows, the widening
-//! chain determines the final type:
-//!
-//! ```text
-//! Null < Bool < Int < BigInt < Double < Date < Timestamp < Text
-//! ```
-//!
-//! Specific rules (implemented in `resolve_type`):
+//! When a JSON or CSV column contains mixed types across rows, these rules
+//! determine the final type. Specific rules (implemented in `resolve_type`):
 //! - **All null** → TEXT (safe catch-all).
 //! - **Uniform non-null** → that type, unchanged.
 //! - **Mixed numeric** (Int / `BigInt` / Double) → widest numeric type seen.
@@ -142,9 +136,8 @@ pub fn map_hyper_type(type_name: &str) -> Option<SqlType> {
 
 // --- Tier 2: JSON Schema Inference ---
 
-/// Intermediate type tag used during schema inference. The widening order is:
-/// Null < Bool < Int < `BigInt` < Double < Date < Timestamp < Text.
-/// When a column has mixed non-numeric types, it collapses to Text.
+/// Intermediate type tag used during schema inference. Mixed Int/`BigInt`/Double
+/// widen to the widest seen; any other mix resolves to Text.
 #[derive(Debug, Clone, PartialEq)]
 enum InferredType {
     Null,
@@ -271,14 +264,14 @@ fn infer_json_value_type(val: &Value) -> InferredType {
 ///
 /// # Safety of the string slices
 ///
-/// Each indexing like `s[0..4]` requires `s.len()` to be at least the
-/// upper bound (otherwise it panics). The `s.len() == 10` / `s.len() >=
-/// 19` guards are the leftmost clauses in each `if` so Rust's
-/// short-circuit `&&` evaluation proves the length invariant before the
-/// slice operations run.
+/// Both patterns are pure ASCII, so the leftmost clause of each `if` is
+/// `s.is_ascii()`. That makes every byte index a char boundary, so the
+/// `s[a..b]` slices below cannot panic on multi-byte input; the length
+/// checks that follow it guarantee the upper bounds are in range.
 fn infer_string_type(s: &str) -> InferredType {
     // Try ISO 8601 date: YYYY-MM-DD
-    if s.len() == 10
+    if s.is_ascii()
+        && s.len() == 10
         && s.chars().nth(4) == Some('-')
         && s.chars().nth(7) == Some('-')
         && s[0..4].parse::<u16>().is_ok()
@@ -288,7 +281,8 @@ fn infer_string_type(s: &str) -> InferredType {
         return InferredType::Date;
     }
     // Try ISO 8601 timestamp: YYYY-MM-DDThh:mm:ss
-    if s.len() >= 19
+    if s.is_ascii()
+        && s.len() >= 19
         && s.chars().nth(10) == Some('T')
         && s[0..10].contains('-')
         && s[11..].contains(':')
@@ -658,10 +652,8 @@ pub fn parse_schema_override(
 /// practice some MCP clients forward this field as a **JSON-encoded string**
 /// rather than a raw JSON object — e.g. Windsurf/Cascade serializes
 /// `{"postal_code": "TEXT"}` as `"\"{\\\"postal_code\\\": \\\"TEXT\\\"}\""`.
-/// If we only accepted `Value::Object` (the old `v.as_object().cloned()`
-/// pattern) the override was silently dropped and ingest would fail with a
-/// confusing `22P02 invalid input syntax` error from hyperd when a column that
-/// the user explicitly wanted TEXT stayed INT.
+/// Both a JSON object and a JSON-encoded string containing an object are
+/// accepted, so the override is honored whichever shape the client forwards.
 ///
 /// Accepted shapes:
 ///
@@ -796,4 +788,34 @@ pub fn apply_schema_override(
         }
     }
     Ok(inferred)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn infer_string_type_recognizes_iso_dates_and_timestamps() {
+        assert_eq!(infer_string_type("2024-01-15"), InferredType::Date);
+        assert_eq!(
+            infer_string_type("2024-01-15T13:45:30"),
+            InferredType::Timestamp
+        );
+        assert_eq!(infer_string_type("hello"), InferredType::Text);
+    }
+
+    #[test]
+    fn infer_string_type_does_not_panic_on_non_ascii() {
+        // 10 bytes, '-' at char 4 and 7, but `s[0..4]` lands inside 'é'.
+        assert_eq!(infer_string_type("abcé-xy-z"), InferredType::Text);
+        // `s[0..10]` lands inside the 'é' that precedes the 'T' (char 10).
+        assert_eq!(infer_string_type("abcdefghiéT12345678"), InferredType::Text);
+        // Multibyte chars before the date/timestamp separators are not ISO 8601.
+        assert_eq!(infer_string_type("é024-01-15T13:45:30"), InferredType::Text);
+        assert_eq!(infer_string_type("2024-01-15T13:45:3é"), InferredType::Text);
+        assert_eq!(
+            infer_string_type("日本語日本語日本語日本語"),
+            InferredType::Text
+        );
+    }
 }

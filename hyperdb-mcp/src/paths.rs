@@ -191,7 +191,7 @@ mod tests {
     use super::*;
 
     /// Process-wide lock for env-var tests. `std::env::set_var` is
-    /// `unsafe` in newer toolchains because it's not thread-safe; we
+    /// `unsafe` in edition 2024 because it's not thread-safe; we
     /// serialize all env-touching tests to keep them sound.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -203,7 +203,7 @@ mod tests {
     }
 
     /// Sets an env var. Marked `unsafe` because [`std::env::set_var`] is
-    /// `unsafe` in newer toolchains; callers hold `ENV_LOCK`.
+    /// `unsafe` in edition 2024; callers hold `ENV_LOCK`.
     unsafe fn set_env(key: &str, value: &str) {
         // SAFETY: serialized by ENV_LOCK; matches std::env contract.
         unsafe { std::env::set_var(key, value) }

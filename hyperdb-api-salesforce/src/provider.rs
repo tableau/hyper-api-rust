@@ -373,7 +373,11 @@ impl DataCloudTokenProvider {
         let response = self.post_with_retry(&token_url, &form_data).await?;
         let response_text = response.text().await?;
 
-        debug!(response = %response_text, "OAuth Access Token response received");
+        // The body carries the access token; log only its size.
+        debug!(
+            bytes = response_text.len(),
+            "OAuth Access Token response received"
+        );
 
         let oauth_response: OAuthTokenResponse =
             serde_json::from_str(&response_text).map_err(|e| {
@@ -433,7 +437,8 @@ impl DataCloudTokenProvider {
         let response = self.post_with_retry(&exchange_url, &form_data).await?;
         let response_text = response.text().await?;
 
-        debug!(response = %response_text, "DC JWT response received");
+        // The body carries the DC JWT; log only its size.
+        debug!(bytes = response_text.len(), "DC JWT response received");
 
         let dc_response: DataCloudTokenResponse =
             serde_json::from_str(&response_text).map_err(|e| {

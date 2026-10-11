@@ -183,10 +183,11 @@ and `Option<T>` fields use `get_opt` (NULL â†’ `None`) instead of `get` (NULL â†
 Use `#[hyperdb(rename = "col_name")]` when a field name doesn't match its
 column name, or `#[hyperdb(index = N)]` for positional access.
 
+The derive macro lives in the `hyperdb-api-derive` crate; add `hyperdb-api-derive = "1.0"` to `[dependencies]`.
+
 ```rust
-use hyperdb_api::{
-    Connection, CreateMode, FromRow, HyperProcess, Result,
-};
+use hyperdb_api::{Connection, CreateMode, HyperProcess, Result};
+use hyperdb_api_derive::FromRow;
 
 // The derive generates: impl FromRow for Product { fn from_row(...) { ... } }
 // Each field maps to the column with the same name.

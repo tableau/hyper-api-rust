@@ -1,8 +1,8 @@
-# hyper-types Development Guide
+# hyperdb-api-core `types` module: Development Guide
 
-Contributor-facing documentation for the `hyper-types` crate: internal architecture, how to extend the type system, testing, and known design decisions.
+Contributor-facing documentation for the `types` module of the internal `hyperdb-api-core` crate: internal architecture, how to extend the type system, testing, and known design decisions.
 
-For user-facing documentation (type mapping, serialization traits, API surface), see [README.md](README.md).
+For user-facing documentation (API surface and usage examples), see the [hyperdb-api README](../../hyperdb-api/README.md).
 
 ---
 
@@ -33,12 +33,12 @@ ToHyperBinary::to_hyper_binary[_not_null]()     ← serialization
 bytes::BytesMut (LittleEndian wire bytes)
   │
   ▼
-hyper-protocol COPY writer / Inserter           ← sent to Hyper
+protocol COPY writer / Inserter                 ← sent to Hyper
   │
   ...round-trip through hyperd...
   │
   ▼
-hyper-protocol COPY reader / RowDescription     ← received from Hyper
+protocol COPY reader / RowDescription           ← received from Hyper
   │
   ▼
 FromHyperBinary::from_hyper_binary()            ← deserialization
@@ -127,18 +127,18 @@ impl ToHyperBinary for MyType {
 
 ### 5. Wire up higher layers
 
-These changes are outside `hyper-types` but complete the integration:
+These changes are outside the `types` module but complete the integration:
 
-- `hyper-protocol`: Handle the type in COPY row parsing (if variable-length)
-- `hyperapi`: Add `row.get::<MyType>()` support in `result.rs`
-- `hyperapi`: Add `Inserter` support if the type can be inserted
+- `protocol` module: Handle the type in COPY row parsing (if variable-length)
+- `hyperdb-api`: Add `row.get::<MyType>()` support in `result.rs`
+- `hyperdb-api`: Add `Inserter` support if the type can be inserted
 
 ### 6. Add tests
 
 - Unit tests in the same file as the implementation
 - Roundtrip tests: serialize then deserialize and compare
 - Edge cases: minimum/maximum values, NULL handling
-- Integration tests in `hyperapi/tests/` with a real `hyperd` server
+- Integration tests in `hyperdb-api/tests/` with a real `hyperd` server
 
 ### 7. Optional: Add chrono integration (`chrono_integration.rs`)
 
@@ -155,14 +155,14 @@ For fixed-size types, add roundtrip and no-panic proof harnesses.
 ### Running Tests
 
 ```bash
-# All hyper-types tests
-cargo test -p hyper-types
+# All hyperdb-api-core tests (narrow with a `types::` filter)
+cargo test -p hyperdb-api-core
 
 # A specific test
-cargo test -p hyper-types test_numeric_from_binary_with_scale
+cargo test -p hyperdb-api-core test_numeric_from_binary_with_scale
 
 # Doc tests only
-cargo test -p hyper-types --doc
+cargo test -p hyperdb-api-core --doc
 ```
 
 ### Test Patterns
@@ -207,10 +207,10 @@ cargo install --locked kani-verifier
 cargo kani setup
 
 # Run all proofs
-cargo kani -p hyper-types
+cargo kani -p hyperdb-api-core
 
 # Run a specific proof
-cargo kani -p hyper-types --harness date_encode_decode_roundtrip
+cargo kani -p hyperdb-api-core --harness date_encode_decode_roundtrip
 ```
 
 **Note:** Kani proofs avoid calling trait methods that return `Box<dyn Error>` because Kani's model of dynamic dispatch causes infinite unwinding on `fmt::Debug` vtables. Instead, proofs verify at the byte level using `to_le_bytes` / `from_le_bytes` directly.
@@ -227,7 +227,7 @@ cargo kani -p hyper-types --harness date_encode_decode_roundtrip
 
 ## Related Documentation
 
-- [README.md](README.md) -- User-facing crate overview and type mapping
-- [../AGENTS.md](../AGENTS.md) -- Repository-wide AI assistant guidance
+- [hyperdb-api README](../../hyperdb-api/README.md) -- User-facing overview and usage examples
+- [../../AGENTS.md](../../AGENTS.md) -- Repository-wide AI assistant guidance
 - [../../docs/RUST_DOCUMENTATION_STYLE.md](../../docs/RUST_DOCUMENTATION_STYLE.md) -- Documentation conventions
-- Source-level docs: `cargo doc -p hyper-types --open`
+- Source-level docs: `cargo doc -p hyperdb-api-core --open`

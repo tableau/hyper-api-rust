@@ -80,6 +80,14 @@ pub enum Error {
     #[error("{0}")]
     Config(String),
 
+    /// TLS negotiation, handshake or certificate-verification failure.
+    ///
+    /// Includes a server that refuses TLS when the configured mode requires
+    /// it. Unreadable certificate files and invalid option combinations are
+    /// [`Error::Config`] instead.
+    #[error("{0}")]
+    Tls(String),
+
     /// Operation timed out.
     #[error("{0}")]
     Timeout(String),
@@ -173,6 +181,11 @@ impl Error {
         Error::Config(message.into())
     }
 
+    /// Creates a TLS error.
+    pub fn tls(message: impl Into<String>) -> Self {
+        Error::Tls(message.into())
+    }
+
     /// Creates a timeout error.
     pub fn timeout(message: impl Into<String>) -> Self {
         Error::Timeout(message.into())
@@ -214,7 +227,14 @@ impl Error {
 
     // Convenience constructors for the common shapes.
 
-    /// Creates an I/O error from an [`io::Error`].
+    /// Creates an error from an [`io::Error`].
+    ///
+    /// rustls reports handshake failures and TLS alerts as an `io::Error`
+    /// wrapping a `rustls::Error`; those become [`Error::Tls`]. Under TLS 1.3
+    /// a server's rejection of the client certificate arrives only on the
+    /// first read after the handshake, so the classification has to happen
+    /// wherever I/O errors are converted, not only during negotiation.
+    /// Everything else is [`Error::Io`].
     ///
     /// Takes the error by value so it can be used point-free as
     /// `.map_err(Error::from_io)`.
@@ -224,7 +244,13 @@ impl Error {
     )]
     #[must_use]
     pub fn from_io(err: io::Error) -> Self {
-        Error::Io(err.to_string())
+        match err
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+        {
+            Some(tls_err) => Error::Tls(tls_err.to_string()),
+            None => Error::Io(err.to_string()),
+        }
     }
 
     /// Creates an error from a database error response.
@@ -251,6 +277,7 @@ impl Error {
             | Error::Protocol(message)
             | Error::Io(message)
             | Error::Config(message)
+            | Error::Tls(message)
             | Error::Timeout(message)
             | Error::Conversion(message)
             | Error::FeatureNotSupported(message)
@@ -463,5 +490,26 @@ mod tests {
 
         // Empty parentheses
         assert_eq!(extract_sqlstate("ERROR: message ()"), None);
+    }
+
+    /// rustls surfaces handshake failures and alerts as an `io::Error`
+    /// wrapping a `rustls::Error`; those must classify as `Tls`, not `Io`.
+    #[test]
+    fn from_io_classifies_rustls_errors_as_tls() {
+        let err = Error::from_io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            rustls::Error::AlertReceived(rustls::AlertDescription::CertificateRequired),
+        ));
+        assert!(matches!(err, Error::Tls(_)), "got {err:?}");
+        assert_eq!(err.message(), err.to_string());
+
+        let err = Error::from_io(io::Error::new(io::ErrorKind::ConnectionReset, "reset"));
+        assert!(
+            matches!(err, Error::Io(ref msg) if msg == "reset"),
+            "got {err:?}"
+        );
+
+        let err = Error::from(io::Error::new(io::ErrorKind::InvalidData, "not rustls"));
+        assert!(matches!(err, Error::Io(_)), "got {err:?}");
     }
 }

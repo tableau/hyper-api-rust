@@ -70,10 +70,10 @@ fn qualified_table_escapes_embedded_quotes() {
 
 // --- Engine::resolve_target_db ---------------------------------------------
 
-/// Empty / None / "local" all resolve to the primary db name. (LOCAL_ALIAS
-/// filtering happens in the server-level `resolve_db` helper, which the
-/// engine method doesn't see — so engine-level resolution returns "local"
-/// verbatim. The server filter is exercised via end-to-end ingest below.)
+/// `None`, `""`, and whitespace resolve to the primary db name at the engine
+/// level. The `"local"` alias is filtered by `HyperMcpServer::resolve_db`,
+/// covered in `end_to_end_mcp_tests.rs` by
+/// `persist_true_plus_database_local_lets_database_win`.
 #[test]
 fn resolve_target_db_none_means_primary() {
     let te = TestEngine::new_ephemeral();
@@ -228,7 +228,7 @@ fn ingest_with_no_target_db_lands_in_primary() {
 // --- describe_tables_in / sample_table_in ----------------------------------
 
 /// `describe_tables_in(Some("persistent"))` lists tables in the
-/// persistent attachment, hiding internal `_hyperdb_*` tables.
+/// persistent attachment.
 #[test]
 fn describe_tables_in_persistent_lists_only_persistent_tables() {
     let te = TestEngine::new_ephemeral();
@@ -665,8 +665,7 @@ fn ensure_exists_in_seeds_catalog_inside_user_attached_db() {
 
     // Catalog doesn't exist yet in user_db (attach-only doesn't seed
     // for an existing file; this attached file was just created so
-    // attach-with-on_missing=create *does* seed — verify and then
-    // make a separate user-attach test below for the no-seed case).
+    // attach-with-on_missing=create *does* seed).
     // Here we just confirm explicit ensure_exists_in is idempotent.
     hyperdb_mcp::table_catalog::ensure_exists_in(&engine, Some("user_db")).unwrap();
     hyperdb_mcp::table_catalog::ensure_exists_in(&engine, Some("user_db")).unwrap();
@@ -820,7 +819,7 @@ fn reconcile_in_per_db_does_not_touch_persistent_catalog() {
     )
     .unwrap();
 
-    // Two tables in persistent (existing behavior).
+    // One table in persistent.
     engine
         .execute_command("CREATE TABLE \"persistent\".\"public\".\"persist_t\" (n INT)")
         .unwrap();

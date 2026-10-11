@@ -6,7 +6,10 @@
   },
   "files": [
     "bin.js",
-    "README.md"
+    "README.md",
+    "LICENSE-MIT.txt",
+    "LICENSE-APACHE.txt",
+    "NOTICE"
   ],
   "keywords": [
     "hyper",

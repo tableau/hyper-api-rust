@@ -4,11 +4,13 @@
 //! Database connection management.
 //!
 //! The [`Connection`] type provides a unified interface for connecting to Hyper
-//! databases via either TCP (`PostgreSQL` wire protocol) or gRPC transport.
+//! databases via the `PostgreSQL` wire protocol (TCP, Unix domain socket, or named pipe) or gRPC transport.
 //! The transport is automatically detected from the endpoint URL:
 //!
-//! - `https://` or `http://` → gRPC transport
-//! - Otherwise → TCP transport (e.g., `localhost:7483`)
+//! - `https://` or `http://` → gRPC (read-only)
+//! - `tab.domain://...` or an absolute socket path → Unix domain socket (Unix only)
+//! - `tab.pipe://...` or a `\\host\pipe\name` path → named pipe (Windows only)
+//! - otherwise `host:port` → TCP (e.g., `localhost:7483`)
 
 use std::path::Path;
 
@@ -107,8 +109,10 @@ pub enum CreateMode {
 /// # Transport Auto-Detection
 ///
 /// The transport is automatically detected from the endpoint URL:
-/// - `https://` or `http://` → gRPC transport (read-only until server supports writes)
-/// - Otherwise → TCP transport (full read/write support)
+/// - `https://` or `http://` → gRPC (read-only)
+/// - `tab.domain://...` or an absolute socket path → Unix domain socket (Unix only)
+/// - `tab.pipe://...` or a `\\host\pipe\name` path → named pipe (Windows only)
+/// - otherwise `host:port` → TCP; all wire-protocol transports have full read/write support
 ///
 /// # CSV / Text Import & Export
 ///
@@ -237,7 +241,7 @@ impl Connection {
     ///
     /// # Arguments
     ///
-    /// * `endpoint` - The server endpoint (host:port).
+    /// * `endpoint` - The server endpoint; see [`ConnectionBuilder`](crate::ConnectionBuilder) for the accepted forms.
     /// * `database_path` - Path to the database file.
     /// * `create_mode` - How to handle database creation.
     ///
@@ -291,8 +295,7 @@ impl Connection {
 
     /// Returns true if this connection supports write operations.
     ///
-    /// Currently, only TCP connections support writes. gRPC connections are
-    /// read-only until the server supports write operations over gRPC.
+    /// Only TCP connections support writes; gRPC connections are read-only.
     pub fn supports_writes(&self) -> bool {
         self.transport.supports_writes()
     }
@@ -361,7 +364,7 @@ impl Connection {
     ///
     /// # Arguments
     ///
-    /// * `endpoint` - The server endpoint (host:port).
+    /// * `endpoint` - The server endpoint; see [`ConnectionBuilder`](crate::ConnectionBuilder) for the accepted forms.
     /// * `database_path` - Path to the database file.
     /// * `create_mode` - How to handle database creation.
     /// * `user` - Username for authentication.
@@ -389,8 +392,8 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Connection`] if the TCP or gRPC handshake fails, and
-    /// [`Error::Io`] if the endpoint cannot be reached.
+    /// Returns [`Error::Connection`] if the TCP or gRPC handshake fails or the
+    /// endpoint cannot be reached.
     pub fn without_database(endpoint: &str) -> Result<Self> {
         crate::ConnectionBuilder::new(endpoint).build()
     }
@@ -411,7 +414,7 @@ impl Connection {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The connection is using gRPC transport (write operations not yet supported)
+    /// - The connection is using gRPC transport (write operations are unsupported over gRPC)
     /// - The command fails to execute
     pub fn execute_command(&self, command: &str) -> Result<u64> {
         let token = self.stats_before_query(command);
@@ -427,8 +430,8 @@ impl Connection {
 
     /// Executes a SQL query and returns a streaming result set.
     ///
-    /// Results are streamed in chunks (default 64K rows), keeping memory usage
-    /// constant regardless of result set size. This makes it safe for any
+    /// Results are streamed in chunks (up to 65,536 rows over TCP), keeping memory
+    /// usage constant regardless of result set size. This makes it safe for any
     /// result size, from a single row to billions of rows.
     ///
     /// # Example
@@ -454,7 +457,7 @@ impl Connection {
     ///
     /// # Memory Behavior
     ///
-    /// - Only one chunk is held in memory at a time (~few MB for 64K rows)
+    /// - Only one chunk is held in memory at a time (~few MB for a 64K-row TCP chunk)
     /// - Safe for result sets of any size (millions/billions of rows)
     /// - Memory usage is `O(chunk_size)`, not `O(total_rows)`
     ///
@@ -463,7 +466,11 @@ impl Connection {
     /// - Returns [`Error::Server`] wrapping a `hyperdb_api_core::client::Error` if the
     ///   SQL fails to parse, execute, or if the server reports an error
     ///   while streaming.
-    /// - Returns [`Error::Io`] on transport-level I/O failures.
+    /// - Returns [`Error::Connection`] if reading from or writing to the
+    ///   transport fails, or [`Error::Closed`] if the server closes the
+    ///   connection.
+    /// - Over gRPC, returns [`Error::Cancelled`] or [`Error::Timeout`] if the
+    ///   call is cancelled or its deadline expires.
     pub fn execute_query(&self, query: &str) -> Result<Rowset<'_>> {
         let token = self.stats_before_query(query);
 
@@ -476,9 +483,9 @@ impl Connection {
             }
             Transport::Grpc(grpc) => {
                 // gRPC streaming: pull chunks lazily so peak memory is
-                // bounded by one gRPC message (tonic default 64 MB), not
-                // by the full result size. Matches TCP's
-                // constant-memory streaming shape.
+                // bounded by one gRPC message (the `GrpcConfig` max message
+                // size, 64 MB by default), not by the full result size.
+                // Matches TCP's constant-memory streaming shape.
                 //
                 // The transport module already creates a fresh gRPC client
                 // per query (gRPC client needs &mut self to execute), so we
@@ -652,7 +659,7 @@ impl Connection {
     ///     let conn = Connection::connect("localhost:7483", "test.hyper", CreateMode::DoNotCreate)?;
     ///     if let Some(row) = conn.fetch_optional("SELECT * FROM users WHERE id = 999")? {
     ///         let name: Option<String> = row.get(1);
-    ///         println!("Found user: {:?}", name);
+    ///         println!("Found user: {name:?}");
     ///     }
     ///     Ok(())
     /// }
@@ -685,7 +692,7 @@ impl Connection {
     ///     for row in rows {
     ///         let id: Option<i32> = row.get(0);
     ///         let name: Option<String> = row.get(1);
-    ///         println!("User {}: {:?}", id.unwrap_or(-1), name);
+    ///         println!("User {}: {name:?}", id.unwrap_or(-1));
     ///     }
     ///     Ok(())
     /// }
@@ -786,11 +793,10 @@ impl Connection {
             .collect()
     }
 
-    /// Returns a lazy iterator over rows, mapping each to `T` via
-    /// [`FromRow`].
+    /// Returns a lazy iterator mapping each row to `T` via [`FromRow`].
     ///
     /// This is the streaming variant of [`fetch_all_as`](Self::fetch_all_as):
-    /// memory usage is bounded by the chunk size (default 64K rows), not by
+    /// memory usage is bounded by the chunk size (up to 65,536 rows over TCP), not by
     /// the total row count. Use this for large result sets where collecting
     /// all rows into a `Vec` would exceed memory limits.
     ///
@@ -847,15 +853,14 @@ impl Connection {
         Ok(crate::result::TypedRowIterator::<T>::new(rowset))
     }
 
-    /// Fetches a single row from a **parameterized** query and maps it to a
-    /// struct using [`FromRow`](crate::FromRow).
+    /// Fetches one row of a **parameterized** query as a [`FromRow`](crate::FromRow) struct.
     ///
     /// This is the parameterized counterpart to
     /// [`fetch_one_as`](Self::fetch_one_as): it binds `$1`, `$2`, … placeholders
     /// from `params` (via [`ToSqlParam`](crate::params::ToSqlParam), exactly as
     /// [`query_params`](Self::query_params) does) and maps the first result row
     /// into `T`. Use it when a parameterized `SELECT` should yield a typed
-    /// struct rather than a raw [`Row`](crate::Row).
+    /// struct rather than a raw [`Row`].
     ///
     /// # Example
     ///
@@ -900,8 +905,7 @@ impl Connection {
         T::from_row(crate::RowAccessor::new(&row, &indices))
     }
 
-    /// Fetches all rows from a **parameterized** query and maps them to structs
-    /// using [`FromRow`](crate::FromRow).
+    /// Fetches all rows of a **parameterized** query as [`FromRow`](crate::FromRow) structs.
     ///
     /// This is the parameterized counterpart to
     /// [`fetch_all_as`](Self::fetch_all_as): it binds `$1`, `$2`, … placeholders
@@ -953,8 +957,7 @@ impl Connection {
             .collect()
     }
 
-    /// Returns a lazy iterator over the rows of a **parameterized** query,
-    /// mapping each to `T` via [`FromRow`].
+    /// Returns a lazy iterator over a **parameterized** query, mapping rows via [`FromRow`].
     ///
     /// This is the parameterized counterpart to
     /// [`stream_as`](Self::stream_as): it binds `$1`, `$2`, … placeholders from
@@ -1027,7 +1030,7 @@ impl Connection {
     /// fn main() -> Result<()> {
     ///     let conn = Connection::connect("localhost:7483", "test.hyper", CreateMode::DoNotCreate)?;
     ///     let count: i64 = conn.fetch_scalar("SELECT COUNT(*) FROM users")?;
-    ///     println!("User count: {}", count);
+    ///     println!("User count: {count}");
     ///     Ok(())
     /// }
     /// ```
@@ -1062,7 +1065,7 @@ impl Connection {
     /// fn main() -> Result<()> {
     ///     let conn = Connection::connect("localhost:7483", "test.hyper", CreateMode::DoNotCreate)?;
     ///     let max_id: Option<i32> = conn.fetch_optional_scalar("SELECT MAX(id) FROM users")?;
-    ///     println!("Max ID: {:?}", max_id);
+    ///     println!("Max ID: {max_id:?}");
     ///     Ok(())
     /// }
     /// ```
@@ -1113,7 +1116,7 @@ impl Connection {
     /// fn main() -> Result<()> {
     ///     let conn = Connection::connect("localhost:7483", "test.hyper", CreateMode::DoNotCreate)?;
     ///     let count = conn.query_count("SELECT COUNT(*) FROM users WHERE active = true")?;
-    ///     println!("Active users: {}", count);
+    ///     println!("Active users: {count}");
     ///     Ok(())
     /// }
     /// ```
@@ -1151,7 +1154,8 @@ impl Connection {
     /// the Parse round-trip on every call. Note that a prepared statement
     /// fixes its parameter OIDs up front, so it cannot accept both whole and
     /// scaled `NUMERIC` values; `query_params` re-parses per call and can.
-    /// See [`Numeric::sql_oid`](crate::ToSqlParam::sql_oid) for the detail.
+    /// See the [`ToSqlParam`](crate::ToSqlParam) implementation for
+    /// [`Numeric`](crate::Numeric) for the detail.
     ///
     /// Under the hood, `query_params` is a one-shot
     /// prepare+execute+close: it prepares an unnamed statement, binds
@@ -1182,7 +1186,7 @@ impl Connection {
     ///         for row in &chunk {
     ///             let id: Option<i32> = row.get(0);
     ///             let name: Option<String> = row.get(1);
-    ///             println!("Found: {:?} - {:?}", id, name);
+    ///             println!("Found: {id:?} - {name:?}");
     ///         }
     ///     }
     ///     Ok(())
@@ -1206,6 +1210,45 @@ impl Connection {
     /// }
     /// ```
     ///
+    /// # Known limitation: `OR` / `IN` lists over parameters
+    ///
+    /// A `hyperd` defect rejects a filter on a **single column** that
+    /// combines a bound parameter with other values through `OR`, `IN`,
+    /// `NOT IN`, `= ANY(ARRAY[...])` or `CASE`, when the filter applies to a
+    /// table scan. Examples are `WHERE id = $1 OR id = $2`,
+    /// `WHERE id IN ($1, $2)` and `WHERE id = $1 OR id = 3`. The statement
+    /// fails when it is prepared, before any value is bound, with SQLSTATE
+    /// `XX000`: "A parameter was accessed in an execution target with too few
+    /// registered parameters." The same filter in an `UPDATE` or `DELETE` fails
+    /// the same way.
+    ///
+    /// The defect affects every API that binds parameters: this method,
+    /// [`command_params`](Self::command_params), the `*_as_params` methods,
+    /// [`prepare_typed`](Self::prepare_typed),
+    /// `query_as!` / `query_scalar!` with arguments, and their async
+    /// counterparts. Filters that combine parameters with `AND` (including
+    /// ranges such as `id >= $1 AND id <= $2`) are not affected, nor is an
+    /// `OR` across two different columns.
+    ///
+    /// Rewrite the list as a subquery over an array built from the
+    /// parameters. Values stay bound, so the query remains injection-safe:
+    ///
+    /// ```no_run
+    /// # use hyperdb_api::{Connection, Result};
+    /// # fn example(conn: &Connection) -> Result<()> {
+    /// // Fails: "WHERE id IN ($1, $2)"
+    /// let result = conn.query_params(
+    ///     "SELECT * FROM users WHERE id IN (SELECT unnest(ARRAY[$1, $2]))",
+    ///     &[&1i64, &2i64],
+    /// )?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Joining against `VALUES ($1), ($2)` also works. Inlining the values as
+    /// SQL literals works too, but only do that for values that are not user
+    /// input.
+    ///
     /// # Errors
     ///
     /// - Returns [`Error::FeatureNotSupported`] if the connection is using gRPC transport
@@ -1213,7 +1256,9 @@ impl Connection {
     /// - Returns [`Error::Server`] if the server rejects the statement at
     ///   `Parse`, `Bind`, or `Execute` time, including on type-mismatch
     ///   between `params` and the inferred OIDs.
-    /// - Returns [`Error::Io`] on transport-level I/O failures.
+    /// - Returns [`Error::Connection`] if reading from or writing to the
+    ///   transport fails, or [`Error::Closed`] if the server closes the
+    ///   connection.
     pub fn query_params(
         &self,
         query: &str,
@@ -1253,7 +1298,8 @@ impl Connection {
     /// Returns the number of affected rows.
     ///
     /// See [`query_params`](Self::query_params) for details on parameter
-    /// handling and SQL injection prevention.
+    /// handling and SQL injection prevention, and for its known limitation
+    /// with `OR` / `IN` lists over parameters, which applies here too.
     ///
     /// # Example
     ///
@@ -1271,7 +1317,9 @@ impl Connection {
     /// - Returns [`Error::FeatureNotSupported`] if the connection is using gRPC transport.
     /// - Returns [`Error::Server`] if the server rejects the statement at
     ///   `Parse`, `Bind`, or `Execute` time.
-    /// - Returns [`Error::Io`] on transport-level I/O failures.
+    /// - Returns [`Error::Connection`] if reading from or writing to the
+    ///   transport fails, or [`Error::Closed`] if the server closes the
+    ///   connection.
     pub fn command_params(
         &self,
         query: &str,
@@ -1314,7 +1362,7 @@ impl Connection {
     ///         "INSERT INTO users VALUES (1, 'Alice')",
     ///         "INSERT INTO users VALUES (2, 'Bob')",
     ///     ])?;
-    ///     println!("Total affected: {}", total);
+    ///     println!("Total affected: {total}");
     ///     Ok(())
     /// }
     /// ```
@@ -1590,7 +1638,7 @@ impl Connection {
     ///     let hyper = HyperProcess::new(None, None)?;
     ///     let conn = Connection::new(&hyper, "test.hyper", CreateMode::CreateIfNotExists)?;
     ///     if let Some(version) = conn.server_version() {
-    ///         println!("Hyper {}", version);
+    ///         println!("Hyper {version}");
     ///         if version >= ServerVersion::new(0, 1, 0) {
     ///             println!("Has feature X");
     ///         }
@@ -1645,7 +1693,7 @@ impl Connection {
     /// fn main() -> Result<()> {
     ///     let conn = Connection::connect("localhost:7483", "test.hyper", CreateMode::DoNotCreate)?;
     ///     let plan = conn.explain("SELECT * FROM users WHERE id = 1")?;
-    ///     println!("{}", plan);
+    ///     println!("{plan}");
     ///     Ok(())
     /// }
     /// ```
@@ -1688,12 +1736,10 @@ impl Connection {
         Ok(lines.join("\n"))
     }
 
-    /// Returns a reference to the underlying TCP client.
+    /// Returns the underlying wire-protocol client, or `None` for gRPC connections.
     ///
-    /// # Panics
-    ///
-    /// This method returns `None` if the connection is using gRPC transport.
-    pub fn tcp_client(&self) -> Option<&Client> {
+    /// TCP, Unix-socket and named-pipe connections all return `Some`.
+    pub(crate) fn tcp_client(&self) -> Option<&Client> {
         match &self.transport {
             Transport::Tcp(tcp) => Some(&tcp.client),
             Transport::Grpc(_) => None,
@@ -1707,26 +1753,25 @@ impl Connection {
         &self.transport
     }
 
-    /// Prepares a SQL statement with automatic parameter type inference.
+    /// Prepares a SQL statement that takes no parameters.
     ///
     /// The returned [`PreparedStatement`](crate::PreparedStatement) can
-    /// be executed many times with different parameter values; the
-    /// server caches the parsed plan. This is the preferred way to
-    /// execute a statement repeatedly inside a loop.
+    /// be executed many times; the server caches the parsed plan. This
+    /// is the preferred way to execute a statement repeatedly inside a
+    /// loop.
     ///
-    /// For explicit parameter types (necessary when `$N` placeholders
-    /// would otherwise be ambiguous), use
-    /// [`prepare_typed`](Self::prepare_typed).
+    /// Hyper does not infer parameter types, so statements with `$N`
+    /// placeholders must use [`prepare_typed`](Self::prepare_typed).
     ///
     /// # Example
     ///
     /// ```no_run
     /// # use hyperdb_api::{Connection, CreateMode, Result};
     /// # fn example(conn: &Connection) -> Result<()> {
-    /// let stmt = conn.prepare("SELECT name FROM users WHERE id = $1")?;
-    /// for id in [1_i32, 2, 3] {
-    ///     let name: String = stmt.fetch_scalar(&[&id])?;
-    ///     println!("{id}: {name}");
+    /// let stmt = conn.prepare("SELECT count(*) FROM users")?;
+    /// for _ in 0..3 {
+    ///     let n: i64 = stmt.fetch_scalar(&[])?;
+    ///     println!("{n} users");
     /// }
     /// # Ok(())
     /// # }
@@ -1742,9 +1787,8 @@ impl Connection {
 
     /// Prepares a SQL statement with explicit parameter type OIDs.
     ///
-    /// Use this when the server cannot infer parameter types from the
-    /// SQL alone (e.g. a bare `$1` in a `WHERE v > $1` clause with no
-    /// other context). Constants for common types live in
+    /// Declares the type of each `$N` placeholder up front (e.g. for a
+    /// `WHERE v > $1` clause). Constants for common types live in
     /// [`hyperdb_api_core::types::oids`].
     ///
     /// In practice this is the *only* way to prepare a statement that binds
@@ -1764,13 +1808,19 @@ impl Connection {
     /// from the value. [`Geography`](crate::Geography) is unaffected and
     /// works normally here.
     ///
+    /// The known limitation with `OR` / `IN` lists over parameters described
+    /// on [`query_params`](Self::query_params) applies here too: such a
+    /// statement fails at `Parse` time.
+    ///
     /// # Errors
     ///
     /// - Returns [`Error::FeatureNotSupported`] if the connection is using gRPC transport
     ///   (prepared statements are TCP-only).
     /// - Returns [`Error::Server`] if the server rejects the `Parse`
     ///   message, e.g. SQL syntax error or unknown OID.
-    /// - Returns [`Error::Io`] on transport-level I/O failures.
+    /// - Returns [`Error::Connection`] if reading from or writing to the
+    ///   transport fails, or [`Error::Closed`] if the server closes the
+    ///   connection.
     pub fn prepare_typed(
         &self,
         query: &str,
@@ -1799,6 +1849,21 @@ impl Connection {
         }
     }
 
+    /// Returns true if the connection is encrypted with TLS.
+    ///
+    /// For TCP, true when TLS was negotiated — set with
+    /// [`ConnectionBuilder::tls`](crate::ConnectionBuilder::tls); a
+    /// [`TlsMode::Prefer`](crate::TlsMode::Prefer) connection to a server that
+    /// declined TLS reports false. For gRPC, true for an `https://` endpoint.
+    /// Always false over a Unix domain socket or a named pipe.
+    #[must_use]
+    pub fn is_tls(&self) -> bool {
+        match &self.transport {
+            Transport::Tcp(tcp) => tcp.client.is_tls(),
+            Transport::Grpc(grpc) => grpc.config.is_tls(),
+        }
+    }
+
     /// Actively checks that the connection is healthy by executing a trivial query.
     ///
     /// Unlike [`is_alive`](Self::is_alive) which only checks local state,
@@ -1818,7 +1883,7 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Server`] or [`Error::Io`] if the `SELECT 1`
+    /// Returns [`Error::Server`] or [`Error::Connection`] if the `SELECT 1`
     /// round-trip fails — i.e. the connection is no longer usable.
     pub fn ping(&self) -> Result<()> {
         self.execute_command("SELECT 1")?;
@@ -1869,7 +1934,7 @@ impl Connection {
     ///     let conn = Connection::new(&hyper, "test.hyper", CreateMode::CreateIfNotExists)?;
     ///
     ///     if let Some(version) = conn.parameter_status("server_version") {
-    ///         println!("Connected to Hyper version: {}", version);
+    ///         println!("Connected to Hyper version: {version}");
     ///     }
     ///     Ok(())
     /// }
@@ -1899,9 +1964,9 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// - Returns [`Error::FeatureNotSupported`] on gRPC connections — cancellation is not
-    ///   yet implemented for gRPC transport.
-    /// - Returns [`Error::Connection`] or [`Error::Io`] if the separate
+    /// - Returns [`Error::FeatureNotSupported`] on gRPC connections, which do not
+    ///   support query cancellation.
+    /// - Returns [`Error::Connection`] if the separate
     ///   cancel-request connection to the server fails.
     pub fn cancel(&self) -> Result<()> {
         match &self.transport {
@@ -1973,17 +2038,17 @@ impl Connection {
     /// fn main() -> Result<()> {
     ///     let hyper = HyperProcess::new(None, None)?;
     ///     let conn = Connection::new(&hyper, "test.hyper", CreateMode::Create)?;
-    ///     
+    ///
     ///     // Do some work with the database
     ///     conn.execute_command("CREATE TABLE test (id INT)")?;
-    ///     
+    ///
     ///     // Unload from memory (but keep connection)
     ///     conn.unload_database()?;
-    ///     
+    ///
     ///     // Database can still be accessed (will be reloaded automatically)
     ///     let count: i64 = conn.fetch_scalar("SELECT COUNT(*) FROM test")?;
-    ///     println!("Count: {}", count);
-    ///     
+    ///     println!("Count: {count}");
+    ///
     ///     Ok(())
     /// }
     /// ```
@@ -2018,16 +2083,16 @@ impl Connection {
     /// fn main() -> Result<()> {
     ///     let hyper = HyperProcess::new(None, None)?;
     ///     let conn = Connection::new(&hyper, "test.hyper", CreateMode::Create)?;
-    ///     
+    ///
     ///     // Do some work with the database
     ///     conn.execute_command("CREATE TABLE test (id INT)")?;
-    ///     
+    ///
     ///     // Release database completely from session
     ///     conn.unload_release()?;
-    ///     
+    ///
     ///     // Database cannot be accessed after this point without new connection
     ///     // conn.execute_command("SELECT * FROM test")?; // This would fail
-    ///     
+    ///
     ///     Ok(())
     /// }
     /// ```
@@ -2054,7 +2119,7 @@ impl Connection {
     ///
     /// The provider determines how stats are collected. Use
     /// [`LogFileStatsProvider`](crate::LogFileStatsProvider) to parse Hyper's log file (requires local
-    /// `hyperd.log`), or implement a custom [`QueryStatsProvider`](crate::QueryStatsProvider).
+    /// `hyperd.log`), or implement a custom [`QueryStatsProvider`].
     ///
     /// # Example
     ///
@@ -2164,9 +2229,7 @@ impl Connection {
     // (rather than the guard's `&mut self`) delegate to these.
     //
     // They are public because a `&self` helper cannot use the guard at all,
-    // and `hyperdb-mcp`'s engine is exactly that case. They replaced the
-    // `#[doc(hidden)] #[deprecated]` `begin_transaction`/`commit`/`rollback`
-    // wrappers, which were removed in 1.0.0.
+    // and `hyperdb-mcp`'s engine is exactly that case.
 
     /// Issues `BEGIN TRANSACTION` without returning a guard.
     ///
@@ -2192,7 +2255,9 @@ impl Connection {
         Ok(())
     }
 
-    /// Issues `COMMIT` for a transaction opened with
+    /// Issues `COMMIT` for an unguarded transaction.
+    ///
+    /// The transaction is opened with
     /// [`begin_transaction_unguarded`](Self::begin_transaction_unguarded).
     ///
     /// **Prefer [`Transaction::commit`](crate::Transaction::commit)** on the
@@ -2206,7 +2271,9 @@ impl Connection {
         Ok(())
     }
 
-    /// Issues `ROLLBACK` for a transaction opened with
+    /// Issues `ROLLBACK` for an unguarded transaction.
+    ///
+    /// The transaction is opened with
     /// [`begin_transaction_unguarded`](Self::begin_transaction_unguarded).
     ///
     /// **Prefer [`Transaction::rollback`](crate::Transaction::rollback)** on

@@ -89,7 +89,7 @@ struct User {
 // Use the derived CREATE_SQL to create the table at runtime:
 conn.execute_command(User::CREATE_SQL)?;
 println!("{}", User::NAME);       // "users"
-println!("{}", User::CREATE_SQL); // "CREATE TABLE IF NOT EXISTS users (id BIGINT NOT NULL, ...)"
+println!("{}", User::CREATE_SQL); // "CREATE TABLE IF NOT EXISTS \"users\" (\"id\" BIGINT NOT NULL, ...)"
 ```
 
 ### Struct-level attributes
@@ -230,6 +230,7 @@ After RA finishes indexing you'll see squigglies on bad SQL strings and errors i
 ## Known limitations
 
 - **Type checking not yet implemented** — only column *names* are validated. Runtime `Error::Column { kind: TypeMismatch }` still catches type drift.
-- **No parameter type checking** — bind parameters are opaque at compile time.
+- **No parameter type checking** — bind arguments are bound at run time (each must implement `ToSqlParam`), but their types are not checked against the `$N` placeholders at compile time.
 - **Validates struct vs. SQL, not SQL vs. production DB** — struct/prod schema drift is still a runtime error.
 - **`INSERT`/`UPDATE`/`DELETE` without `RETURNING`** are not supported by `query_as!`; use `Connection::execute_command` directly.
+- **`OR` / `IN` lists over arguments are rejected by `hyperd`** — an engine defect rejects a single-column filter such as `WHERE id IN ($1, $2)` or `WHERE id = $1 OR id = $2` with SQLSTATE `XX000`. Write `WHERE id IN (SELECT unnest(ARRAY[$1, $2]))` instead. See the `Connection::query_params` docs in `hyperdb-api`.

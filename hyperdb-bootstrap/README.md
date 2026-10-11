@@ -11,32 +11,17 @@ Windows). This crate automates the "download the right wheel for your
 platform, extract `hyperd` out of it, put it somewhere useful" step so
 contributors and CI can bootstrap with a single command.
 
-> **Why the PyPI wheels?** Two properties that no other distribution
-> channel offers together. First, **the download URL is constructible** from
-> nothing but the version and the platform's wheel tag:
+> **Why the PyPI wheels?** The download URL is constructible from the version
+> and the platform's wheel tag alone:
 >
 > ```text
 > https://files.pythonhosted.org/packages/py3/t/tableauhyperapi/tableauhyperapi-{version}-py3-none-{wheel_tag}.whl
 > ```
 >
-> Tableau's own download filenames embed an opaque build id (`r07abb490`)
-> that cannot be derived from the version, so every bump previously required
-> scraping an HTML page to discover it. Second, **PyPI publishes a sha256 per
-> file**, so the pinned digests are now *read off an API* rather than produced
-> by downloading four ~80 MB archives and hashing them by hand.
->
-> The bytes are the same either way: the `hyperd` inside the
-> `macosx_13_0_arm64` wheel is bit-identical (sha256
-> `aef5c819…6450e478`, 277,836,448 bytes) to the one this crate used to pull
-> from Tableau. Same build, different envelope — and the wheels are ~3.6–4.5%
-> smaller. Both report `minos 13.0`, so the `macosx_13_0` wheel tag is not a
-> raised support floor and no contributor loses support.
->
-> *Historical note, since older revisions of this file argued it at length:*
-> Tableau's C++ `macos-arm64` zip did once ship an **x86_64** `hyperd`, which
-> is why this crate used to take the Java bundle specifically. Tableau fixed
-> that in `0.0.26225`; from that release the C++ and Java binaries are
-> byte-identical, so the distinction no longer explains anything.
+> and PyPI publishes a sha256 for every file at
+> `https://pypi.org/pypi/tableauhyperapi/<version>/json`, which is where the
+> digests pinned in `hyperd-version.toml` come from. The `macos-arm64` build is
+> a native arm64 binary that requires macOS 13 or later.
 
 ## Install
 
@@ -56,7 +41,7 @@ hyperdb-bootstrap download --dest /opt/hyperd
 # Force a re-download even if the version is already cached
 hyperdb-bootstrap download --force
 
-# Install a specific release ad-hoc — just the version, no build id needed
+# Install a specific release ad-hoc (version only)
 hyperdb-bootstrap download --version 0.0.26359
 
 # Use an external pinned-version TOML instead of the baked-in default
@@ -66,8 +51,11 @@ hyperdb-bootstrap download --version-file ./my-hyperd.toml
 # catch yanks/renames early. Exits non-zero on any failure.
 hyperdb-bootstrap verify
 
+# Check a candidate bump before merging
+hyperdb-bootstrap verify --version-file ./candidate.toml
+
 # Print the installed binary's path
-hyperdb-bootstrap which
+hyperdb-bootstrap which             # add --dest DIR for a custom root
 
 # Print the pinned release metadata
 hyperdb-bootstrap version
@@ -79,32 +67,32 @@ four wheel tags are unchanged from `0.0.19484` through `0.0.26479`, so this work
 for any realistic ad-hoc pin or benchmark baseline. For a release whose wheel
 tags differ, write a full pin file and pass `--version-file`.
 
-**Version-source precedence (highest → lowest):**
-
-1. `--version X`
-2. `--version-file PATH`
-3. `./hyperd-version.toml` (auto-discovered in current dir)
-4. Compiled-in default shipped with this crate
+**Version source** — `--version X` and `--version-file PATH` are mutually
+exclusive. With neither, `download` uses `./hyperd-version.toml` if it exists in
+the current directory, otherwise the pin compiled into this crate.
 
 ## Library
 
 ```rust
-use hyperd_bootstrap::{install, InstallOptions, VersionSource};
+use hyperdb_bootstrap::{install, InstallOptions, VersionSource};
 
-let installed = install(InstallOptions {
-    dest_root: "/opt/hyperd".into(),
-    version_source: VersionSource::Builtin,
-    platform: None, // auto-detect
-    force: false,
-})?;
+fn main() -> Result<(), hyperdb_bootstrap::Error> {
+    let installed = install(InstallOptions {
+        dest_root: "/opt/hyperd".into(),
+        version_source: VersionSource::Builtin,
+        platform: None, // auto-detect
+        force: false,
+    })?;
 
-println!("hyperd: {}", installed.binary_path.display());
-# Ok::<(), hyperd_bootstrap::Error>(())
+    println!("hyperd: {}", installed.binary_path.display());
+    Ok(())
+}
 ```
 
 The library is blocking (no async runtime) and has no `tokio` dependency,
 so it can be dropped into build scripts, `postinstall` hooks, or
-synchronous applications.
+synchronous applications. Downloads and `verify` shell out to `curl`, which
+must be on `PATH`; minimal container images often need it installed.
 
 ## Build-time guarantees
 
@@ -146,8 +134,7 @@ tag produces a **silent 404** rather than a clear error. Keeping them in
 
 ## Install layout
 
-The versioned cache directory and `current/VERSION` are keyed on the version
-alone — there is no build id in the path any more.
+The versioned cache directory and `current/VERSION` are keyed on the version alone.
 
 ```text
 <dest>/

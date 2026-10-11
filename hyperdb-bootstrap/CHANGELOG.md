@@ -7,7 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The installer now validates the release `version` before using it as a
+  directory name.** A version such as `../victim` made the install step
+  `remove_dir_all` a path outside the install root. A version containing
+  anything other than ASCII alphanumerics, `.`, `-`, `_` or `+` (or equal to
+  `.` / `..`) is rejected with the new `Error::InvalidVersion` variant.
+
 ## [1.0.0-rc.3] - 2026-09-07
+
+Entries accumulated under `[Unreleased]` from 0.1.1 until this section was
+dated, so several first shipped in earlier releases. The root `CHANGELOG.md`
+records where each shipped: the `0.0.26359` pin in 0.7.1, and the PyPI wheels
+with the `0.0.26479` pin in 1.0.0-rc.2.
 
 ### Changed
 
@@ -61,7 +74,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     the four download URLs. It therefore validates the exact pinned bytes
     rather than merely that the CDN serves *something* at that path.
 
-- **BREAKING:** the minimum supported Rust version is now **1.88**, up from
+- The minimum supported Rust version is now **1.88**, up from
   1.81, and the crate is compiled with **edition 2024**. 1.88 is the version
   Red Hat Enterprise Linux 9.7 ships as `rust-toolset`.
 - **BREAKING:** the TLS crypto provider is now **ring** rather than AWS-LC.

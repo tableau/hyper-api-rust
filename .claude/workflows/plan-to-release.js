@@ -545,7 +545,7 @@ CRITICAL — verify against the REAL published artifact, NOT this session's conn
    \`npx -y ${npmPackage}@${expected} --ephemeral-only --no-daemon\`
    These two flags avoid two real collisions with the session's live MCP, observed on the v0.7.0 run:
    - \`--ephemeral-only\`: the shared persistent \`workspace.hyper\` is held open by the session's server; opening it from a second process throws SQLSTATE 55006 ("database file is locked by another process"). The KV smoke checks only need the ephemeral DB, so skip persistent entirely.
-   - \`--no-daemon\`: a newer client performs a daemon version-takeover on the shared port 7485 (a shipped feature) — killing the session's daemon. \`--no-daemon\` spawns a private hyperd and leaves the session's daemon alone.
+   - \`--no-daemon\`: a newer client performs a daemon version-takeover on the shared per-user health socket (a shipped feature) — killing the session's daemon. \`--no-daemon\` spawns a private hyperd and leaves the session's daemon alone.
    Do the MCP JSON-RPC handshake (initialize -> notifications/initialized -> tools/call). GATE FIRST: call \`status\` and assert its reported version starts with "${expected}". If it does not, STOP — you are not testing the new artifact; report version_match=false. Only if the version matches, run these checks and record each as a test:
    - kv_set returns a \`created\` field (true on first write, false on overwrite of the same key) and \`value_bytes\`.
    - kv_set with overwrite:false on an existing key returns \`{stored:false, existed:true}\` / does not clobber.

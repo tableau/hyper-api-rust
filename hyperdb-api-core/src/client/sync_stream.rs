@@ -4,11 +4,13 @@
 //! Sync stream abstraction for multiple transport types.
 //!
 //! This module provides [`SyncStream`], an enum that can hold different
-//! sync stream types (TCP, Unix Domain Socket) while implementing the
-//! necessary I/O traits.
+//! sync stream types (TCP, TLS over TCP, Unix Domain Socket, named pipe)
+//! while implementing the necessary I/O traits.
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+
+use rustls::{ClientConnection, StreamOwned};
 
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
@@ -16,15 +18,18 @@ use std::os::unix::net::UnixStream;
 #[cfg(windows)]
 use std::fs::File;
 
-/// A sync stream that can be either TCP or Unix Domain Socket.
+/// A sync stream over TCP, TLS over TCP, a Unix Domain Socket or a named pipe.
 ///
 /// This enum provides a unified interface for different transport mechanisms,
-/// allowing [`Client`](crate::client::Client) to work with both TCP and
-/// Unix Domain Sockets transparently.
+/// allowing [`Client`](crate::client::Client) to work with all of them
+/// transparently.
 #[derive(Debug)]
 pub enum SyncStream {
     /// TCP stream for network connections.
     Tcp(TcpStream),
+
+    /// TLS-encrypted TCP stream, after a successful `SSLRequest` handshake.
+    Tls(Box<StreamOwned<ClientConnection, TcpStream>>),
 
     /// Unix Domain Socket stream for local IPC (Unix only).
     #[cfg(unix)]
@@ -49,10 +54,16 @@ impl SyncStream {
         SyncStream::Unix(stream)
     }
 
-    /// Returns true if this is a TCP stream.
+    /// Returns true if this is a TCP stream, encrypted or not.
     #[must_use]
     pub fn is_tcp(&self) -> bool {
-        matches!(self, SyncStream::Tcp(_))
+        matches!(self, SyncStream::Tcp(_) | SyncStream::Tls(_))
+    }
+
+    /// Returns true if this is a TLS-encrypted TCP stream.
+    #[must_use]
+    pub fn is_tls(&self) -> bool {
+        matches!(self, SyncStream::Tls(_))
     }
 
     /// Returns true if this is a Unix Domain Socket stream.
@@ -85,6 +96,7 @@ impl SyncStream {
     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
         match self {
             SyncStream::Tcp(stream) => stream.set_nodelay(nodelay),
+            SyncStream::Tls(stream) => stream.sock.set_nodelay(nodelay),
             #[cfg(unix)]
             SyncStream::Unix(_) => Ok(()), // No-op for Unix sockets
             #[cfg(windows)]
@@ -102,6 +114,7 @@ impl SyncStream {
     pub fn set_read_timeout(&self, dur: Option<std::time::Duration>) -> io::Result<()> {
         match self {
             SyncStream::Tcp(stream) => stream.set_read_timeout(dur),
+            SyncStream::Tls(stream) => stream.sock.set_read_timeout(dur),
             #[cfg(unix)]
             SyncStream::Unix(stream) => stream.set_read_timeout(dur),
             #[cfg(windows)]
@@ -119,6 +132,7 @@ impl SyncStream {
     pub fn set_write_timeout(&self, dur: Option<std::time::Duration>) -> io::Result<()> {
         match self {
             SyncStream::Tcp(stream) => stream.set_write_timeout(dur),
+            SyncStream::Tls(stream) => stream.sock.set_write_timeout(dur),
             #[cfg(unix)]
             SyncStream::Unix(stream) => stream.set_write_timeout(dur),
             #[cfg(windows)]
@@ -131,6 +145,10 @@ impl SyncStream {
     pub fn local_addr_string(&self) -> String {
         match self {
             SyncStream::Tcp(stream) => stream
+                .local_addr()
+                .map_or_else(|_| "unknown".to_string(), |a| a.to_string()),
+            SyncStream::Tls(stream) => stream
+                .sock
                 .local_addr()
                 .map_or_else(|_| "unknown".to_string(), |a| a.to_string()),
             #[cfg(unix)]
@@ -151,6 +169,10 @@ impl SyncStream {
             SyncStream::Tcp(stream) => stream
                 .peer_addr()
                 .map_or_else(|_| "unknown".to_string(), |a| a.to_string()),
+            SyncStream::Tls(stream) => stream
+                .sock
+                .peer_addr()
+                .map_or_else(|_| "unknown".to_string(), |a| a.to_string()),
             #[cfg(unix)]
             SyncStream::Unix(stream) => stream
                 .peer_addr()
@@ -161,29 +183,20 @@ impl SyncStream {
             SyncStream::NamedPipe(_) => "named-pipe".to_string(),
         }
     }
-
-    /// Attempts to clone the stream.
-    ///
-    /// # Errors
-    ///
-    /// Returns an [`io::Error`] from the underlying transport's
-    /// `try_clone` call — typically because the OS refused to
-    /// duplicate the descriptor.
-    pub fn try_clone(&self) -> io::Result<Self> {
-        match self {
-            SyncStream::Tcp(stream) => Ok(SyncStream::Tcp(stream.try_clone()?)),
-            #[cfg(unix)]
-            SyncStream::Unix(stream) => Ok(SyncStream::Unix(stream.try_clone()?)),
-            #[cfg(windows)]
-            SyncStream::NamedPipe(file) => Ok(SyncStream::NamedPipe(file.try_clone()?)),
-        }
-    }
 }
 
 impl Read for SyncStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             SyncStream::Tcp(stream) => stream.read(buf),
+            // rustls reports a peer that closes the socket without a
+            // `close_notify` alert as `UnexpectedEof`. Report it as EOF, as
+            // the plaintext stream would: the wire protocol is length-framed,
+            // so a truncated message is still caught by the reader.
+            SyncStream::Tls(stream) => match stream.read(buf) {
+                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => Ok(0),
+                other => other,
+            },
             #[cfg(unix)]
             SyncStream::Unix(stream) => stream.read(buf),
             #[cfg(windows)]
@@ -196,6 +209,7 @@ impl Write for SyncStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
             SyncStream::Tcp(stream) => stream.write(buf),
+            SyncStream::Tls(stream) => stream.write(buf),
             #[cfg(unix)]
             SyncStream::Unix(stream) => stream.write(buf),
             #[cfg(windows)]
@@ -206,6 +220,7 @@ impl Write for SyncStream {
     fn flush(&mut self) -> io::Result<()> {
         match self {
             SyncStream::Tcp(stream) => stream.flush(),
+            SyncStream::Tls(stream) => stream.flush(),
             #[cfg(unix)]
             SyncStream::Unix(stream) => stream.flush(),
             #[cfg(windows)]

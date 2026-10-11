@@ -486,6 +486,17 @@ pub fn cancel_request(process_id: i32, secret_key: i32, buf: &mut BytesMut) {
     buf.put_i32(secret_key);
 }
 
+/// Writes an `SSLRequest`.
+///
+/// Sent on a fresh TCP connection in place of the startup message. The
+/// server answers with a single byte: `'S'` (proceed with a TLS handshake)
+/// or `'N'` (TLS not available), after which the startup message follows,
+/// encrypted or not.
+pub fn ssl_request(buf: &mut BytesMut) {
+    buf.put_i32(8); // Length
+    buf.put_i32(80877103); // SSL request code
+}
+
 /// Writes a copy data message.
 ///
 /// Sends a chunk of COPY data to the server during COPY IN operation.
@@ -524,4 +535,29 @@ pub fn copy_fail(message: &str, buf: &mut BytesMut) {
     buf.put_i32(4 + msg_len(message.len()) + 1);
     buf.put_slice(message.as_bytes());
     buf.put_u8(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssl_request_bytes() {
+        let mut buf = BytesMut::new();
+        ssl_request(&mut buf);
+        assert_eq!(&buf[..], &[0x00, 0x00, 0x00, 0x08, 0x04, 0xD2, 0x16, 0x2F]);
+    }
+
+    #[test]
+    fn cancel_request_bytes() {
+        let mut buf = BytesMut::new();
+        cancel_request(7, -2, &mut buf);
+        assert_eq!(
+            &buf[..],
+            &[
+                0x00, 0x00, 0x00, 0x10, 0x04, 0xD2, 0x16, 0x2E, 0x00, 0x00, 0x00, 0x07, 0xFF, 0xFF,
+                0xFF, 0xFE,
+            ]
+        );
+    }
 }

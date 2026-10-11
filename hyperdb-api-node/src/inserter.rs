@@ -27,7 +27,7 @@ use crate::types::TableDefinition;
 ///
 /// Rows are buffered in memory; `execute()` encodes them into Hyper's
 /// binary COPY format and ships them to the server on a tokio task.
-/// For Arrow IPC data, use [`ArrowInserter`](crate::arrow_inserter::ArrowInserter)
+/// For Arrow IPC data, use `ArrowInserter`
 /// instead — it bypasses the per-row JS encoding loop entirely.
 #[napi]
 #[derive(Debug)]
@@ -232,51 +232,12 @@ impl RowInserter {
             return Ok(0);
         }
 
-        // Start a COPY IN session and stream the pre-encoded buffer.
-        let client = conn.async_tcp_client().ok_or_else(|| {
-            Error::from_reason(
-                "Inserter requires a TCP connection. \
-                 gRPC connections do not support COPY operations.",
-            )
-        })?;
-
-        let columns: Vec<String> = table_def.columns().iter().map(|c| c.name.clone()).collect();
-        let column_refs: Vec<&str> = columns.iter().map(std::string::String::as_str).collect();
-        let table_name = table_def.qualified_name();
-
-        let mut writer = client
-            .copy_in_arc_with_format(&table_name, &column_refs, "HYPERBINARY")
+        // Stream the pre-encoded buffer as one COPY IN session.
+        let count = conn
+            .copy_in_hyperbinary(&table_def, &encoded)
             .await
             .map_err(|e| Error::from_reason(e.to_string()))?;
-
-        // hyperd caps COPY packets at ~150 MB; slice the pre-encoded
-        // buffer so large inserts don't trigger `packet with length
-        // > 157286400` on the server side.
-        const MAX_COPY_CHUNK: usize = 64 * 1024 * 1024;
-        let mut cursor = 0;
-        while cursor < encoded.len() {
-            let end = (cursor + MAX_COPY_CHUNK).min(encoded.len());
-            writer
-                .send_direct(&encoded[cursor..end])
-                .await
-                .map_err(|e| Error::from_reason(e.to_string()))?;
-            writer
-                .flush_stream()
-                .await
-                .map_err(|e| Error::from_reason(e.to_string()))?;
-            cursor = end;
-        }
-
-        let count = writer
-            .finish()
-            .await
-            .map_err(|e| Error::from_reason(e.to_string()))?;
-        #[expect(
-            clippy::cast_possible_wrap,
-            reason = "NAPI BigInt ↔ Hyper u64 bit-pattern reinterpret; JS consumers read the BigInt as an unsigned inserted-row count"
-        )]
-        let signed = count as i64;
-        Ok(signed)
+        i64::try_from(count).map_err(|_| Error::from_reason("row count exceeds i64::MAX"))
     }
 }
 
@@ -315,9 +276,7 @@ fn encode_rows(
     }
 }
 
-/// Adds a value to the chunk using the column's SQL type for correct binary encoding.
-///
-/// Narrows an integer to `i16` for a `SMALLINT` destination column, or fails.
+/// Narrows an `i64` to `i16` for a `SMALLINT` destination column, or fails.
 ///
 /// Truncating with `as` would be silent data corruption: `add_i16` encodes two
 /// bytes, so a wrapped value is a *valid* encoding of the wrong number and
@@ -407,7 +366,7 @@ fn add_value_typed(
     clippy::trivially_copy_pass_by_ref,
     reason = "signature kept for API consistency with the trait family that unifies Copy and non-Copy implementers"
 )]
-/// Parses a JS object `{ 0: number[], 2: number[] }` into a `HashMap`<usize, Vec<f64>>.
+/// Parses a JS object `{ 0: number[], 2: number[] }` into a `HashMap<usize, Vec<f64>>`.
 fn parse_number_columns(_env: &Env, obj: &Object) -> Result<HashMap<usize, Vec<f64>>> {
     let names = obj.get_property_names()?;
     let len = names.get_named_property::<u32>("length")?;
@@ -447,8 +406,7 @@ fn js_value_to_insert_value(val: Unknown) -> Result<InsertValue> {
     match val.get_type()? {
         ValueType::Null | ValueType::Undefined => Ok(InsertValue::Null),
         ValueType::Boolean => {
-            // napi-rs 3: `coerce_to_bool()` now returns `Result<bool>` directly;
-            // the old 2.x pattern of `.get_value()` on a `JsBoolean` wrapper is gone.
+            // The match arm guarantees a JS boolean; `coerce_to_bool` returns its value.
             let b = val.coerce_to_bool()?;
             Ok(InsertValue::Bool(b))
         }
@@ -489,13 +447,8 @@ fn js_value_to_insert_value(val: Unknown) -> Result<InsertValue> {
             }
         }
         ValueType::String => {
-            // SAFETY: we just matched `ValueType::String` from `val.get_type()`
-            // above, so NAPI has validated that the JS value is a JsString.
-            // `JsUnknown::cast` simply reinterprets the wrapper to the
-            // type-specific handle and is sound under that invariant.
-            // napi-rs 3: `cast::<T>()` now returns `Result<T>` (previously `T`),
-            // so the `?` propagates the type-check failure before we call
-            // `into_utf8()`.
+            // SAFETY: `get_type()` returned `ValueType::String`, so the handle is a
+            // JS string; `Unknown::cast::<JsString>` wraps it without a further type check.
             let s = unsafe { val.cast::<napi::JsString>() }?
                 .into_utf8()?
                 .as_str()?
@@ -503,15 +456,9 @@ fn js_value_to_insert_value(val: Unknown) -> Result<InsertValue> {
             Ok(InsertValue::String(s))
         }
         ValueType::Object => {
-            // SAFETY: we matched `ValueType::Object` above, which covers both
-            // plain objects and Node `Buffer` instances. `JsUnknown::cast`
-            // only reinterprets the handle; if the underlying object is not
-            // actually a `Buffer`, `into_value()` fails with `Err(..)` and
-            // we fall back to the string-coercion branch. NAPI's value type
-            // tag guarantees soundness of the `cast` itself.
-            // napi-rs 3: `cast::<Buffer>()` now returns `Result<Buffer>` directly
-            // (previously it was `Buffer` + an `.into_value()` step that could
-            // fail). `Buffer` derefs to `[u8]`, so `.to_vec()` copies the bytes.
+            // SAFETY: `get_type()` returned `ValueType::Object`. `Unknown::cast::<Buffer>`
+            // calls `napi_get_buffer_info`, which returns `Err` for a non-Buffer object,
+            // so plain objects fall through to the string-coercion branch.
             if let Ok(buf) = unsafe { val.cast::<Buffer>() } {
                 Ok(InsertValue::Bytes(buf.to_vec()))
             } else {

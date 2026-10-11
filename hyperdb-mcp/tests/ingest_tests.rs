@@ -1,8 +1,8 @@
 // Copyright (c) 2026, Salesforce, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Tests for inline data ingest (JSON and CSV): basic round-trips, append
-//! mode, schema overrides, and error handling for empty input.
+//! Integration tests for JSON, JSONL, and CSV ingest (inline and file),
+//! format detection, `extract_json_path`, and merge mode.
 
 mod common;
 use common::TestEngine;
@@ -382,9 +382,8 @@ fn detect_file_format_defaults_to_csv_when_unreadable() {
 #[test]
 fn ingest_json_file_handles_log_extension_via_content_sniff() {
     let mut te = TestEngine::new_ephemeral();
-    // Construct the payload through `detect_file_format` so the test
-    // mirrors the production dispatch path rather than hard-coding a
-    // specific ingest function.
+    // Assert `detect_file_format` first to pin the content sniff that
+    // production dispatch relies on.
     let (path, _keep) = tmp_with_ext(
         "log",
         b"{\"id\":1,\"msg\":\"hello\"}\n\

@@ -275,16 +275,16 @@ impl ChartDisposition {
 #[must_use]
 pub fn resolve_chart_disposition(
     inline: bool,
-    output_path: Option<&str>,
+    output_path: Option<&std::path::Path>,
     format: ChartFormat,
 ) -> ChartDisposition {
     match (inline, output_path) {
         (true, None) => ChartDisposition::InlineOnly,
         (true, Some(p)) => ChartDisposition::WriteAndInline {
-            path: std::path::PathBuf::from(p),
+            path: p.to_path_buf(),
         },
         (false, Some(p)) => ChartDisposition::WriteOnly {
-            path: std::path::PathBuf::from(p),
+            path: p.to_path_buf(),
         },
         (false, None) => ChartDisposition::WriteOnly {
             path: auto_generated_chart_path(format),
@@ -353,7 +353,8 @@ pub fn write_chart_to_disk(
         ));
     }
 
-    if !overwrite && path.exists() {
+    // A dangling symlink counts as existing.
+    if !overwrite && std::fs::symlink_metadata(path).is_ok() {
         return Err(McpError::new(
             ErrorCode::PermissionDenied,
             format!(
@@ -1097,8 +1098,8 @@ enum TemporalKind {
 
 /// How to interpret the x column when extracting f64 axis positions.
 ///
-/// Drives [`group_series`] and the corresponding rendering branch in
-/// [`line_or_scatter`] / [`draw_bar`]. `Temporal` is the new mode added
+/// Drives `group_series` and the corresponding rendering branch in
+/// [`line_or_scatter`] / [`draw_bar`]. `Temporal` is the mode
 /// for proportional time-axis rendering: x positions are real Unix
 /// epoch seconds (so 6 hours apart on the wire are 6 hours apart on
 /// the chart), and tick labels are formatted via chrono.

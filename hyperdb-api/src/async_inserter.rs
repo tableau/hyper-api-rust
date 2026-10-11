@@ -174,35 +174,22 @@ impl<'conn> AsyncInserter<'conn> {
     pub fn add_interval(&mut self, value: Interval) -> Result<()> {
         self.chunk.add_interval(value)
     }
-    /// Adds a `Numeric` value (NUMERIC). The encoding (small vs big) is
-    /// chosen from the table definition's column precision at this position.
+    /// Adds a `Numeric` value (NUMERIC). The value is rescaled to the
+    /// column's declared scale, and the encoding (small vs big) is chosen from
+    /// the column's precision at this position.
     ///
     /// # Errors
     ///
-    /// Returns an error if the column's precision cannot be determined from
-    /// the table definition (NUMERIC columns must be declared with explicit
-    /// precision/scale).
+    /// - Returns an error if the column's precision and scale cannot be
+    ///   determined from the table definition (NUMERIC columns must be
+    ///   declared with explicit precision/scale).
+    /// - Returns [`Error::Conversion`] if the value cannot be represented at
+    ///   the column's scale without losing digits or overflowing.
     pub fn add_numeric(&mut self, value: Numeric) -> Result<()> {
         let column_index = self.chunk.column_index();
-        let precision = self
-            .table_def
-            .columns
-            .get(column_index)
-            .and_then(super::table_definition::ColumnDefinition::sql_type)
-            .and_then(|t| t.precision())
-            .ok_or_else(|| {
-                let col_name = self
-                    .table_def
-                    .columns
-                    .get(column_index)
-                    .map_or("<unknown>", |c| c.name.as_str());
-                Error::conversion(format!(
-                    "Cannot determine numeric precision for column '{col_name}' at index {column_index}. \
-                     Ensure the column is defined with explicit SqlType including precision."
-                ))
-            })?;
+        let (precision, unscaled) =
+            crate::inserter::numeric_for_column(&self.table_def, column_index, value)?;
         if precision <= Numeric::SMALL_NUMERIC_MAX_PRECISION {
-            let unscaled = value.unscaled_value();
             let narrowed = i64::try_from(unscaled).map_err(|_| {
                 Error::conversion(format!(
                     "Numeric value {unscaled} is out of range for i64 storage (precision {precision})"
@@ -210,7 +197,7 @@ impl<'conn> AsyncInserter<'conn> {
             })?;
             self.chunk.add_i64(narrowed)
         } else {
-            self.chunk.add_data128(&value.to_packed())
+            self.chunk.add_data128(&unscaled.to_le_bytes())
         }
     }
 
@@ -221,8 +208,9 @@ impl<'conn> AsyncInserter<'conn> {
     ///
     /// - Returns [`Error::InvalidTableDefinition`] if the column count for the row doesn't match
     ///   the table definition.
-    /// - Returns [`Error::Server`] / [`Error::Io`] on transport failures
-    ///   during the auto-flush.
+    /// - Returns [`Error::Server`] if the server rejects the COPY or its data.
+    /// - Returns [`Error::Connection`] on a transport I/O failure, or
+    ///   [`Error::Closed`] if the server closed the connection.
     pub async fn end_row(&mut self) -> Result<()> {
         self.chunk.end_row()?;
         self.row_count += 1;
@@ -272,8 +260,9 @@ impl<'conn> AsyncInserter<'conn> {
     /// # Errors
     ///
     /// - Returns [`Error::InvalidTableDefinition`] if there's an incomplete row (partial column).
-    /// - Returns [`Error::Server`] / [`Error::Io`] if the COPY session or
-    ///   transport fails.
+    /// - Returns [`Error::Server`] if the server rejects the COPY or its data.
+    /// - Returns [`Error::Connection`] on a transport I/O failure, or
+    ///   [`Error::Closed`] if the server closed the connection.
     pub async fn execute(&mut self) -> Result<u64> {
         if self.chunk.column_index() != 0 {
             return Err(Error::invalid_table_definition(

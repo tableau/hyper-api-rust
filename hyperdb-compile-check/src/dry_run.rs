@@ -6,7 +6,7 @@
 //! Wraps arbitrary user SQL in a CTE and runs it against the shared
 //! `CompileTimeDb`, returning the `ResultSchema` without touching any rows.
 //!
-//! # Critical: query execution is lazy (Phase 0 S6)
+//! # Query execution is lazy
 //!
 //! `Connection::execute_query()` does NOT run the query on the TCP transport.
 //! The query only executes — and server errors / the `RowDescription` (schema)
@@ -30,15 +30,76 @@ use crate::db::CompileTimeDb;
 /// [`crate::error_extract::classify`]).
 pub fn dry_run(db: &mut CompileTimeDb, user_sql: &str) -> Result<ResultSchema> {
     let wrapped = format!("WITH __hdb_q AS ({user_sql}) SELECT * FROM __hdb_q LIMIT 0");
+    // A `$N` placeholder can't be executed without bound values, and Hyper
+    // rejects NULL in some positions. Preparing the statement (Parse/Describe,
+    // no Bind) lets the server infer the parameter types and still report the
+    // result schema, which is all validation needs.
+    let placeholders = placeholder_count(user_sql);
+    if placeholders > 0 {
+        let oids = vec![hyperdb_api::Oid::new(0); placeholders];
+        return Ok(db.conn.prepare_typed(&wrapped, &oids)?.schema().clone());
+    }
     let mut rowset = db.conn.execute_query(&wrapped)?;
 
-    // Force execution (Phase 0 S6): LIMIT 0 returns Ok(None) from next_chunk
+    // Force execution: LIMIT 0 returns Ok(None) from next_chunk
     // but populates the schema cache first.
     rowset.next_chunk()?;
 
     rowset
         .schema()
         .ok_or_else(|| Error::Protocol("dry-run: schema missing after next_chunk".into()))
+}
+
+/// The highest `$N` placeholder in `sql`, ignoring quoted strings and
+/// identifiers. Returns 0 when there are none.
+fn placeholder_count(sql: &str) -> usize {
+    let bytes = sql.as_bytes();
+    let mut max = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            quote @ (b'\'' | b'"') => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    i += 1;
+                }
+            }
+            b'$' => {
+                let digits = bytes[i + 1..]
+                    .iter()
+                    .take_while(|b| b.is_ascii_digit())
+                    .count();
+                if digits > 0
+                    && let Ok(n) = sql[i + 1..i + 1 + digits].parse::<usize>()
+                {
+                    max = max.max(n);
+                }
+                i += digits;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    max
+}
+
+#[cfg(test)]
+mod placeholder_tests {
+    use super::placeholder_count;
+
+    #[test]
+    fn counts_highest_placeholder() {
+        assert_eq!(placeholder_count("SELECT 1"), 0);
+        assert_eq!(placeholder_count("SELECT * FROM t WHERE a = $1"), 1);
+        assert_eq!(placeholder_count("WHERE a = $2 AND b = $1"), 2);
+        assert_eq!(placeholder_count("WHERE a = $10"), 10);
+    }
+
+    #[test]
+    fn ignores_quoted_text() {
+        assert_eq!(placeholder_count("SELECT '$3', \"$4\""), 0);
+        assert_eq!(placeholder_count("SELECT 'it''s $5' WHERE a = $1"), 1);
+    }
 }
 
 #[cfg(test)]
@@ -88,6 +149,21 @@ mod tests {
             .map(hyperdb_api::ResultColumn::name)
             .collect();
         assert_eq!(names, &["a", "b"]);
+    }
+
+    #[test]
+    #[ignore = "requires HYPERD_PATH; run manually"]
+    fn dry_run_with_bind_placeholders() {
+        let mut db = get_or_init().lock();
+        db.conn
+            .execute_command("CREATE TEMP TABLE IF NOT EXISTS _dr_bind (id BIGINT, name TEXT)")
+            .unwrap();
+        let schema = dry_run(
+            &mut db,
+            "SELECT id, name FROM _dr_bind WHERE name = $1 AND id >= $2",
+        )
+        .unwrap();
+        assert_eq!(schema.column_count(), 2);
     }
 
     #[test]

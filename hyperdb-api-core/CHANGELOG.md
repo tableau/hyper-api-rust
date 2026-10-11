@@ -13,6 +13,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`client::tls`: TLS for TCP connections**, negotiated with PostgreSQL's
+  `SSLRequest` and libpq `sslmode` semantics. `TlsConfig` / `TlsMode` (with
+  `ParseTlsModeError`) are set through `Config::with_tls` and read back with
+  `Config::tls`. `Client::is_tls` and `AsyncClient::is_tls` report the
+  outcome, and `SyncStream::Tls` / `AsyncStream::Tls` carry the encrypted
+  stream. A cancel request for a TLS session is sent over TLS. Session
+  resumption is disabled, because `hyperd` aborts every resumed handshake.
+
+### Removed
+
+- **`SyncStream::try_clone`.** A rustls stream cannot be cloned, and nothing
+  called it.
+- **The old, never-wired `client::tls` surface:** `TlsConfig`'s public fields
+  (`verify_server`, `ca_cert_path`, `client_cert_path`, `client_key_path`,
+  `server_name`), `TlsConfig::danger_accept_invalid_certs`, the `TlsMode`
+  helpers `is_enabled` / `is_required` / `verify_server` / `verify_hostname`,
+  and the `rustls_impl` module (`create_connector`, `TlsStream`,
+  `wrap_stream`).
+
+### Changed
+
+- **`client::tls` is reshaped around libpq `sslmode`** (BREAKING).
+  `TlsConfig::new` takes the `TlsMode`; `ca_cert` is now `root_cert`;
+  `TlsMode::VerifyCA` is now `TlsMode::VerifyCa`; `TlsConfig`'s fields are
+  private (`TlsConfig::mode` reads the mode back).
+- **`client::Error` has a new `Tls` variant** (BREAKING for exhaustive
+  matches; the enum is not `#[non_exhaustive]`), built with `Error::tls`.
+  Handshake and certificate failures, including a `rustls::Error` surfacing
+  through I/O, map to it.
+- **`SyncStream` / `AsyncStream` gained a `Tls` variant, and `is_tcp()` is
+  `true` for it** (a TLS stream runs over TCP); `is_tls()` tells them apart.
+- **`Config`'s `FromStr` error type is `client::Error`** (was `String`). The
+  libpq TLS keys (`sslmode`, `sslrootcert`, `sslcert`, `sslkey`, ...) are
+  rejected with `Error::Config` instead of being forwarded to the server as
+  startup options, where they were silently ignored.
+- **`SqlType` and its struct variants (`Numeric`, `Varchar`, `Char`) are
+  `#[non_exhaustive]`.** `SqlType::try_numeric` is the non-panicking
+  counterpart of `SqlType::numeric` for untrusted precision and scale.
+- **`client::grpc::TransferMode` is now a crate-owned enum** (`Sync`, `Async`,
+  `Adaptive`) with `From` conversions to the generated protobuf type, replacing
+  the re-export of the prost type. `GrpcColumnInfo`'s `name` and `sql_type`
+  fields are now `pub(crate)`; use the accessors.
+
+### Fixed
+
+- `protocol::escape::SqlIdentifier`, `format_table_name` and `escape_identifier`
+  now always quote identifiers. They previously left lowercase names bare, so
+  reserved words such as `order` produced invalid SQL. Output changes from
+  `users` to `"users"`.
+
+- **A cancelled COPY write could wedge the async connection.** Dropping a COPY
+  write future mid-frame left a partial `CopyData` frame on the wire, so the
+  queued `CopyFail` was read as part of that frame and
+  `drain_pending_copy_cancel` waited forever for `ReadyForQuery`.
+  `AsyncRawConnection` now tracks an in-flight write: after an interrupted
+  write the connection reports unhealthy, no `CopyFail` is queued, and
+  `finish_copy` / `cancel_copy` refuse to run on it. The post-cancel drain is
+  also bounded and marks the connection desynchronized instead of looping.
+
+- **`Interval` `Display` kept the sign only when the time component was an hour
+  or more.** A negative interval under one hour (for example −30 minutes)
+  rendered as a positive `00:30:00`; it now renders `-00:30:00`.
+- **`AuthenticatedGrpcClient::has_table` returned `true` for every table.** It
+  judged existence by the byte length of the Arrow stream, which is non-empty
+  even for a zero-row result; it now counts rows.
+- **`AuthenticatedGrpcClient::get_table_labels` / `get_column_labels` escape
+  their `schema` and `table` arguments** instead of interpolating them into
+  the catalog query unescaped.
+- **gRPC `QueryParameters::json_positional` and `json_named` produced JSON
+  that `hyperd` rejects** (`22023 invalid JSON query parameters`). They sent
+  bare values (`[42,"hi"]`) and an object (`{"id":42}`). `hyperd` requires an
+  array of typed entries (`[{"type":"bigint","value":"42"}]`, plus `"name"` for
+  named parameters), which both now emit. The Hyper type is inferred from the
+  JSON value (`bool`, `bigint`, `numeric` above `i64::MAX`, `float8`,
+  `varchar`; `null` as a nullable `varchar`); array and object values return
+  an error. The docs for `from_json_string` / `from_json_value`, which pass
+  JSON through unchanged, now describe the typed format instead of showing
+  examples `hyperd` would reject.
+
 ## [1.0.0-rc.3] - 2026-09-07
 
 ### Added

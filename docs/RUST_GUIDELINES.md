@@ -21,7 +21,7 @@ reviewed 2026-09-04 against the full 92-guideline export.
 
 [msft-about]: https://microsoft.github.io/rust-guidelines/guidelines/index.html
 [msft-all]: https://microsoft.github.io/rust-guidelines/agents/all.txt
-[msft-changelog]: https://microsoft.github.io/rust-guidelines/changelog.html
+[msft-changelog]: https://microsoft.github.io/rust-guidelines/changelog/index.html
 
 This page cites the subset that is either machine-enforced here or has been a
 live review topic; the remainder are adopted by reference.
@@ -72,11 +72,11 @@ review; point to them when requesting changes.
 ### API design
 
 - **M-WEASEL-WORDS.** Avoid weasel words (`Service`, `Manager`, `Factory`,
-  `Helper`). Prefer names that describe what the type *is* or *does*. One
-  legitimate exception in this repo: `ConnectionManager` in
-  [hyperdb-api/src/pool.rs](../hyperdb-api/src/pool.rs), which matches
-  `deadpool::Manager` trait nomenclature. Upstream also rules out accepting
-  builders as parameters: where repeatable instantiation is needed, take
+  `Helper`). Prefer names that describe what the type *is* or *does*. The
+  crate-private `ConnectionManager` in
+  [hyperdb-api/src/pool.rs](../hyperdb-api/src/pool.rs) is the one place the
+  word appears; it implements `deadpool::Manager` and is not public API.
+  Upstream also rules out accepting builders as parameters: where repeatable instantiation is needed, take
   `impl Fn() -> Foo` rather than a `FooBuilder`.
 - **M-SHORT-NAMES.** At most two short words per identifier (`AppConfig`, not
   `GlobalApplicationConfig`); no crate or module prefix baked into the name
@@ -108,16 +108,18 @@ review; point to them when requesting changes.
   parameters, look for a helper type.
 - **M-DONT-LEAK-TYPES.** Prefer `std` types in public APIs. Third-party types
   (`bytes::Bytes`, `arrow::RecordBatch`, …) are only exposed when they
-  materially improve the API over an equivalent in `std`. Note upstream also
-  sanctions leaking "behind a relevant feature flag" — the option this crate
-  cannot currently take, since `hyperdb-api` has no features. Revisit the
-  unconditional `arrow` / `chrono` / `geo-types` leaks when feature flags
-  land post-1.0.0.
+  materially improve the API over an equivalent in `std`. The 1.0 policy keeps
+  the `arrow` / `chrono` / `geo-types` leaks, re-exports those crates from the
+  `hyperdb-api` root so callers use the exact version we build against, and
+  treats a major bump of any of them as a `hyperdb-api` major (README, "Semver
+  and re-exported crates"). A default-off feature cannot decouple the cadence
+  and moving existing capability behind one would itself be breaking, so none
+  is planned.
 - **M-FEATURES-ADDITIVE.** Any feature added must be purely additive: it must
   not disable or modify a public item, must not require another feature to be
   manually enabled, and every combination must compile. Prefer a `std`
   feature over a `no-std` one. Currently near-vacuous here (`hyperdb-api` has
-  no features), but load-bearing for the planned post-1.0.0 feature work —
+  no features), but load-bearing for any feature added later —
   and note that moving *existing* always-on capability behind a default-off
   feature is a breaking change, while default-on is not.
 
