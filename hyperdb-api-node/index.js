@@ -35,8 +35,9 @@ function getPlatformPackage() {
       // reliable again — see npm-build-publish.yml matrix.
       return arch === 'arm64' ? 'hyperdb-api-node-darwin-arm64' : null
     case 'linux':
-      if (arch === 'arm64') return isMusl() ? 'hyperdb-api-node-linux-arm64-musl' : 'hyperdb-api-node-linux-arm64-gnu'
-      return isMusl() ? 'hyperdb-api-node-linux-x64-musl' : 'hyperdb-api-node-linux-x64-gnu'
+      // Only linux-x64-gnu is published; ARM64 and musl have no prebuilt package.
+      if (arch === 'arm64' || isMusl()) return null
+      return 'hyperdb-api-node-linux-x64-gnu'
     case 'win32':
       return 'hyperdb-api-node-win32-x64-msvc'
     default:

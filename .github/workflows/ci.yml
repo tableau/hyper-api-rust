@@ -423,9 +423,7 @@ jobs:
             hyperdb-api-node/package.json
             hyperdb-api-node/npm/darwin-arm64/package.json
             hyperdb-api-node/npm/darwin-x64/package.json
-            hyperdb-api-node/npm/linux-arm64-gnu/package.json
             hyperdb-api-node/npm/linux-x64-gnu/package.json
-            hyperdb-api-node/npm/linux-x64-musl/package.json
             hyperdb-api-node/npm/win32-x64-msvc/package.json
           )
           OFFENDERS=()
