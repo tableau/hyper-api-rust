@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* **The npm platform packages now ship `THIRD-PARTY-LICENSES.txt`,** listing
+  the licenses of the Rust crates linked into the native addon. It is
+  generated at publish time with `cargo-about` (`about.toml`, `about.hbs`), and
+  a CI job fails if a dependency uses a license outside the accepted list.
 * **TLS for TCP connections:** `ConnectionBuilder.tls({ mode, rootCert,
   clientCert, clientKey, serverName })`, with libpq `sslmode` semantics
   (`"disable"`, `"prefer"`, `"require"`, `"verify-ca"`, `"verify-full"`), and

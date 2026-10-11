@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **The npm platform packages now ship `THIRD-PARTY-LICENSES.txt`,** listing
+  the licenses of the Rust crates linked into the `hyperdb-mcp` binary. It is
+  generated at publish time with `cargo-about` (`about.toml`, `about.hbs`), and
+  a CI job fails if a dependency uses a license outside the accepted list.
+
 ### Changed
 
 - **Upgraded the `rmcp` SDK dependency from 1.x to 3.4.** Resolves the

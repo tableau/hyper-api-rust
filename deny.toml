@@ -20,7 +20,8 @@ feature-depth = 1
 [licenses]
 # We distribute under a dual MIT OR Apache-2.0 license. The allowlist below
 # lists every SPDX identifier we accept from dependencies. Copyleft licenses
-# (GPL, LGPL, AGPL, SSPL) are deliberately absent.
+# (GPL, LGPL, AGPL, SSPL) are deliberately absent. `about.toml`'s `accepted`
+# list must stay identical, or the third-party notices job disagrees with this one.
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",

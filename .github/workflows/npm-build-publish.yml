@@ -176,6 +176,9 @@ jobs:
           MACOSX_DEPLOYMENT_TARGET: "13.0"
         run: cargo build --release --target "$TARGET" -p hyperdb-api-node
 
+      - name: Install cargo-about
+        run: cargo install cargo-about --locked --features cli --version 0.9.2
+
       - name: Download and verify hyperd
         env:
           SLUG: ${{ matrix.hyperd-slug }}
@@ -262,6 +265,8 @@ jobs:
             cp "$f" "$DEST/"
           done
           cp LICENSE-HYPERD "$DEST/"
+          cargo about generate --manifest-path hyperdb-mcp/Cargo.toml about.hbs \
+            -o "$DEST/THIRD-PARTY-LICENSES.txt"
           chmod +x "$DEST/hyperdb-mcp${EXE}" "$DEST/${HYPERD_BIN}" 2>/dev/null || true
           echo "Contents of $DEST:"
           ls -la "$DEST/"
@@ -287,6 +292,8 @@ jobs:
             cp "$f" "$DEST/"
           done
           cp LICENSE-HYPERD "$DEST/"
+          cargo about generate --manifest-path hyperdb-api-node/Cargo.toml about.hbs \
+            -o "$DEST/THIRD-PARTY-LICENSES.txt"
           chmod +x "$DEST/${HYPERD_BIN}" 2>/dev/null || true
           echo "Contents of $DEST:"
           ls -la "$DEST/"
