@@ -200,6 +200,35 @@ async function main() {
     await lookup.close();
   }
 
+  // 12b. prepareTyped: values are coerced to the declared OIDs (a JS
+  // integer for FLOAT8 used to be sent as 4 bytes and read back as ~2.5e-323).
+  {
+    const f8 = await conn.prepareTyped('SELECT $1::DOUBLE PRECISION', [701]);
+    const f8Rows = await f8.query([5]);
+    assert(f8Rows[0].getFloat64(0) === 5, `FLOAT8 given integer 5, got ${f8Rows[0].getFloat64(0)}`);
+    await f8.close();
+
+    const f4 = await conn.prepareTyped('SELECT $1::REAL', [700]);
+    assert((await f4.query([1.5]))[0].getFloat64(0) === 1.5, 'FLOAT4 given 1.5');
+    await f4.close();
+
+    const i2 = await conn.prepareTyped('SELECT $1::SMALLINT', [21]);
+    assert((await i2.query([7]))[0].getInt32(0) === 7, 'INT2 given 7');
+    let rejected = false;
+    try {
+      await i2.query([40000]);
+    } catch (e) {
+      rejected = /SMALLINT/.test(String(e));
+    }
+    assert(rejected, 'INT2 given 40000 must throw a range error');
+    await i2.close();
+
+    const num = await conn.prepareTyped('SELECT $1::NUMERIC(10,0)', [1700]);
+    assert((await num.query([12]))[0].getFloat64(0) === 12, 'NUMERIC given 12');
+    await num.close();
+    console.log('   prepareTyped coerces JS values to declared OIDs ✓');
+  }
+
   // 13. Connection pool
   console.log('\n13. Connection pool...');
   const { ConnectionPool } = await import('../pool.mjs');
