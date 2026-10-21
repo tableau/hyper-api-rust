@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.0-rc.6](https://github.com/tableau/hyper-api-rust/compare/v1.0.0-rc.5...v1.0.0-rc.6) (2026-10-21)
+
+
+### Bug Fixes
+
+* **deps:** upgrade zip to 9 and patch rustls advisories ([#361](https://github.com/tableau/hyper-api-rust/issues/361)) ([7502a16](https://github.com/tableau/hyper-api-rust/commit/7502a167d929dcc1197c8563a00c8927ce5fa47e))
+* **mcp:** stop waiting on a daemon record overwritten by a pre-1.0 daemon ([#363](https://github.com/tableau/hyper-api-rust/issues/363)) ([264b56d](https://github.com/tableau/hyper-api-rust/commit/264b56d65c8378c6056bf43133ea7e3b9cab9301))
+
 ## [1.0.0-rc.5](https://github.com/tableau/hyper-api-rust/compare/v1.0.0-rc.4...v1.0.0-rc.5) (2026-10-06)
 
 
