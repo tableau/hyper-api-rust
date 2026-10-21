@@ -31,6 +31,11 @@ const SPAWN_TIMEOUT: Duration = Duration::from_secs(20);
 /// successor can start without colliding with it.
 pub const STOP_WAIT: Duration = Duration::from_secs(15);
 
+/// How long a held lock beside a pre-1.0 record is given before the client
+/// concludes the lock holder is unreachable. It covers a daemon that has taken
+/// the lock but not yet bound its health endpoint.
+const LEGACY_RECORD_GRACE: Duration = Duration::from_secs(2);
+
 /// Polling interval while waiting for the discovery file.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -99,6 +104,33 @@ fn ensure_daemon_in(
             return wait_for_daemon(dir, timeout);
         }
 
+        // A pre-1.0 daemon takes no lock and rewrites `daemon.json` in its own
+        // shape, so a held lock beside a legacy record means it overwrote the
+        // record of the daemon that does hold the lock. The daemon never
+        // rewrites it, so waiting cannot help: ask the holder for its own info,
+        // and give up once it has had a moment to start answering.
+        if let Some(legacy_record) = discovery::read_legacy_record(dir) {
+            if let Some(info) = query_lock_holder(dir) {
+                info!(
+                    legacy_pid = legacy_record.pid,
+                    daemon_pid = info.pid,
+                    "daemon record was overwritten by a pre-1.0 daemon; recovered the lock holder's info from it"
+                );
+                return maybe_take_over(info, dir, spawn, timeout, stop_wait);
+            }
+            if start.elapsed() >= LEGACY_RECORD_GRACE.min(timeout) {
+                return Err(io::Error::other(format!(
+                    "a daemon holds the lock in {dir}, but {record} was overwritten by a pre-1.0 \
+                     daemon (pid {pid}, port {port}) and the lock holder does not answer on its \
+                     own endpoint. Stop the pre-1.0 daemon (kill {pid}) and delete {record}",
+                    dir = dir.display(),
+                    record = dir.join("daemon.json").display(),
+                    pid = legacy_record.pid,
+                    port = legacy_record.health_port,
+                )));
+            }
+        }
+
         // The lock is held but no live record answers: a daemon is starting
         // or stopping. Wait for it; spawning a second one would only lose the
         // race for the lock.
@@ -114,6 +146,25 @@ fn ensure_daemon_in(
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+/// Ask whoever holds the daemon lock for its own [`DaemonInfo`] over the
+/// endpoint `dir` implies, bypassing `daemon.json`. `None` when nothing
+/// identified answers there, or its reply is not a record for this directory.
+///
+/// A Windows pipe name is random per daemon and recorded only in the file, so
+/// there the endpoint cannot be derived and this finds nothing.
+fn query_lock_holder(dir: &Path) -> Option<DaemonInfo> {
+    let endpoint = HealthEndpoint::for_new_daemon(dir).ok()?;
+    super::health::ping_identified(
+        &endpoint,
+        Duration::from_millis(500),
+        Duration::from_millis(500),
+    )?;
+    let reply = super::health::send_command(&endpoint, "STATUS").ok()?;
+    let info: DaemonInfo = serde_json::from_str(reply.trim()).ok()?;
+    HealthEndpoint::from_record(&info.health_endpoint, dir)?;
+    Some(info)
 }
 
 /// Spawn `hyperdb-mcp daemon` as a fully detached background process.
@@ -363,6 +414,86 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert_eq!(calls.get(), 0, "the spawner must never run");
         assert!(started.elapsed() >= Duration::from_millis(300));
+    }
+
+    /// A held lock plus a pre-1.0 record means a legacy daemon (which takes no
+    /// lock) overwrote the record of the daemon that does hold it. That record
+    /// will never become a current one, so waiting out the timeout is pointless:
+    /// fail at once, spawn nothing, and leave the record for its owner.
+    #[test]
+    fn held_lock_with_a_legacy_record_fails_fast_without_spawning() {
+        let dir = tempfile::tempdir().expect("state dir");
+        let _held = DaemonLock::try_acquire(dir.path())
+            .expect("lock probe")
+            .expect("fresh dir is lockable");
+        let record = write_legacy_record(dir.path(), 4_242, 9);
+        let calls = Cell::new(0);
+
+        let started = Instant::now();
+        let error = ensure_daemon_in(
+            dir.path(),
+            counting_spawner(&calls),
+            Duration::from_secs(30),
+            NO_LEGACY_WAIT,
+        )
+        .expect_err("an unreachable lock holder must not succeed");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "must not wait out the spawn timeout, took {:?}",
+            started.elapsed()
+        );
+        assert_ne!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            error.to_string().contains("4242"),
+            "the error should name the legacy daemon's pid: {error}"
+        );
+        assert_eq!(calls.get(), 0, "the spawner must never run");
+        assert!(
+            record.exists(),
+            "a legacy daemon's record is not ours to remove"
+        );
+    }
+
+    /// The lock holder is reachable on the well-known endpoint even though the
+    /// record no longer names it: ask it for its own info instead of trusting
+    /// (or waiting on) the clobbered file.
+    #[test]
+    #[cfg(unix)]
+    fn held_lock_with_a_legacy_record_recovers_the_info_from_the_lock_holder() {
+        let dir = tempfile::tempdir().expect("state dir");
+        let _held = DaemonLock::try_acquire(dir.path())
+            .expect("lock probe")
+            .expect("fresh dir is lockable");
+        write_legacy_record(dir.path(), 4_242, 9);
+
+        let endpoint = HealthEndpoint::for_new_daemon(dir.path()).expect("derive endpoint");
+        let info = DaemonInfo {
+            pid: 777,
+            hyperd_endpoint: "127.0.0.1:55555".to_string(),
+            health_endpoint: endpoint.as_str().to_string(),
+            started_at: "2026-10-21T21:55:08+00:00".to_string(),
+            // Newer than any client, so the version takeover never fires.
+            version: "999.0.0".to_string(),
+        };
+        let listener = HealthListener::bind(&endpoint).expect("bind health listener");
+        let state = Arc::new(DaemonState::new(endpoint));
+        let shared = Arc::new(Mutex::new(info.clone()));
+        let run_state = Arc::clone(&state);
+        let thread = std::thread::spawn(move || listener.run(run_state, shared));
+        let calls = Cell::new(0);
+
+        let recovered = ensure_daemon_in(
+            dir.path(),
+            counting_spawner(&calls),
+            Duration::from_secs(30),
+            NO_LEGACY_WAIT,
+        );
+
+        state.request_shutdown();
+        thread.join().expect("listener thread");
+        assert_eq!(recovered.expect("the lock holder answers STATUS"), info);
+        assert_eq!(calls.get(), 0, "the spawner must never run");
     }
 
     /// With the lock free, a leftover record is stale: it is removed under

@@ -91,6 +91,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **A pre-1.0 daemon overwriting the daemon record no longer stalls startup for about a minute.** A pre-1.0 daemon takes no lock and rewrites `daemon.json` in its own shape, so the client saw a held lock and an unreadable record and polled the full 20 s spawn timeout, again on each engine retry. It now asks the lock holder for its own info and uses that. If the holder does not answer within 2 s it fails with an error naming the pre-1.0 daemon's pid and the file to delete.
 - On Windows a stale pre-1.0 daemon record whose port nobody serves is now removed. The probe gave up on the connect before Windows reported the refusal (about two seconds), treated the port as unknown, and kept the record, so the client stayed in local mode.
 - `query` results now render `BYTES` as a `\x`-prefixed lowercase hex string and `TIME`/`INTERVAL` as their text form instead of null/garbage from the string fallback.
 - The stdio server now answers Claude Code's opening `server/discover` probe with `-32601 Method not found`, so the client falls back to `initialize` instead of failing with "Server's protocol version is not supported: 2026-07-28". Previously rmcp either served the probe, locking the session into the stateless `2026-07-28` lifecycle, or rejected it with `-32022`.
