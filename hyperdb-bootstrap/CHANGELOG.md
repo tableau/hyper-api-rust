@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Upgraded `zip` from 8 to 9** to pick up the fixes for RUSTSEC-2026-0367,
+  RUSTSEC-2026-0368 and RUSTSEC-2026-0369 (symlink and SUID/SGID handling in
+  `ZipArchive::extract`). `extract_hyperd` walks entries itself and never calls
+  `extract`, so it was not exercising the vulnerable path, but the dependency
+  now clears `cargo audit` and `cargo deny`. No source changes were needed.
 - **The installer now validates the release `version` before using it as a
   directory name.** A version such as `../victim` made the install step
   `remove_dir_all` a path outside the install root. A version containing
