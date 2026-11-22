@@ -13,4 +13,10 @@ ignore = [
     # `plotters` chart rendering in hyperdb-mcp; no direct use, no patch exists, no
     # runtime risk. Tracking plotters-rs/plotters#736. Mirror of deny.toml.
     "RUSTSEC-2026-0192",
+    # `chrono` unmaintained (RUSTSEC-2026-0543, informational). Public API
+    # dependency; no patched version. Mirror of deny.toml.
+    "RUSTSEC-2026-0543",
+    # `crypto-bigint` 0.5.5 timing variability (RUSTSEC-2026-0387). Pinned by
+    # `jsonwebtoken`->`p256`; outbound JWT signing only. Mirror of deny.toml.
+    "RUSTSEC-2026-0387",
 ]

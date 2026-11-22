@@ -70,6 +70,17 @@ ignore = [
     # ttf-parser); tracking upstream at plotters-rs/plotters#736. Re-evaluate when
     # plotters migrates its font stack (e.g. to skrifa).
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained, no patch exists; transitive via plotters chart rendering, no direct use, no runtime risk" },
+    # `chrono` unmaintained (RUSTSEC-2026-0543, informational — no patched version).
+    # `chrono` is part of the public API (re-exported from `hyperdb-api`), so it
+    # cannot be dropped before 1.0. Not a vulnerability. Re-evaluate when a
+    # maintained successor or an advisory resolution lands.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, informational; part of the public API, no patched version" },
+    # `crypto-bigint` 0.5.5 timing variability (RUSTSEC-2026-0387). Pinned by
+    # `p256`/`elliptic-curve` 0.13 via `jsonwebtoken`, used only for *outbound*
+    # JWT signing in `hyperdb-api-salesforce`, where timing sidechannels are not
+    # observable to a remote attacker. Fix needs the RustCrypto 0.14 stack
+    # (crypto-bigint >=0.7.6); re-evaluate when `jsonwebtoken` adopts it.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint pinned by jsonwebtoken->p256; outbound JWT signing only, timing sidechannel not observable" },
 ]
 
 # -------------------------------------------------------------------------
