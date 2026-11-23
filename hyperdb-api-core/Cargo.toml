@@ -28,7 +28,7 @@ socket2 = { workspace = true }
 
 # Geography dependencies (types layer)
 geo-types = { version = "0.7" }
-wkt = { version = "0.14" }
+wkt = { version = "0.15" }
 geozero = { version = "0.15", features = ["with-wkb", "with-geo"] }
 
 # Chrono (types layer; required)
