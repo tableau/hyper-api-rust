@@ -14,7 +14,6 @@ rust-version = "1.88"
 description = "Compile-time SQL validation logic for hyperdb-api (not a proc-macro)"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/tableau/hyper-api-rust"
-homepage = "https://github.com/tableau/hyper-api-rust"
 readme = "README.md"
 keywords = ["database", "hyper", "sql", "validation"]
 categories = ["database", "development-tools"]
