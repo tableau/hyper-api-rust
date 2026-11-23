@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.0.0-rc.6](https://github.com/tableau/hyper-api-rust/compare/v1.0.0-rc.5...v1.0.0-rc.6) (2026-11-23)
+
+
+### Bug Fixes
+
+* **deps:** clear cargo-deny/cargo-audit advisories ([#371](https://github.com/tableau/hyper-api-rust/issues/371)) ([4b3b561](https://github.com/tableau/hyper-api-rust/commit/4b3b5615914e7644f1b5c1503bf6227f76732919))
+* **deps:** patch hyper-explorer npm advisories ([#374](https://github.com/tableau/hyper-api-rust/issues/374)) ([9e77ceb](https://github.com/tableau/hyper-api-rust/commit/9e77cebb0e926f9928bd786234cfd4446891469e))
+* **deps:** refresh hyperdb-compile-check lockfile for rustls and other advisories ([#373](https://github.com/tableau/hyper-api-rust/issues/373)) ([7aadd20](https://github.com/tableau/hyper-api-rust/commit/7aadd20750b1e06fef497d6f3097f3dcf7f891b1))
+* **deps:** upgrade zip to 9 and patch rustls advisories ([#361](https://github.com/tableau/hyper-api-rust/issues/361)) ([7502a16](https://github.com/tableau/hyper-api-rust/commit/7502a167d929dcc1197c8563a00c8927ce5fa47e))
+* **mcp:** stop waiting on a daemon record overwritten by a pre-1.0 daemon ([#363](https://github.com/tableau/hyper-api-rust/issues/363)) ([264b56d](https://github.com/tableau/hyper-api-rust/commit/264b56d65c8378c6056bf43133ea7e3b9cab9301))
+* typed prepared parameters (core big-endian SqlParam, node prepareTyped OID coercion) ([#376](https://github.com/tableau/hyper-api-rust/issues/376)) ([e5eff21](https://github.com/tableau/hyper-api-rust/commit/e5eff21fbc8e67c566b7e1f2d12bbabb348b07c2))
+
 ## [1.0.0-rc.5](https://github.com/tableau/hyper-api-rust/compare/v1.0.0-rc.4...v1.0.0-rc.5) (2026-10-06)
 
 
