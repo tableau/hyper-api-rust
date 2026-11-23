@@ -208,33 +208,20 @@ fn test_parameterized_query_support() {
         .exec("INSERT INTO test_params VALUES (1, 'Alice'), (2, 'Bob')")
         .expect("Failed to insert");
 
-    // Try to prepare a parameterized query
-    let result = client.prepare("SELECT name FROM test_params WHERE id = $1");
-
-    match result {
-        Ok(stmt) => {
-            // If prepare succeeds, try to execute with a parameter
-            let exec_result = client.execute(&stmt, hyperdb_api_core::params![1_i32]);
-            match exec_result {
-                Ok(rows) => {
-                    // Full support for parameterized queries
-                    assert!(!rows.is_empty(), "Should return results");
-                }
-                Err(e) => {
-                    // Prepare succeeded but execute failed - partial support
-                    eprintln!("Note: Parameterized query execute failed: {e}");
-                }
-            }
-        }
-        Err(e) => {
-            // Hyper doesn't support parameterized queries - expected
-            eprintln!("Note: Hyper does not support $1 style parameters: {e}");
-            assert!(
-                e.to_string().contains("parameter"),
-                "Error should mention parameters: {e}"
-            );
-        }
-    }
+    // Hyper rejects untyped `$n` placeholders in plain `prepare()` (it cannot
+    // infer the type), so declare the parameter type explicitly. Every other
+    // outcome is a failure: this test must not silently skip.
+    let stmt = client
+        .prepare_typed(
+            "SELECT name FROM test_params WHERE id = $1",
+            &[hyperdb_api_core::types::oids::INT],
+        )
+        .expect("prepare_typed with explicit INT parameter must succeed");
+    let rows = client
+        .execute(&stmt, hyperdb_api_core::params![2_i32])
+        .expect("execute with bound INT parameter must succeed");
+    assert_eq!(rows.len(), 1, "id = 2 must match exactly one row");
+    assert_eq!(rows[0].get_string(0).as_deref(), Some("Bob"));
 
     client.close().expect("Failed to close");
 }

@@ -64,6 +64,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+* **`Connection.prepareTyped` now encodes each parameter at the width its declared OID requires.** Values used to be sent at the width inferred from the JS value, so a `FLOAT8` given the integer `5` silently read back as `2.47e-323`, and `FLOAT4`/`INT2`/`NUMERIC` failed with `22P03`. `INT2`/`INT4`/`INT8`/`FLOAT4`/`FLOAT8`/`BOOL`/`TEXT`/whole-number `NUMERIC`
+  and string `DATE`/`TIME`/`TIMESTAMP`/`TIMESTAMPTZ` values are coerced; an out-of-range, fractional (for integers), non-finite, wrong-JS-type, or wrong-arity value now throws instead of corrupting data. Other OIDs keep value-inferred encoding.
 * Inserting a JS number into an integer column (`addRow` with a float, or `addColumnar`) now throws when the value is `NaN`, infinite, or outside the column's range. It used to saturate or become `0` silently.
 * `ConnectionPool.acquire()` no longer exceeds `max` under concurrent calls:
   in-flight connection attempts now reserve a slot (released on failure), where

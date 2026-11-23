@@ -116,7 +116,7 @@ impl PreparedStatement {
     #[napi(ts_args_type = "params: Array<number | bigint | string | boolean | null | Buffer>")]
     pub async fn query(&self, params: Vec<serde_json::Value>) -> Result<Vec<RowData>> {
         self.ensure_alive()?;
-        let encoded = encode_json_params(params);
+        let encoded = self.encode(params)?;
         let conn = Arc::clone(&self.conn);
         let cached = Arc::clone(&self.cached);
         let explicit = self.explicit_oids.clone();
@@ -129,7 +129,7 @@ impl PreparedStatement {
     #[napi(ts_args_type = "params: Array<number | bigint | string | boolean | null | Buffer>")]
     pub async fn execute(&self, params: Vec<serde_json::Value>) -> Result<i64> {
         self.ensure_alive()?;
-        let encoded = encode_json_params(params);
+        let encoded = self.encode(params)?;
         let conn = Arc::clone(&self.conn);
         let cached = Arc::clone(&self.cached);
         let explicit = self.explicit_oids.clone();
@@ -141,7 +141,7 @@ impl PreparedStatement {
     #[napi(ts_args_type = "params: Array<number | bigint | string | boolean | null | Buffer>")]
     pub async fn fetch_one(&self, params: Vec<serde_json::Value>) -> Result<RowData> {
         self.ensure_alive()?;
-        let encoded = encode_json_params(params);
+        let encoded = self.encode(params)?;
         let conn = Arc::clone(&self.conn);
         let cached = Arc::clone(&self.cached);
         let explicit = self.explicit_oids.clone();
@@ -153,7 +153,7 @@ impl PreparedStatement {
     #[napi(ts_args_type = "params: Array<number | bigint | string | boolean | null | Buffer>")]
     pub async fn fetch_optional(&self, params: Vec<serde_json::Value>) -> Result<Option<RowData>> {
         self.ensure_alive()?;
-        let encoded = encode_json_params(params);
+        let encoded = self.encode(params)?;
         let conn = Arc::clone(&self.conn);
         let cached = Arc::clone(&self.cached);
         let explicit = self.explicit_oids.clone();
@@ -189,6 +189,15 @@ impl PreparedStatement {
         let mut guard = self.cached.lock().await;
         let _ = guard.take();
         Ok(())
+    }
+
+    /// Encodes JS values: coerced to the declared OIDs for `prepareTyped`
+    /// statements, inferred from the JS value otherwise.
+    fn encode(&self, params: Vec<serde_json::Value>) -> Result<Vec<ParamValue>> {
+        match &self.explicit_oids {
+            Some(oids) => coerce_params(oids, params).map_err(Error::from_reason),
+            None => Ok(encode_json_params(params)),
+        }
     }
 
     fn ensure_alive(&self) -> Result<()> {
@@ -281,8 +290,11 @@ async fn ensure_cached(
     wanted_oids: Vec<hyperdb_api::Oid>,
 ) -> Result<tokio::sync::OwnedMutexGuard<Option<CachedPrepared>>> {
     let mut guard = Arc::clone(cache).lock_owned().await;
+    // With explicit OIDs the statement is prepared once (eagerly in
+    // `prepareTyped`) and never re-prepared: values are coerced to the
+    // declared OIDs instead (see `coerce_params`).
     let needs_new = match (guard.as_ref(), explicit) {
-        (Some(c), Some(_)) => c.oids != wanted_oids && explicit.is_none(),
+        (Some(_), Some(_)) => false,
         (Some(c), None) => c.oids != wanted_oids,
         (None, _) => true,
     };
@@ -427,10 +439,16 @@ async fn run_fetch_optional(
 enum ParamValue {
     Null,
     Bool(bool),
+    I16(i16),
     I32(i32),
     I64(i64),
+    F32(f32),
     F64(f64),
+    Numeric(hyperdb_api::Numeric),
     String(String),
+    /// Text-format value bound under an explicit declared OID (DATE, TIME,
+    /// TIMESTAMP, ...): Hyper parses the text itself.
+    TypedText(hyperdb_api::Oid, String),
     // Buffer params aren't reachable via serde_json::Value today — kept
     // so the ToSqlParam impl stays complete for future JS-side wiring.
     Bytes(Vec<u8>),
@@ -441,11 +459,23 @@ impl hyperdb_api::ToSqlParam for ParamValue {
         match self {
             ParamValue::Null => None,
             ParamValue::Bool(v) => v.encode_param(),
+            ParamValue::I16(v) => v.encode_param(),
             ParamValue::I32(v) => v.encode_param(),
+            ParamValue::F32(v) => v.encode_param(),
+            ParamValue::Numeric(v) => v.encode_param(),
+            ParamValue::TypedText(_, v) => v.encode_param(),
             ParamValue::I64(v) => v.encode_param(),
             ParamValue::F64(v) => v.encode_param(),
             ParamValue::String(v) => v.encode_param(),
             ParamValue::Bytes(v) => v.as_slice().encode_param(),
+        }
+    }
+
+    fn param_format(&self) -> hyperdb_api::ParamFormat {
+        match self {
+            ParamValue::TypedText(..) => hyperdb_api::ParamFormat::Text,
+            ParamValue::Numeric(v) => v.param_format(),
+            _ => hyperdb_api::ParamFormat::Binary,
         }
     }
 
@@ -456,7 +486,11 @@ impl hyperdb_api::ToSqlParam for ParamValue {
             // unique type (e.g. `WHERE col = $1` with a known col type).
             ParamValue::Null => hyperdb_api::Oid::new(0),
             ParamValue::Bool(v) => v.sql_oid(),
+            ParamValue::I16(v) => v.sql_oid(),
             ParamValue::I32(v) => v.sql_oid(),
+            ParamValue::F32(v) => v.sql_oid(),
+            ParamValue::Numeric(v) => v.sql_oid(),
+            ParamValue::TypedText(oid, _) => *oid,
             ParamValue::I64(v) => v.sql_oid(),
             ParamValue::F64(v) => v.sql_oid(),
             ParamValue::String(v) => v.sql_oid(),
@@ -468,7 +502,11 @@ impl hyperdb_api::ToSqlParam for ParamValue {
         match self {
             ParamValue::Null => "NULL".to_string(),
             ParamValue::Bool(v) => v.to_sql_literal(),
+            ParamValue::I16(v) => v.to_sql_literal(),
             ParamValue::I32(v) => v.to_sql_literal(),
+            ParamValue::F32(v) => v.to_sql_literal(),
+            ParamValue::Numeric(v) => v.to_sql_literal(),
+            ParamValue::TypedText(_, v) => v.to_sql_literal(),
             ParamValue::I64(v) => v.to_sql_literal(),
             ParamValue::F64(v) => v.to_sql_literal(),
             ParamValue::String(v) => v.to_sql_literal(),
@@ -511,5 +549,256 @@ fn json_value_to_param(val: serde_json::Value) -> ParamValue {
         // Arrays and objects don't have a natural scalar mapping — pass
         // as the JSON stringification for JSON/JSONB columns.
         Value::Array(_) | Value::Object(_) => ParamValue::String(val.to_string()),
+    }
+}
+
+/// Largest magnitude below which every integer is exactly representable
+/// as an `f64` (2^53).
+const MAX_EXACT_F64_INT: i64 = 1 << 53;
+
+/// Reads a JSON number as an exact `i64`: an integer, or a float with no
+/// fractional part that lies within `i64` range.
+fn exact_i64(n: &serde_json::Number) -> Option<i64> {
+    if let Some(i) = n.as_i64() {
+        return Some(i);
+    }
+    let f = n.as_f64()?;
+    // `-2^63 <= f < 2^63` and integral, so the conversion is exact.
+    if f.fract() == 0.0 && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&f)
+    {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "guarded above: `f` is integral and within the i64 range"
+        )]
+        let i = f as i64;
+        Some(i)
+    } else {
+        None
+    }
+}
+
+/// Coerces one JS value to the width and format required by the declared
+/// parameter `oid`. Errors (never saturates or wraps) when the value does
+/// not fit or has the wrong JS type.
+fn coerce_param(
+    oid: hyperdb_api::Oid,
+    idx: usize,
+    val: serde_json::Value,
+) -> std::result::Result<ParamValue, String> {
+    use hyperdb_api::oids;
+    use serde_json::Value;
+
+    let n = idx + 1;
+    let bad = |what: &str, val: &Value| {
+        format!(
+            "parameter ${n}: cannot bind JS value {val} as {what} (declared OID {})",
+            oid.0
+        )
+    };
+    if val.is_null() {
+        return Ok(ParamValue::Null);
+    }
+    match oid {
+        o if o == oids::SMALL_INT || o == oids::INT || o == oids::BIG_INT => {
+            let name = if o == oids::SMALL_INT {
+                "SMALLINT"
+            } else if o == oids::INT {
+                "INTEGER"
+            } else {
+                "BIGINT"
+            };
+            let i = match &val {
+                Value::Number(num) => exact_i64(num),
+                _ => None,
+            }
+            .ok_or_else(|| bad(name, &val))?;
+            if o == oids::SMALL_INT {
+                i16::try_from(i)
+                    .map(ParamValue::I16)
+                    .map_err(|_| bad(name, &val))
+            } else if o == oids::INT {
+                i32::try_from(i)
+                    .map(ParamValue::I32)
+                    .map_err(|_| bad(name, &val))
+            } else {
+                Ok(ParamValue::I64(i))
+            }
+        }
+        o if o == oids::DOUBLE || o == oids::FLOAT => {
+            let name = if o == oids::DOUBLE {
+                "DOUBLE PRECISION"
+            } else {
+                "REAL"
+            };
+            let f = match &val {
+                Value::Number(num) => match num.as_i64() {
+                    // Integers must be exactly representable as f64.
+                    Some(i) if i.abs() > MAX_EXACT_F64_INT => None,
+                    Some(i) => {
+                        // |i| <= 2^53 here, so the conversion is exact.
+                        #[expect(
+                            clippy::cast_precision_loss,
+                            reason = "guarded above: |i| <= 2^53 is exact in f64"
+                        )]
+                        let exact = i as f64;
+                        Some(exact)
+                    }
+                    None => num.as_f64().filter(|f| f.is_finite()),
+                },
+                _ => None,
+            }
+            .ok_or_else(|| bad(name, &val))?;
+            if o == oids::DOUBLE {
+                Ok(ParamValue::F64(f))
+            } else if f.abs() > f64::from(f32::MAX) {
+                Err(bad(name, &val))
+            } else {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "float narrowing: range-checked above; rounding to f32 precision is the declared REAL semantics"
+                )]
+                let narrowed = f as f32;
+                Ok(ParamValue::F32(narrowed))
+            }
+        }
+        o if o == oids::BOOL => match val {
+            Value::Bool(b) => Ok(ParamValue::Bool(b)),
+            _ => Err(bad("BOOLEAN", &val)),
+        },
+        o if o == oids::TEXT || o == oids::VARCHAR || o == oids::CHAR => match val {
+            Value::String(s) => Ok(ParamValue::String(s)),
+            _ => Err(bad("TEXT", &val)),
+        },
+        o if o == oids::NUMERIC => {
+            // A declared NUMERIC OID carries no scale (Hyper resolves it to
+            // NUMERIC(1,0)), so only whole numbers can bind; scaled values
+            // would be rejected by the server (22003).
+            let i = match &val {
+                Value::Number(num) => exact_i64(num),
+                _ => None,
+            }
+            .ok_or_else(|| {
+                format!(
+                    "{}; only whole numbers can bind to a declared NUMERIC (use CAST($n AS NUMERIC(p,s)) with a string for scaled values)",
+                    bad("NUMERIC", &val)
+                )
+            })?;
+            Ok(ParamValue::Numeric(hyperdb_api::Numeric::from_i64(i)))
+        }
+        o if o == oids::DATE
+            || o == oids::TIME
+            || o == oids::TIMESTAMP
+            || o == oids::TIMESTAMP_TZ =>
+        {
+            match val {
+                Value::String(s) => Ok(ParamValue::TypedText(o, s)),
+                _ => Err(bad("a date/time string", &val)),
+            }
+        }
+        // Other OIDs (BYTEA, JSON, INTERVAL, 0, ...) keep the value-inferred
+        // encoding; the server validates it against the declared type.
+        _ => Ok(json_value_to_param(val)),
+    }
+}
+
+/// Encodes JS-supplied parameters for a statement prepared with explicit
+/// OIDs, coercing each value to its declared type.
+fn coerce_params(
+    oids: &[hyperdb_api::Oid],
+    params: Vec<serde_json::Value>,
+) -> std::result::Result<Vec<ParamValue>, String> {
+    if oids.len() != params.len() {
+        return Err(format!(
+            "statement was prepared with {} typed parameter(s) but {} value(s) were supplied",
+            oids.len(),
+            params.len()
+        ));
+    }
+    oids.iter()
+        .zip(params)
+        .enumerate()
+        .map(|(i, (oid, val))| coerce_param(*oid, i, val))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyperdb_api::{Oid, ToSqlParam};
+    use serde_json::json;
+
+    fn oid(n: u32) -> Oid {
+        Oid::new(n)
+    }
+
+    fn one(o: u32, v: serde_json::Value) -> std::result::Result<ParamValue, String> {
+        coerce_params(&[oid(o)], vec![v]).map(|mut p| p.remove(0))
+    }
+
+    fn bytes(o: u32, v: serde_json::Value) -> Vec<u8> {
+        one(o, v)
+            .expect("coerces")
+            .encode_param()
+            .expect("non-null")
+    }
+
+    #[test]
+    fn float8_given_integer_is_eight_byte_double() {
+        let p = one(701, json!(5)).expect("coerces");
+        assert_eq!(p.sql_oid(), oid(701));
+        assert_eq!(p.encode_param().unwrap(), 5.0_f64.to_be_bytes().to_vec());
+    }
+
+    #[test]
+    fn float4_given_float_is_four_byte_real() {
+        assert_eq!(bytes(700, json!(1.5)), 1.5_f32.to_be_bytes().to_vec());
+        assert_eq!(bytes(700, json!(2)), 2.0_f32.to_be_bytes().to_vec());
+    }
+
+    #[test]
+    fn int2_int4_int8_use_declared_width() {
+        assert_eq!(bytes(21, json!(7)), 7_i16.to_be_bytes().to_vec());
+        assert_eq!(bytes(23, json!(7)), 7_i32.to_be_bytes().to_vec());
+        assert_eq!(bytes(20, json!(7)), 7_i64.to_be_bytes().to_vec());
+        assert_eq!(bytes(20, json!(7.0)), 7_i64.to_be_bytes().to_vec());
+    }
+
+    #[test]
+    fn integer_range_and_fraction_are_rejected() {
+        assert!(one(21, json!(40_000)).is_err());
+        assert!(one(23, json!(5_000_000_000_i64)).is_err());
+        assert!(one(23, json!(1.5)).is_err());
+        assert!(one(20, json!("7")).is_err());
+        assert!(one(701, json!("1.5")).is_err());
+        assert!(one(700, json!(1.0e300)).is_err());
+        assert!(one(16, json!(1)).is_err());
+    }
+
+    #[test]
+    fn numeric_whole_is_binary_numeric() {
+        let p = one(1700, json!(12)).expect("coerces");
+        assert_eq!(p.sql_oid(), oid(1700));
+        assert_eq!(
+            p.encode_param().unwrap(),
+            hyperdb_api::Numeric::from_i64(12).encode_param().unwrap()
+        );
+        assert!(one(1700, json!(1.5)).is_err());
+    }
+
+    #[test]
+    fn bool_text_and_temporal_strings() {
+        assert_eq!(bytes(16, json!(true)), vec![1]);
+        assert_eq!(bytes(25, json!("hi")), b"hi".to_vec());
+        let d = one(1082, json!("2024-03-05")).expect("coerces");
+        assert_eq!(d.sql_oid(), oid(1082));
+        assert_eq!(d.param_format(), hyperdb_api::ParamFormat::Text);
+        assert_eq!(d.encode_param().unwrap(), b"2024-03-05".to_vec());
+        assert!(one(1082, json!(5)).is_err());
+    }
+
+    #[test]
+    fn null_and_arity() {
+        assert!(matches!(one(23, json!(null)), Ok(ParamValue::Null)));
+        assert!(coerce_params(&[oid(23)], vec![]).is_err());
     }
 }

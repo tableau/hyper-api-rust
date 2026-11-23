@@ -36,42 +36,44 @@ use super::sync_stream::SyncStream;
 ///
 /// This trait enables the [`params!`](crate::params) macro to automatically encode values.
 pub trait SqlParam {
-    /// Encodes the value as binary bytes.
+    /// Encodes the value in standard PostgreSQL binary parameter format
+    /// (format code 1): big-endian for numerics. `execute` binds every
+    /// parameter with that format code.
     fn encode(&self) -> Vec<u8>;
 }
 
 impl SqlParam for i16 {
     #[inline]
     fn encode(&self) -> Vec<u8> {
-        self.to_le_bytes().to_vec()
+        self.to_be_bytes().to_vec()
     }
 }
 
 impl SqlParam for i32 {
     #[inline]
     fn encode(&self) -> Vec<u8> {
-        self.to_le_bytes().to_vec()
+        self.to_be_bytes().to_vec()
     }
 }
 
 impl SqlParam for i64 {
     #[inline]
     fn encode(&self) -> Vec<u8> {
-        self.to_le_bytes().to_vec()
+        self.to_be_bytes().to_vec()
     }
 }
 
 impl SqlParam for f32 {
     #[inline]
     fn encode(&self) -> Vec<u8> {
-        self.to_le_bytes().to_vec()
+        self.to_be_bytes().to_vec()
     }
 }
 
 impl SqlParam for f64 {
     #[inline]
     fn encode(&self) -> Vec<u8> {
-        self.to_le_bytes().to_vec()
+        self.to_be_bytes().to_vec()
     }
 }
 
@@ -670,22 +672,22 @@ mod tests {
     #[test]
     fn test_sql_param_i16() {
         assert_eq!(0_i16.encode(), vec![0, 0]);
-        assert_eq!(1_i16.encode(), vec![1, 0]);
+        assert_eq!(1_i16.encode(), vec![0, 1]);
         assert_eq!((-1_i16).encode(), vec![255, 255]);
     }
 
     #[test]
     fn test_sql_param_i32() {
         assert_eq!(0_i32.encode(), vec![0, 0, 0, 0]);
-        assert_eq!(1_i32.encode(), vec![1, 0, 0, 0]);
+        assert_eq!(1_i32.encode(), vec![0, 0, 0, 1]);
         assert_eq!((-1_i32).encode(), vec![255, 255, 255, 255]);
-        assert_eq!(256_i32.encode(), vec![0, 1, 0, 0]);
+        assert_eq!(256_i32.encode(), vec![0, 0, 1, 0]);
     }
 
     #[test]
     fn test_sql_param_i64() {
         assert_eq!(0_i64.encode(), vec![0, 0, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(1_i64.encode(), vec![1, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(1_i64.encode(), vec![0, 0, 0, 0, 0, 0, 0, 1]);
         assert_eq!(
             (-1_i64).encode(),
             vec![255, 255, 255, 255, 255, 255, 255, 255]
@@ -696,7 +698,7 @@ mod tests {
     fn test_sql_param_f32() {
         let encoded = 1.5_f32.encode();
         assert_eq!(encoded.len(), 4);
-        let decoded = f32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
+        let decoded = f32::from_be_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
         assert_eq!(decoded, 1.5);
     }
 
@@ -704,7 +706,7 @@ mod tests {
     fn test_sql_param_f64() {
         let encoded = 1.5_f64.encode();
         assert_eq!(encoded.len(), 8);
-        let decoded = f64::from_le_bytes([
+        let decoded = f64::from_be_bytes([
             encoded[0], encoded[1], encoded[2], encoded[3], encoded[4], encoded[5], encoded[6],
             encoded[7],
         ]);
@@ -748,14 +750,14 @@ mod tests {
     fn test_params_macro_single() {
         let p = params![42_i32];
         assert_eq!(p.len(), 1);
-        assert_eq!(p[0], Some(vec![42, 0, 0, 0]));
+        assert_eq!(p[0], Some(vec![0, 0, 0, 42]));
     }
 
     #[test]
     fn test_params_macro_multiple() {
         let p = params![42_i32, "hello", true];
         assert_eq!(p.len(), 3);
-        assert_eq!(p[0], Some(vec![42, 0, 0, 0]));
+        assert_eq!(p[0], Some(vec![0, 0, 0, 42]));
         assert_eq!(p[1], Some(b"hello".to_vec()));
         assert_eq!(p[2], Some(vec![1]));
     }
