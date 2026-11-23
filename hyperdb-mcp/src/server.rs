@@ -6316,10 +6316,13 @@ mod engine_mutex_poison_tests {
         });
         let err = outcome.expect_err("a panicking tool body must become an error reply");
         assert_eq!(err.code, ErrorCode::InternalError);
+        // The failure text deliberately does not echo `err.message`: CodeQL's
+        // `rust/cleartext-logging` treats every `McpError.message` as carrying
+        // the daemon IPC endpoint (see `engine.rs`), so printing it here raises
+        // a false positive even though this test never touches a daemon.
         assert!(
             err.message.contains("simulated tool handler bug"),
-            "{}",
-            err.message
+            "panic payload missing from the InternalError reply"
         );
         assert!(
             !server.engine.is_poisoned(),
