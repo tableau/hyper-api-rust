@@ -6,7 +6,6 @@ rust-version.workspace = true
 description = "Download and install the hyperd executable from the PyPI tableauhyperapi wheels"
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 readme = "README.md"
 keywords = ["hyper", "tableau", "hyperd", "bootstrap", "download"]
 categories = ["command-line-utilities", "development-tools"]

@@ -6,7 +6,6 @@ rust-version.workspace = true
 description = "MCP server for Hyper database — instant SQL analytics for LLM workflows"
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 readme = "README.md"
 keywords = ["database", "hyper", "mcp", "analytics", "arrow"]
 categories = ["database", "command-line-utilities"]

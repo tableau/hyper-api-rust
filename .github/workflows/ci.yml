@@ -60,6 +60,9 @@ jobs:
           # promoting warn-level lints to errors at the env level would
           # break local-friendly behaviors elsewhere.
           rustflags: ""
+          # Likewise opt out of the action's default CARGO_BUILD_WARNINGS=deny:
+          # it also fires on cargo lints in trybuild's generated workspace.
+          build-warnings: warn
       - run: cargo fmt --all --check
 
   clippy:
@@ -96,6 +99,9 @@ jobs:
           # See fmt job for rationale; clippy enforces -D warnings via
           # the explicit `-- -D warnings` arg below, not via env.
           rustflags: ""
+          # Likewise opt out of the action's default CARGO_BUILD_WARNINGS=deny:
+          # it also fires on cargo lints in trybuild's generated workspace.
+          build-warnings: warn
       - name: Cache hyperd binary
         # --all-features enables the compile-time feature, which starts an
         # embedded Hyper instance inside the proc-macro host during clippy.
@@ -139,6 +145,9 @@ jobs:
           toolchain: "1.88"
           cache-key: msrv
           rustflags: ""
+          # Likewise opt out of the action's default CARGO_BUILD_WARNINGS=deny:
+          # it also fires on cargo lints in trybuild's generated workspace.
+          build-warnings: warn
       - name: Cache hyperd binary
         # --all-features enables the compile-time feature, whose proc macro
         # starts an embedded Hyper instance at expansion time.
@@ -175,6 +184,9 @@ jobs:
           toolchain: stable
           cache-key: doc
           rustflags: ""
+          # Likewise opt out of the action's default CARGO_BUILD_WARNINGS=deny:
+          # it also fires on cargo lints in trybuild's generated workspace.
+          build-warnings: warn
       - name: Build docs for every published crate
         # Mirrors `make doc`. --no-deps keeps the failure surface to our own
         # rustdoc, not a dependency's.
@@ -226,6 +238,9 @@ jobs:
           cache-key: test-${{ matrix.os }}
           # See fmt job for rationale.
           rustflags: ""
+          # Likewise opt out of the action's default CARGO_BUILD_WARNINGS=deny:
+          # it also fires on cargo lints in trybuild's generated workspace.
+          build-warnings: warn
 
       - name: Cache hyperd binary
         # Keyed on the pinned release file, so bumping the pin
@@ -290,6 +305,9 @@ jobs:
           cache-key: test-ubuntu-24.04
           # See fmt job for rationale.
           rustflags: ""
+          # Likewise opt out of the action's default CARGO_BUILD_WARNINGS=deny:
+          # it also fires on cargo lints in trybuild's generated workspace.
+          build-warnings: warn
       - uses: actions/setup-node@v7
         with:
           node-version: 20
@@ -339,6 +357,9 @@ jobs:
           toolchain: stable
           cache-key: publish-dry-run
           rustflags: ""
+          # Likewise opt out of the action's default CARGO_BUILD_WARNINGS=deny:
+          # it also fires on cargo lints in trybuild's generated workspace.
+          build-warnings: warn
       - run: |
           cargo publish -p hyperdb-bootstrap  --dry-run
           cargo publish -p sea-query-hyperdb  --dry-run
@@ -382,6 +403,9 @@ jobs:
           toolchain: stable
           cache-key: audit
           rustflags: ""
+          # Likewise opt out of the action's default CARGO_BUILD_WARNINGS=deny:
+          # it also fires on cargo lints in trybuild's generated workspace.
+          build-warnings: warn
       - run: cargo install cargo-audit --locked
       - run: cargo audit --deny warnings
 
@@ -399,6 +423,9 @@ jobs:
           toolchain: stable
           cache-key: about
           rustflags: ""
+          # Likewise opt out of the action's default CARGO_BUILD_WARNINGS=deny:
+          # it also fires on cargo lints in trybuild's generated workspace.
+          build-warnings: warn
       - run: cargo install cargo-about --locked --features cli --version 0.9.2
       - name: Generate the notices for both shipped binaries
         run: |
