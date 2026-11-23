@@ -361,11 +361,7 @@ pub(crate) fn is_known_salesforce_host(host: &str) -> bool {
     }
 
     // Test/development patterns
-    if host.starts_with("login.test") && host.ends_with(".pc-rnd.salesforce.com") {
-        return true;
-    }
-
-    false
+    host.starts_with("login.test") && host.ends_with(".pc-rnd.salesforce.com")
 }
 
 #[cfg(test)]
