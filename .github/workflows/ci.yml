@@ -291,7 +291,8 @@ jobs:
         run: |
           cargo test --workspace \
             --exclude hyperdb-api-node \
-            --exclude hyperdb-bootstrap
+            --exclude hyperdb-bootstrap \
+            ${{ matrix.experimental && '--no-fail-fast' || '' }}
         # hyperdb-api-node needs napi-rs + a Node.js toolchain; the
         # node-bindings job builds and smoke-tests it. hyperdb-bootstrap has
         # its own coverage (next step) and doesn't need hyperd running.
