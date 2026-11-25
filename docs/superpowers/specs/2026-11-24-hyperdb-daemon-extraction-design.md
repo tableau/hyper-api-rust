@@ -315,6 +315,34 @@ fix. Phase S, and independent of the extraction.
 Compatibility: a pre-token client talking to a token-requiring daemon must be
 handled deliberately. The plan specifies the behaviour and a test for it.
 
+### D7a — Upgrading from pre-1.0 clients and daemons
+
+Nobody has to uninstall an older `hyperdb-mcp` before using a newer one. The
+daemon is per user (one per state directory), and the existing version rule
+only ever replaces an *older* daemon: a newer client sends it `STOP` and starts
+its own; an older or equal client reuses whatever is running. Phase A changes
+none of this, because the binary, tool surface, record format and control
+protocol stay as they are. Only Phase S (D6, D7) can break a mixed install:
+
+| Client | Daemon | Result |
+| --- | --- | --- |
+| newer | older | The client takes the daemon over, or keeps using it: a record with no password or token behaves as today. |
+| older | newer | The client cannot authenticate to the shared engine and gets `ERR unauthorized` on `STOP`. It cannot take over a newer daemon, so it fails for as long as that daemon runs. |
+
+The second row is the case to handle. It arises when an old client stays
+running next to a newer one (for example, a version pinned in a second editor).
+**Decision:** from 1.0, pre-1.0 clients are unsupported against a 1.0 daemon.
+There is no compatibility layer, as with the earlier move of the health channel
+off TCP. What the design adds is clarity, not compatibility:
+
+- The first release carrying Phase S documents the rule in the `hyperdb-mcp`
+  changelog and release notes: upgrade every client together.
+- The daemon reports a rejected client in `STATUS` and its log, with a message
+  that names the upgrade, so a failure is diagnosable from the daemon side.
+- An already-shipped client cannot be changed, so its own error text is outside
+  the design. Phase S includes a test that records what an old client sees, and
+  the changelog quotes it.
+
 ### D8 — Launcher for library users (open)
 
 How does a library caller start a daemon when the host binary has no `daemon`

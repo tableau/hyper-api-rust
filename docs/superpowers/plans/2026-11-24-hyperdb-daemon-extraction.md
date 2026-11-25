@@ -246,6 +246,10 @@ Design D5 and D6 hold the rationale and the probe results; read them first.
      authenticate. Make sure that surfaces as a clear error (and, where the
      MCP has a takeover path, that it behaves like any failed attach). Note it
      in the `hyperdb-mcp` changelog.
+     Per design D7a, pre-1.0 clients are unsupported against a 1.0 daemon:
+     the daemon reports a rejected client in `STATUS` and its log, naming the
+     upgrade, and a test records what an old client sees so the changelog can
+     quote it.
   8. **Fallback, documented only.** In `engine_auth.rs`'s module docs, record
      the environment-variable route from design D6 and what switching to it
      takes. Do not implement it.
