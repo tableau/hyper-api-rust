@@ -84,6 +84,7 @@ fn main() {
         "macos-arm64",
         "macos-x86_64",
         "linux-x86_64",
+        "linux-arm64",
         "windows-x86_64",
     ];
     for (table, keys) in [

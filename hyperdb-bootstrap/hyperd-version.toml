@@ -22,6 +22,11 @@ version = "0.0.26479"
 "macos-arm64"    = "macosx_13_0_arm64"
 "macos-x86_64"   = "macosx_10_11_x86_64"
 "linux-x86_64"   = "manylinux2014_x86_64"
+# aarch64 wheels first appear on PyPI at 0.0.27426 (Linux-only upload), so there
+# is no wheel at the pinned `version` yet and no sha256 below. `verify` reports
+# this as "not yet published" rather than a failure. Bump `version` to a full
+# release that carries an aarch64 wheel, then add its digest to [sha256].
+"linux-arm64"    = "manylinux2014_aarch64"
 "windows-x86_64" = "win_amd64"
 
 # sha256 of each platform's .whl, as published by PyPI. Omit a platform to skip

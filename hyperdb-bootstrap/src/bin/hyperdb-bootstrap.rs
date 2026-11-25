@@ -176,6 +176,7 @@ fn run_version() -> Result<()> {
         Platform::MacosArm64,
         Platform::MacosX86_64,
         Platform::LinuxX86_64,
+        Platform::LinuxArm64,
         Platform::WindowsX86_64,
     ] {
         println!(

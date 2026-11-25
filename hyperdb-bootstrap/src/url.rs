@@ -68,6 +68,7 @@ mod tests {
                 (Platform::MacosArm64, "macosx_13_0_arm64".to_string()),
                 (Platform::MacosX86_64, "macosx_10_11_x86_64".to_string()),
                 (Platform::LinuxX86_64, "manylinux2014_x86_64".to_string()),
+                (Platform::LinuxArm64, "manylinux2014_aarch64".to_string()),
                 (Platform::WindowsX86_64, "win_amd64".to_string()),
             ]),
             sha256: HashMap::new(),
@@ -89,6 +90,7 @@ mod tests {
             (Platform::MacosArm64, "macosx_13_0_arm64"),
             (Platform::MacosX86_64, "macosx_10_11_x86_64"),
             (Platform::LinuxX86_64, "manylinux2014_x86_64"),
+            (Platform::LinuxArm64, "manylinux2014_aarch64"),
             (Platform::WindowsX86_64, "win_amd64"),
         ] {
             assert_eq!(
@@ -118,6 +120,7 @@ mod tests {
             Platform::MacosArm64,
             Platform::MacosX86_64,
             Platform::LinuxX86_64,
+            Platform::LinuxArm64,
             Platform::WindowsX86_64,
         ] {
             let url = build_download_url(&r, p).expect("builtin pin has every wheel tag");
