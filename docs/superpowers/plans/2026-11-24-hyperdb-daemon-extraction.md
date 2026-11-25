@@ -143,12 +143,16 @@ S.3 + S.4 + S.2.
      takeover path then treats it like any failed takeover. Document this in
      the `hyperdb-mcp` changelog.
   7. Never print the token in `STATUS`, the doctor output or any log.
+  8. **Protocol version** (design D7). Add `protocol_version: u32` to
+     `DaemonRecord` with `#[serde(default)]` (absent means `0`) and to the
+     `STATUS` JSON; this daemon writes `1`. Leave the `PING` reply unchanged.
 - **Tests** (unit tests in the touched modules, plus `hyperdb-mcp/tests/daemon_tests.rs`):
   `STOP` with the correct token stops the daemon; `STOP` with no token or a
   wrong token is rejected and the daemon keeps running; same for
   `REPORT_HYPERD_ERROR` (three wrong-token reports must **not** trip
   `RESTART_LIMIT`); a record without the field parses; `STATUS` and the doctor
-  output contain no token.
+  output contain no token; a new record and `STATUS` carry
+  `protocol_version: 1`, and a record without it parses as `0`.
 - **Acceptance:** the full gate.
 - **Commit:** `fix(mcp): require a per-daemon token for STOP and REPORT_HYPERD_ERROR`.
 
@@ -232,8 +236,9 @@ Design D5 and D6 hold the rationale and the probe results; read them first.
      must fail with an authentication error. If it succeeds, stop `hyperd`,
      log an `error`, and fail startup. Then connect with the password and
      strict SCRAM on, and run `SELECT 1`.
-  5. **Discovery record.** Add `engine_password` to `DaemonRecord` with
-     `#[serde(default)]`. Never print it in `STATUS`, the doctor, or any log.
+  5. **Discovery record.** Add `engine_password` and `engine_user` (the
+     `authorized_users` name) to `DaemonRecord` with `#[serde(default)]`;
+     clients connect as `engine_user` rather than a hard-coded name. Never print it in `STATUS`, the doctor, or any log.
      The password stays the same for the daemon's lifetime, including
      supervisor restarts of `hyperd`, so clients keep working across a
      restart; the config file is reused as-is on restart.
@@ -440,32 +445,36 @@ lists the places that enumerate crates.
 
 ---
 
-## Phase B — Public `acquire()` API (outline; spec revision required)
+## Phase B — Standalone daemon and public contract (outline; spec revision required)
 
-Prerequisites: the maintainer's go decision from Phase 0's numbers, decision
-D8 made, Phase S shipped, and issue #242 (recovery from an unresponsive
-`hyperd`) fixed.
+Prerequisites: the maintainer's go decision from Phase 0's numbers, Phase S
+shipped, and issue #242 (recovery from an unresponsive `hyperd`) fixed. D8 is
+decided: a standalone binary.
 
 Expected tasks, to be specified in a design revision:
 
-1. **Protocol version.** Integer in `daemon.json` and the `PING` reply; clients
-   accept N and N-1 and treat anything else as "no daemon".
+1. **Protocol version.** Phase S put it in `daemon.json` and `STATUS`; add it
+   to the `PING` reply. Clients accept N and N-1 and treat anything else as
+   "no daemon".
 2. **Cohort state directories.** `~/.hyperdb/daemons/<cohort-hash>/` for
    library daemons; the MCP keeps `~/.hyperdb`.
 3. **Leases.** `ACQUIRE` / `RELEASE` commands, lease count in `STATUS`, idle
    timer runs only at zero leases, heartbeats expire dead clients' leases.
-4. **Launcher** per D8, likely a `hyperdb-daemon` binary target plus a lookup
-   order (`HYPERDB_DAEMON_PATH`, beside `hyperd`, `PATH`), and its distribution
-   story.
-5. **API surface.** `Acquisition`, `Options` (`#[non_exhaustive]`), `Engine`,
+4. **Standalone binary** per D8: a `hyperdb-daemon` binary target, a lookup
+   order (`HYPERDB_DAEMON_PATH`, beside `hyperd`, `PATH`), a `hyperd` path
+   option, and prebuilt release assets for every supported platform.
+5. **Language-neutral contract** per D9: the `acquire --json` and `exec`
+   commands, the documented `daemon.json` schema and control protocol, and a
+   C++ Hyper API example that connects with the printed credentials.
+6. **Rust API surface.** `Acquisition`, `Options` (`#[non_exhaustive]`), `Engine`,
    `SharedEngine`, `acquire` and `acquire_async`, typed errors, and the
    `SharedOrPrivate` fallback deadline.
-6. **Library defaults.** Idle timeout on by default; libraries never take over
+7. **Library defaults.** Idle timeout on by default; libraries never take over
    an older daemon.
-7. **Docs and examples.** A shared-engine example under `hyperdb-api/examples/`
+8. **Docs and examples.** A shared-engine example under `hyperdb-api/examples/`
    or the new crate, the IPC-versus-TCP performance trade-off (design D5), and
    the trust model.
-8. **Security review** of the protocol changes before release.
+9. **Security review** of the protocol changes before release.
 
 Phase B makes `hyperdb-daemon` a public API, so it is a `feat:` and needs a
 `### Added` entry in its changelog.
