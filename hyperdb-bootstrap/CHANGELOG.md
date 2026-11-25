@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`Platform::LinuxArm64` (`linux-arm64`, `aarch64-unknown-linux-gnu`).**
+  `Platform::current()` now resolves 64-bit ARM Linux hosts, and the builtin pin
+  carries the `manylinux2014_aarch64` wheel tag. The pin has no aarch64 digest
+  yet (no wheel exists at the pinned version), so use
+  `download --version <v>` with a release that ships one (first available:
+  `0.0.27426`); `verify` reports the platform as "not yet published" rather than
+  failing. `Platform` is an exhaustive public enum, so downstream `match`es on
+  it need a new arm.
+
 ### Fixed
 
 - **Upgraded `zip` from 8 to 9** to pick up the fixes for RUSTSEC-2026-0367,

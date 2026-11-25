@@ -211,6 +211,19 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-26, windows-2025]
+        include:
+          # Linux ARM is advisory while it is being brought up: it must not
+          # gate merges, and it cannot use the pinned engine yet. The pin
+          # (hyperdb-bootstrap/hyperd-version.toml) has no aarch64 wheel until
+          # the next full Hyper API release, so this leg downloads the first
+          # release that shipped one. Drop `experimental` and `hyperd-version`
+          # (and add `ubuntu-24.04-arm` to `os` above) once the pin carries an
+          # aarch64 digest.
+          - os: ubuntu-24.04-arm
+            experimental: true
+            hyperd-version: "0.0.27426"
+    # `experimental` is unset (null) on the gating legs, so this is false there.
+    continue-on-error: ${{ matrix.experimental == true }}
     steps:
       - uses: actions/checkout@v7
       - name: Free disk space (Linux only)
@@ -250,11 +263,23 @@ jobs:
         uses: actions/cache@v6
         with:
           path: .hyperd
-          key: hyperd-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('hyperdb-bootstrap/hyperd-version.toml') }}
+          key: hyperd-${{ runner.os }}-${{ runner.arch }}-${{ matrix.hyperd-version }}-${{ hashFiles('hyperdb-bootstrap/hyperd-version.toml') }}
 
       - name: Download hyperd
         if: steps.hyperd-cache.outputs.cache-hit != 'true'
-        run: cargo run --release -p hyperdb-bootstrap --bin hyperdb-bootstrap -- download
+        shell: bash
+        env:
+          # Empty on gating legs (use the pin); set on advisory legs that
+          # cannot use it. `--version` carries no digest, so that engine is
+          # downloaded unverified and a WARN is logged.
+          HYPERD_VERSION_OVERRIDE: ${{ matrix.hyperd-version }}
+        run: |
+          cargo run --release -p hyperdb-bootstrap --bin hyperdb-bootstrap -- \
+            download ${HYPERD_VERSION_OVERRIDE:+--version "$HYPERD_VERSION_OVERRIDE"}
+
+      - name: Show hyperd version
+        shell: bash
+        run: .hyperd/current/hyperd --version
 
       - name: Workspace tests
         shell: bash
@@ -266,7 +291,8 @@ jobs:
         run: |
           cargo test --workspace \
             --exclude hyperdb-api-node \
-            --exclude hyperdb-bootstrap
+            --exclude hyperdb-bootstrap \
+            ${{ matrix.experimental && '--no-fail-fast' || '' }}
         # hyperdb-api-node needs napi-rs + a Node.js toolchain; the
         # node-bindings job builds and smoke-tests it. hyperdb-bootstrap has
         # its own coverage (next step) and doesn't need hyperd running.
@@ -320,6 +346,55 @@ jobs:
       - name: Download hyperd
         if: steps.hyperd-cache.outputs.cache-hit != 'true'
         run: cargo run --release -p hyperdb-bootstrap --bin hyperdb-bootstrap -- download
+      - name: Build native addon (debug)
+        run: |
+          cd hyperdb-api-node
+          npm install --ignore-scripts
+          npm run build:debug
+      - name: Smoke test
+        env:
+          HYPERD_PATH: ${{ github.workspace }}/.hyperd/current
+        run: |
+          cd hyperdb-api-node
+          npm test
+
+  node-bindings-arm:
+    # Advisory twin of `node-bindings` on a native Linux ARM runner. Kept as a
+    # separate job (not a matrix leg) so the required check name
+    # `hyperdb-api-node (build + smoke)` is unchanged. It builds the napi addon
+    # for aarch64-unknown-linux-gnu and runs the smoke test against the first
+    # hyperd release that ships an aarch64 wheel; see the `test` job for why.
+    name: hyperdb-api-node (build + smoke, linux-arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install system libraries
+        run: sudo apt-get update -q && sudo apt-get install -y libfontconfig1-dev mold protobuf-compiler
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          cache-key: node-bindings-ubuntu-24.04-arm
+          # See fmt job for rationale.
+          rustflags: ""
+          # See the `test` job: don't let the action's default
+          # CARGO_BUILD_WARNINGS=deny fail on cargo lints.
+          build-warnings: warn
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+      - name: Cache hyperd binary
+        id: hyperd-cache
+        uses: actions/cache@v6
+        with:
+          path: .hyperd
+          key: hyperd-${{ runner.os }}-${{ runner.arch }}-0.0.27426-${{ hashFiles('hyperdb-bootstrap/hyperd-version.toml') }}
+      - name: Download hyperd (first release with an aarch64 wheel)
+        if: steps.hyperd-cache.outputs.cache-hit != 'true'
+        run: cargo run --release -p hyperdb-bootstrap --bin hyperdb-bootstrap -- download --version 0.0.27426
+      - name: Show hyperd version
+        run: .hyperd/current/hyperd --version
       - name: Build native addon (debug)
         run: |
           cd hyperdb-api-node

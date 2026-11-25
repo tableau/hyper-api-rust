@@ -14,6 +14,17 @@ use hyperdb_api::{AsyncConnectionBuilder, ConnectionBuilder, HyperProcess};
 const SLOW_QUERY: &str = "SELECT COUNT(*) FROM generate_series(1, 20000) AS a(x), \
                           generate_series(1, 100000) AS b(y) WHERE (a.x::BIGINT * b.y) % 7 = 3";
 
+/// Whether `err` is the server's query-timeout cancellation.
+///
+/// hyperd's wording changed between releases: older engines report the
+/// statement as "canceled", while 0.0.27426 reports `53S01` "The query
+/// exceeded the time limit of N milliseconds". The SQLSTATE is the stable part,
+/// so accept it alongside either message.
+fn is_timeout_error(err: &hyperdb_api::Error) -> bool {
+    let text = err.to_string().to_lowercase();
+    text.contains("cancel") || text.contains("53s01") || text.contains("exceeded the time limit")
+}
+
 #[test]
 fn sync_query_timeout_cancels_slow_query() {
     let params = test_hyper_params("sync_query_timeout").unwrap();
@@ -29,10 +40,7 @@ fn sync_query_timeout_cancels_slow_query() {
     let result: hyperdb_api::Result<i64> = conn.fetch_scalar(SLOW_QUERY);
     eprintln!("ELAPSED {:?}", start.elapsed());
     let err = result.expect_err("slow query should be cancelled");
-    assert!(
-        err.to_string().to_lowercase().contains("cancel"),
-        "unexpected error: {err}"
-    );
+    assert!(is_timeout_error(&err), "unexpected error: {err}");
     assert!(
         start.elapsed() < Duration::from_secs(30),
         "query ran for {:?}, timeout not enforced",
@@ -60,10 +68,7 @@ async fn async_query_timeout_cancels_slow_query() {
     let result: hyperdb_api::Result<i64> = conn.fetch_scalar(SLOW_QUERY).await;
     eprintln!("ELAPSED {:?}", start.elapsed());
     let err = result.expect_err("slow query should be cancelled");
-    assert!(
-        err.to_string().to_lowercase().contains("cancel"),
-        "unexpected error: {err}"
-    );
+    assert!(is_timeout_error(&err), "unexpected error: {err}");
     assert!(start.elapsed() < Duration::from_secs(30));
 }
 

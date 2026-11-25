@@ -34,7 +34,7 @@ pub mod error;
 pub mod extract;
 /// High-level `install` entry point and its configuration types.
 pub mod install;
-/// Supported host platforms (macOS arm64/x86_64, Linux x86_64, Windows x86_64).
+/// Supported host platforms (macOS arm64/x86_64, Linux x86_64/arm64, Windows x86_64).
 pub mod platform;
 /// Pinned-release metadata loaded from `hyperd-version.toml`.
 pub mod release;

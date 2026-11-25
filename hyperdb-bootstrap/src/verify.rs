@@ -32,6 +32,7 @@ const PLATFORMS: &[Platform] = &[
     Platform::MacosArm64,
     Platform::MacosX86_64,
     Platform::LinuxX86_64,
+    Platform::LinuxArm64,
     Platform::WindowsX86_64,
 ];
 
@@ -51,6 +52,12 @@ pub enum DigestStatus {
     /// The pin carries no digest for this platform, so there is nothing to
     /// compare. Not a failure: an empty digest is documented as "skip".
     NotPinned,
+    /// PyPI has no wheel for this platform at the pinned version *and* the pin
+    /// carries no digest for it. That combination is how a platform is staged
+    /// ahead of its first release (for example `linux-arm64` before an
+    /// aarch64 wheel exists), so it is reported but not a failure. A platform
+    /// that *does* carry a digest and is missing is still [`Self::FileMissing`].
+    NotYetPublished,
     /// The PyPI index could not be consulted. Not treated as a failure, since
     /// an index outage says nothing about the pin.
     Unknown(String),
@@ -59,8 +66,8 @@ pub enum DigestStatus {
 impl DigestStatus {
     /// Returns `true` unless PyPI actively contradicts the pin.
     ///
-    /// [`Self::Unknown`] and [`Self::NotPinned`] are "no information", not
-    /// failure; [`Self::Mismatch`] and [`Self::FileMissing`] are hard failures.
+    /// [`Self::Unknown`], [`Self::NotPinned`] and [`Self::NotYetPublished`] are
+    /// "no information", not failure; [`Self::Mismatch`] and [`Self::FileMissing`] are hard failures.
     #[must_use]
     pub fn ok(&self) -> bool {
         !matches!(self, Self::Mismatch { .. } | Self::FileMissing)
@@ -76,6 +83,9 @@ impl fmt::Display for DigestStatus {
             }
             Self::FileMissing => f.write_str("PyPI has no file with this name (stale wheel tag?)"),
             Self::NotPinned => f.write_str("no digest pinned"),
+            Self::NotYetPublished => {
+                f.write_str("not yet published at this version (no digest pinned)")
+            }
             Self::Unknown(why) => write!(f, "digest unchecked ({why})"),
         }
     }
@@ -103,7 +113,10 @@ impl VerifyOutcome {
     /// digest check did not contradict the pin.
     #[must_use]
     pub fn ok(&self) -> bool {
-        matches!(self.status, Some(s) if (200..400).contains(&s)) && self.digest.ok()
+        let reachable = matches!(self.status, Some(s) if (200..400).contains(&s));
+        // A platform staged ahead of its first wheel 404s by design.
+        let staged = self.status == Some(404) && self.digest == DigestStatus::NotYetPublished;
+        (reachable || staged) && self.digest.ok()
     }
 }
 
@@ -215,7 +228,8 @@ fn compare_digests(index_json: &str, release: &PinnedRelease) -> HashMap<Platfor
                     published.get(filename.as_str()),
                     release.sha256_for(platform),
                 ) {
-                    (None, _) => DigestStatus::FileMissing,
+                    (None, None) => DigestStatus::NotYetPublished,
+                    (None, Some(_)) => DigestStatus::FileMissing,
                     (Some(_), None) => DigestStatus::NotPinned,
                     (Some(actual), Some(pinned)) if actual.eq_ignore_ascii_case(pinned) => {
                         DigestStatus::Match
@@ -320,9 +334,14 @@ mod tests {
             wheel_tag: HashMap::from([
                 (Platform::MacosArm64, "macosx_13_0_arm64".to_string()),
                 (Platform::LinuxX86_64, "manylinux2014_x86_64".to_string()),
+                (Platform::LinuxArm64, "manylinux2014_aarch64".to_string()),
                 (Platform::WindowsX86_64, "win_amd64".to_string()),
             ]),
-            sha256: HashMap::from([(Platform::MacosArm64, sha_arm64.to_string())]),
+            sha256: HashMap::from([
+                (Platform::MacosArm64, sha_arm64.to_string()),
+                // Pinned but absent from `INDEX_JSON`: a genuinely stale tag.
+                (Platform::WindowsX86_64, "b".repeat(64)),
+            ]),
         }
     }
 
@@ -368,6 +387,34 @@ mod tests {
             DigestStatus::FileMissing
         );
         assert!(!statuses[&Platform::WindowsX86_64].ok());
+    }
+
+    /// A platform staged with a wheel tag but no digest, whose wheel PyPI does
+    /// not (yet) publish, is pending rather than broken.
+    #[test]
+    fn unpinned_and_unpublished_is_not_yet_published() {
+        let statuses = compare_digests(INDEX_JSON, &pin(&"a".repeat(64)));
+        assert_eq!(
+            statuses[&Platform::LinuxArm64],
+            DigestStatus::NotYetPublished
+        );
+        assert!(statuses[&Platform::LinuxArm64].ok());
+    }
+
+    /// The 404 a staged platform's URL probe returns must not fail the run, but
+    /// the same 404 on a platform with a pinned digest must.
+    #[test]
+    fn outcome_tolerates_404_only_for_staged_platforms() {
+        let outcome = |digest| VerifyOutcome {
+            platform: Platform::LinuxArm64,
+            url: String::new(),
+            status: Some(404),
+            error: None,
+            digest,
+        };
+        assert!(outcome(DigestStatus::NotYetPublished).ok());
+        assert!(!outcome(DigestStatus::FileMissing).ok());
+        assert!(!outcome(DigestStatus::NotPinned).ok());
     }
 
     #[test]

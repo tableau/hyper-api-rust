@@ -122,9 +122,16 @@ must be on `PATH`; minimal container images often need it installed.
 | macOS   | arm64   | `macos-arm64`     | `macosx_13_0_arm64`      |
 | macOS   | x86_64  | `macos-x86_64`    | `macosx_10_11_x86_64`    |
 | Linux   | x86_64  | `linux-x86_64`    | `manylinux2014_x86_64`   |
+| Linux   | arm64   | `linux-arm64`     | `manylinux2014_aarch64`  |
 | Windows | x86_64  | `windows-x86_64`  | `win_amd64`              |
 
 Any other `(OS, ARCH)` errors out with a clear message.
+
+`linux-arm64` is staged ahead of its first pinned release: aarch64 wheels were
+first published at `0.0.27426` (a Linux-only upload), so the pin carries the
+tag but no digest, and `verify` reports the platform as "not yet published"
+instead of failing. On an ARM host use `download --version 0.0.27426` until the
+pin moves to a release that ships an aarch64 wheel.
 
 The wheel tags are pin *data*, not constants in the Rust source: they aren't
 guaranteed stable across releases (arm64 wheels only exist from `0.0.19484`,

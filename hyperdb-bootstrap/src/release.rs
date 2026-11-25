@@ -113,7 +113,7 @@ mod tests {
     }
 
     #[test]
-    fn builtin_pins_a_wheel_tag_and_digest_for_every_platform() {
+    fn builtin_pins_a_wheel_tag_and_digest_for_every_published_platform() {
         let r = PinnedRelease::builtin();
         for p in [
             Platform::MacosArm64,
@@ -124,6 +124,18 @@ mod tests {
             assert!(r.wheel_tag_for(p).is_some(), "{p} has no wheel tag");
             assert!(r.sha256_for(p).is_some(), "{p} has no sha256");
         }
+    }
+
+    /// `linux-arm64` is pinned by tag only until the pinned `version` has an
+    /// aarch64 wheel on PyPI; `download --version <v>` needs the tag to build
+    /// the URL. Delete the digest half of this once a release carries one.
+    #[test]
+    fn builtin_pins_a_wheel_tag_for_linux_arm64() {
+        let r = PinnedRelease::builtin();
+        assert_eq!(
+            r.wheel_tag_for(Platform::LinuxArm64),
+            Some("manylinux2014_aarch64")
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 // Copyright (c) 2026, Salesforce, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Host-platform detection and slug encoding for the four targets that
+//! Host-platform detection and slug encoding for the five targets that
 //! Tableau's Hyper API ships binaries for.
 
 use serde::{Deserialize, Serialize};
@@ -9,7 +9,7 @@ use std::fmt;
 
 use crate::Error;
 
-/// One of the four platforms that Tableau publishes a `hyperd` build for.
+/// One of the five platforms that Tableau publishes a `hyperd` build for.
 ///
 /// The variant names encode both OS and architecture and map 1:1 to the
 /// slugs used in the release URL structure and in `hyperd-version.toml`.
@@ -25,6 +25,9 @@ pub enum Platform {
     /// 64-bit Linux (`x86_64-unknown-linux-gnu`).
     #[serde(rename = "linux-x86_64")]
     LinuxX86_64,
+    /// 64-bit ARM Linux (`aarch64-unknown-linux-gnu`).
+    #[serde(rename = "linux-arm64")]
+    LinuxArm64,
     /// 64-bit Windows (`x86_64-pc-windows-msvc`).
     #[serde(rename = "windows-x86_64")]
     WindowsX86_64,
@@ -40,7 +43,7 @@ impl Platform {
     /// # Errors
     ///
     /// Returns [`Error::UnsupportedPlatform`] when the host OS/arch pair
-    /// does not match one of the four supported targets.
+    /// does not match one of the five supported targets.
     pub fn current() -> Result<Self, Error> {
         let os = std::env::consts::OS;
         let arch = std::env::consts::ARCH;
@@ -48,6 +51,7 @@ impl Platform {
             ("macos", "aarch64") => Ok(Self::MacosArm64),
             ("macos", "x86_64") => Ok(Self::MacosX86_64),
             ("linux", "x86_64") => Ok(Self::LinuxX86_64),
+            ("linux", "aarch64") => Ok(Self::LinuxArm64),
             ("windows", "x86_64") => Ok(Self::WindowsX86_64),
             _ => Err(Error::unsupported_platform(os, arch)),
         }
@@ -61,6 +65,7 @@ impl Platform {
             Self::MacosArm64 => "macos-arm64",
             Self::MacosX86_64 => "macos-x86_64",
             Self::LinuxX86_64 => "linux-x86_64",
+            Self::LinuxArm64 => "linux-arm64",
             Self::WindowsX86_64 => "windows-x86_64",
         }
     }
@@ -90,6 +95,7 @@ impl std::str::FromStr for Platform {
             "macos-arm64" => Ok(Self::MacosArm64),
             "macos-x86_64" => Ok(Self::MacosX86_64),
             "linux-x86_64" => Ok(Self::LinuxX86_64),
+            "linux-arm64" => Ok(Self::LinuxArm64),
             "windows-x86_64" => Ok(Self::WindowsX86_64),
             other => Err(Error::unknown_platform_slug(other)),
         }
@@ -106,6 +112,7 @@ mod tests {
             Platform::MacosArm64,
             Platform::MacosX86_64,
             Platform::LinuxX86_64,
+            Platform::LinuxArm64,
             Platform::WindowsX86_64,
         ] {
             assert_eq!(p.slug().parse::<Platform>().unwrap(), p);
@@ -116,5 +123,6 @@ mod tests {
     fn executable_name_windows() {
         assert_eq!(Platform::WindowsX86_64.executable_name(), "hyperd.exe");
         assert_eq!(Platform::LinuxX86_64.executable_name(), "hyperd");
+        assert_eq!(Platform::LinuxArm64.executable_name(), "hyperd");
     }
 }
