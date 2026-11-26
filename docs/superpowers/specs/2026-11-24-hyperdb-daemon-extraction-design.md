@@ -12,6 +12,17 @@ control channel, supervision with crash restart, and idle shutdown. That
 machinery is useful to ordinary Hyper API users — test suites, CLIs invoked in
 a loop, warm worker pools — but today it can only be reached from the MCP.
 
+The main reason to share an engine is to share its **databases**. A `.hyper`
+file is locked by the `hyperd` that opened it, so two processes that each
+start their own engine cannot both work on the same file. A shared engine
+lets all the processes of one application, written against the Hyper API in
+any language, work on the same databases at the same time. Each application
+gets its own engine, keyed by an **app ID** (D9): the MCP, an indexing
+service and a catalog service each run a separate engine and do not share
+databases with each other, so each can be updated and restarted on its own.
+Startup cost is secondary: Phase 0 measured about 61 ms from spawn to first
+query.
+
 This design splits the work into four phases, each of which can stop there:
 
 | Phase | What | Public API? | Rough size |
@@ -110,15 +121,23 @@ surface.
 
 - Phase A: the daemon lives in its own crate; `hyperdb-mcp` behaviour,
   on-disk formats, the control protocol, and the MCP tool surface are unchanged.
-- Phase B: a Hyper API user can share one warm `hyperd` across processes of the
-  same application, opt-in, with a typed error or an observable fallback when
-  sharing is unavailable. This includes users of the Hyper API in other
+- Phase B: the processes of one application, running as the same OS user,
+  can share one `hyperd` and the databases it has open. Each application has
+  its own engine, identified by its app ID; the MCP is app `mcp`. Sharing is
+  opt-in, with a typed error or an observable
+  fallback when it is unavailable. This includes users of the Hyper API in other
   languages (C++, Python, Java), who run the standalone `hyperdb-daemon`
   binary and connect with their own Hyper API client. Rust is not required.
 
 ## Non-goals
 
-- Sharing across unrelated applications or trust domains.
+- Sharing across OS users or trust domains. The trust boundary is the OS
+  user: anyone running as that user can read the engine password (D6).
+- Sharing databases between applications. Each app ID gets its own engine,
+  and the `.hyper` file lock keeps one engine's databases out of another's.
+  The separation between apps is organisational, not a security boundary:
+  every engine runs as the same OS user, so a process that knows another
+  app's ID can join that app's engine.
 - A network-reachable daemon. The engine listens on loopback only
   (`127.0.0.1`). A remote engine is a plausible later extension, because D6's
   TCP-plus-SCRAM model does not tie authentication to the local machine. It
@@ -382,9 +401,9 @@ into, and test suites rule out L1 anyway. L1 is dropped. Consequences:
 The public contract is the binary's behaviour, not a Rust API, so that any
 language can use it:
 
-- **Command line.** `hyperdb-daemon acquire --cohort <name> --json` starts the
-  cohort's daemon or reuses it, and prints the engine endpoint, user, password
-  and protocol version. `hyperdb-daemon exec --cohort <name> -- <command>`
+- **Command line.** `hyperdb-daemon acquire --app <id> --json` starts the
+  app's daemon or reuses it, and prints the engine endpoint, user, password
+  and protocol version. `hyperdb-daemon exec --app <id> -- <command>`
   holds a lease for the lifetime of the child process, which suits test
   suites. Exact names are fixed in the Phase B spec revision.
 - **Documented formats.** The `daemon.json` schema and the control protocol
@@ -396,9 +415,16 @@ language can use it:
 The offline design exploration proposed a Rust API worth keeping as a
 convenience layer over that contract. In brief:
 
-- **Cohorts.** A daemon is keyed by a caller-supplied cohort name, with state
-  under `~/.hyperdb/daemons/<cohort-hash>/`. The MCP stays on `~/.hyperdb` for
-  compatibility. No machine-wide default for libraries.
+- **App IDs.** A daemon is keyed by an app ID, which every caller must
+  supply; there is no shared default. All processes of one application use
+  the same ID and so share one engine and its databases; different
+  applications use different IDs and get separate engines, which they update
+  and restart independently. The MCP is app `mcp` and keeps its existing state
+  under `~/.hyperdb`, so it needs no migration. Other apps keep state under
+  `~/.hyperdb/apps/<id>/`. IDs are limited to `[a-z0-9-]`, so the directory
+  name is the ID itself. A test suite that wants isolation picks its own ID.
+  Each engine costs about 56 MiB idle (Phase 0); the idle timeout reclaims
+  engines no process is using.
 - **Three explicit intents.** `Acquisition::{Private, Shared, SharedOrPrivate}`.
   `Private` is the default and is today's `HyperProcess`. `Shared` fails with a
   typed error. `SharedOrPrivate` has a hard `fallback_deadline` and reports why
@@ -407,9 +433,20 @@ convenience layer over that contract. In brief:
   runs only at zero leases; heartbeats expire leases of dead clients. Idle
   timeout is **on** by default for library daemons, so a test run leaves no
   resident service behind.
-- **Libraries never take over.** A library never sends `STOP` to an older
-  daemon. An incompatible daemon is treated as absent and a separate cohort
-  daemon is started. Takeover stays an MCP and operator action.
+- **Takeover respects leases.** Stopping an app's daemon stops the engine of
+  every process of that app, so version takeover changes: no client, the MCP
+  included, sends `STOP` while another client holds a lease. Takeover only
+  ever happens between versions of the same app, for example during a rolling
+  update. A newer client
+  meeting an older daemon with live leases uses it if the protocol versions
+  are compatible, and fails with a typed error naming the version mismatch
+  otherwise. A library never takes over; an explicit operator stop still can.
+- **One engine version per app.** Each app chooses and pins its own `hyperd`,
+  so apps never have to agree on one. Within an app, processes from different
+  releases may bring different builds; the Phase B revision defines which one
+  the app's daemon starts and how database file versions are handled across
+  an app update: a file upgraded by a newer engine may not open in an older
+  one.
 - **Protocol version.** The integer Phase S introduces (D7), added to the
   `PING` reply; clients support N and N-1.
 - **Surface.** `acquire(how, &Options) -> Result<Engine>` and `acquire_async`,
@@ -423,10 +460,11 @@ the direction.
 
 ## Open decisions for the maintainer
 
-1. **Go / no-go on Phase B**, after Phase 0's numbers. Suggested bar: if a
-   release-mode `HyperProcess::new()` to first query is well under a second on
-   macOS and Linux, the sharing benefit is small for most users and Phase A is
-   the place to stop.
+1. **Go / no-go on Phase B.** Not gated on startup time. Phase 0 measured
+   about 61 ms from spawn to first query (macOS arm64, `docs/BENCHMARK_GUIDE.md`),
+   so startup alone would not justify Phase B; sharing databases across the
+   processes of an application (Summary) is the reason, and the decision rests
+   on that.
 2. **Timing of Phase A:** any time; there is no 1.0 deadline (finding 4). It
    can wait until after the Linux ARM work lands, which touches the same
    release plumbing.

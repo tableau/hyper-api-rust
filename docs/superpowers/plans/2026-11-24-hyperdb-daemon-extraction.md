@@ -456,8 +456,9 @@ Expected tasks, to be specified in a design revision:
 1. **Protocol version.** Phase S put it in `daemon.json` and `STATUS`; add it
    to the `PING` reply. Clients accept N and N-1 and treat anything else as
    "no daemon".
-2. **Cohort state directories.** `~/.hyperdb/daemons/<cohort-hash>/` for
-   library daemons; the MCP keeps `~/.hyperdb`.
+2. **Per-app state directories.** A required app ID (`[a-z0-9-]`) keys each
+   daemon; state lives under `~/.hyperdb/apps/<id>/`. The MCP is app `mcp`
+   and keeps `~/.hyperdb`.
 3. **Leases.** `ACQUIRE` / `RELEASE` commands, lease count in `STATUS`, idle
    timer runs only at zero leases, heartbeats expire dead clients' leases.
 4. **Standalone binary** per D8: a `hyperdb-daemon` binary target, a lookup
@@ -469,8 +470,13 @@ Expected tasks, to be specified in a design revision:
 6. **Rust API surface.** `Acquisition`, `Options` (`#[non_exhaustive]`), `Engine`,
    `SharedEngine`, `acquire` and `acquire_async`, typed errors, and the
    `SharedOrPrivate` fallback deadline.
-7. **Library defaults.** Idle timeout on by default; libraries never take over
-   an older daemon.
+7. **Per-app engines and takeover.** One engine per app ID, no shared
+   default; apps do not share databases. Version takeover becomes lease-aware
+   (no `STOP` while another process of the app holds a lease) and only
+   happens between versions of the same app; libraries never take over.
+   Define which `hyperd` an app's daemon runs across an app update and how
+   database file versions are handled. Idle timeout on by default for
+   library daemons.
 8. **Docs and examples.** A shared-engine example under `hyperdb-api/examples/`
    or the new crate, the IPC-versus-TCP performance trade-off (design D5), and
    the trust model.
