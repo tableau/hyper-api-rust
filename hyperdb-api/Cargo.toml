@@ -140,3 +140,7 @@ path = "benches/benchmark_suite.rs"
 [[example]]
 name = "kv_benchmark"
 path = "benches/kv_benchmark.rs"
+
+[[example]]
+name = "hyperd_startup_cost"
+path = "benches/hyperd_startup_cost.rs"
