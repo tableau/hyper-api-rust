@@ -1962,6 +1962,7 @@ dependencies = [
  "notify",
  "parquet",
  "plotters",
+ "rand 0.10.3",
  "rmcp",
  "schemars",
  "semver",

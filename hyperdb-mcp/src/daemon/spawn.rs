@@ -332,7 +332,28 @@ fn maybe_take_over(
     };
 
     // Send STOP (best-effort; ignore error if daemon is already dying).
-    let _ = super::health::send_command(&endpoint, "STOP");
+    // A record without a token is an older daemon, which takes the bare
+    // command. A token-checking daemon answers `ERR unauthorized` when the
+    // token is missing or wrong; waiting the full `stop_wait` for a daemon that
+    // was told no would only stall the caller, so fail at once.
+    let stop = super::health::authenticated_command(
+        "STOP",
+        discovery::control_token_in(dir, &endpoint).as_ref(),
+    );
+    if let Ok(reply) = super::health::send_command(&endpoint, &stop)
+        && reply.trim() == super::health::UNAUTHORIZED_REPLY
+    {
+        warn!(
+            endpoint = %info.health_endpoint,
+            "old daemon refused STOP, not taking over"
+        );
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the running daemon refused STOP: the control token was unavailable or rejected \
+             (daemon.json missing, stale or overwritten -- for instance by a pre-1.0 daemon -- \
+             or this client is older than the daemon)",
+        ));
+    }
 
     // Wait for the old daemon to let go of the lock.
     if let Err(error) = wait_for_lock_release(dir, stop_wait) {
@@ -876,9 +897,11 @@ mod tests {
                 version: "0.0.1".to_string(),
             };
             let record = dir.join("daemon.json");
-            std::fs::write(&record, serde_json::to_vec(&info).expect("serialize")).expect("write");
-
+            // Like a real daemon, publish the control token with the record:
+            // the takeover's STOP is only honored if it reads and sends it.
             let state = Arc::new(DaemonState::new(endpoint));
+            discovery::write_enriched_discovery_file_in(dir, &info, state.control_token())
+                .expect("write record");
             let quit = Arc::new(AtomicBool::new(false));
             let listener_state = Arc::clone(&state);
             let listener_thread = std::thread::spawn(move || {
@@ -955,6 +978,39 @@ mod tests {
             "spawned while the old daemon held the lock"
         );
         assert!(started.elapsed() >= Duration::from_millis(500));
+    }
+
+    /// A daemon that answers `STOP` with `ERR unauthorized` (here: the record
+    /// holds a stale token) must fail the takeover at once with a
+    /// `PermissionDenied` error, not after the full `STOP` wait, and never
+    /// spawn.
+    #[test]
+    fn takeover_fails_fast_when_the_daemon_refuses_stop() {
+        let dir = tempfile::tempdir().expect("state dir");
+        let _old = FakeOldDaemon::start(dir.path(), None);
+        let info = discovery::discover_in(dir.path()).expect("fake daemon is discoverable");
+        let stale = discovery::ControlToken::generate().expect("token");
+        discovery::write_enriched_discovery_file_in(dir.path(), &info, &stale)
+            .expect("overwrite record with a stale token");
+        let calls = Cell::new(0);
+        let started = Instant::now();
+
+        let error = ensure_daemon_in(
+            dir.path(),
+            counting_spawner(&calls),
+            Duration::from_millis(200),
+            Duration::from_secs(10),
+        )
+        .expect_err("a refused STOP must not end in a takeover");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert!(error.to_string().contains("control token"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?}, it must not wait out the STOP wait",
+            started.elapsed()
+        );
+        assert_eq!(calls.get(), 0, "the spawner must never run");
     }
 
     /// An old daemon that never releases the lock: no spawn, a `TimedOut`

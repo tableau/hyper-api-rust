@@ -21,11 +21,17 @@
 //!   token proves it's a hyperdb-mcp daemon, not some other program that
 //!   happens to answer on the endpoint)
 //! - `HEARTBEAT\n` -> `OK\n` (resets idle timer)
-//! - `STOP\n` -> `STOPPING\n` (triggers graceful shutdown)
+//! - `STOP <token>\n` -> `STOPPING\n` (triggers graceful shutdown)
 //! - `STATUS\n` -> JSON line with daemon info (reports the *current* hyperd
 //!   endpoint, which can change after a restart).
-//! - `REPORT_HYPERD_ERROR\n` -> `OK\n` (sets the restart-requested flag --
-//!   the monitor task picks it up on its next tick).
+//! - `REPORT_HYPERD_ERROR <token>\n` -> `OK\n` (sets the restart-requested
+//!   flag -- the monitor task picks it up on its next tick).
+//!
+//! `STOP` and `REPORT_HYPERD_ERROR` carry the daemon's [`ControlToken`], read
+//! from the owner-only `daemon.json`; a missing or wrong token gets
+//! `ERR unauthorized` and changes nothing. `PING`, `HEARTBEAT` and `STATUS`
+//! stay open. A daemon whose record has no token (older than protocol 1) is
+//! sent the bare command.
 //!
 //! Known limits, accepted because only the owning user can reach the channel:
 //! the server does not bound the length of a request line or the number of
@@ -39,7 +45,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 use super::control::{self, CONNECTION_IO_TIMEOUT, ControlListener, ControlStream, HealthEndpoint};
-use super::discovery::{DaemonInfo, DaemonRecord};
+use super::discovery::{self, ControlToken, DaemonInfo, DaemonRecord};
 
 /// Identifying token included in PONG responses. Used to verify that an
 /// endpoint is served by a hyperdb-mcp daemon (not some other program).
@@ -58,6 +64,9 @@ pub const PONG_TOKEN: &str = "hyperdb-mcp";
 /// until that join returns. One second bounds that unconditionally while still
 /// costing only one wakeup per second (see issue #274 for the measurements).
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The reply to `STOP` or `REPORT_HYPERD_ERROR` without a valid control token.
+pub const UNAUTHORIZED_REPLY: &str = "ERR unauthorized";
 
 /// Construct the PONG response with the identifying token and version.
 fn pong_response() -> String {
@@ -107,12 +116,30 @@ pub struct DaemonState {
     /// poll of the `hyperd` monitor (every 5 s). `notify_one` stores a permit,
     /// so a request that lands before the loop first awaits is not lost.
     shutdown_notify: tokio::sync::Notify,
+    /// Capability a client must present on `STOP` and `REPORT_HYPERD_ERROR`.
+    /// Drawn once per state; the daemon publishes it in `daemon.json`.
+    control_token: ControlToken,
 }
 
 impl DaemonState {
     /// A fresh state for a daemon whose health listener is (or will be) bound
     /// at `endpoint`.
+    ///
+    /// Convenience for tests and tools. `run_daemon` does not use it: it draws
+    /// the token itself and passes it to [`Self::with_control_token`] so an RNG
+    /// failure is an error, not a panic.
+    ///
+    /// # Panics
+    /// Panics if the OS random number generator fails.
     pub fn new(endpoint: HealthEndpoint) -> Self {
+        Self::with_control_token(
+            endpoint,
+            ControlToken::generate().expect("OS random number generator unavailable"),
+        )
+    }
+
+    /// [`Self::new`] with a caller-supplied control token.
+    pub fn with_control_token(endpoint: HealthEndpoint, control_token: ControlToken) -> Self {
         Self {
             last_activity: Mutex::new(Instant::now()),
             shutdown: AtomicBool::new(false),
@@ -120,7 +147,13 @@ impl DaemonState {
             endpoint,
             listener_registered: AtomicBool::new(false),
             shutdown_notify: tokio::sync::Notify::new(),
+            control_token,
         }
+    }
+
+    /// The token this daemon requires on its mutating commands.
+    pub fn control_token(&self) -> &ControlToken {
+        &self.control_token
     }
 
     /// Record activity (resets idle timer).
@@ -371,7 +404,7 @@ fn status_json(info: &Mutex<DaemonInfo>) -> String {
         Ok(record) => serde_json::to_string(&record).unwrap_or_default(),
         Err(error) => {
             warn!(%error, "could not collect daemon executable identity for STATUS");
-            serde_json::to_string(&snapshot).unwrap_or_default()
+            serde_json::to_string(&DaemonRecord::without_identity(&snapshot)).unwrap_or_default()
         }
     }
 }
@@ -388,8 +421,31 @@ fn handle_client(mut stream: ControlStream, state: &DaemonState, info: &Mutex<Da
         match reader.read_line(&mut line) {
             Ok(0) | Err(_) => break,
             Ok(_) => {
-                let cmd = line.trim();
+                let line = line.trim();
+                let (cmd, presented) = match line.split_once(char::is_whitespace) {
+                    Some((cmd, rest)) => (cmd, Some(rest.trim())),
+                    None => (line, None),
+                };
+                // Only the two mutating verbs take an argument; anything else
+                // with trailing text is an unknown command, as before.
+                let cmd = if presented.is_some() && !matches!(cmd, "STOP" | "REPORT_HYPERD_ERROR") {
+                    line
+                } else {
+                    cmd
+                };
+                let authorized =
+                    || presented.is_some_and(|token| state.control_token.matches(token));
                 let response = match cmd {
+                    "STOP" | "REPORT_HYPERD_ERROR" if !authorized() => {
+                        warn!(
+                            command = cmd,
+                            "rejected a health command without a valid control token; the \
+                             client is either older than this daemon (upgrade all hyperdb-mcp \
+                             clients together) or read a missing, stale or overwritten \
+                             daemon.json"
+                        );
+                        format!("{UNAUTHORIZED_REPLY}\n")
+                    }
                     "PING" => pong_response(),
                     "HEARTBEAT" => {
                         state.touch();
@@ -417,6 +473,17 @@ fn handle_client(mut stream: ControlStream, state: &DaemonState, info: &Mutex<Da
     let _ = reader.into_inner().finish();
 }
 
+/// The wire form of a command that needs the daemon's control token: the verb
+/// and the token, or the bare verb for a daemon whose record carries none (an
+/// older daemon, which does not check).
+#[must_use]
+pub fn authenticated_command(verb: &str, token: Option<&ControlToken>) -> String {
+    match token {
+        Some(token) => format!("{verb} {}", token.as_str()),
+        None => verb.to_string(),
+    }
+}
+
 /// Send a command to the daemon's health endpoint and return the response.
 ///
 /// Uses generous timeouts (2s connect, 5s read) suitable for `STOP`/`STATUS`
@@ -440,7 +507,11 @@ pub fn send_command(endpoint: &HealthEndpoint, command: &str) -> std::io::Result
 /// Errors are logged at debug level and otherwise ignored.
 pub fn report_hyperd_error_to_daemon(endpoint: &HealthEndpoint) {
     let timeout = Duration::from_millis(200);
-    match send_command_with_timeout(endpoint, "REPORT_HYPERD_ERROR", timeout, timeout) {
+    let command = authenticated_command(
+        "REPORT_HYPERD_ERROR",
+        discovery::control_token_for(endpoint).as_ref(),
+    );
+    match send_command_with_timeout(endpoint, &command, timeout, timeout) {
         Ok(response) => {
             debug!(response = %response.trim(), "reported hyperd error to daemon");
         }
@@ -732,7 +803,8 @@ mod tests {
             "identity": {
                 "mcp_version": crate::version::mcp_version_string(),
                 "executable_path": executable_path
-            }
+            },
+            "protocol_version": 1
         })
     }
 
@@ -805,7 +877,8 @@ mod tests {
             &mut failures,
         );
 
-        let _ = send_command(&endpoint, "STOP");
+        let stop = authenticated_command("STOP", Some(state.control_token()));
+        let _ = send_command(&endpoint, &stop);
         handle.join().unwrap();
 
         assert!(

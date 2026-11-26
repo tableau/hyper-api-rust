@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Control-token API for the daemon health protocol:** `ControlToken`
+  (`generate`, `as_str`, `matches`), `discovery::control_token_for` /
+  `control_token_in`, `health::authenticated_command`,
+  `health::UNAUTHORIZED_REPLY`, and `DaemonState::with_control_token` /
+  `control_token`.
 - **The npm platform packages now ship `THIRD-PARTY-LICENSES.txt`,** listing
   the licenses of the Rust crates linked into the `hyperdb-mcp` binary. It is
   generated at publish time with `cargo-about` (`about.toml`, `about.hbs`), and
@@ -16,6 +21,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **The daemon now requires a per-daemon control token on `STOP` and
+  `REPORT_HYPERD_ERROR`.** Each daemon start draws 32 random bytes from the OS
+  RNG and publishes them hex-encoded as `control_token` in the owner-only
+  `daemon.json`; clients read it from there and send `STOP <token>` /
+  `REPORT_HYPERD_ERROR <token>`. A missing or wrong token gets `ERR
+  unauthorized` and changes nothing (a rejected report cannot trip the restart
+  limit). `PING`, `HEARTBEAT` and `STATUS` stay open, and the token is never in
+  `STATUS`, `doctor` output or logs. The record and `STATUS` also gain
+  `protocol_version` (`1`; absent means `0`). **Mixed versions:** upgrade every
+  hyperdb-mcp client together. A newer client talking to an older daemon (no
+  token in the record) sends the bare command as before; an older client
+  talking to this daemon gets `ERR unauthorized` on `STOP`, so it cannot stop
+  or take over the daemon, and its `REPORT_HYPERD_ERROR` is rejected too, so
+  it loses the fast restart and only the daemon's 5 s liveness poll remains. A
+  takeover refused this way fails at once with a `PermissionDenied` error
+  instead of waiting out the stop timeout.
 - **BREAKING (Rust API): `schema::map_hyper_type` now returns `Result`** instead
   of panicking on an out-of-range `NUMERIC`; callers must handle the error.
 - **`get_readme` is now written in a compact schema notation.** Tool

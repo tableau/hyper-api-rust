@@ -369,7 +369,36 @@ fn running_daemon_endpoint() -> daemon::control::HealthEndpoint {
 
 fn daemon_stop() {
     let endpoint = running_daemon_endpoint();
-    match health::send_command(&endpoint, "STOP") {
+    let token = discovery::control_token_for(&endpoint);
+    let stop = health::authenticated_command("STOP", token.as_ref());
+    match health::send_command(&endpoint, &stop) {
+        Ok(response) if response.trim() == health::UNAUTHORIZED_REPLY => {
+            if token.is_some() {
+                eprintln!(
+                    "The daemon refused STOP: it rejected the control token in daemon.json. \
+                     The record may be stale or overwritten, or this client is older than the \
+                     daemon (upgrade every hyperdb-mcp client to the same version)."
+                );
+            } else {
+                // No token was found, so there was nothing to present. Give the
+                // user a way out: the PID, from the daemon's own STATUS.
+                let pid = health::send_command(&endpoint, "STATUS")
+                    .ok()
+                    .and_then(|reply| {
+                        serde_json::from_str::<discovery::DaemonInfo>(reply.trim()).ok()
+                    })
+                    .map(|info| info.pid);
+                eprintln!(
+                    "The daemon requires a control token, but none was found in daemon.json \
+                     (missing, unreadable or written by an older daemon), so STOP was refused."
+                );
+                match pid {
+                    Some(pid) => eprintln!("Stop it manually: the daemon's process ID is {pid}."),
+                    None => eprintln!("Its process ID could not be read from STATUS."),
+                }
+            }
+            std::process::exit(1);
+        }
         Ok(response) => {
             println!("Daemon responded: {}", response.trim());
         }
