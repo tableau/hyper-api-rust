@@ -69,6 +69,12 @@ fn acquire_env_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// `verb` with the control token the daemon in `dir` published in its record,
+/// as a real client sends it.
+fn with_recorded_token(verb: &str, dir: &Path, endpoint: &HealthEndpoint) -> String {
+    health::authenticated_command(verb, discovery::control_token_in(dir, endpoint).as_ref())
+}
+
 // ─── Unit tests: DaemonState (no env vars, safe to run in parallel) ───────────
 
 /// A `DaemonState` for a daemon whose endpoint lives in a fresh state
@@ -434,13 +440,49 @@ fn health_protocol_stop_triggers_shutdown() {
 
     assert!(!health.state.should_shutdown());
 
-    let response = health::send_command(&health.endpoint, "STOP").unwrap();
+    let stop = health::authenticated_command("STOP", Some(health.state.control_token()));
+    let response = health::send_command(&health.endpoint, &stop).unwrap();
     assert_eq!(response.trim(), "STOPPING");
 
     assert!(health.state.should_shutdown());
 
     // Health listener should exit its loop
     health.join();
+}
+
+#[test]
+fn health_protocol_stop_without_or_with_wrong_token_is_rejected() {
+    let (_dir, mut health) = start_health_listener();
+
+    for command in ["STOP", "STOP wrong-token", "STOP "] {
+        let response = health::send_command(&health.endpoint, command).unwrap();
+        assert_eq!(response.trim(), "ERR unauthorized", "command {command:?}");
+    }
+    assert!(
+        !health.state.should_shutdown(),
+        "a rejected STOP must not shut the daemon down"
+    );
+
+    // The daemon is still serving, and the right token still works.
+    let stop = health::authenticated_command("STOP", Some(health.state.control_token()));
+    assert_eq!(
+        health::send_command(&health.endpoint, &stop)
+            .unwrap()
+            .trim(),
+        "STOPPING"
+    );
+    health.join();
+}
+
+#[test]
+fn health_protocol_status_never_contains_the_token() {
+    let (_dir, health) = start_health_listener();
+
+    let response = health::send_command(&health.endpoint, "STATUS").unwrap();
+    assert!(!response.contains(health.state.control_token().as_str()));
+    let parsed: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
+    assert!(parsed.get("control_token").is_none());
+    assert_eq!(parsed["protocol_version"], 1);
 }
 
 #[test]
@@ -467,7 +509,9 @@ fn health_protocol_report_hyperd_error_sets_flag() {
 
     assert!(!health.state.consume_restart_request(), "flag starts clear");
 
-    let response = health::send_command(&health.endpoint, "REPORT_HYPERD_ERROR").unwrap();
+    let report =
+        health::authenticated_command("REPORT_HYPERD_ERROR", Some(health.state.control_token()));
+    let response = health::send_command(&health.endpoint, &report).unwrap();
     assert_eq!(response.trim(), "OK");
 
     // The handler ran on a different thread. The flag is set before the OK
@@ -475,6 +519,27 @@ fn health_protocol_report_hyperd_error_sets_flag() {
     assert!(
         health.state.consume_restart_request(),
         "REPORT_HYPERD_ERROR must set the restart-requested flag"
+    );
+}
+
+#[test]
+fn health_protocol_unauthorized_reports_never_set_the_restart_flag() {
+    let (_dir, health) = start_health_listener();
+
+    // The restart flag is the only path from a report to a restart (and so to
+    // `RESTART_LIMIT`). More than `RESTART_LIMIT` rejected reports must leave
+    // it clear.
+    for command in ["REPORT_HYPERD_ERROR", "REPORT_HYPERD_ERROR nope"]
+        .into_iter()
+        .cycle()
+        .take(hyperdb_mcp::daemon::run::RESTART_LIMIT + 1)
+    {
+        let response = health::send_command(&health.endpoint, command).unwrap();
+        assert_eq!(response.trim(), "ERR unauthorized", "command {command:?}");
+    }
+    assert!(
+        !health.state.consume_restart_request(),
+        "a rejected report must not request a restart"
     );
 }
 
@@ -711,6 +776,16 @@ fn run_engine_report_child() {
         .expect("daemon info mutex must not be poisoned")
         .clone();
     discovery::write_discovery_file(&daemon_info).expect("write isolated daemon discovery record");
+    // A real daemon publishes its control token with the record; the report is
+    // only honored when the client reads and sends it.
+    let mut record = serde_json::to_value(&daemon_info).expect("record as JSON");
+    record["protocol_version"] = serde_json::Value::from(1);
+    record["control_token"] = serde_json::Value::from(health.state.control_token().as_str());
+    std::fs::write(
+        discovery::discovery_file_path().expect("discovery file path"),
+        serde_json::to_vec(&record).expect("serialize record"),
+    )
+    .expect("rewrite discovery record with the control token");
     assert!(
         !health.state.consume_restart_request(),
         "restart flag must begin clear"
@@ -1795,7 +1870,11 @@ fn client_report_triggers_restart_after_kill() {
     // Even so, the monitor only reacts on its 5s tick, so the worst-case
     // recovery time is unchanged. This test just verifies the report path
     // triggers the same restart as detection-via-polling.
-    let response = health::send_command(&daemon.endpoint, "REPORT_HYPERD_ERROR").unwrap();
+    let response = health::send_command(
+        &daemon.endpoint,
+        &with_recorded_token("REPORT_HYPERD_ERROR", &daemon.state_dir, &daemon.endpoint),
+    )
+    .unwrap();
     assert_eq!(response.trim(), "OK");
 
     let new_endpoint = wait_for_live_hyperd_after_kill(
@@ -2399,7 +2478,10 @@ impl TestDaemon {
 
 impl Drop for TestDaemon {
     fn drop(&mut self) {
-        let _ = health::send_command(&self.endpoint, "STOP");
+        let _ = health::send_command(
+            &self.endpoint,
+            &with_recorded_token("STOP", &self.state_dir, &self.endpoint),
+        );
         // The daemon holds the state directory's lock until after its `hyperd`
         // has exited, so the lock being free is the one reliable sign of full
         // shutdown (`HyperProcess` drop can take ~5s). Waiting on the control
@@ -2635,7 +2717,11 @@ fn a_daemon_started_right_after_stop_takes_over_the_state_directory() {
     let bound = Duration::from_secs(3);
     let exit_bound = Duration::from_secs(15);
     let started = Instant::now();
-    let response = health::send_command(&endpoint, "STOP").expect("STOP reaches daemon A");
+    let response = health::send_command(
+        &endpoint,
+        &with_recorded_token("STOP", &state_dir, &endpoint),
+    )
+    .expect("STOP reaches daemon A");
     assert_eq!(response.trim(), "STOPPING");
     let daemon_b = spawn_daemon_thread();
 
@@ -2675,7 +2761,10 @@ fn a_daemon_started_right_after_stop_takes_over_the_state_directory() {
 
     // Tear B down and wait for its lock, as TestDaemon does.
     let endpoint_b = HealthEndpoint::from_record(&info_b.health_endpoint, &state_dir).unwrap();
-    let _ = health::send_command(&endpoint_b, "STOP");
+    let _ = health::send_command(
+        &endpoint_b,
+        &with_recorded_token("STOP", &state_dir, &endpoint_b),
+    );
     hyperdb_mcp::daemon::spawn::wait_for_lock_release(&state_dir, Duration::from_secs(15))
         .expect("daemon B releases the lock after STOP");
     daemon_b
@@ -2699,7 +2788,11 @@ fn stop_removes_the_daemon_record_promptly() {
     assert!(record.exists(), "a running daemon has a record");
 
     let sent = Instant::now();
-    health::send_command(&daemon.endpoint, "STOP").expect("STOP reaches the daemon");
+    health::send_command(
+        &daemon.endpoint,
+        &with_recorded_token("STOP", &daemon.state_dir, &daemon.endpoint),
+    )
+    .expect("STOP reaches the daemon");
     while record.exists() {
         assert!(
             sent.elapsed() < Duration::from_secs(1),

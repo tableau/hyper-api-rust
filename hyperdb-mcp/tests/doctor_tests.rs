@@ -2031,8 +2031,14 @@ fn doctor_cli_reports_live_from_discovery_via_real_health_listener() {
 
         let listener = RunningHealthListener::start(&sandbox);
         let discovery_path = sandbox.state_dir.join("daemon.json");
+        // The record carries the control token; the doctor must read it
+        // without ever echoing it.
+        let token = listener.state.control_token().as_str().to_owned();
+        let mut fixture = serde_json::to_value(&listener.info).expect("fixture value");
+        fixture["protocol_version"] = Value::from(1);
+        fixture["control_token"] = Value::from(token.clone());
         let discovery_bytes =
-            serde_json::to_vec_pretty(&listener.info).expect("serialize discovery fixture");
+            serde_json::to_vec_pretty(&fixture).expect("serialize discovery fixture");
         std::fs::write(&discovery_path, &discovery_bytes).expect("write discovery fixture");
         let before = snapshot_tree(&sandbox.root);
 
@@ -2043,6 +2049,13 @@ fn doctor_cli_reports_live_from_discovery_via_real_health_listener() {
             &launcher_metadata,
             Some(missing_hyperd.as_os_str()),
         );
+        if String::from_utf8_lossy(&output.stdout).contains(&token)
+            || String::from_utf8_lossy(&output.stderr).contains(&token)
+        {
+            failures.push(format!(
+                "attempt {attempt}: doctor --json leaked the control token"
+            ));
+        }
         let report = parse_json_report(
             &output,
             "hyperdb-mcp doctor --json against discovery HealthListener",
@@ -2073,6 +2086,11 @@ fn doctor_cli_reports_live_from_discovery_via_real_health_listener() {
             );
             let human = std::str::from_utf8(&human_output.stdout)
                 .expect("live-daemon human report must be UTF-8");
+            if human.contains(&token) {
+                failures.push(format!(
+                    "attempt {attempt}: doctor leaked the control token"
+                ));
+            }
             if let Some(failure) = live_daemon_human_parity_failure(&report, human) {
                 failures.push(format!(
                     "attempt {attempt}: live JSON/human identity parity: {failure}"
@@ -2087,7 +2105,9 @@ fn doctor_cli_reports_live_from_discovery_via_real_health_listener() {
         match std::fs::read(&discovery_path) {
             Ok(after) if after == discovery_bytes => {}
             Ok(after) => failures.push(format!(
-                "attempt {attempt}: discovery bytes changed: before={discovery_bytes:?}, after={after:?}"
+                "attempt {attempt}: discovery bytes changed ({} bytes before, {} after; not printed: they hold the control token)",
+                discovery_bytes.len(),
+                after.len()
             )),
             Err(error) => failures.push(format!(
                 "attempt {attempt}: discovery fixture disappeared: {error}"

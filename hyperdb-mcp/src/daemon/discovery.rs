@@ -44,12 +44,93 @@ pub(crate) struct DaemonBuildIdentity {
     executable_path: crate::diagnostics::ReportedPath,
 }
 
+/// The health-protocol revision this build speaks and writes into `daemon.json`
+/// and `STATUS`. A record that predates the field reads as `0`. Revision `1`
+/// adds the per-daemon [`ControlToken`] on `STOP` and `REPORT_HYPERD_ERROR`.
+pub(crate) const DAEMON_PROTOCOL_VERSION: u32 = 1;
+
+/// Per-daemon capability for the mutating health commands (`STOP`,
+/// `REPORT_HYPERD_ERROR`): 32 bytes from the OS RNG, hex-encoded, fresh on
+/// every daemon start.
+///
+/// It lives in the owner-only `daemon.json` and is never served by `STATUS`.
+/// `Debug` is redacted so a `{:?}` of a record, a state or an error cannot put
+/// it in a log or a doctor report.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ControlToken(String);
+
+impl ControlToken {
+    /// Draw a fresh token from the operating system's RNG.
+    ///
+    /// # Errors
+    /// Returns an error if the OS RNG is unavailable; the daemon then refuses
+    /// to start rather than run with a guessable token.
+    pub fn generate() -> io::Result<Self> {
+        use rand::TryRng as _;
+        use std::fmt::Write as _;
+
+        let mut bytes = [0_u8; 32];
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut bytes)
+            .map_err(|e| io::Error::other(format!("OS random number generator failed: {e}")))?;
+        let mut hex = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            write!(hex, "{byte:02x}").map_err(|e| io::Error::other(e.to_string()))?;
+        }
+        Ok(Self(hex))
+    }
+
+    /// The token as it is sent on the wire.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Constant-time comparison against a presented token. Only the length,
+    /// which is not secret, can end the comparison early.
+    #[must_use]
+    pub fn matches(&self, presented: &str) -> bool {
+        let (expected, presented) = (self.0.as_bytes(), presented.as_bytes());
+        if expected.len() != presented.len() {
+            return false;
+        }
+        let difference = expected
+            .iter()
+            .zip(presented)
+            .fold(0_u8, |acc, (a, b)| acc | (a ^ b));
+        std::hint::black_box(difference) == 0
+    }
+}
+
+impl std::fmt::Debug for ControlToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ControlToken(<redacted>)")
+    }
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde `skip_serializing_if` passes a reference"
+)]
+fn is_legacy_protocol(version: &u32) -> bool {
+    *version == 0
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DaemonRecord {
     #[serde(flatten)]
     info: DaemonInfo,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     identity: Option<DaemonBuildIdentity>,
+    /// Health-protocol revision; absent (an older daemon) reads as `0`, and `0`
+    /// is not written back, so a legacy record reserializes unchanged.
+    #[serde(default, skip_serializing_if = "is_legacy_protocol")]
+    protocol_version: u32,
+    /// Capability for `STOP` / `REPORT_HYPERD_ERROR`. Absent from `STATUS`
+    /// output and from records written by an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    control_token: Option<ControlToken>,
 }
 
 impl DaemonRecord {
@@ -63,7 +144,30 @@ impl DaemonRecord {
                     executable.as_os_str(),
                 ),
             }),
+            protocol_version: DAEMON_PROTOCOL_VERSION,
+            control_token: None,
         })
+    }
+
+    /// The record `STATUS` falls back to when the executable identity cannot
+    /// be collected: no identity, never a token, but still the protocol version.
+    pub(super) fn without_identity(info: &DaemonInfo) -> Self {
+        Self {
+            info: info.clone(),
+            identity: None,
+            protocol_version: DAEMON_PROTOCOL_VERSION,
+            control_token: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn protocol_version(&self) -> u32 {
+        self.protocol_version
+    }
+
+    #[cfg(test)]
+    pub(crate) fn control_token(&self) -> Option<&ControlToken> {
+        self.control_token.as_ref()
     }
 
     pub(crate) fn info(&self) -> &DaemonInfo {
@@ -306,8 +410,13 @@ pub fn write_discovery_file_in(dir: &Path, info: &DaemonInfo) -> io::Result<()> 
 /// Write the record with this process's identity, into `dir`. The daemon
 /// passes the state directory it already holds rather than re-reading the
 /// environment.
-pub(super) fn write_enriched_discovery_file_in(dir: &Path, info: &DaemonInfo) -> io::Result<()> {
-    let record = DaemonRecord::with_current_identity(info)?;
+pub(super) fn write_enriched_discovery_file_in(
+    dir: &Path,
+    info: &DaemonInfo,
+    control_token: &ControlToken,
+) -> io::Result<()> {
+    let mut record = DaemonRecord::with_current_identity(info)?;
+    record.control_token = Some(control_token.clone());
     write_discovery_record(dir, &record)
 }
 
@@ -401,6 +510,40 @@ pub fn discover_in(dir: &Path) -> Option<DaemonInfo> {
         Some(info)
     } else {
         None
+    }
+}
+
+/// The control token the daemon serving `health` published in its record, or
+/// `None` when the record carries none (a daemon older than protocol 1, which
+/// takes the bare command) or cannot be read.
+///
+/// The record is only believed if it names `health` as its endpoint, so a
+/// token is never sent to an endpoint it was not issued for.
+#[must_use]
+pub fn control_token_for(health: &HealthEndpoint) -> Option<ControlToken> {
+    control_token_in(&state_dir().ok()?, health)
+}
+
+/// Whether two endpoint strings name the same endpoint. On Unix they are socket
+/// paths and are compared as paths, as [`HealthEndpoint::from_record`] does.
+fn same_endpoint(a: &str, b: &str) -> bool {
+    if cfg!(unix) {
+        Path::new(a) == Path::new(b)
+    } else {
+        a == b
+    }
+}
+
+/// [`control_token_for`] for an explicit state directory.
+#[must_use]
+pub fn control_token_in(dir: &Path, health: &HealthEndpoint) -> Option<ControlToken> {
+    match read_discovery_file_raw(&dir.join("daemon.json")) {
+        RawDiscoveryRead::Parsed { record, .. }
+            if same_endpoint(&record.info().health_endpoint, health.as_str()) =>
+        {
+            record.control_token
+        }
+        _ => None,
     }
 }
 
@@ -713,7 +856,8 @@ mod tests {
                     "display": "/opt/hyperdb/bin/hyperdb-mcp",
                     "encoding": "utf8"
                 }
-            }
+            },
+            "protocol_version": 1
         });
         let mut failures = Vec::new();
 
@@ -743,6 +887,8 @@ mod tests {
         let new_record = DaemonRecord {
             info: legacy_info(),
             identity: Some(identity.clone()),
+            protocol_version: DAEMON_PROTOCOL_VERSION,
+            control_token: None,
         };
         match catch_serde(|| serde_json::to_value(&new_record)) {
             Ok(new_wire) => {
@@ -1818,5 +1964,62 @@ mod tests {
             trusted_hyperd_endpoint(&info, &health, dir.path()),
             Some(legit_socket(dir.path()))
         );
+    }
+
+    #[test]
+    fn control_token_is_64_hex_chars_fresh_each_time_and_redacted() {
+        let a = ControlToken::generate().unwrap();
+        let b = ControlToken::generate().unwrap();
+        assert_eq!(a.as_str().len(), 64);
+        assert!(a.as_str().bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+        assert!(!format!("{a:?}").contains(a.as_str()));
+    }
+
+    #[test]
+    fn control_token_matches_only_the_exact_token() {
+        let token = ControlToken::generate().unwrap();
+        assert!(token.matches(token.as_str()));
+        assert!(!token.matches(""));
+        assert!(!token.matches("wrong"));
+        assert!(!token.matches(&format!("{}0", token.as_str())));
+        let mut flipped = token.as_str().to_string();
+        flipped.replace_range(..1, if flipped.starts_with('a') { "b" } else { "a" });
+        assert!(!token.matches(&flipped));
+    }
+
+    #[test]
+    fn record_without_token_or_protocol_version_parses_as_legacy() {
+        let wire = json!({
+            "pid": 1,
+            "hyperd_endpoint": "127.0.0.1:1",
+            "health_endpoint": "/x.sock",
+            "started_at": "t",
+            "version": "0.7.0",
+        });
+        let record: DaemonRecord = serde_json::from_value(wire).unwrap();
+        assert_eq!(record.protocol_version(), 0);
+        assert!(record.control_token().is_none());
+    }
+
+    #[test]
+    fn written_record_carries_token_and_protocol_version_one() {
+        let dir = short_state_dir();
+        let info = info_for(dir.path(), 4242);
+        let token = ControlToken::generate().unwrap();
+        write_enriched_discovery_file_in(dir.path(), &info, &token).unwrap();
+
+        let raw: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("daemon.json")).unwrap())
+                .unwrap();
+        assert_eq!(raw["protocol_version"], 1);
+        assert_eq!(raw["control_token"], token.as_str());
+
+        let endpoint = HealthEndpoint::from_record(&info.health_endpoint, dir.path()).unwrap();
+        assert_eq!(control_token_in(dir.path(), &endpoint), Some(token));
+        // A record is not believed for an endpoint it does not name.
+        let other = short_state_dir();
+        let other_endpoint = HealthEndpoint::for_new_daemon(other.path()).unwrap();
+        assert_eq!(control_token_in(dir.path(), &other_endpoint), None);
     }
 }

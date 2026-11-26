@@ -201,14 +201,20 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), Box<dyn std::error::
         started_at: chrono::Utc::now().to_rfc3339(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     };
-    discovery::write_enriched_discovery_file_in(&state_dir, &info)?;
+    // The state owns the control token; publish it in the record before anyone
+    // can discover the daemon.
+    // A failing OS RNG is a startup error, never a daemon with a weak token.
+    let state = Arc::new(DaemonState::with_control_token(
+        endpoint,
+        discovery::ControlToken::generate()?,
+    ));
+    discovery::write_enriched_discovery_file_in(&state_dir, &info, state.control_token())?;
     info!(path = %state_dir.join("daemon.json").display(), "discovery file written");
 
     // Step 5: Build the shared state.
     // - `info_arc` is shared with the health listener so STATUS reports the
     //   current endpoint even after a restart.
     // - `hyper_state` is owned by the monitor task; the listener never touches it.
-    let state = Arc::new(DaemonState::new(endpoint));
     let info_arc = Arc::new(Mutex::new(info));
     let hyper_state = Arc::new(Mutex::new(HyperState {
         hyper: Some(hyper),
@@ -418,7 +424,7 @@ async fn hyperd_monitor(
             continue;
         }
 
-        match try_restart_hyperd(&hyper_state, &info_arc, state_dir) {
+        match try_restart_hyperd(&hyper_state, &info_arc, state_dir, state.control_token()) {
             Ok(new_endpoint) => {
                 info!(endpoint = %new_endpoint, "hyperd restarted");
                 // Drain any reports that landed *during* the restart — those
@@ -454,6 +460,7 @@ fn try_restart_hyperd(
     hyper_state: &Mutex<HyperState>,
     info_arc: &Mutex<DaemonInfo>,
     state_dir: &Path,
+    control_token: &discovery::ControlToken,
 ) -> Result<String, RestartError> {
     let mut guard = hyper_state.lock().expect("HyperState mutex poisoned");
 
@@ -514,7 +521,7 @@ fn try_restart_hyperd(
         let mut info_guard = info_arc.lock().expect("DaemonInfo mutex poisoned");
         let mut snapshot = info_guard.clone();
         snapshot.hyperd_endpoint.clone_from(&new_endpoint);
-        discovery::write_enriched_discovery_file_in(state_dir, &snapshot)
+        discovery::write_enriched_discovery_file_in(state_dir, &snapshot, control_token)
             .map_err(|e| RestartError::SpawnFailed(format!("discovery write: {e}")))?;
         info_guard.hyperd_endpoint.clone_from(&new_endpoint);
     }
