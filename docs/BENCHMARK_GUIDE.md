@@ -573,6 +573,69 @@ out differently — worth measuring.
 
 ---
 
+## `hyperd` startup cost and idle memory
+
+`hyperdb-api/benches/hyperd_startup_cost.rs` measures what it costs to bring
+up a `hyperd` and connect to it, which bounds how much a long-lived shared
+engine can save over spawning one per process. It runs N iterations
+(default 30) of spawn, connect, `SELECT 1`, shutdown; samples one idle engine
+after 5 seconds; and compares connect time against an engine that requires
+SCRAM-SHA-256 with the password-less connect time. `BENCH_TRANSPORT=ipc`
+selects the same Unix Domain Socket / Named Pipe transport switch the suite
+uses; the SCRAM comparison always runs over TCP.
+
+```sh
+HYPERD_PATH="$PWD/.hyperd/current" \
+  cargo run -p hyperdb-api --release --example hyperd_startup_cost -- 30
+BENCH_TRANSPORT=ipc HYPERD_PATH="$PWD/.hyperd/current" \
+  cargo run -p hyperdb-api --release --example hyperd_startup_cost -- 30
+```
+
+### Host and engine (2026-11-25)
+
+- **OS:** macOS 27.2.1 (aarch64)
+- **CPU:** Apple M3 Max
+- **Memory:** 96 GB
+- **hyperd:** `main.0.0.26479.r96880f6a`
+- **Iterations:** 30 per transport
+
+### Per-phase wall time, milliseconds
+
+Each iteration starts a fresh `hyperd`, so "connect" is the first connection
+to a cold engine.
+
+| Phase | TCP min | TCP median | TCP p95 | IPC min | IPC median | IPC p95 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Spawn to endpoint | 51.03 | 54.77 | 55.94 | 51.78 | 54.74 | 55.78 |
+| Connect (no password) | 1.04 | 1.24 | 1.48 | 0.82 | 0.91 | 1.15 |
+| First query (`SELECT 1`) | 4.61 | 5.21 | 5.85 | 4.56 | 5.01 | 6.11 |
+| Shutdown | 5.49 | 7.25 | 8.82 | 5.35 | 7.04 | 9.02 |
+
+### Idle resident memory
+
+One `hyperd`, idle for 5 seconds, `ps -o rss=`: 57,520 KiB (56.2 MiB) over
+TCP and 58,064 KiB (56.7 MiB) over IPC. This is the resident set of the
+`hyperd` process only. It is measured on Unix; the Windows leg is skipped
+(no `ps`).
+
+### Connect time: password-less versus SCRAM-SHA-256
+
+Connections to an already-warm engine over TCP, 30 connect-and-close cycles
+each, milliseconds. The SCRAM engine is started with a config file declaring
+one user with a SCRAM-SHA-256 verifier plus `strict_settings_mode`; the bench
+uses a fixed, benchmark-only test credential.
+
+| Auth | Run | Min | Median | p95 |
+| --- | --- | ---: | ---: | ---: |
+| Password-less | TCP run | 0.19 | 0.24 | 0.37 |
+| SCRAM-SHA-256 | TCP run | 0.66 | 0.73 | 0.99 |
+| Password-less | IPC run | 0.13 | 0.19 | 0.33 |
+| SCRAM-SHA-256 | IPC run | 0.60 | 0.69 | 0.90 |
+
+The "Run" label is the `BENCH_TRANSPORT` setting of the invocation; the
+connections themselves are TCP in both. SCRAM adds about 0.5 ms per
+connection at the median.
+
 ## Adding a platform
 
 1. Build in release mode: `cargo build --release -p hyperdb-api --example benchmark_suite`
